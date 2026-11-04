@@ -1,0 +1,42 @@
+name: arbpilot
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: arbpilot
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-arbpilot}
+      POSTGRES_DB: arbpilot
+    volumes:
+      - arbpilot-pgdata:/var/lib/postgresql/data
+    # 默认只绑定本机；远程访问请通过 SSH 隧道/VPN，不要直接暴露数据库。
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U arbpilot -d arbpilot"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  executor:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.executor
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      ARBPILOT_BIND_ADDR: 0.0.0.0:8787
+      ARBPILOT_API_TOKEN: ${ARBPILOT_API_TOKEN:?请先设置 ARBPILOT_API_TOKEN}
+      ARBPILOT_MODE: paper
+      ARBPILOT_ALLOW_LIVE_TRADING: "false"
+      DATABASE_URL: postgres://arbpilot:${POSTGRES_PASSWORD:-arbpilot}@postgres:5432/arbpilot
+      RUST_LOG: info,arbpilot_executor=debug
+    # 管理端口仅绑定回环地址，桌面端通过 SSH 隧道连接。
+    ports:
+      - "127.0.0.1:8787:8787"
+
+volumes:
+  arbpilot-pgdata:

@@ -1,0 +1,17 @@
+[package]
+name = "arb-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ArbPilot 领域模型、风控引擎与交易所适配 trait"
+
+[dependencies]
+async-trait = { workspace = true }
+chrono = { workspace = true }
+rust_decimal = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+rust_decimal_macros = { workspace = true }

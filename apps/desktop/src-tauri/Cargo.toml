@@ -1,0 +1,18 @@
+[package]
+name = "arbpilot-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ArbPilot 桌面端（Tauri 2）"
+
+[lib]
+name = "arbpilot_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+tauri = { version = "2", features = [] }
