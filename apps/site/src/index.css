@@ -1,0 +1,174 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme inline {
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  --color-canvas: var(--canvas);
+  --color-panel: var(--panel);
+  --color-panel-soft: var(--panel-soft);
+  --color-hover: var(--hover);
+
+  --color-line: var(--line);
+  --color-line-strong: var(--line-strong);
+
+  --color-fg: var(--fg);
+  --color-body: var(--body);
+  --color-muted: var(--muted);
+  --color-subtle: var(--subtle);
+
+  --color-accent: var(--accent);
+  --color-accent-strong: var(--accent-strong);
+  --color-accent-solid: var(--accent-solid);
+  --color-accent-solid-hover: var(--accent-solid-hover);
+  --color-on-accent: var(--on-accent);
+
+  --color-danger: var(--danger);
+  --color-warning: var(--warning);
+  --color-info: var(--info);
+}
+
+/* 浅色为默认，深色通过 html.dark 切换 */
+:root {
+  color-scheme: light;
+
+  --canvas: #f6f7fa;
+  --panel: #ffffff;
+  --panel-soft: #f1f4f8;
+  --hover: #eef2f7;
+
+  --line: #e3e8ef;
+  --line-strong: #cbd5e1;
+
+  --fg: #0b1220;
+  --body: #334155;
+  --muted: #5b6b7f;
+  --subtle: #8b98a9;
+
+  --accent: #047857;
+  --accent-strong: #065f46;
+  --accent-solid: #059669;
+  --accent-solid-hover: #047857;
+  --on-accent: #ffffff;
+
+  --danger: #be123c;
+  --warning: #b45309;
+  --info: #0369a1;
+
+  --grid-line: rgba(15, 23, 42, 0.08);
+  --noise-dot: rgba(15, 23, 42, 0.06);
+  --glow: rgba(5, 150, 105, 0.12);
+}
+
+.dark {
+  color-scheme: dark;
+
+  --canvas: #05080c;
+  --panel: #0a0f15;
+  --panel-soft: #0e141c;
+  --hover: #121a24;
+
+  --line: #1b2532;
+  --line-strong: #27364a;
+
+  --fg: #f1f5f9;
+  --body: #cbd5e1;
+  --muted: #94a3b8;
+  --subtle: #64748b;
+
+  --accent: #6ee7b7;
+  --accent-strong: #a7f3d0;
+  --accent-solid: #34d399;
+  --accent-solid-hover: #6ee7b7;
+  --on-accent: #05080c;
+
+  --danger: #fda4af;
+  --warning: #fcd34d;
+  --info: #7dd3fc;
+
+  --grid-line: rgba(148, 163, 184, 0.08);
+  --noise-dot: rgba(255, 255, 255, 0.045);
+  --glow: rgba(16, 185, 129, 0.1);
+}
+
+@layer base {
+  html {
+    scroll-behavior: smooth;
+  }
+
+  body {
+    @apply bg-canvas text-body antialiased;
+    font-family:
+      "Inter",
+      -apple-system,
+      BlinkMacSystemFont,
+      "PingFang SC",
+      "Microsoft YaHei",
+      sans-serif;
+  }
+
+  ::selection {
+    @apply bg-accent/30 text-fg;
+  }
+
+  ::-webkit-scrollbar {
+    width: 10px;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    @apply rounded-full bg-line-strong;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+}
+
+@layer utilities {
+  /* 页面统一宽度与左右留白 */
+  .page {
+    @apply mx-auto w-full max-w-[1180px] px-6 lg:px-8;
+  }
+
+  /* 小号英文标签 */
+  .eyebrow {
+    @apply font-mono text-[11px] uppercase tracking-[0.28em] text-accent/80;
+  }
+
+  /* 标题中的衬线斜体，呼应编辑部风格 */
+  .accent-serif {
+    font-family: "Songti SC", "Noto Serif SC", "Source Han Serif SC", Georgia, serif;
+    font-style: italic;
+  }
+
+  .card {
+    @apply rounded-2xl border border-line bg-panel;
+  }
+
+  .hairline {
+    @apply border-line;
+  }
+
+  /* 背景细网格 */
+  .grid-backdrop {
+    background-image:
+      linear-gradient(to right, var(--grid-line) 1px, transparent 1px),
+      linear-gradient(to bottom, var(--grid-line) 1px, transparent 1px);
+    background-size: 56px 56px;
+    mask-image: radial-gradient(ellipse 80% 60% at 50% 0%, #000 30%, transparent 100%);
+  }
+
+  .noise {
+    background-image: radial-gradient(var(--noise-dot) 1px, transparent 1px);
+    background-size: 3px 3px;
+  }
+
+  .glow {
+    background-color: var(--glow);
+  }
+
+  .text-balance {
+    text-wrap: balance;
+  }
+}
