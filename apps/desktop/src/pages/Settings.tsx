@@ -6,6 +6,7 @@ import { Badge } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "../components/ui/card";
 import { BillingCard } from "../components/BillingCard";
+import DocsPage from "./Docs";
 import { checkAppUpdate, currentAppVersion, relaunchApp } from "../lib/appUpdate";
 import type { DownloadProgress, PendingUpdate } from "../lib/appUpdate";
 import { isDesktopRuntime } from "../lib/deploy";
@@ -14,18 +15,20 @@ import {
   useCreateSettlement,
   useCreateTelegramPairing,
   useMarketAuthors,
+  useNotificationSettings,
   useRevokeTelegramBinding,
   useRiskLimits,
   useSettlements,
   useTelegramStatus,
   useUpdateMarketAuthor,
+  useUpdateNotificationSettings,
   useUpdateRiskLimits,
   useUpdateSettlement,
 } from "../hooks/useApi";
 import { DEFAULT_TOKEN, getApiToken, getExecutorUrl, isLocalExecutor, setApiToken, setExecutorUrl } from "../lib/api";
 import { formatDateTime, formatUsd } from "../lib/format";
 import { fmt, useI18n } from "../lib/i18n";
-import type { RiskLimits, SettlementStatus } from "../lib/types";
+import type { NotificationSettings, RiskLimits, SettlementStatus } from "../lib/types";
 import { cn } from "../lib/utils";
 
 const inputClass =
@@ -34,7 +37,7 @@ const inputClass =
 const smallInputClass =
   "w-full rounded-md border border-line bg-panel-soft px-2 py-1 text-xs text-body outline-none focus:border-accent/60";
 
-type SettingsTab = "connection" | "risk" | "account" | "author" | "notify" | "client";
+type SettingsTab = "connection" | "risk" | "account" | "author" | "notify" | "client" | "deploy";
 
 export default function SettingsPage() {
   const queryClient = useQueryClient();
@@ -65,6 +68,7 @@ export default function SettingsPage() {
     { id: "author", label: t.settings.tabAuthor },
     { id: "notify", label: t.settings.tabNotify },
     { id: "client", label: t.settings.tabClient },
+    { id: "deploy", label: t.settings.tabDeploy },
   ];
 
   return (
@@ -141,7 +145,14 @@ export default function SettingsPage() {
 
       {tab === "author" && <AuthorSettings />}
 
-      {tab === "notify" && <TelegramCard />}
+      {tab === "notify" && (
+        <div className="space-y-4">
+          <NotificationCard />
+          <TelegramCard />
+        </div>
+      )}
+
+      {tab === "deploy" && <DocsPage embedded />}
 
       {tab === "client" && (
         <div className="space-y-4">
@@ -773,6 +784,222 @@ function LimitItem({ label, value }: { label: string; value: string }) {
       <dt className="text-[11px] text-muted">{label}</dt>
       <dd className="mt-0.5 font-mono text-xs text-body">{value}</dd>
     </div>
+  );
+}
+
+/** 全部新闻来源；接口返回空列表时表示「全部来源」。 */
+const NEWS_SOURCE_IDS = ["binance", "upbit", "okx", "bybit", "bitget"] as const;
+
+interface NotificationDraft {
+  newsEnabled: boolean;
+  newsSources: string[];
+  fundingEnabled: boolean;
+  fundingThreshold: string;
+  fundingCooldownHours: string;
+  telegramEnabled: boolean;
+  desktopEnabled: boolean;
+}
+
+function toNotificationDraft(settings: NotificationSettings): NotificationDraft {
+  return {
+    newsEnabled: settings.news_enabled,
+    newsSources: settings.news_sources.length ? settings.news_sources : [...NEWS_SOURCE_IDS],
+    fundingEnabled: settings.funding_enabled,
+    fundingThreshold: String(Number(settings.funding_min_annualized_pct)),
+    fundingCooldownHours: String(Math.round((settings.funding_cooldown_secs / 3600) * 10) / 10),
+    telegramEnabled: settings.telegram_enabled,
+    desktopEnabled: settings.desktop_enabled,
+  };
+}
+
+/** 消息开关与消息配置：新闻推送、资金费率套利提醒的条件与渠道。 */
+function NotificationCard() {
+  const { t } = useI18n();
+  const settings = useNotificationSettings();
+  const update = useUpdateNotificationSettings();
+  const [draft, setDraft] = useState<NotificationDraft | null>(null);
+
+  // 首次拿到配置后回填表单；保存成功后不清空，便于继续微调。
+  useEffect(() => {
+    if (settings.data && !draft) {
+      setDraft(toNotificationDraft(settings.data));
+    }
+  }, [settings.data, draft]);
+
+  const toggleSource = (source: string) => {
+    if (!draft) return;
+    const sources = draft.newsSources.includes(source)
+      ? draft.newsSources.filter((item) => item !== source)
+      : [...draft.newsSources, source];
+    setDraft({ ...draft, newsSources: sources });
+  };
+
+  const save = () => {
+    if (!draft) return;
+    update.mutate({
+      news_enabled: draft.newsEnabled,
+      news_sources: draft.newsSources,
+      funding_enabled: draft.fundingEnabled,
+      funding_min_annualized_pct: Number(draft.fundingThreshold) || 0,
+      funding_cooldown_secs: Math.round((Number(draft.fundingCooldownHours) || 0) * 3600),
+      telegram_enabled: draft.telegramEnabled,
+      desktop_enabled: draft.desktopEnabled,
+    });
+  };
+
+  const sourceName = (source: (typeof NEWS_SOURCE_IDS)[number]) => t.news.sources[source].name;
+
+  return (
+    <Card>
+      <CardHeader>
+        <div>
+          <CardTitle>{t.settings.notifyTitle}</CardTitle>
+          <CardDescription>{t.settings.notifyDesc}</CardDescription>
+        </div>
+        {settings.isError && <Badge tone="danger">{t.settings.notConnected}</Badge>}
+      </CardHeader>
+      <CardContent className="space-y-4">
+        {!draft ? (
+          <p className="py-8 text-center text-xs text-muted">
+            {settings.isError ? t.settings.notifyUnavailable : t.settings.unavailable}
+          </p>
+        ) : (
+          <>
+            <div className="grid gap-2 sm:grid-cols-2">
+              <NotifyToggle
+                label={t.settings.notifyNews}
+                hint={t.settings.notifyNewsHint}
+                checked={draft.newsEnabled}
+                onChange={(checked) => setDraft({ ...draft, newsEnabled: checked })}
+              />
+              <NotifyToggle
+                label={t.settings.notifyFunding}
+                hint={t.settings.notifyFundingHint}
+                checked={draft.fundingEnabled}
+                onChange={(checked) => setDraft({ ...draft, fundingEnabled: checked })}
+              />
+            </div>
+
+            <div className="space-y-2">
+              <p className="text-[11px] text-muted">{t.settings.notifyNewsSources}</p>
+              <div className="flex flex-wrap gap-1.5">
+                {NEWS_SOURCE_IDS.map((source) => {
+                  const active = draft.newsSources.includes(source);
+                  return (
+                    <button
+                      key={source}
+                      type="button"
+                      disabled={!draft.newsEnabled}
+                      onClick={() => toggleSource(source)}
+                      className={cn(
+                        "rounded-lg border px-2.5 py-1 text-xs transition-colors disabled:opacity-50",
+                        active
+                          ? "border-accent/40 bg-accent/10 text-fg"
+                          : "border-line text-muted hover:bg-hover",
+                      )}
+                    >
+                      {sourceName(source)}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            <div className="grid gap-3 sm:grid-cols-2">
+              <label className="block space-y-1.5">
+                <span className="text-[11px] text-muted">{t.settings.notifyThreshold}</span>
+                <input
+                  className={`${inputClass} font-mono`}
+                  type="number"
+                  min="0"
+                  step="0.1"
+                  disabled={!draft.fundingEnabled}
+                  value={draft.fundingThreshold}
+                  onChange={(event) =>
+                    setDraft({ ...draft, fundingThreshold: event.target.value })
+                  }
+                />
+                <span className="block text-[11px] leading-relaxed text-subtle">
+                  {t.settings.notifyThresholdHint}
+                </span>
+              </label>
+              <label className="block space-y-1.5">
+                <span className="text-[11px] text-muted">{t.settings.notifyCooldown}</span>
+                <input
+                  className={`${inputClass} font-mono`}
+                  type="number"
+                  min="0"
+                  step="0.5"
+                  disabled={!draft.fundingEnabled}
+                  value={draft.fundingCooldownHours}
+                  onChange={(event) =>
+                    setDraft({ ...draft, fundingCooldownHours: event.target.value })
+                  }
+                />
+                <span className="block text-[11px] leading-relaxed text-subtle">
+                  {t.settings.notifyCooldownHint}
+                </span>
+              </label>
+            </div>
+
+            <div className="space-y-2">
+              <p className="text-[11px] text-muted">{t.settings.notifyChannels}</p>
+              <div className="grid gap-2 sm:grid-cols-2">
+                <NotifyToggle
+                  label={t.settings.notifyTelegram}
+                  hint={t.settings.notifyTelegramHint}
+                  checked={draft.telegramEnabled}
+                  onChange={(checked) => setDraft({ ...draft, telegramEnabled: checked })}
+                />
+                <NotifyToggle
+                  label={t.settings.notifyDesktop}
+                  hint={t.settings.notifyDesktopHint}
+                  checked={draft.desktopEnabled}
+                  onChange={(checked) => setDraft({ ...draft, desktopEnabled: checked })}
+                />
+              </div>
+            </div>
+
+            <div className="flex items-center gap-3">
+              <Button size="sm" onClick={save} disabled={update.isPending}>
+                {t.settings.notifySave}
+              </Button>
+              {update.isSuccess && (
+                <span className="text-xs text-accent">{t.settings.notifySaved}</span>
+              )}
+              {update.isError && <span className="text-xs text-danger">{update.error.message}</span>}
+            </div>
+          </>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+function NotifyToggle({
+  label,
+  hint,
+  checked,
+  onChange,
+}: {
+  label: string;
+  hint: string;
+  checked: boolean;
+  onChange: (checked: boolean) => void;
+}) {
+  return (
+    <label className="flex cursor-pointer items-start justify-between gap-3 rounded-lg border border-line px-3 py-2.5">
+      <span className="min-w-0">
+        <span className="block text-xs font-medium text-body">{label}</span>
+        <span className="mt-0.5 block text-[11px] leading-relaxed text-muted">{hint}</span>
+      </span>
+      <input
+        type="checkbox"
+        className="mt-0.5 h-4 w-4 shrink-0 cursor-pointer accent-accent"
+        checked={checked}
+        onChange={(event) => onChange(event.target.checked)}
+      />
+    </label>
   );
 }
 

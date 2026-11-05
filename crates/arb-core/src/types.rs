@@ -62,6 +62,32 @@ pub enum Side {
     Sell,
 }
 
+/// 持仓方向。`Side` 描述买卖动作，这里描述持有的是多头还是空头。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PositionSide {
+    Long,
+    Short,
+}
+
+impl PositionSide {
+    /// 开仓动作：做多买入，做空卖出。
+    pub fn open_side(self) -> Side {
+        match self {
+            Self::Long => Side::Buy,
+            Self::Short => Side::Sell,
+        }
+    }
+
+    /// 平仓动作与开仓相反。
+    pub fn close_side(self) -> Side {
+        match self {
+            Self::Long => Side::Sell,
+            Self::Short => Side::Buy,
+        }
+    }
+}
+
 /// 订单来源，用于审计与权限区分。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

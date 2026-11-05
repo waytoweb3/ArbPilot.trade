@@ -79,6 +79,34 @@ export function useUpdateRiskLimits() {
   });
 }
 
+/** 策略范围可选的交易所与交易对，由执行器数据库配置；配置变更后自动刷新。 */
+export function useMarketConfig() {
+  return useQuery({
+    queryKey: ["market-config"],
+    queryFn: api.marketConfig,
+    staleTime: 60_000,
+    refetchInterval: 60_000,
+  });
+}
+
+/** 通知配置：新闻推送与资金费率套利提醒的开关、阈值与渠道。 */
+export function useNotificationSettings() {
+  return useQuery({
+    queryKey: ["notification-settings"],
+    queryFn: api.notificationSettings,
+    staleTime: 30_000,
+  });
+}
+
+/** 保存通知配置，执行器保存后立即对后续推送生效。 */
+export function useUpdateNotificationSettings() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: api.updateNotificationSettings,
+    onSuccess: (data) => queryClient.setQueryData(["notification-settings"], data),
+  });
+}
+
 /** 各交易所资金费率采集器状态：入库条数、最近一次采集结果与各交易对最新费率。 */
 export function useFundingStatus() {
   return useQuery({
@@ -252,6 +280,24 @@ export function useStrategyRuns(id: string | null, enabled = true) {
   });
 }
 
+/** 数据库中的内置策略模板；启动时由执行器补齐并编译。 */
+export function useStrategyTemplates() {
+  return useQuery({
+    queryKey: ["strategy-templates"],
+    queryFn: () => api.strategyTemplates(),
+  });
+}
+
+/** 用模板创建一条草稿策略：复制定义并绑定模板编译出的沙箱模块。 */
+export function useInstantiateTemplate() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ key, name }: { key: string; name?: string }) =>
+      api.instantiateTemplate(key, name),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["strategies"] }),
+  });
+}
+
 export function useCreateStrategy() {
   const queryClient = useQueryClient();
   return useMutation({
@@ -288,6 +334,9 @@ export function useUpdateStrategyScope() {
       spot_venue: string;
       perp_venue: string;
       symbols: string[];
+      event_sources?: string[];
+      event_keywords?: string[];
+      event_window_secs?: number;
     }) => api.updateStrategyScope(id, body),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["strategies"] });
@@ -534,6 +583,24 @@ export function useCancelSubscription() {
   return useMutation({
     mutationFn: (id: string) => api.cancelSubscription(id),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["market"] }),
+  });
+}
+
+/** 已订阅策略导入到自己的执行器：导入后立即出现在策略列表里。 */
+export function useImportPublication() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      publicationId,
+      subscriberId,
+    }: {
+      publicationId: string;
+      subscriberId: string;
+    }) => api.importPublication(publicationId, subscriberId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["strategies"] });
+      queryClient.invalidateQueries({ queryKey: ["strategy-versions"] });
+    },
   });
 }
 

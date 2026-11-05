@@ -77,7 +77,8 @@ function CommandRow({ label, command }: { label: string; command: string }) {
   );
 }
 
-export default function DocsPage() {
+/** 自托管部署文档；嵌入设置页时隐藏自身标题。 */
+export default function DocsPage({ embedded = false }: { embedded?: boolean }) {
   const { t } = useI18n();
   const queryClient = useQueryClient();
   const desktop = isDesktopRuntime();
@@ -248,11 +249,13 @@ export default function DocsPage() {
           : fmt(t.docs.update, { version: latestVersion ?? "" });
 
   return (
-    <div className="space-y-6">
-      <header>
-        <h1 className="text-xl font-semibold text-fg">{t.docs.title}</h1>
-        <p className="mt-1 text-sm text-muted">{t.docs.subtitle}</p>
-      </header>
+    <div className={embedded ? "space-y-4" : "space-y-6"}>
+      {!embedded && (
+        <header>
+          <h1 className="text-xl font-semibold text-fg">{t.docs.title}</h1>
+          <p className="mt-1 text-sm text-muted">{t.docs.subtitle}</p>
+        </header>
+      )}
 
       {!desktop && (
         <div className="flex items-start gap-2 rounded-lg border border-warning/30 bg-warning/10 px-3 py-2 text-[11px] leading-relaxed text-warning">

@@ -18,13 +18,16 @@ use super::strategies;
 
 /// 尚未写代码时返回的模板，演示如何读取行情并提交意图。
 pub const CODE_TEMPLATE: &str = r#";; ArbPilot 策略代码模板（WebAssembly Text）
-;; 沙箱只提供行情读取与 open/close/hold；没有文件、网络、密钥或下单能力。
+;; 沙箱只提供行情、K 线、指标读取与 open/open_pair/close/hold；
+;; 没有文件、网络、密钥或下单能力，所有意图仍会经过统一风控网关。
 (module
   (import "arbpilot" "markets" (func $markets (result i32)))
   (import "arbpilot" "market" (func $market (param i32 i32) (result f64)))
+  (import "arbpilot" "candles" (func $candles (param i32) (result i32)))
+  (import "arbpilot" "indicator" (func $indicator (param i32 i32) (result f64)))
   (import "arbpilot" "position_present" (func $position_present (result i32)))
   (import "arbpilot" "position_held_secs" (func $position_held_secs (result i64)))
-  (import "arbpilot" "open" (func $open (param i32 i32 f64) (result i32)))
+  (import "arbpilot" "open" (func $open (param i32 i32 f64 i32) (result i32)))
   (import "arbpilot" "close" (func $close (param i32 i32) (result i32)))
   (import "arbpilot" "hold" (func $hold (result i32)))
 
@@ -32,11 +35,10 @@ pub const CODE_TEMPLATE: &str = r#";; ArbPilot 策略代码模板（WebAssembly 
   ;; 示例交易对；请改成策略 universe 中的符号，并同步调整长度。
   (data (i32.const 1024) "BTCUSDT")
 
-  ;; 入场资金费率阈值（0.0003 = 3 bps）与最长持仓时间。
-  (global $entry_funding f64 (f64.const 0.0003))
+  ;; 最长持仓时间：86400 秒 = 24 小时。
   (global $max_holding_secs i64 (i64.const 86400))
 
-  (func (export "abi_version") (result i32) i32.const 1)
+  (func (export "abi_version") (result i32) i32.const 2)
 
   ;; alloc 需要保证主机写入输入 JSON 时有足够内存，且不覆盖 data 段。
   (global $heap (mut i32) (i32.const 8192))
@@ -67,16 +69,21 @@ pub const CODE_TEMPLATE: &str = r#";; ArbPilot 策略代码模板（WebAssembly 
         (drop (call $hold))
         (return (i32.const 0))))
 
-    ;; 没有持仓：资金费率高于阈值时按市场上限开仓。
-    (if (i32.gt_s (call $markets) (i32.const 0))
+    ;; 没有持仓：快均线在慢均线上方（趋势向上）时按市场上限做多。
+    ;; indicator 编号 0 = 快均线、1 = 慢均线；数据不足时返回 0。
+    ;; market 字段 5 = max_notional_usd；open 最后一个参数 1 = 做多、-1 = 做空。
+    (if (i32.gt_s (call $candles (i32.const 0)) (i32.const 0))
       (then
-        (if (f64.gt (call $market (i32.const 0) (i32.const 4)) (global.get $entry_funding))
+        (if (f64.gt
+              (call $indicator (i32.const 0) (i32.const 0))
+              (call $indicator (i32.const 0) (i32.const 1)))
           (then
             (drop
               (call $open
                 (i32.const 1024)
                 (i32.const 7)
-                (call $market (i32.const 0) (i32.const 7))))))))
+                (call $market (i32.const 0) (i32.const 5))
+                (i32.const 1)))))))
 
     (drop (call $hold))
     i32.const 0))

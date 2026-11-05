@@ -10,10 +10,25 @@ pub enum AlertLevel {
     Critical,
 }
 
+/// 消息通知类型：新闻推送与资金费率套利提醒。
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoticeKind {
+    News,
+    Funding,
+}
+
 /// 通过 WebSocket 推送给桌面端的事件，同时用于审计落库。
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ExecutorEvent {
+    /// 按通知设置触发的消息提醒，桌面端据此弹应用内通知。
+    Notice {
+        kind: NoticeKind,
+        title: String,
+        message: String,
+        at: DateTime<Utc>,
+    },
     OpportunityUpdated {
         count: usize,
         observed_at: DateTime<Utc>,

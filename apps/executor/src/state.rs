@@ -7,11 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use arb_core::{
-    CostAssumptions, EntryRules, ExecutionRules, ExitRules, Instrument, OpportunityKind, Order,
-    Position, RiskLimits, StrategyDefinition, StrategyRecord, StrategyRisk, StrategySource,
-    StrategyStatus, StrategyUniverse,
-};
+use arb_core::{Order, Position, RiskLimits, StrategyRecord};
 use chrono::Utc;
 use rust_decimal::Decimal;
 use tokio::sync::broadcast;
@@ -21,12 +17,13 @@ use crate::{
     accounts::{AccountEndpoints, Accounts},
     config::Config,
     events::{AlertLevel, ExecutorEvent},
-    exchange::{LiveEndpoints, LiveExchange, OkxMarketClient, OKX_VENUE, VENUE},
+    exchange::{LiveEndpoints, LiveExchange, OkxMarketClient},
     funding::FundingFeed,
     http_client::HttpClient,
     license::LicenseManager,
-    market::{MarketFeed, OKX_SPOT_VENUE, SPOT_VENUE},
+    market::MarketFeed,
     news::NewsFeed,
+    notifier::Notifier,
     realtime::RealtimeFeed,
     store::Store,
     telegram::TelegramBot,
@@ -133,15 +130,8 @@ impl AppState {
         ));
         let funding = FundingFeed::start(config.as_ref(), http, realtime, store.clone());
 
-        // 策略定义从存储加载；首次启动时按当前配置生成内置资金费率策略。
-        let mut strategies = store.load_strategies().await;
-        if strategies.is_empty() {
-            strategies = default_strategies(&config);
-            for record in &strategies {
-                store.save_strategy(record).await;
-                store.save_strategy_version(record).await;
-            }
-        }
+        // 策略定义完全以数据库为准：没有保存过策略时列表就是空的，不再自动生成内置策略。
+        let strategies = store.load_strategies().await;
 
         // 授权令牌在启动时从本地恢复，过期后仍需回桌面端重新登录换取。
         let license = Arc::new(LicenseManager::start(
@@ -152,6 +142,8 @@ impl AppState {
         ));
 
         let risk_limits = config.risk.clone();
+        // 通知分发器复用同一份 Store / 事件总线 / 电报机器人，行情与新闻采集命中条件时调用。
+        let notifier = Notifier::new(store.clone(), events.clone(), telegram.clone());
         let state = Self {
             config,
             store,
@@ -173,6 +165,9 @@ impl AppState {
         };
         // 机器人需要读取执行器状态，因此在 AppState 构造完成后再挂载轮询。
         state.telegram.clone().attach(state.clone());
+        // 行情与新闻采集在产生新数据后按通知设置推送。
+        state.market.attach_notifier(notifier.clone());
+        state.news.attach_notifier(notifier);
         state
     }
 
@@ -231,76 +226,4 @@ impl AppState {
             server_time: Utc::now(),
         }
     }
-}
-
-/// 首次启动时的内置策略：每个可用交易所一条「现货多 + 永续空」资金费率策略。
-///
-/// 这些策略只是可直接运行的初始定义，用户可复制后修改并重新校验、回测。
-fn default_strategies(config: &Config) -> Vec<StrategyRecord> {
-    let status = if config.funding_enabled {
-        StrategyStatus::Running
-    } else {
-        StrategyStatus::Paused
-    };
-    let mut records = vec![builtin_funding_record(
-        config,
-        status,
-        SPOT_VENUE,
-        VENUE,
-        "Binance Spot/Perp",
-    )];
-    if config.okx_enabled {
-        records.push(builtin_funding_record(
-            config,
-            status,
-            OKX_SPOT_VENUE,
-            OKX_VENUE,
-            "OKX Spot/Swap",
-        ));
-    }
-    records
-}
-
-fn builtin_funding_record(
-    config: &Config,
-    status: StrategyStatus,
-    spot_venue: &str,
-    perp_venue: &str,
-    label: &str,
-) -> StrategyRecord {
-    let definition = StrategyDefinition {
-        name: format!("Funding Basis · {label}"),
-        kind: OpportunityKind::FundingRate,
-        universe: StrategyUniverse {
-            venues: vec![spot_venue.to_string(), perp_venue.to_string()],
-            symbols: config.market_symbols.clone(),
-            instruments: vec![Instrument::Spot, Instrument::Perp],
-        },
-        entry: EntryRules {
-            funding_spread_min: Decimal::new(3, 4),
-            net_edge_min: Decimal::new(1, 4),
-        },
-        exit: ExitRules {
-            spread_below: Decimal::new(2, 4),
-            max_holding_hours: Decimal::from(24),
-        },
-        risk: StrategyRisk {
-            max_notional_usd: config.risk.max_order_notional_usd.min(Decimal::from(1_000)),
-            max_unhedged_seconds: 3,
-        },
-        execution: ExecutionRules {
-            leverage: Decimal::ONE,
-            max_slippage_bps: Decimal::from(10),
-            cooldown_secs: 300,
-        },
-        costs: CostAssumptions::default(),
-        notes: Some(
-            "现货多 + 永续空，收取正资金费率；费率低于退出阈值或超过最长持仓时间后平仓。"
-                .to_string(),
-        ),
-    };
-
-    let mut record = StrategyRecord::new(definition, StrategySource::BuiltIn, status);
-    record.validation = record.definition.validate(&config.risk);
-    record
 }

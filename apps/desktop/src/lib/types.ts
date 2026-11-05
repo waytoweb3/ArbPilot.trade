@@ -3,6 +3,9 @@ export type Decimal = number | string;
 
 export type OpportunityKind = "funding_rate" | "cex_cex_spread" | "cex_dex_spread";
 
+/** 策略类型：内置资金费率套利，或由沙箱代码定义的自定义策略。 */
+export type StrategyKind = "funding_rate" | "custom";
+
 export type VenueKind = "cex" | "dex";
 
 export type Side = "buy" | "sell";
@@ -38,6 +41,34 @@ export interface StrategyUniverse {
   instruments: Instrument[];
 }
 
+/** 数据库中配置的交易所：现货腿与永续腿分开维护。 */
+export interface MarketVenueConfig {
+  venue: string;
+  segment: "spot" | "perp";
+  display_name: string;
+}
+
+/** 策略范围下拉的数据来源，全部由执行器从数据库读取。 */
+export interface MarketConfig {
+  venues: MarketVenueConfig[];
+  /** 按交易所分组的交易对；现货与永续共用同一份清单。 */
+  symbols: Record<string, string[]>;
+}
+
+/** 消息通知配置：新闻推送与资金费率套利提醒的开关、阈值与渠道。 */
+export interface NotificationSettings {
+  news_enabled: boolean;
+  /** 参与推送的新闻来源；空列表表示全部来源。 */
+  news_sources: string[];
+  funding_enabled: boolean;
+  /** 触发提醒的最小年化资金费率（百分比数值，例如 10 表示 10%）。 */
+  funding_min_annualized_pct: Decimal;
+  /** 同一交易对再次提醒的最小间隔（秒）。 */
+  funding_cooldown_secs: number;
+  telegram_enabled: boolean;
+  desktop_enabled: boolean;
+}
+
 export interface EntryRules {
   /** 资金费率下限（小数，如 0.0003）。 */
   funding_spread_min: Decimal;
@@ -67,15 +98,33 @@ export interface CostAssumptions {
   slippage_bps: Decimal;
 }
 
+/** 沙箱策略的数据窗口：主机据此拉取 K 线并计算指标。 */
+export interface DataRules {
+  timeframe: string;
+  lookback: number;
+  fast: number;
+  slow: number;
+  atr: number;
+  channel: number;
+  /** 事件来源白名单；为空表示接受全部来源。 */
+  event_sources?: string[];
+  /** 事件关键词：标题包含任一关键词才会进入沙箱；为空表示不按关键词过滤。 */
+  event_keywords?: string[];
+  /** 事件窗口（秒）：只注入最近这段时间内发布的公告。 */
+  event_window_secs?: number;
+}
+
 /** 版本化、可校验的策略定义；回测与实盘共用同一份结构。 */
 export interface StrategyDefinition {
   name: string;
-  kind: OpportunityKind;
+  kind: StrategyKind;
   universe: StrategyUniverse;
   entry: EntryRules;
   exit: ExitRules;
   risk: StrategyRisk;
   execution: ExecutionRules;
+  /** 沙箱策略的 K 线与指标窗口；内置套利不读取。 */
+  data: DataRules;
   costs: CostAssumptions;
   notes: string | null;
 }
@@ -97,7 +146,11 @@ export type BacktestAssumption =
   | "round_trip_fees"
   | "round_trip_slippage"
   | "settled_funding_only"
-  | "net_edge_per_settlement";
+  | "net_edge_per_settlement"
+  | "wasm_bar_replay"
+  | "bar_close_fills"
+  | "limit_fill_on_touch"
+  | "no_event_replay";
 
 export interface BacktestEquityPoint {
   at: string;
@@ -136,8 +189,16 @@ export interface StrategyEvent {
 
 export interface StrategyOpenPosition {
   symbol: string;
-  long_venue: string;
-  short_venue: string;
+  /** 配对套利的现货腿；单腿持仓为空。 */
+  long_venue?: string;
+  /** 配对套利的永续腿；单腿持仓为空。 */
+  short_venue?: string;
+  /** 单腿持仓的交易所。 */
+  venue?: string | null;
+  /** 单腿持仓方向；配对套利为空。 */
+  side?: "long" | "short" | null;
+  /** 单腿持仓的开仓价。 */
+  entry_price?: Decimal | null;
   notional_usd: Decimal;
   opened_at: string;
   entry_net_edge_bps: Decimal;
@@ -204,6 +265,16 @@ export interface StrategyRecord {
   run_scope?: StrategyRunScope;
   last_heartbeat_at: string | null;
   created_at: string;
+  updated_at: string;
+}
+
+/** 数据库中内置的策略模板：实例化只复制定义并绑定同一个沙箱模块。 */
+export interface StrategyTemplateView {
+  key: string;
+  name: string;
+  description: string;
+  definition: StrategyDefinition;
+  artifact_id: string | null;
   updated_at: string;
 }
 
@@ -642,9 +713,22 @@ export interface StrategyPublication {
   visibility: MarketVisibility;
   pricing: StrategyPricing;
   status: PublicationStatus;
+  /** 发布时冻结的沙箱模块哈希；为空表示作者还没重新发布过。 */
+  artifact_sha256: string | null;
+  /** 发布时冻结的策略定义，订阅者导入时直接使用。 */
+  definition: StrategyDefinition | null;
   changelog: StrategyChangelogEntry[];
   created_at: string;
   updated_at: string;
+}
+
+/** 订阅可下载的策略交付物：冻结的定义 + 可执行的沙箱模块。 */
+export interface PublicationBundle {
+  publication_id: string;
+  strategy_version: number;
+  definition: StrategyDefinition;
+  artifact_sha256: string;
+  wasm_base64: string;
 }
 
 /** 版本化表现记录，必须绑定策略版本、区间与成本假设。 */

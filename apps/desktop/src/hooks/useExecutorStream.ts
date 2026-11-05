@@ -9,6 +9,7 @@ export function useExecutorStream() {
   const queryClient = useQueryClient();
   const setStreamConnected = useExecutorStore((state) => state.setStreamConnected);
   const pushEvent = useExecutorStore((state) => state.pushEvent);
+  const pushNotice = useExecutorStore((state) => state.pushNotice);
 
   useEffect(() => {
     let socket: WebSocket | null = null;
@@ -35,9 +36,23 @@ export function useExecutorStream() {
 
       socket.onmessage = (event) => {
         try {
-          const payload = JSON.parse(String(event.data)) as { type?: string };
+          const payload = JSON.parse(String(event.data)) as {
+            type?: string;
+            kind?: "news" | "funding";
+            title?: string;
+            message?: string;
+            at?: string;
+          };
           const type = payload.type ?? "unknown";
           pushEvent(type);
+          if (type === "notice" && payload.title && payload.message) {
+            pushNotice({
+              kind: payload.kind ?? "news",
+              title: payload.title,
+              message: payload.message,
+              at: payload.at ?? new Date().toISOString(),
+            });
+          }
           if (type === "order_updated") {
             queryClient.invalidateQueries({ queryKey: ["orders"] });
             queryClient.invalidateQueries({ queryKey: ["positions"] });
@@ -58,5 +73,5 @@ export function useExecutorStream() {
       window.clearTimeout(timer);
       socket?.close();
     };
-  }, [pushEvent, queryClient, setStreamConnected]);
+  }, [pushEvent, pushNotice, queryClient, setStreamConnected]);
 }

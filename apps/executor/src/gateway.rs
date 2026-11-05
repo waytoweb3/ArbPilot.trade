@@ -6,13 +6,41 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
+use serde_json::json;
 use uuid::Uuid;
 
 use crate::{error::ApiError, events::ExecutorEvent, state::AppState};
 
 const MAX_IN_MEMORY_ORDERS: usize = 500;
 
-/// 双腿下单请求。桌面端、Telegram 与策略都必须走这里，统一经过风控。
+/// 单腿下单请求。方向由 `side` 决定，价格为空时按当前对手价成交。
+#[derive(Debug, Clone)]
+pub struct LegOrderRequest {
+    pub venue: String,
+    pub symbol: String,
+    pub side: Side,
+    /// 该腿的名义价值（美元）。
+    pub notional_usd: Decimal,
+    /// 指定成交价；为空表示市价腿，用当前对手价作为保护价。
+    pub limit_price: Option<Decimal>,
+}
+
+/// 一次提交的订单：可以是单腿、配对双腿，或其他多腿组合。
+#[derive(Debug, Clone)]
+pub struct OrderBatchRequest {
+    pub legs: Vec<LegOrderRequest>,
+    pub leverage: Decimal,
+    pub max_slippage_bps: Option<Decimal>,
+    pub strategy_id: Option<Uuid>,
+    pub origin: OrderOrigin,
+    pub idempotency_key: String,
+    /// 平仓：反向操作、reduce_only，并减少已有仓位。
+    pub closing: bool,
+    /// 第一腿成交后，其余腿必须在该时限内完成，超时按失衡处理。
+    pub max_unhedged_secs: Option<u64>,
+}
+
+/// 配对下单请求。桌面端、Telegram 与内置资金费率策略都走这里。
 #[derive(Debug, Clone)]
 pub struct PairOrderRequest {
     pub symbol: String,
@@ -39,27 +67,144 @@ pub struct PairOrderOutcome {
     pub replayed: bool,
 }
 
-/// 统一订单入口：幂等检查 → 行情校验 → 风控 → 实盘下单 → 仓位记账。
+fn origin_label(origin: OrderOrigin) -> &'static str {
+    match origin {
+        OrderOrigin::Desktop => "desktop",
+        OrderOrigin::Telegram => "telegram",
+        OrderOrigin::Strategy => "strategy",
+    }
+}
+
+/// 订单动作统一落库到 `order_events`；数据库不可用时 Store 内部退化为本地日志。
+async fn log_event(state: &AppState, order_id: Uuid, event_type: &str, detail: serde_json::Value) {
+    state
+        .store
+        .append_order_event(order_id, event_type, detail)
+        .await;
+}
+
+/// 尚未生成订单就被拒绝的请求写入 `audit_log`，保证每次下单尝试都有痕迹。
+async fn reject_request(
+    state: &AppState,
+    request: &OrderBatchRequest,
+    reason: impl Into<String>,
+) -> ApiError {
+    let reason = reason.into();
+    let symbols = request
+        .legs
+        .iter()
+        .map(|leg| leg.symbol.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    state
+        .store
+        .append_audit_log(
+            origin_label(request.origin),
+            "order.rejected",
+            Some(symbols.as_str()).filter(|value| !value.is_empty()),
+            json!({
+                "reason": &reason,
+                "idempotency_key": &request.idempotency_key,
+                "closing": request.closing,
+                "leverage": request.leverage,
+                "legs": request.legs.iter().map(|leg| json!({
+                    "venue": &leg.venue,
+                    "symbol": &leg.symbol,
+                    "side": leg.side,
+                    "notional_usd": leg.notional_usd,
+                    "limit_price": leg.limit_price,
+                })).collect::<Vec<_>>(),
+            }),
+        )
+        .await;
+    ApiError::BadRequest(reason)
+}
+
+/// 配对入口：翻译成两条腿后复用统一的逐腿提交。
 ///
-/// 策略执行器只能调用该函数，不能直接访问交易所或密钥。
+/// 策略执行器只能调用网关，不能直接访问交易所或密钥。
 pub async fn submit_pair(
     state: &AppState,
     request: PairOrderRequest,
 ) -> Result<PairOrderOutcome, ApiError> {
-    if request.notional_usd <= Decimal::ZERO {
-        return Err(ApiError::BadRequest("notional_usd 必须大于 0".to_string()));
-    }
     if request.long_venue == request.short_venue {
+        state
+            .store
+            .append_audit_log(
+                origin_label(request.origin),
+                "order.rejected",
+                Some(request.symbol.as_str()),
+                json!({
+                    "reason": "双腿交易所不能相同",
+                    "idempotency_key": &request.idempotency_key,
+                    "long_venue": &request.long_venue,
+                    "short_venue": &request.short_venue,
+                }),
+            )
+            .await;
         return Err(ApiError::BadRequest("双腿交易所不能相同".to_string()));
     }
+    // 开仓：买多头腿、卖空头腿；平仓：反向操作且 reduce_only。
+    let (long_side, short_side) = if request.closing {
+        (Side::Sell, Side::Buy)
+    } else {
+        (Side::Buy, Side::Sell)
+    };
 
-    if let Some(existing_id) = state
+    submit_legs(
+        state,
+        OrderBatchRequest {
+            legs: vec![
+                LegOrderRequest {
+                    venue: request.long_venue,
+                    symbol: request.symbol.clone(),
+                    side: long_side,
+                    notional_usd: request.notional_usd,
+                    limit_price: None,
+                },
+                LegOrderRequest {
+                    venue: request.short_venue,
+                    symbol: request.symbol,
+                    side: short_side,
+                    notional_usd: request.notional_usd,
+                    limit_price: None,
+                },
+            ],
+            leverage: request.leverage,
+            max_slippage_bps: request.max_slippage_bps,
+            strategy_id: request.strategy_id,
+            origin: request.origin,
+            idempotency_key: request.idempotency_key,
+            closing: request.closing,
+            max_unhedged_secs: request.max_unhedged_secs,
+        },
+    )
+    .await
+}
+
+/// 统一订单入口：幂等检查 → 行情校验 → 风控 → 实盘下单 → 仓位记账。
+///
+/// 单腿与多腿共用同一条路径，全部经过统一风控后才能到达交易所。
+pub async fn submit_legs(
+    state: &AppState,
+    request: OrderBatchRequest,
+) -> Result<PairOrderOutcome, ApiError> {
+    if request.legs.is_empty() {
+        return Err(reject_request(state, &request, "至少需要一条订单腿").await);
+    }
+    for leg in &request.legs {
+        if leg.notional_usd <= Decimal::ZERO {
+            return Err(reject_request(state, &request, "notional_usd 必须大于 0").await);
+        }
+    }
+
+    let existing_order_id = state
         .idempotency
         .read()
         .expect("幂等锁不可用")
         .get(&request.idempotency_key)
-        .copied()
-    {
+        .copied();
+    if let Some(existing_id) = existing_order_id {
         let existing = state
             .orders
             .read()
@@ -68,6 +213,16 @@ pub async fn submit_pair(
             .find(|order| order.id == existing_id)
             .cloned();
         if let Some(order) = existing {
+            log_event(
+                state,
+                order.id,
+                "idempotent_replay",
+                json!({
+                    "idempotency_key": &request.idempotency_key,
+                    "status": order.status,
+                }),
+            )
+            .await;
             return Ok(PairOrderOutcome {
                 order,
                 decision: None,
@@ -76,75 +231,47 @@ pub async fn submit_pair(
         }
     }
 
-    let long_quote = state
-        .market
-        .quote(&request.long_venue, &request.symbol)
-        .ok_or_else(|| {
-            ApiError::BadRequest(format!(
-                "{} 在 {} 没有可用行情",
-                request.symbol, request.long_venue
-            ))
-        })?;
-    let short_quote = state
-        .market
-        .quote(&request.short_venue, &request.symbol)
-        .ok_or_else(|| {
-            ApiError::BadRequest(format!(
-                "{} 在 {} 没有可用行情",
-                request.symbol, request.short_venue
-            ))
-        })?;
-
-    let long_quantity = (request.notional_usd / long_quote.ask).round_dp(6);
-    let short_quantity = (request.notional_usd / short_quote.bid).round_dp(6);
-    if long_quantity <= Decimal::ZERO || short_quantity <= Decimal::ZERO {
-        return Err(ApiError::BadRequest("下单数量过小".to_string()));
-    }
-
-    // 开仓：买多头腿、卖空头腿；平仓：反向操作且 reduce_only。
-    let (long_side, short_side) = if request.closing {
-        (Side::Sell, Side::Buy)
-    } else {
-        (Side::Buy, Side::Sell)
-    };
-    let reduce_only = request.closing;
     let limits = state.risk_limits();
+    let mut observed_at = Utc::now();
+    let mut legs = Vec::with_capacity(request.legs.len());
+    for leg in &request.legs {
+        let Some(quote) = state.market.quote(&leg.venue, &leg.symbol) else {
+            let reason = format!("{} 在 {} 没有可用行情", leg.symbol, leg.venue);
+            return Err(reject_request(state, &request, reason).await);
+        };
+        // 市价腿按对手价成交：买入看卖一，卖出看买一。
+        let price = leg.limit_price.unwrap_or(if leg.side == Side::Buy {
+            quote.ask
+        } else {
+            quote.bid
+        });
+        if price <= Decimal::ZERO {
+            let reason = format!("{} 在 {} 的成交价无效", leg.symbol, leg.venue);
+            return Err(reject_request(state, &request, reason).await);
+        }
+        let quantity = (leg.notional_usd / price).round_dp(6);
+        if quantity <= Decimal::ZERO {
+            return Err(reject_request(state, &request, "下单数量过小").await);
+        }
+        observed_at = observed_at.min(quote.observed_at);
+        legs.push(OrderLegIntent {
+            venue: leg.venue.clone(),
+            symbol: leg.symbol.clone(),
+            side: leg.side,
+            quantity,
+            limit_price: price,
+            reduce_only: request.closing,
+        });
+    }
 
     let intent = OrderIntent {
         idempotency_key: request.idempotency_key.clone(),
         origin: request.origin,
         strategy_id: request.strategy_id,
-        legs: vec![
-            OrderLegIntent {
-                venue: request.long_venue.clone(),
-                symbol: request.symbol.clone(),
-                side: long_side,
-                quantity: long_quantity,
-                limit_price: if request.closing {
-                    long_quote.bid
-                } else {
-                    long_quote.ask
-                },
-                reduce_only,
-            },
-            OrderLegIntent {
-                venue: request.short_venue.clone(),
-                symbol: request.symbol.clone(),
-                side: short_side,
-                quantity: short_quantity,
-                limit_price: if request.closing {
-                    short_quote.ask
-                } else {
-                    short_quote.bid
-                },
-                reduce_only,
-            },
-        ],
+        legs,
         leverage: request.leverage,
-        max_slippage_bps: request
-            .max_slippage_bps
-            .unwrap_or(limits.max_slippage_bps),
-        quote_observed_at: long_quote.observed_at.min(short_quote.observed_at),
+        max_slippage_bps: request.max_slippage_bps.unwrap_or(limits.max_slippage_bps),
+        quote_observed_at: observed_at,
         created_at: Utc::now(),
     };
 
@@ -171,6 +298,20 @@ pub async fn submit_pair(
                 .join("；"),
         );
         state.store.save_order(&order).await;
+        log_event(
+            state,
+            order.id,
+            "risk_rejected",
+            json!({
+                "status": order.status,
+                "origin": origin_label(order.intent.origin),
+                "strategy_id": order.intent.strategy_id,
+                "idempotency_key": &order.intent.idempotency_key,
+                "note": &order.note,
+                "violations": violations,
+            }),
+        )
+        .await;
         state.emit_order(&order);
         remember(state, &request.idempotency_key, &order);
         return Ok(PairOrderOutcome {
@@ -182,6 +323,30 @@ pub async fn submit_pair(
 
     let mut order = Order::from_intent(intent.clone(), OrderStatus::Submitting);
     state.store.save_order(&order).await;
+    log_event(
+        state,
+        order.id,
+        "order_submitted",
+        json!({
+            "status": order.status,
+            "origin": origin_label(order.intent.origin),
+            "strategy_id": order.intent.strategy_id,
+            "idempotency_key": &order.intent.idempotency_key,
+            "closing": request.closing,
+            "leverage": order.intent.leverage,
+            "max_slippage_bps": order.intent.max_slippage_bps,
+            "quote_observed_at": order.intent.quote_observed_at,
+            "legs": order.legs.iter().map(|leg| json!({
+                "venue": &leg.intent.venue,
+                "symbol": &leg.intent.symbol,
+                "side": leg.intent.side,
+                "quantity": leg.intent.quantity,
+                "limit_price": leg.intent.limit_price,
+                "reduce_only": leg.intent.reduce_only,
+            })).collect::<Vec<_>>(),
+        }),
+    )
+    .await;
 
     let mut failure: Option<String> = None;
     let mut first_fill_at: Option<DateTime<Utc>> = None;
@@ -197,6 +362,22 @@ pub async fn submit_pair(
             client_order_id: format!("{}-{index}", request.idempotency_key),
         };
         // 每条腿都按自己的交易所取凭证并签名，同一笔订单可以跨交易所。
+        log_event(
+            state,
+            order.id,
+            "leg_submitting",
+            json!({
+                "index": index,
+                "venue": &venue,
+                "symbol": &leg.symbol,
+                "side": leg.side,
+                "quantity": leg.quantity,
+                "limit_price": leg.limit_price,
+                "reduce_only": leg.reduce_only,
+                "client_order_id": &place.client_order_id,
+            }),
+        )
+        .await;
         let executed = state.exchange.place_order(&venue, place);
 
         let placed = match (first_fill_at, request.max_unhedged_secs) {
@@ -220,13 +401,43 @@ pub async fn submit_pair(
             Ok(ack) => {
                 let entry = &mut order.legs[index];
                 entry.status = LegStatus::Filled;
-                entry.venue_order_id = Some(ack.venue_order_id);
+                entry.venue_order_id = Some(ack.venue_order_id.clone());
                 entry.filled_quantity = leg.quantity;
                 entry.average_price = Some(leg.limit_price);
                 first_fill_at.get_or_insert_with(Utc::now);
+                log_event(
+                    state,
+                    order.id,
+                    "leg_filled",
+                    json!({
+                        "index": index,
+                        "venue": &venue,
+                        "symbol": &leg.symbol,
+                        "side": leg.side,
+                        "venue_order_id": &ack.venue_order_id,
+                        "filled_quantity": leg.quantity,
+                        "average_price": leg.limit_price,
+                    }),
+                )
+                .await;
             }
             Err(error) => {
                 order.legs[index].status = LegStatus::Rejected;
+                log_event(
+                    state,
+                    order.id,
+                    "leg_failed",
+                    json!({
+                        "index": index,
+                        "venue": &venue,
+                        "symbol": &leg.symbol,
+                        "side": leg.side,
+                        "quantity": leg.quantity,
+                        "limit_price": leg.limit_price,
+                        "error": &error,
+                    }),
+                )
+                .await;
                 failure = Some(format!("第 {} 腿下单失败: {error}", index + 1));
                 break;
             }
@@ -246,6 +457,31 @@ pub async fn submit_pair(
             state.set_paused(true, Some("双腿失衡，等待人工确认补偿"));
         }
         state.store.save_order(&order).await;
+        log_event(
+            state,
+            order.id,
+            if has_filled_leg {
+                "order_unwinding"
+            } else {
+                "order_failed"
+            },
+            json!({
+                "status": order.status,
+                "note": &order.note,
+                "compensation": format!("{compensation:?}"),
+                "paused": has_filled_leg,
+                "legs": order.legs.iter().map(|leg| json!({
+                    "venue": &leg.intent.venue,
+                    "symbol": &leg.intent.symbol,
+                    "side": leg.intent.side,
+                    "status": leg.status,
+                    "venue_order_id": &leg.venue_order_id,
+                    "filled_quantity": leg.filled_quantity,
+                    "average_price": leg.average_price,
+                })).collect::<Vec<_>>(),
+            }),
+        )
+        .await;
         state.emit_order(&order);
         let _ = state.events.send(ExecutorEvent::order_transition(
             &order,
@@ -297,6 +533,24 @@ pub async fn submit_pair(
     }
 
     state.store.save_order(&order).await;
+    log_event(
+        state,
+        order.id,
+        "order_filled",
+        json!({
+            "status": order.status,
+            "closing": request.closing,
+            "legs": order.legs.iter().map(|leg| json!({
+                "venue": &leg.intent.venue,
+                "symbol": &leg.intent.symbol,
+                "side": leg.intent.side,
+                "venue_order_id": &leg.venue_order_id,
+                "filled_quantity": leg.filled_quantity,
+                "average_price": leg.average_price,
+            })).collect::<Vec<_>>(),
+        }),
+    )
+    .await;
     state.emit_order(&order);
     remember(state, &request.idempotency_key, &order);
 

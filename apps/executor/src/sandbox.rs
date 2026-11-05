@@ -4,7 +4,7 @@
 //! - 不链接 WASI，模块无法读写文件、发起网络请求或读取环境变量；
 //! - 只导入 `arbpilot` 命名空间下的 emit/log 与结构化行情读取、决策辅助函数；
 //! - 通过燃料限制、epoch 超时、线性内存上限与输出大小上限约束资源；
-//! - 输入只有确定性行情快照，输出只有开仓/平仓/保持意图；
+//! - 输入只有确定性行情快照，输出只有开仓/平仓/挂单/撤单/保持意图；
 //! - 本模块不持有交易所密钥，也没有下单能力；意图必须交给统一风控网关。
 
 use std::{
@@ -14,12 +14,15 @@ use std::{
 };
 
 use arb_core::{
-    OpportunityKind, SandboxArtifact, SandboxDecision, SandboxInput, SandboxLimits,
-    SandboxMarketSnapshot, SandboxOrderLimits, SandboxOutput, SandboxPositionSnapshot,
-    SandboxRunReport, SandboxRunStatus, SANDBOX_ABI_VERSION, SANDBOX_CLOSE, SANDBOX_EMIT,
-    SANDBOX_ENTRYPOINT, SANDBOX_HOLD, SANDBOX_IMPORT_NAMESPACE, SANDBOX_LOG, SANDBOX_MARKET,
-    SANDBOX_MARKETS, SANDBOX_OPEN, SANDBOX_POSITION_HELD_SECS, SANDBOX_POSITION_NOTIONAL,
-    SANDBOX_POSITION_PRESENT,
+    DataRules, Instrument, OpportunityKind, SandboxArtifact, SandboxCandle, SandboxDecision,
+    SandboxEvent, SandboxInput, SandboxLimits, SandboxMarketSnapshot, SandboxOrderLimits,
+    SandboxOutput, SandboxPositionSnapshot, SandboxRunReport, SandboxRunStatus,
+    SANDBOX_ABI_VERSION, SANDBOX_CANCEL, SANDBOX_CANDLE, SANDBOX_CANDLES, SANDBOX_CLOSE,
+    SANDBOX_EMIT, SANDBOX_ENTRYPOINT, SANDBOX_EVENT, SANDBOX_EVENTS, SANDBOX_EVENT_TEXT,
+    SANDBOX_HOLD, SANDBOX_IMPORT_NAMESPACE, SANDBOX_INDICATOR, SANDBOX_LIMIT, SANDBOX_LOG,
+    SANDBOX_MARKET, SANDBOX_MARKETS, SANDBOX_MARKET_SYMBOL, SANDBOX_OPEN, SANDBOX_OPEN_PAIR,
+    SANDBOX_POSITION_ENTRY_PRICE, SANDBOX_POSITION_HELD_BARS, SANDBOX_POSITION_HELD_SECS,
+    SANDBOX_POSITION_NOTIONAL, SANDBOX_POSITION_PRESENT, SANDBOX_POSITION_SIDE,
 };
 use rust_decimal::{
     prelude::{FromPrimitive, ToPrimitive},
@@ -36,6 +39,8 @@ use crate::state::AppState;
 const EPOCH_TICK: Duration = Duration::from_millis(10);
 const DEFAULT_SPOT_VENUE: &str = "binance-spot";
 const DEFAULT_PERP_VENUE: &str = "binance";
+/// 单次评估最多注入的事件条数，避免输入过大。
+const MAX_SANDBOX_EVENTS: usize = 16;
 
 struct Runtime {
     engine: Engine,
@@ -70,41 +75,21 @@ fn runtime() -> &'static Runtime {
 
 /// 模块通过辅助函数能读到的确定性输入快照。
 ///
-/// 快照只包含行情与持仓的数值，不含账户、凭证或任何可写能力；静态检查阶段
-/// （无输入）使用空快照，所有读取函数安全返回 0。
+/// 快照只包含行情、K 线与持仓的数值，不含账户、凭证或任何可写能力；静态检查
+/// 阶段（无输入）使用空快照，所有读取函数安全返回 0。
 #[derive(Debug, Default)]
 struct InputSnapshot {
-    /// 每个市场按 `SANDBOX_FIELD_*` 顺序展开的字段。
-    markets: Vec<[f64; 8]>,
-    /// 持仓名义价值（USD）与已持有秒数。
-    position: Option<(f64, i64)>,
+    markets: Vec<SandboxMarketSnapshot>,
+    position: Option<SandboxPositionSnapshot>,
+    events: Vec<SandboxEvent>,
 }
 
 impl InputSnapshot {
     fn from_input(input: &SandboxInput) -> Self {
         Self {
-            markets: input
-                .markets
-                .iter()
-                .map(|market| {
-                    [
-                        to_f64(market.spot_bid),
-                        to_f64(market.spot_ask),
-                        to_f64(market.perp_bid),
-                        to_f64(market.perp_ask),
-                        to_f64(market.funding_rate),
-                        to_f64(market.gross_spread_bps),
-                        to_f64(market.net_edge_bps),
-                        to_f64(market.max_notional_usd),
-                    ]
-                })
-                .collect(),
-            position: input.position.as_ref().map(|position| {
-                (
-                    to_f64(position.notional_usd),
-                    position.held_secs.min(i64::MAX as u64) as i64,
-                )
-            }),
+            markets: input.markets.clone(),
+            position: input.position.clone(),
+            events: input.events.clone(),
         }
     }
 }
@@ -187,21 +172,34 @@ fn compile(bytes: &[u8]) -> Result<Module, String> {
 }
 
 fn check_imports(module: &Module) -> Result<(), String> {
-    const ALLOWED: [&str; 10] = [
+    const ALLOWED: [&str; 23] = [
         SANDBOX_EMIT,
         SANDBOX_LOG,
         SANDBOX_MARKETS,
         SANDBOX_MARKET,
+        SANDBOX_MARKET_SYMBOL,
+        SANDBOX_CANDLES,
+        SANDBOX_CANDLE,
+        SANDBOX_INDICATOR,
+        SANDBOX_EVENTS,
+        SANDBOX_EVENT,
+        SANDBOX_EVENT_TEXT,
         SANDBOX_POSITION_PRESENT,
         SANDBOX_POSITION_NOTIONAL,
         SANDBOX_POSITION_HELD_SECS,
+        SANDBOX_POSITION_HELD_BARS,
+        SANDBOX_POSITION_SIDE,
+        SANDBOX_POSITION_ENTRY_PRICE,
         SANDBOX_OPEN,
+        SANDBOX_OPEN_PAIR,
         SANDBOX_CLOSE,
+        SANDBOX_LIMIT,
+        SANDBOX_CANCEL,
         SANDBOX_HOLD,
     ];
     for import in module.imports() {
-        let allowed = import.module() == SANDBOX_IMPORT_NAMESPACE
-            && ALLOWED.contains(&import.name());
+        let allowed =
+            import.module() == SANDBOX_IMPORT_NAMESPACE && ALLOWED.contains(&import.name());
         if !allowed {
             return Err(format!(
                 "模块导入了不允许的依赖 {}.{}；沙箱只提供 {SANDBOX_IMPORT_NAMESPACE} 下的行情读取与决策辅助函数",
@@ -298,11 +296,7 @@ fn instantiate_with_snapshot(
                 };
                 let start = ptr as usize;
                 let end = start.saturating_add(len as usize);
-                let Some(bytes) = memory
-                    .data(&caller)
-                    .get(start..end)
-                    .map(<[u8]>::to_vec)
-                else {
+                let Some(bytes) = memory.data(&caller).get(start..end).map(<[u8]>::to_vec) else {
                     return 1;
                 };
                 let state = caller.data_mut();
@@ -328,11 +322,7 @@ fn instantiate_with_snapshot(
                 };
                 let start = ptr as usize;
                 let end = start.saturating_add(len as usize);
-                let Some(bytes) = memory
-                    .data(&caller)
-                    .get(start..end)
-                    .map(<[u8]>::to_vec)
-                else {
+                let Some(bytes) = memory.data(&caller).get(start..end).map(<[u8]>::to_vec) else {
                     return 1;
                 };
                 let Ok(line) = String::from_utf8(bytes) else {
@@ -362,7 +352,7 @@ fn instantiate_with_snapshot(
             SANDBOX_IMPORT_NAMESPACE,
             SANDBOX_MARKET,
             |caller: Caller<'_, HostState>, index: i32, field: i32| -> f64 {
-                if index < 0 || field < 0 {
+                if index < 0 {
                     return 0.0;
                 }
                 caller
@@ -370,12 +360,166 @@ fn instantiate_with_snapshot(
                     .snapshot
                     .markets
                     .get(index as usize)
-                    .and_then(|market| market.get(field as usize))
-                    .copied()
+                    .map(|market| market.field(field))
                     .unwrap_or(0.0)
             },
         )
         .map_err(|error| format!("注册 market 失败: {error}"))?;
+    linker
+        .func_wrap(
+            SANDBOX_IMPORT_NAMESPACE,
+            SANDBOX_MARKET_SYMBOL,
+            |mut caller: Caller<'_, HostState>, index: i32, ptr: i32, cap: i32| -> i32 {
+                if index < 0 || ptr < 0 || cap < 0 {
+                    return 0;
+                }
+                let Some(symbol) = caller
+                    .data()
+                    .snapshot
+                    .markets
+                    .get(index as usize)
+                    .map(|market| market.symbol.clone())
+                else {
+                    return 0;
+                };
+                let bytes = symbol.as_bytes();
+                if bytes.is_empty() || bytes.len() > cap as usize {
+                    return 0;
+                }
+                let Some(memory) = exported_memory(&mut caller) else {
+                    return 0;
+                };
+                let start = ptr as usize;
+                let end = start.saturating_add(bytes.len());
+                let Some(target) = memory.data_mut(&mut caller).get_mut(start..end) else {
+                    return 0;
+                };
+                target.copy_from_slice(bytes);
+                bytes.len() as i32
+            },
+        )
+        .map_err(|error| format!("注册 market_symbol 失败: {error}"))?;
+    linker
+        .func_wrap(
+            SANDBOX_IMPORT_NAMESPACE,
+            SANDBOX_CANDLES,
+            |caller: Caller<'_, HostState>, index: i32| -> i32 {
+                if index < 0 {
+                    return 0;
+                }
+                caller
+                    .data()
+                    .snapshot
+                    .markets
+                    .get(index as usize)
+                    .map(|market| market.candles.len().min(i32::MAX as usize) as i32)
+                    .unwrap_or(0)
+            },
+        )
+        .map_err(|error| format!("注册 candles 失败: {error}"))?;
+    linker
+        .func_wrap(
+            SANDBOX_IMPORT_NAMESPACE,
+            SANDBOX_CANDLE,
+            |caller: Caller<'_, HostState>, index: i32, offset: i32, field: i32| -> f64 {
+                if index < 0 || offset < 0 {
+                    return 0.0;
+                }
+                let Some(market) = caller.data().snapshot.markets.get(index as usize) else {
+                    return 0.0;
+                };
+                // offset 0 表示最新一根，从数组末尾往前取。
+                let Some(position) = market.candles.len().checked_sub(offset as usize + 1) else {
+                    return 0.0;
+                };
+                market
+                    .candles
+                    .get(position)
+                    .map(|candle| candle.field(field))
+                    .unwrap_or(0.0)
+            },
+        )
+        .map_err(|error| format!("注册 candle 失败: {error}"))?;
+    linker
+        .func_wrap(
+            SANDBOX_IMPORT_NAMESPACE,
+            SANDBOX_INDICATOR,
+            |caller: Caller<'_, HostState>, index: i32, id: i32| -> f64 {
+                if index < 0 {
+                    return 0.0;
+                }
+                caller
+                    .data()
+                    .snapshot
+                    .markets
+                    .get(index as usize)
+                    .map(|market| market.indicators.by_id(id))
+                    .unwrap_or(0.0)
+            },
+        )
+        .map_err(|error| format!("注册 indicator 失败: {error}"))?;
+    // 事件读取：目前只有交易所上币公告，按发布时间升序给出最近窗口内的事件。
+    linker
+        .func_wrap(
+            SANDBOX_IMPORT_NAMESPACE,
+            SANDBOX_EVENTS,
+            |caller: Caller<'_, HostState>| -> i32 {
+                caller.data().snapshot.events.len().min(i32::MAX as usize) as i32
+            },
+        )
+        .map_err(|error| format!("注册 events 失败: {error}"))?;
+    linker
+        .func_wrap(
+            SANDBOX_IMPORT_NAMESPACE,
+            SANDBOX_EVENT,
+            |caller: Caller<'_, HostState>, index: i32, field: i32| -> f64 {
+                if index < 0 {
+                    return 0.0;
+                }
+                caller
+                    .data()
+                    .snapshot
+                    .events
+                    .get(index as usize)
+                    .map(|event| event.field(field))
+                    .unwrap_or(0.0)
+            },
+        )
+        .map_err(|error| format!("注册 event 失败: {error}"))?;
+    linker
+        .func_wrap(
+            SANDBOX_IMPORT_NAMESPACE,
+            SANDBOX_EVENT_TEXT,
+            |mut caller: Caller<'_, HostState>, index: i32, field: i32, ptr: i32, cap: i32| -> i32 {
+                if index < 0 || ptr < 0 || cap < 0 {
+                    return 0;
+                }
+                let Some(text) = caller
+                    .data()
+                    .snapshot
+                    .events
+                    .get(index as usize)
+                    .map(|event| event.text(field).to_string())
+                else {
+                    return 0;
+                };
+                let bytes = text.as_bytes();
+                if bytes.is_empty() || bytes.len() > cap as usize {
+                    return 0;
+                }
+                let Some(memory) = exported_memory(&mut caller) else {
+                    return 0;
+                };
+                let start = ptr as usize;
+                let end = start.saturating_add(bytes.len());
+                let Some(target) = memory.data_mut(&mut caller).get_mut(start..end) else {
+                    return 0;
+                };
+                target.copy_from_slice(bytes);
+                bytes.len() as i32
+            },
+        )
+        .map_err(|error| format!("注册 event_text 失败: {error}"))?;
     linker
         .func_wrap(
             SANDBOX_IMPORT_NAMESPACE,
@@ -390,7 +534,13 @@ fn instantiate_with_snapshot(
             SANDBOX_IMPORT_NAMESPACE,
             SANDBOX_POSITION_NOTIONAL,
             |caller: Caller<'_, HostState>| -> f64 {
-                caller.data().snapshot.position.map(|p| p.0).unwrap_or(0.0)
+                caller
+                    .data()
+                    .snapshot
+                    .position
+                    .as_ref()
+                    .map(|position| to_f64(position.notional_usd))
+                    .unwrap_or(0.0)
             },
         )
         .map_err(|error| format!("注册 position_notional 失败: {error}"))?;
@@ -399,19 +549,83 @@ fn instantiate_with_snapshot(
             SANDBOX_IMPORT_NAMESPACE,
             SANDBOX_POSITION_HELD_SECS,
             |caller: Caller<'_, HostState>| -> i64 {
-                caller.data().snapshot.position.map(|p| p.1).unwrap_or(0)
+                caller
+                    .data()
+                    .snapshot
+                    .position
+                    .as_ref()
+                    .map(|position| position.held_secs.min(i64::MAX as u64) as i64)
+                    .unwrap_or(0)
             },
         )
         .map_err(|error| format!("注册 position_held_secs 失败: {error}"))?;
+    linker
+        .func_wrap(
+            SANDBOX_IMPORT_NAMESPACE,
+            SANDBOX_POSITION_HELD_BARS,
+            |caller: Caller<'_, HostState>| -> i32 {
+                caller
+                    .data()
+                    .snapshot
+                    .position
+                    .as_ref()
+                    .map(|position| position.held_bars.min(i32::MAX as u32) as i32)
+                    .unwrap_or(0)
+            },
+        )
+        .map_err(|error| format!("注册 position_held_bars 失败: {error}"))?;
+    linker
+        .func_wrap(
+            SANDBOX_IMPORT_NAMESPACE,
+            SANDBOX_POSITION_SIDE,
+            |caller: Caller<'_, HostState>| -> i32 {
+                caller
+                    .data()
+                    .snapshot
+                    .position
+                    .as_ref()
+                    .map(|position| match position.side {
+                        arb_core::PositionSide::Long => 1,
+                        arb_core::PositionSide::Short => -1,
+                    })
+                    .unwrap_or(0)
+            },
+        )
+        .map_err(|error| format!("注册 position_side 失败: {error}"))?;
+    linker
+        .func_wrap(
+            SANDBOX_IMPORT_NAMESPACE,
+            SANDBOX_POSITION_ENTRY_PRICE,
+            |caller: Caller<'_, HostState>| -> f64 {
+                caller
+                    .data()
+                    .snapshot
+                    .position
+                    .as_ref()
+                    .map(|position| to_f64(position.entry_price))
+                    .unwrap_or(0.0)
+            },
+        )
+        .map_err(|error| format!("注册 position_entry_price 失败: {error}"))?;
 
     // 决策辅助：直接提交意图，模块不必拼 JSON。
     linker
         .func_wrap(
             SANDBOX_IMPORT_NAMESPACE,
             SANDBOX_OPEN,
-            |mut caller: Caller<'_, HostState>, ptr: i32, len: i32, notional: f64| -> i32 {
+            |mut caller: Caller<'_, HostState>,
+             ptr: i32,
+             len: i32,
+             notional: f64,
+             side: i32|
+             -> i32 {
                 let Some(symbol) = read_guest_string(&mut caller, ptr, len) else {
                     return 1;
+                };
+                let side = match side {
+                    1 => arb_core::PositionSide::Long,
+                    -1 => arb_core::PositionSide::Short,
+                    _ => return 1,
                 };
                 let Some(notional_usd) = Decimal::from_f64(notional) else {
                     return 1;
@@ -421,12 +635,36 @@ fn instantiate_with_snapshot(
                     SandboxDecision::Open {
                         symbol,
                         notional_usd,
+                        side,
+                        venue: None,
                         reason: None,
                     },
                 )
             },
         )
         .map_err(|error| format!("注册 open 失败: {error}"))?;
+    linker
+        .func_wrap(
+            SANDBOX_IMPORT_NAMESPACE,
+            SANDBOX_OPEN_PAIR,
+            |mut caller: Caller<'_, HostState>, ptr: i32, len: i32, notional: f64| -> i32 {
+                let Some(symbol) = read_guest_string(&mut caller, ptr, len) else {
+                    return 1;
+                };
+                let Some(notional_usd) = Decimal::from_f64(notional) else {
+                    return 1;
+                };
+                push_decision(
+                    caller.data_mut(),
+                    SandboxDecision::OpenPair {
+                        symbol,
+                        notional_usd,
+                        reason: None,
+                    },
+                )
+            },
+        )
+        .map_err(|error| format!("注册 open_pair 失败: {error}"))?;
     linker
         .func_wrap(
             SANDBOX_IMPORT_NAMESPACE,
@@ -445,6 +683,63 @@ fn instantiate_with_snapshot(
             },
         )
         .map_err(|error| format!("注册 close 失败: {error}"))?;
+    linker
+        .func_wrap(
+            SANDBOX_IMPORT_NAMESPACE,
+            SANDBOX_LIMIT,
+            |mut caller: Caller<'_, HostState>,
+             ptr: i32,
+             len: i32,
+             price: f64,
+             notional: f64,
+             side: i32|
+             -> i32 {
+                let Some(symbol) = read_guest_string(&mut caller, ptr, len) else {
+                    return 1;
+                };
+                let side = match side {
+                    1 => arb_core::PositionSide::Long,
+                    -1 => arb_core::PositionSide::Short,
+                    _ => return 1,
+                };
+                let (Some(price), Some(notional_usd)) =
+                    (Decimal::from_f64(price), Decimal::from_f64(notional))
+                else {
+                    return 1;
+                };
+                push_decision(
+                    caller.data_mut(),
+                    SandboxDecision::PlaceLimit {
+                        symbol,
+                        side,
+                        // f64 → Decimal 会带上二进制尾差，统一收敛到 8 位小数。
+                        price: price.round_dp(8).normalize(),
+                        notional_usd: notional_usd.round_dp(2).normalize(),
+                        venue: None,
+                        reason: None,
+                    },
+                )
+            },
+        )
+        .map_err(|error| format!("注册 limit 失败: {error}"))?;
+    linker
+        .func_wrap(
+            SANDBOX_IMPORT_NAMESPACE,
+            SANDBOX_CANCEL,
+            |mut caller: Caller<'_, HostState>, ptr: i32, len: i32| -> i32 {
+                let Some(symbol) = read_guest_string(&mut caller, ptr, len) else {
+                    return 1;
+                };
+                push_decision(
+                    caller.data_mut(),
+                    SandboxDecision::Cancel {
+                        symbol,
+                        reason: None,
+                    },
+                )
+            },
+        )
+        .map_err(|error| format!("注册 cancel 失败: {error}"))?;
     linker
         .func_wrap(
             SANDBOX_IMPORT_NAMESPACE,
@@ -488,7 +783,9 @@ fn push_decision(state: &mut HostState, decision: SandboxDecision) -> i32 {
 }
 
 fn exported_memory(caller: &mut Caller<'_, HostState>) -> Option<Memory> {
-    caller.get_export("memory").and_then(|export| export.into_memory())
+    caller
+        .get_export("memory")
+        .and_then(|export| export.into_memory())
 }
 
 /// 同步执行一次评估，调用方应放在阻塞线程池中。
@@ -512,22 +809,19 @@ fn run_blocking(
         }
     };
 
-    let (mut store, instance) = match instantiate_with_snapshot(
-        &module,
-        limits,
-        InputSnapshot::from_input(input),
-    ) {
-        Ok(pair) => pair,
-        Err(error) => {
-            return SandboxRunReport::failed(
-                artifact,
-                limits,
-                SandboxRunStatus::Invalid,
-                error,
-                elapsed_ms(started),
-            )
-        }
-    };
+    let (mut store, instance) =
+        match instantiate_with_snapshot(&module, limits, InputSnapshot::from_input(input)) {
+            Ok(pair) => pair,
+            Err(error) => {
+                return SandboxRunReport::failed(
+                    artifact,
+                    limits,
+                    SandboxRunStatus::Invalid,
+                    error,
+                    elapsed_ms(started),
+                )
+            }
+        };
 
     let result = invoke(&mut store, &instance, input);
     let fuel_consumed = store
@@ -587,28 +881,17 @@ fn run_blocking(
     }
 }
 
-/// 把实时资金费率机会转成确定性输入。模块看不到账户、密钥或任何凭证。
-pub fn build_input(
+/// 把当前行情、K 线与持仓转成确定性输入。模块看不到账户、密钥或任何凭证。
+pub async fn build_input(
     state: &AppState,
     record: Option<&arb_core::StrategyRecord>,
     symbol: Option<&str>,
     fallback_strategy_id: uuid::Uuid,
 ) -> SandboxInput {
-    use rust_decimal::Decimal;
-
     let now = chrono::Utc::now();
-    let (spot_venue, perp_venue, symbols, order_limits) = match record {
+    let (venues, symbols, order_limits, data) = match record {
         Some(record) => (
-            record
-                .definition
-                .spot_venue()
-                .map(str::to_string)
-                .unwrap_or_else(|| DEFAULT_SPOT_VENUE.to_string()),
-            record
-                .definition
-                .perp_venue()
-                .map(str::to_string)
-                .unwrap_or_else(|| DEFAULT_PERP_VENUE.to_string()),
+            record.definition.universe.venues.clone(),
             record.definition.universe.symbols.clone(),
             SandboxOrderLimits {
                 max_notional_usd: record
@@ -618,88 +901,292 @@ pub fn build_input(
                     .min(state.risk_limits().max_order_notional_usd),
                 max_leverage: record.definition.execution.leverage,
                 max_slippage_bps: record.definition.execution.max_slippage_bps,
-                max_unhedged_secs: record.definition.risk.max_unhedged_seconds as u64,
+                max_unhedged_secs: record.definition.risk.max_unhedged_seconds,
             },
+            record.definition.data.clone(),
         ),
         None => (
-            DEFAULT_SPOT_VENUE.to_string(),
-            DEFAULT_PERP_VENUE.to_string(),
-            Vec::new(),
+            vec![
+                DEFAULT_SPOT_VENUE.to_string(),
+                DEFAULT_PERP_VENUE.to_string(),
+            ],
+            state.config.market_symbols.clone(),
             SandboxOrderLimits {
                 max_notional_usd: state.risk_limits().max_order_notional_usd,
                 max_leverage: state.risk_limits().max_leverage,
                 max_slippage_bps: Decimal::from(10),
                 max_unhedged_secs: 3,
             },
+            DataRules::default(),
         ),
     };
 
-    let markets: Vec<SandboxMarketSnapshot> = state
-        .market
-        .opportunities()
-        .into_iter()
-        .filter(|opportunity| {
-            opportunity.kind == OpportunityKind::FundingRate
-                && opportunity.is_fresh(now, chrono::Duration::seconds(30))
-        })
-        .filter(|opportunity| {
-            symbol
-                .map(|symbol| opportunity.symbol == symbol)
-                .unwrap_or(true)
-        })
-        .filter(|opportunity| {
-            symbols.is_empty()
-                || (symbols.contains(&opportunity.symbol)
-                    && opportunity.long_venue == spot_venue
-                    && opportunity.short_venue == perp_venue)
-        })
-        .filter_map(|opportunity| {
-            let spot = state
+    // 策略定义可能不限制交易对，此时回退到执行器的全局交易对列表。
+    let symbols = if symbols.is_empty() {
+        state.config.market_symbols.clone()
+    } else {
+        symbols
+    };
+    let opportunities = state.market.opportunities();
+    let mut markets = Vec::with_capacity(venues.len() * symbols.len());
+    for venue in &venues {
+        for market_symbol in &symbols {
+            if let Some(filter) = symbol {
+                if !filter.eq_ignore_ascii_case(market_symbol) {
+                    continue;
+                }
+            }
+            let Some(quote) = state.market.quote(venue, market_symbol) else {
+                continue;
+            };
+            let instrument = instrument_for(venue);
+            let candles = match state
                 .market
-                .quote(&opportunity.long_venue, &opportunity.symbol)?;
-            let perp = state
-                .market
-                .quote(&opportunity.short_venue, &opportunity.symbol)?;
-            Some(SandboxMarketSnapshot {
-                symbol: opportunity.symbol.clone(),
-                spot_venue: opportunity.long_venue.clone(),
-                perp_venue: opportunity.short_venue.clone(),
-                spot_bid: spot.bid,
-                spot_ask: spot.ask,
-                perp_bid: perp.bid,
-                perp_ask: perp.ask,
-                funding_rate: opportunity.funding_rate.unwrap_or_default(),
-                gross_spread_bps: opportunity.gross_spread_bps,
-                net_edge_bps: opportunity.net_edge_bps,
-                // 机会模型不携带下次结算时间，模块只能依赖费率与基差。
+                .candles(venue, market_symbol, &data.timeframe, data.lookback)
+                .await
+            {
+                Ok(candles) => candles
+                    .into_iter()
+                    .map(|candle| SandboxCandle {
+                        open_time: candle.open_time,
+                        open: candle.open,
+                        high: candle.high,
+                        low: candle.low,
+                        close: candle.close,
+                        volume: candle.volume,
+                    })
+                    .collect(),
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        venue,
+                        symbol = market_symbol.as_str(),
+                        "拉取策略 K 线失败，指标不可用"
+                    );
+                    Vec::new()
+                }
+            };
+            let indicators = arb_core::indicators::compute(&candles, &data);
+            // 资金费率与可成交额度来自同一交易所的资金费率机会。
+            let opportunity = opportunities.iter().find(|opportunity| {
+                opportunity.kind == OpportunityKind::FundingRate
+                    && &opportunity.symbol == market_symbol
+                    && (&opportunity.long_venue == venue || &opportunity.short_venue == venue)
+            });
+            let funding_rate = (instrument == Instrument::Perp)
+                .then(|| opportunity.and_then(|opportunity| opportunity.funding_rate))
+                .flatten();
+            let max_notional_usd = opportunity
+                .map(|opportunity| opportunity.max_notional_usd)
+                .unwrap_or(order_limits.max_notional_usd);
+
+            markets.push(SandboxMarketSnapshot {
+                symbol: market_symbol.clone(),
+                venue: venue.clone(),
+                instrument,
+                bid: quote.bid,
+                ask: quote.ask,
+                last: None,
+                funding_rate,
                 next_funding_at: None,
-                observed_at: opportunity.observed_at,
-                max_notional_usd: opportunity.max_notional_usd,
-            })
-        })
-        .collect();
+                max_notional_usd,
+                observed_at: quote.observed_at,
+                candles,
+                indicators,
+            });
+        }
+    }
 
     let position = record
         .and_then(|record| record.runtime.open.as_ref())
-        .map(|open| SandboxPositionSnapshot {
-            symbol: open.symbol.clone(),
-            notional_usd: open.notional_usd,
-            opened_at: open.opened_at,
-            held_secs: now
+        .map(|open| {
+            let fallback_venue = record
+                .and_then(|record| record.definition.trade_venue())
+                .unwrap_or(DEFAULT_PERP_VENUE);
+            // 配对持仓以永续腿代表方向；单腿持仓读取自己的交易所。
+            let venue = if open.is_pair() {
+                open.short_venue.as_str()
+            } else {
+                open.venue.as_deref().unwrap_or(fallback_venue)
+            };
+            let market = markets
+                .iter()
+                .find(|market| market.venue == venue && market.symbol == open.symbol);
+            let held_secs = now
                 .signed_duration_since(open.opened_at)
                 .num_seconds()
-                .max(0) as u64,
-            entry_net_edge_bps: open.entry_net_edge_bps,
+                .max(0) as u64;
+            let held_bars = market
+                .map(|market| {
+                    market
+                        .candles
+                        .iter()
+                        .filter(|candle| candle.open_time > open.opened_at)
+                        .count() as u32
+                })
+                .unwrap_or_else(|| (held_secs / timeframe_secs(&data.timeframe)) as u32);
+            let entry_price = open.entry_price.unwrap_or_else(|| {
+                market
+                    .map(|market| (market.bid + market.ask) / Decimal::from(2))
+                    .unwrap_or(Decimal::ZERO)
+            });
+
+            SandboxPositionSnapshot {
+                symbol: open.symbol.clone(),
+                venue: venue.to_string(),
+                side: if open.is_pair() {
+                    arb_core::PositionSide::Short
+                } else {
+                    open.side.unwrap_or(arb_core::PositionSide::Long)
+                },
+                notional_usd: open.notional_usd,
+                entry_price,
+                opened_at: open.opened_at,
+                held_secs,
+                held_bars,
+                entry_net_edge_bps: open.entry_net_edge_bps,
+            }
         });
+
+    let events = record
+        .map(|record| collect_events(state, record, now))
+        .unwrap_or_default();
 
     SandboxInput {
         abi_version: SANDBOX_ABI_VERSION,
-        strategy_id: record.map(|record| record.id).unwrap_or(fallback_strategy_id),
+        strategy_id: record
+            .map(|record| record.id)
+            .unwrap_or(fallback_strategy_id),
         strategy_version: record.map(|record| record.version).unwrap_or(0),
         now,
         limits: order_limits,
         markets,
         position,
+        events,
+    }
+}
+
+/// 把最近的上币公告转成策略可见的事件；只保留来源、关键词与时间窗口都命中的条目。
+fn collect_events(
+    state: &AppState,
+    record: &arb_core::StrategyRecord,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<SandboxEvent> {
+    let data = &record.definition.data;
+    let symbols = record.definition.universe.symbols.clone();
+    let mut events: Vec<SandboxEvent> = state
+        .news
+        .snapshot(MAX_SANDBOX_EVENTS * 8)
+        .items
+        .into_iter()
+        .filter(|item| {
+            data.event_sources.is_empty()
+                || data
+                    .event_sources
+                    .iter()
+                    .any(|source| source.eq_ignore_ascii_case(&item.source))
+        })
+        .filter(|item| {
+            let keywords: Vec<String> = data
+                .event_keywords
+                .iter()
+                .map(|keyword| keyword.trim().to_lowercase())
+                .filter(|keyword| !keyword.is_empty())
+                .collect();
+            keywords.is_empty() || {
+                let title = item.title.to_lowercase();
+                keywords.iter().any(|keyword| title.contains(keyword))
+            }
+        })
+        .filter_map(|item| {
+            let age = now.signed_duration_since(item.published_at).num_seconds();
+            if age < 0 || age as u64 > data.event_window_secs {
+                return None;
+            }
+            let symbol = matched_symbol(&item.title, &symbols);
+            // 策略声明了交易对时只交付命中其交易对的公告，避免无关噪声。
+            if !symbols.is_empty() && symbol.is_none() {
+                return None;
+            }
+            Some(SandboxEvent {
+                source: item.source,
+                kind: "listing".to_string(),
+                title: item.title,
+                symbol,
+                published_at: item.published_at,
+                age_secs: age as u64,
+            })
+        })
+        .collect();
+    events.sort_by(|left, right| left.published_at.cmp(&right.published_at));
+    if events.len() > MAX_SANDBOX_EVENTS {
+        events.drain(..events.len() - MAX_SANDBOX_EVENTS);
+    }
+    events
+}
+
+/// 在公告标题里找策略声明的交易对，返回命中的完整交易对。
+fn matched_symbol(title: &str, symbols: &[String]) -> Option<String> {
+    let text = title.to_uppercase();
+    symbols
+        .iter()
+        .filter(|symbol| !symbol.trim().is_empty())
+        .find(|symbol| {
+            let upper = symbol.to_uppercase();
+            if contains_token(&text, &upper) {
+                return true;
+            }
+            let base = base_asset(symbol);
+            !base.is_empty() && contains_token(&text, &base)
+        })
+        .cloned()
+}
+
+/// 去掉常见计价货币后缀，得到标题里可能出现的币种名。
+fn base_asset(symbol: &str) -> String {
+    const QUOTES: [&str; 6] = ["USDT", "USDC", "FDUSD", "BUSD", "USD", "PERP"];
+    let upper = symbol.trim().to_uppercase();
+    for quote in QUOTES {
+        if let Some(base) = upper.strip_suffix(quote) {
+            if !base.is_empty() {
+                return base.to_string();
+            }
+        }
+    }
+    upper
+}
+
+/// 按符号边界匹配，避免 "AI" 命中 "SAIL" 这类误判。
+fn contains_token(haystack: &str, token: &str) -> bool {
+    haystack.match_indices(token).any(|(index, _)| {
+        let before = haystack[..index].chars().next_back();
+        let after = haystack[index + token.len()..].chars().next();
+        !before.is_some_and(|value| value.is_ascii_alphanumeric())
+            && !after.is_some_and(|value| value.is_ascii_alphanumeric())
+    })
+}
+
+/// 以 `-spot` 结尾的交易所标识走现货，其余按永续处理。
+fn instrument_for(venue: &str) -> Instrument {
+    if venue.trim().to_ascii_lowercase().ends_with("-spot") {
+        Instrument::Spot
+    } else {
+        Instrument::Perp
+    }
+}
+
+/// K 线周期换算成秒，用于在缺少 K 线时估算持仓根数。
+fn timeframe_secs(timeframe: &str) -> u64 {
+    match timeframe {
+        "1m" => 60,
+        "5m" => 300,
+        "15m" => 900,
+        "30m" => 1_800,
+        "1h" => 3_600,
+        "4h" => 14_400,
+        "1d" => 86_400,
+        "1w" => 604_800,
+        _ => 300,
     }
 }
 
@@ -713,8 +1200,7 @@ fn invoke(
         .ok_or_else(|| wasmtime::Error::msg("模块缺少 memory"))?;
     let payload = serde_json::to_vec(input)
         .map_err(|error| wasmtime::Error::msg(format!("序列化沙箱输入失败: {error}")))?;
-    let len = i32::try_from(payload.len())
-        .map_err(|_| wasmtime::Error::msg("沙箱输入过大"))?;
+    let len = i32::try_from(payload.len()).map_err(|_| wasmtime::Error::msg("沙箱输入过大"))?;
 
     let alloc: TypedFunc<i32, i32> = instance
         .get_typed_func(&mut *store, "alloc")
@@ -730,9 +1216,7 @@ fn invoke(
         .map_err(|_| wasmtime::Error::msg(format!("模块缺少导出函数 {SANDBOX_ENTRYPOINT}")))?;
     let code = evaluate.call(&mut *store, (ptr, len))?;
     if code != 0 {
-        return Err(wasmtime::Error::msg(format!(
-            "模块返回非零状态码 {code}"
-        )));
+        return Err(wasmtime::Error::msg(format!("模块返回非零状态码 {code}")));
     }
     Ok(())
 }
@@ -835,9 +1319,7 @@ pub async fn evaluate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arb_core::{
-        SandboxMarketSnapshot, SandboxOrderLimits, SandboxPositionSnapshot,
-    };
+    use arb_core::SandboxIndicators;
     use chrono::Utc;
     use rust_decimal_macros::dec;
     use uuid::Uuid;
@@ -848,7 +1330,7 @@ mod tests {
   (import "arbpilot" "emit" (func $emit (param i32 i32) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 1024) "{\"decisions\":[{\"action\":\"hold\",\"reason\":\"test\"}]}")
-  (func (export "abi_version") (result i32) i32.const 1)
+  (func (export "abi_version") (result i32) i32.const 2)
   (func (export "alloc") (param i32) (result i32) i32.const 4096)
   (func (export "evaluate") (param i32 i32) (result i32)
     i32.const 1024
@@ -863,18 +1345,90 @@ mod tests {
 (module
   (import "arbpilot" "markets" (func $markets (result i32)))
   (import "arbpilot" "market" (func $market (param i32 i32) (result f64)))
-  (import "arbpilot" "open" (func $open (param i32 i32 f64) (result i32)))
+  (import "arbpilot" "open" (func $open (param i32 i32 f64 i32) (result i32)))
   (import "arbpilot" "hold" (func $hold (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 1024) "BTCUSDT")
-  (func (export "abi_version") (result i32) i32.const 1)
+  (func (export "abi_version") (result i32) i32.const 2)
   (func (export "alloc") (param i32) (result i32) i32.const 8192)
   (func (export "evaluate") (param i32 i32) (result i32)
     (if (i32.gt_s (call $markets) (i32.const 0))
       (then
-        (if (f64.gt (call $market (i32.const 0) (i32.const 4)) (f64.const 0.0003))
+        (if (f64.gt (call $market (i32.const 0) (i32.const 3)) (f64.const 0.0003))
           (then
-            (drop (call $open (i32.const 1024) (i32.const 7) (f64.const 500)))))))
+            (drop (call $open (i32.const 1024) (i32.const 7) (f64.const 500) (i32.const 1)))))))
+    (drop (call $hold))
+    i32.const 0))
+"#;
+
+    /// 读取 K 线与指标的模块：快均线在慢均线上方时做多。
+    const KLINE_WAT: &str = r#"
+(module
+  (import "arbpilot" "candles" (func $candles (param i32) (result i32)))
+  (import "arbpilot" "indicator" (func $indicator (param i32 i32) (result f64)))
+  (import "arbpilot" "open" (func $open (param i32 i32 f64 i32) (result i32)))
+  (import "arbpilot" "hold" (func $hold (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 1024) "BTCUSDT")
+  (func (export "abi_version") (result i32) i32.const 2)
+  (func (export "alloc") (param i32) (result i32) i32.const 8192)
+  (func (export "evaluate") (param i32 i32) (result i32)
+    (if (i32.gt_s (call $candles (i32.const 0)) (i32.const 0))
+      (then
+        (if (f64.gt
+              (call $indicator (i32.const 0) (i32.const 0))
+              (call $indicator (i32.const 0) (i32.const 1)))
+          (then
+            (drop (call $open (i32.const 1024) (i32.const 7) (f64.const 500) (i32.const 1)))))))
+    (drop (call $hold))
+    i32.const 0))
+"#;
+
+    /// 网格模块：登记一笔待触发限价意图并撤销同交易对的旧挂单。
+    const GRID_WAT: &str = r#"
+(module
+  (import "arbpilot" "limit" (func $limit (param i32 i32 f64 f64 i32) (result i32)))
+  (import "arbpilot" "cancel" (func $cancel (param i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 1024) "BTCUSDT")
+  (func (export "abi_version") (result i32) i32.const 2)
+  (func (export "alloc") (param i32) (result i32) i32.const 8192)
+  (func (export "evaluate") (param i32 i32) (result i32)
+    (drop (call $limit (i32.const 1024) (i32.const 7) (f64.const 9500) (f64.const 500) (i32.const 1)))
+    (drop (call $cancel (i32.const 1024) (i32.const 7)))
+    i32.const 0))
+"#;
+
+    /// 事件模块：最新公告命中交易对时，用公告里的交易对开仓。
+    const EVENT_WAT: &str = r#"
+(module
+  (import "arbpilot" "events" (func $events (result i32)))
+  (import "arbpilot" "event" (func $event (param i32 i32) (result f64)))
+  (import "arbpilot" "event_text" (func $event_text (param i32 i32 i32 i32) (result i32)))
+  (import "arbpilot" "open" (func $open (param i32 i32 f64 i32) (result i32)))
+  (import "arbpilot" "hold" (func $hold (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 1024) "                        ")
+  (func (export "abi_version") (result i32) i32.const 2)
+  (func (export "alloc") (param i32) (result i32) i32.const 8192)
+  (func (export "evaluate") (param i32 i32) (result i32)
+    (local $count i32)
+    (local $len i32)
+    (local.set $count (call $events))
+    (if (i32.gt_s (local.get $count) (i32.const 0))
+      (then
+        (if (f64.ge (call $event (i32.const 0) (i32.const 2)) (f64.const 1))
+          (then
+            (local.set $len
+              (call $event_text (i32.const 0) (i32.const 3) (i32.const 1024) (i32.const 24)))
+            (if (i32.gt_s (local.get $len) (i32.const 0))
+              (then
+                (drop
+                  (call $open
+                    (i32.const 1024)
+                    (local.get $len)
+                    (f64.const 500)
+                    (i32.const 1)))))))))
     (drop (call $hold))
     i32.const 0))
 "#;
@@ -883,7 +1437,7 @@ mod tests {
     const LOOP_WAT: &str = r#"
 (module
   (memory (export "memory") 1)
-  (func (export "abi_version") (result i32) i32.const 1)
+  (func (export "abi_version") (result i32) i32.const 2)
   (func (export "alloc") (param i32) (result i32) i32.const 4096)
   (func (export "evaluate") (param i32 i32) (result i32)
     (loop $forever br $forever)
@@ -917,20 +1471,31 @@ mod tests {
             },
             markets: vec![SandboxMarketSnapshot {
                 symbol: "BTCUSDT".into(),
-                spot_venue: "binance-spot".into(),
-                perp_venue: "binance".into(),
-                spot_bid: dec!(100),
-                spot_ask: dec!(101),
-                perp_bid: dec!(100),
-                perp_ask: dec!(101),
-                funding_rate: dec!(0.0005),
-                gross_spread_bps: dec!(5),
-                net_edge_bps: dec!(3),
+                venue: "binance".into(),
+                instrument: Instrument::Perp,
+                bid: dec!(100),
+                ask: dec!(101),
+                last: None,
+                funding_rate: Some(dec!(0.0005)),
                 next_funding_at: None,
-                observed_at: Utc::now(),
                 max_notional_usd: dec!(1000),
+                observed_at: Utc::now(),
+                candles: vec![SandboxCandle {
+                    open_time: Utc::now() - chrono::Duration::minutes(5),
+                    open: dec!(100),
+                    high: dec!(102),
+                    low: dec!(99),
+                    close: dec!(101),
+                    volume: dec!(10),
+                }],
+                indicators: SandboxIndicators {
+                    sma_fast: Some(dec!(101)),
+                    sma_slow: Some(dec!(100)),
+                    ..SandboxIndicators::default()
+                },
             }],
-            position: None::<SandboxPositionSnapshot>,
+            position: None,
+            events: Vec::new(),
         }
     }
 
@@ -940,7 +1505,7 @@ mod tests {
 (module
   (import "wasi_snapshot_preview1" "fd_write" (func (param i32 i32 i32 i32) (result i32)))
   (memory (export "memory") 1)
-  (func (export "abi_version") (result i32) i32.const 1)
+  (func (export "abi_version") (result i32) i32.const 2)
   (func (export "alloc") (param i32) (result i32) i32.const 0)
   (func (export "evaluate") (param i32 i32) (result i32) i32.const 0))
 "#;
@@ -952,7 +1517,10 @@ mod tests {
     #[test]
     fn runs_hold_module() {
         let bytes = wat::parse_str(HOLD_WAT).expect("wat 编译");
-        assert_eq!(inspect(&bytes, &SandboxLimits::default()).unwrap(), 1);
+        assert_eq!(
+            inspect(&bytes, &SandboxLimits::default()).unwrap(),
+            SANDBOX_ABI_VERSION
+        );
         let artifact = artifact(&bytes);
         let report = run_blocking(&artifact, &bytes, &input(), &SandboxLimits::default());
         assert_eq!(report.status, SandboxRunStatus::Ok, "{:?}", report.error);
@@ -962,7 +1530,10 @@ mod tests {
     #[test]
     fn runs_helper_module_without_emit() {
         let bytes = wat::parse_str(HELPER_WAT).expect("wat 编译");
-        assert_eq!(inspect(&bytes, &SandboxLimits::default()).unwrap(), 1);
+        assert_eq!(
+            inspect(&bytes, &SandboxLimits::default()).unwrap(),
+            SANDBOX_ABI_VERSION
+        );
         let artifact = artifact(&bytes);
         let report = run_blocking(&artifact, &bytes, &input(), &SandboxLimits::default());
         assert_eq!(report.status, SandboxRunStatus::Ok, "{:?}", report.error);
@@ -970,6 +1541,86 @@ mod tests {
             decision,
             SandboxDecision::Open { symbol, .. } if symbol == "BTCUSDT"
         )));
+    }
+
+    #[test]
+    fn reads_candles_and_indicators() {
+        let bytes = wat::parse_str(KLINE_WAT).expect("wat 编译");
+        let artifact = artifact(&bytes);
+        let report = run_blocking(&artifact, &bytes, &input(), &SandboxLimits::default());
+        assert_eq!(report.status, SandboxRunStatus::Ok, "{:?}", report.error);
+        assert!(report.decisions.iter().any(|decision| matches!(
+            decision,
+            SandboxDecision::Open {
+                side: arb_core::PositionSide::Long,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn submits_limit_and_cancel_decisions() {
+        let bytes = wat::parse_str(GRID_WAT).expect("wat 编译");
+        let artifact = artifact(&bytes);
+        let report = run_blocking(&artifact, &bytes, &input(), &SandboxLimits::default());
+        assert_eq!(report.status, SandboxRunStatus::Ok, "{:?}", report.error);
+        assert!(report.decisions.iter().any(|decision| matches!(
+            decision,
+            SandboxDecision::PlaceLimit {
+                symbol,
+                side: arb_core::PositionSide::Long,
+                price,
+                ..
+            } if symbol == "BTCUSDT" && *price == dec!(9500)
+        )));
+        assert!(report.decisions.iter().any(|decision| matches!(
+            decision,
+            SandboxDecision::Cancel { symbol, .. } if symbol == "BTCUSDT"
+        )));
+    }
+
+    /// 事件导入：有命中交易对的公告才开仓，没有公告时保持空仓。
+    #[test]
+    fn reads_events_and_opens_on_matched_listing() {
+        let bytes = wat::parse_str(EVENT_WAT).expect("wat 编译");
+        let artifact = artifact(&bytes);
+
+        let mut with_event = input();
+        with_event.events = vec![SandboxEvent {
+            source: "binance".to_string(),
+            kind: "listing".to_string(),
+            title: "Binance Will List XYZ".to_string(),
+            symbol: Some("XYZUSDT".to_string()),
+            published_at: Utc::now(),
+            age_secs: 30,
+        }];
+        let report = run_blocking(&artifact, &bytes, &with_event, &SandboxLimits::default());
+        assert_eq!(report.status, SandboxRunStatus::Ok, "{:?}", report.error);
+        assert!(report.decisions.iter().any(|decision| matches!(
+            decision,
+            SandboxDecision::Open { symbol, .. } if symbol == "XYZUSDT"
+        )));
+
+        let empty = input();
+        let report = run_blocking(&artifact, &bytes, &empty, &SandboxLimits::default());
+        assert_eq!(report.status, SandboxRunStatus::Ok, "{:?}", report.error);
+        assert!(!report
+            .decisions
+            .iter()
+            .any(|decision| matches!(decision, SandboxDecision::Open { .. })));
+    }
+
+    #[test]
+    fn matches_event_symbols_on_word_boundaries() {
+        let symbols = vec!["BTCUSDT".to_string(), "AIUSDT".to_string()];
+        assert_eq!(
+            matched_symbol("Binance Will List BTC (BTC)", &symbols),
+            Some("BTCUSDT".to_string())
+        );
+        // 子串命中不算：SAIL 里包含 AI。
+        assert_eq!(matched_symbol("Binance Will List SAIL", &symbols), None);
+        assert_eq!(base_asset("BTCUSDT"), "BTC");
+        assert_eq!(base_asset("ETHFDUSD"), "ETH");
     }
 
     #[test]
@@ -982,7 +1633,12 @@ mod tests {
             ..SandboxLimits::default()
         };
         let report = run_blocking(&artifact, &bytes, &input(), &limits);
-        assert_eq!(report.status, SandboxRunStatus::Timeout, "{:?}", report.error);
+        assert_eq!(
+            report.status,
+            SandboxRunStatus::Timeout,
+            "{:?}",
+            report.error
+        );
     }
 
     #[test]

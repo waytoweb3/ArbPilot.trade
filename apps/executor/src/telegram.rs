@@ -501,7 +501,8 @@ impl TelegramBot {
             .unwrap_or(false)
     }
 
-    async fn broadcast(&self, text: &str) {
+    /// 向所有已绑定账号推送一条消息，供告警与通知分发使用。
+    pub async fn broadcast(&self, text: &str) {
         let targets: Vec<i64> = self
             .bindings
             .read()

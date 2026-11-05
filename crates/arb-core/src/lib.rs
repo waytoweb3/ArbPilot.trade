@@ -8,6 +8,7 @@
 //! - 交易所适配器 trait（由具体交易所实现）
 
 pub mod exchange;
+pub mod indicators;
 pub mod market;
 pub mod order;
 pub mod risk;
@@ -31,25 +32,36 @@ pub use risk::{
     RiskContext, RiskDecision, RiskEngine, RiskLimits, RiskViolation, RiskViolationCode,
 };
 pub use sandbox::{
-    SandboxArtifact, SandboxArtifactSource, SandboxBinding, SandboxDecision, SandboxInput,
-    SandboxLimits, SandboxMarketSnapshot, SandboxOrderLimits, SandboxOutput,
-    SandboxPositionSnapshot, SandboxRunReport, SandboxRunStatus, SANDBOX_ABI_VERSION,
-    SANDBOX_CLOSE, SANDBOX_EMIT, SANDBOX_ENTRYPOINT, SANDBOX_FIELD_FUNDING_RATE,
-    SANDBOX_FIELD_GROSS_SPREAD_BPS, SANDBOX_FIELD_MAX_NOTIONAL_USD, SANDBOX_FIELD_NET_EDGE_BPS,
-    SANDBOX_FIELD_PERP_ASK, SANDBOX_FIELD_PERP_BID, SANDBOX_FIELD_SPOT_ASK,
-    SANDBOX_FIELD_SPOT_BID, SANDBOX_HOLD, SANDBOX_IMPORT_NAMESPACE, SANDBOX_LOG, SANDBOX_MARKET,
-    SANDBOX_MARKETS, SANDBOX_OPEN, SANDBOX_POSITION_HELD_SECS, SANDBOX_POSITION_NOTIONAL,
-    SANDBOX_POSITION_PRESENT,
+    SandboxArtifact, SandboxArtifactSource, SandboxBinding, SandboxCandle, SandboxDecision,
+    SandboxEvent, SandboxIndicators, SandboxInput, SandboxLimits, SandboxMarketSnapshot,
+    SandboxOrderLimits,
+    SandboxOutput, SandboxPositionSnapshot, SandboxRunReport, SandboxRunStatus,
+    SANDBOX_ABI_VERSION, SANDBOX_CANDLE, SANDBOX_CANDLE_CLOSE, SANDBOX_CANDLE_HIGH,
+    SANDBOX_CANDLE_LOW, SANDBOX_CANDLE_OPEN, SANDBOX_CANDLE_OPEN_TIME, SANDBOX_CANDLE_VOLUME,
+    SANDBOX_CANDLES, SANDBOX_CANCEL, SANDBOX_CLOSE, SANDBOX_EMIT, SANDBOX_ENTRYPOINT,
+    SANDBOX_EVENT, SANDBOX_EVENTS, SANDBOX_EVENT_AGE_SECS, SANDBOX_EVENT_MATCHED,
+    SANDBOX_EVENT_PUBLISHED_AT, SANDBOX_EVENT_TEXT, SANDBOX_EVENT_TEXT_KIND,
+    SANDBOX_EVENT_TEXT_SOURCE, SANDBOX_EVENT_TEXT_SYMBOL, SANDBOX_EVENT_TEXT_TITLE,
+    SANDBOX_FIELD_ASK, SANDBOX_FIELD_BID, SANDBOX_FIELD_FUNDING_RATE,
+    SANDBOX_FIELD_INSTRUMENT, SANDBOX_FIELD_LAST, SANDBOX_FIELD_MAX_NOTIONAL_USD, SANDBOX_HOLD,
+    SANDBOX_IMPORT_NAMESPACE, SANDBOX_INDICATOR, SANDBOX_INDICATOR_ATR,
+    SANDBOX_INDICATOR_CHANNEL_HIGH, SANDBOX_INDICATOR_CHANNEL_LOW, SANDBOX_INDICATOR_EMA_FAST,
+    SANDBOX_INDICATOR_EMA_SLOW, SANDBOX_INDICATOR_SMA_FAST, SANDBOX_INDICATOR_SMA_SLOW,
+    SANDBOX_LIMIT, SANDBOX_LOG, SANDBOX_MARKET, SANDBOX_MARKET_SYMBOL, SANDBOX_MARKETS,
+    SANDBOX_OPEN,
+    SANDBOX_OPEN_PAIR, SANDBOX_POSITION_ENTRY_PRICE, SANDBOX_POSITION_HELD_BARS,
+    SANDBOX_POSITION_HELD_SECS, SANDBOX_POSITION_NOTIONAL, SANDBOX_POSITION_PRESENT,
+    SANDBOX_POSITION_SIDE,
 };
 pub use strategy::{
-    run_backtest, BacktestAssumption, BacktestReport, CostAssumptions, EntryRules, EquityPoint,
-    ExecutionRules, ExitRules, FundingSample, Instrument, StrategyCode, StrategyCodeLanguage,
-    StrategyCodeOrigin, StrategyDefinition, StrategyEvent, StrategyEventLevel,
-    StrategyOpenPosition, StrategyRecord, StrategyRisk, StrategyRunScope, StrategyRuntime,
-    StrategySource, StrategyStatus, StrategyUniverse, StrategyValidation, ValidationIssue,
-    ValidationSeverity,
+    run_backtest, BacktestAssumption, BacktestReport, CostAssumptions, DataRules, EntryRules,
+    EquityPoint, ExecutionRules, ExitRules, FundingSample, Instrument, StrategyCode,
+    StrategyCodeLanguage, StrategyCodeOrigin, StrategyDefinition, StrategyEvent,
+    StrategyEventLevel, StrategyKind, StrategyOpenPosition, StrategyPendingOrder, StrategyRecord,
+    StrategyRisk, StrategyRunScope, StrategyRuntime, StrategySource, StrategyStatus,
+    StrategyUniverse, StrategyValidation, ValidationIssue, ValidationSeverity,
 };
 pub use types::{
     Balance, LegStatus, Opportunity, OpportunityKind, Order, OrderIntent, OrderLeg, OrderLegIntent,
-    OrderOrigin, OrderStatus, Position, Quote, Side, VenueKind,
+    OrderOrigin, OrderStatus, Position, PositionSide, Quote, Side, VenueKind,
 };

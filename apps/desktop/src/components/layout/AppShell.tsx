@@ -1,5 +1,4 @@
 import {
-  BookOpen,
   Bot,
   Languages,
   LayoutDashboard,
@@ -16,6 +15,7 @@ import {
   Wallet,
   Wifi,
   WifiOff,
+  X,
 } from "lucide-react";
 import { useCallback, useState } from "react";
 import { NavLink, Outlet } from "react-router-dom";
@@ -23,7 +23,7 @@ import { NavLink, Outlet } from "react-router-dom";
 import { useHealth, useNews } from "../../hooks/useApi";
 import { useLicenseSync } from "../../hooks/useAccount";
 import { useExecutorStream } from "../../hooks/useExecutorStream";
-import { formatUptime } from "../../lib/format";
+import { formatDateTime, formatUptime } from "../../lib/format";
 import { useI18n } from "../../lib/i18n";
 import { countUnread, useNewsPrefs } from "../../lib/news";
 import { useTheme } from "../../lib/theme";
@@ -40,6 +40,8 @@ export function AppShell() {
   useLicenseSync();
   const health = useHealth();
   const streamConnected = useExecutorStore((state) => state.streamConnected);
+  const notices = useExecutorStore((state) => state.notices);
+  const dismissNotice = useExecutorStore((state) => state.dismissNotice);
   const { t, locale, toggleLocale } = useI18n();
   const { resolved, toggleTheme } = useTheme();
   const [collapsed, setCollapsed] = useState(() => localStorage.getItem(SIDEBAR_KEY) === "1");
@@ -76,7 +78,6 @@ export function AppShell() {
     { to: "/news", label: t.nav.news, icon: Newspaper, badge: unread },
     { to: "/strategies", label: t.nav.strategies, icon: Bot },
     { to: "/market", label: t.nav.market, icon: Store },
-    { to: "/docs", label: t.nav.docs, icon: BookOpen },
     { to: "/settings", label: t.nav.settings, icon: SettingsIcon },
   ];
 
@@ -246,6 +247,36 @@ export function AppShell() {
         <main className="min-h-0 flex-1 overflow-y-auto px-6 py-6">
           <Outlet />
         </main>
+      </div>
+
+      {/* 应用内通知：执行器按通知设置推送新闻与资金费率套利提醒。 */}
+      <div className="pointer-events-none fixed right-4 bottom-4 z-50 flex w-80 flex-col gap-2">
+        {notices.map((notice) => (
+          <div
+            key={notice.id}
+            className="pointer-events-auto rounded-lg border border-line-strong bg-panel px-3 py-2.5 shadow-lg"
+          >
+            <div className="flex items-start justify-between gap-2">
+              <p className="text-xs font-medium text-fg">{notice.title}</p>
+              <button
+                type="button"
+                onClick={() => dismissNotice(notice.id)}
+                title={t.shell.noticeClose}
+                aria-label={t.shell.noticeClose}
+                className="shrink-0 rounded p-0.5 text-subtle transition-colors hover:bg-hover hover:text-body"
+              >
+                <X size={13} />
+              </button>
+            </div>
+            <p className="mt-1 whitespace-pre-wrap text-[11px] leading-relaxed text-muted">
+              {notice.message}
+            </p>
+            <p className="mt-1 font-mono text-[10px] text-subtle">
+              {notice.kind === "funding" ? t.settings.notifyFunding : t.settings.notifyNews} ·{" "}
+              {formatDateTime(notice.at)}
+            </p>
+          </div>
+        ))}
       </div>
     </div>
   );

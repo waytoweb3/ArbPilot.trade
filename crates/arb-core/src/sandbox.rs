@@ -1,6 +1,6 @@
 //! WASM 策略沙箱的受限 ABI 与运行结果类型。
 //!
-//! 沙箱只接收确定性的行情快照，只输出「开仓 / 平仓 / 保持」意图：
+//! 沙箱只接收确定性的行情快照，只输出「开仓 / 平仓 / 挂单 / 撤单 / 保持」意图：
 //! - 模块无法访问 WASI、文件系统、网络、环境变量或任何交易所密钥；
 //! - 主机限制燃料、内存、墙钟时间、输出大小与决策条数；
 //! - 输出意图仍必须经过执行器统一风控网关，沙箱本身没有下单能力。
@@ -10,10 +10,13 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::strategy::{ValidationIssue, ValidationSeverity};
+use crate::{
+    strategy::{Instrument, ValidationIssue, ValidationSeverity},
+    types::PositionSide,
+};
 
 /// 当前沙箱 ABI 版本。模块导出 `abi_version()` 必须返回该值。
-pub const SANDBOX_ABI_VERSION: u32 = 1;
+pub const SANDBOX_ABI_VERSION: u32 = 2;
 /// 模块必须导出的决策函数名。
 pub const SANDBOX_ENTRYPOINT: &str = "evaluate";
 /// 主机提供给模块的回调，用于提交决策 JSON。
@@ -29,22 +32,73 @@ pub const SANDBOX_IMPORT_NAMESPACE: &str = "arbpilot";
 /// 仍然没有任何文件、网络、环境变量或交易能力。
 pub const SANDBOX_MARKETS: &str = "markets";
 pub const SANDBOX_MARKET: &str = "market";
+/// 把第 `index` 个交易对的名称写入模块内存，返回字节数；失败返回 0。
+pub const SANDBOX_MARKET_SYMBOL: &str = "market_symbol";
+pub const SANDBOX_CANDLES: &str = "candles";
+pub const SANDBOX_CANDLE: &str = "candle";
+pub const SANDBOX_INDICATOR: &str = "indicator";
 pub const SANDBOX_POSITION_PRESENT: &str = "position_present";
 pub const SANDBOX_POSITION_NOTIONAL: &str = "position_notional";
 pub const SANDBOX_POSITION_HELD_SECS: &str = "position_held_secs";
+pub const SANDBOX_POSITION_HELD_BARS: &str = "position_held_bars";
+pub const SANDBOX_POSITION_SIDE: &str = "position_side";
+pub const SANDBOX_POSITION_ENTRY_PRICE: &str = "position_entry_price";
 pub const SANDBOX_OPEN: &str = "open";
+/// 资金费率配对开仓：现货多 + 永续空，交易所与交易对取自策略定义。
+pub const SANDBOX_OPEN_PAIR: &str = "open_pair";
 pub const SANDBOX_CLOSE: &str = "close";
+/// 网格挂单：登记一个价格触及时才真正下单的限价意图。
+pub const SANDBOX_LIMIT: &str = "limit";
+/// 撤销该策略在某交易对上的全部待触发限价意图。
+pub const SANDBOX_CANCEL: &str = "cancel";
 pub const SANDBOX_HOLD: &str = "hold";
+/// 最近可见事件的条数。
+pub const SANDBOX_EVENTS: &str = "events";
+/// 读取第 `index` 条事件的数值字段。
+pub const SANDBOX_EVENT: &str = "event";
+/// 把第 `index` 条事件的文本字段写入模块内存，返回字节数；失败返回 0。
+pub const SANDBOX_EVENT_TEXT: &str = "event_text";
+
+/// `event(index, field)` 的字段编号。
+pub const SANDBOX_EVENT_PUBLISHED_AT: i32 = 0;
+/// 距本次评估的秒数。
+pub const SANDBOX_EVENT_AGE_SECS: i32 = 1;
+/// 是否命中策略声明的交易对（0/1）。
+pub const SANDBOX_EVENT_MATCHED: i32 = 2;
+
+/// `event_text(index, field, ptr, cap)` 的字段编号。
+pub const SANDBOX_EVENT_TEXT_SOURCE: i32 = 0;
+pub const SANDBOX_EVENT_TEXT_KIND: i32 = 1;
+pub const SANDBOX_EVENT_TEXT_TITLE: i32 = 2;
+/// 命中的交易对；未命中时为空字符串。
+pub const SANDBOX_EVENT_TEXT_SYMBOL: i32 = 3;
 
 /// `market(index, field)` 的字段编号。
-pub const SANDBOX_FIELD_SPOT_BID: i32 = 0;
-pub const SANDBOX_FIELD_SPOT_ASK: i32 = 1;
-pub const SANDBOX_FIELD_PERP_BID: i32 = 2;
-pub const SANDBOX_FIELD_PERP_ASK: i32 = 3;
-pub const SANDBOX_FIELD_FUNDING_RATE: i32 = 4;
-pub const SANDBOX_FIELD_GROSS_SPREAD_BPS: i32 = 5;
-pub const SANDBOX_FIELD_NET_EDGE_BPS: i32 = 6;
-pub const SANDBOX_FIELD_MAX_NOTIONAL_USD: i32 = 7;
+pub const SANDBOX_FIELD_BID: i32 = 0;
+pub const SANDBOX_FIELD_ASK: i32 = 1;
+pub const SANDBOX_FIELD_LAST: i32 = 2;
+pub const SANDBOX_FIELD_FUNDING_RATE: i32 = 3;
+/// 0 = 现货，1 = 永续。
+pub const SANDBOX_FIELD_INSTRUMENT: i32 = 4;
+pub const SANDBOX_FIELD_MAX_NOTIONAL_USD: i32 = 5;
+
+/// `candle(market, offset, field)` 的字段编号；`offset` 0 表示最新一根。
+pub const SANDBOX_CANDLE_OPEN: i32 = 0;
+pub const SANDBOX_CANDLE_HIGH: i32 = 1;
+pub const SANDBOX_CANDLE_LOW: i32 = 2;
+pub const SANDBOX_CANDLE_CLOSE: i32 = 3;
+pub const SANDBOX_CANDLE_VOLUME: i32 = 4;
+/// 开盘时间（Unix 秒）。
+pub const SANDBOX_CANDLE_OPEN_TIME: i32 = 5;
+
+/// `indicator(market, id)` 的编号，缺数据时返回 0。
+pub const SANDBOX_INDICATOR_SMA_FAST: i32 = 0;
+pub const SANDBOX_INDICATOR_SMA_SLOW: i32 = 1;
+pub const SANDBOX_INDICATOR_EMA_FAST: i32 = 2;
+pub const SANDBOX_INDICATOR_EMA_SLOW: i32 = 3;
+pub const SANDBOX_INDICATOR_ATR: i32 = 4;
+pub const SANDBOX_INDICATOR_CHANNEL_HIGH: i32 = 5;
+pub const SANDBOX_INDICATOR_CHANNEL_LOW: i32 = 6;
 
 /// 沙箱资源限额。默认值保守，可按策略调整但需通过校验。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -215,33 +269,178 @@ impl SandboxBinding {
     }
 }
 
-/// 单条行情快照，字段全部为确定性数值，不含任何凭证。
+/// 单根 K 线。模块无法访问历史接口，只能看到主机传入的确定性窗口。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SandboxCandle {
+    pub open_time: DateTime<Utc>,
+    pub open: Decimal,
+    pub high: Decimal,
+    pub low: Decimal,
+    pub close: Decimal,
+    pub volume: Decimal,
+}
+
+/// 主机侧计算好的指标，避免模块自己维护滚动窗口。
+///
+/// 数据不足时字段为 `None`，模块读取辅助函数会得到 0。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SandboxIndicators {
+    pub sma_fast: Option<Decimal>,
+    pub sma_slow: Option<Decimal>,
+    pub ema_fast: Option<Decimal>,
+    pub ema_slow: Option<Decimal>,
+    /// 平均真实波幅。
+    pub atr: Option<Decimal>,
+    /// 唐奇安通道上轨（前 N 根最高价）。
+    pub channel_high: Option<Decimal>,
+    /// 唐奇安通道下轨（前 N 根最低价）。
+    pub channel_low: Option<Decimal>,
+}
+
+impl SandboxIndicators {
+    /// 按 `SANDBOX_INDICATOR_*` 编号取值；缺数据返回 0。
+    pub fn by_id(&self, id: i32) -> f64 {
+        let value = match id {
+            SANDBOX_INDICATOR_SMA_FAST => self.sma_fast,
+            SANDBOX_INDICATOR_SMA_SLOW => self.sma_slow,
+            SANDBOX_INDICATOR_EMA_FAST => self.ema_fast,
+            SANDBOX_INDICATOR_EMA_SLOW => self.ema_slow,
+            SANDBOX_INDICATOR_ATR => self.atr,
+            SANDBOX_INDICATOR_CHANNEL_HIGH => self.channel_high,
+            SANDBOX_INDICATOR_CHANNEL_LOW => self.channel_low,
+            _ => None,
+        };
+        value.map(to_f64).unwrap_or(0.0)
+    }
+}
+
+impl SandboxCandle {
+    /// 按 `SANDBOX_CANDLE_*` 编号取值。
+    pub fn field(&self, id: i32) -> f64 {
+        let value = match id {
+            SANDBOX_CANDLE_OPEN => self.open,
+            SANDBOX_CANDLE_HIGH => self.high,
+            SANDBOX_CANDLE_LOW => self.low,
+            SANDBOX_CANDLE_CLOSE => self.close,
+            SANDBOX_CANDLE_VOLUME => self.volume,
+            SANDBOX_CANDLE_OPEN_TIME => Decimal::from(self.open_time.timestamp()),
+            _ => Decimal::ZERO,
+        };
+        to_f64(value)
+    }
+}
+
+/// 一条交给策略判断的事件。目前来自交易所上币公告。
+///
+/// 主机只提供已经发生的公开信息，事件本身不带交易能力；模块自行决定是否开仓。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SandboxEvent {
+    pub source: String,
+    pub kind: String,
+    pub title: String,
+    /// 命中策略声明的交易对时给出该交易对，否则为空。
+    #[serde(default)]
+    pub symbol: Option<String>,
+    pub published_at: DateTime<Utc>,
+    /// 距本次评估的秒数，由主机预先算好，模块不需要自己处理时间。
+    #[serde(default)]
+    pub age_secs: u64,
+}
+
+impl SandboxEvent {
+    /// 按 `SANDBOX_EVENT_*` 编号取值；缺数据返回 0。
+    pub fn field(&self, id: i32) -> f64 {
+        let value = match id {
+            SANDBOX_EVENT_PUBLISHED_AT => Decimal::from(self.published_at.timestamp()),
+            SANDBOX_EVENT_AGE_SECS => Decimal::from(self.age_secs),
+            SANDBOX_EVENT_MATCHED => {
+                if self.symbol.is_some() {
+                    Decimal::ONE
+                } else {
+                    Decimal::ZERO
+                }
+            }
+            _ => Decimal::ZERO,
+        };
+        to_f64(value)
+    }
+
+    /// 按 `SANDBOX_EVENT_TEXT_*` 编号取文本；未知编号返回空串。
+    pub fn text(&self, id: i32) -> &str {
+        match id {
+            SANDBOX_EVENT_TEXT_SOURCE => self.source.as_str(),
+            SANDBOX_EVENT_TEXT_KIND => self.kind.as_str(),
+            SANDBOX_EVENT_TEXT_TITLE => self.title.as_str(),
+            SANDBOX_EVENT_TEXT_SYMBOL => self.symbol.as_deref().unwrap_or_default(),
+            _ => "",
+        }
+    }
+}
+
+/// 单个可交易市场（交易所 + 交易对 + 品种）的快照。
+///
+/// 字段全部为确定性数值，不含任何凭证；K 线与指标使用策略定义里的周期。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxMarketSnapshot {
     pub symbol: String,
-    pub spot_venue: String,
-    pub perp_venue: String,
-    pub spot_bid: Decimal,
-    pub spot_ask: Decimal,
-    pub perp_bid: Decimal,
-    pub perp_ask: Decimal,
-    /// 当期资金费率（小数，如 0.0003）。
-    pub funding_rate: Decimal,
-    pub gross_spread_bps: Decimal,
-    pub net_edge_bps: Decimal,
+    pub venue: String,
+    pub instrument: Instrument,
+    pub bid: Decimal,
+    pub ask: Decimal,
+    /// 最新成交价；缺失时模块可退回用中间价。
+    pub last: Option<Decimal>,
+    /// 资金费率（仅永续有值）。
+    pub funding_rate: Option<Decimal>,
     pub next_funding_at: Option<DateTime<Utc>>,
-    pub observed_at: DateTime<Utc>,
-    /// 该机会按盘口深度可成交的最大名义价值。
+    /// 该市场按盘口深度可成交的最大名义价值。
     pub max_notional_usd: Decimal,
+    pub observed_at: DateTime<Utc>,
+    #[serde(default)]
+    pub candles: Vec<SandboxCandle>,
+    #[serde(default)]
+    pub indicators: SandboxIndicators,
+}
+
+impl SandboxMarketSnapshot {
+    /// 按 `SANDBOX_FIELD_*` 编号取值；缺数据返回 0。
+    pub fn field(&self, id: i32) -> f64 {
+        let value = match id {
+            SANDBOX_FIELD_BID => self.bid,
+            SANDBOX_FIELD_ASK => self.ask,
+            SANDBOX_FIELD_LAST => self
+                .last
+                .unwrap_or((self.bid + self.ask) / Decimal::from(2)),
+            SANDBOX_FIELD_FUNDING_RATE => self.funding_rate.unwrap_or_default(),
+            SANDBOX_FIELD_INSTRUMENT => match self.instrument {
+                Instrument::Spot => Decimal::ZERO,
+                Instrument::Perp => Decimal::ONE,
+            },
+            SANDBOX_FIELD_MAX_NOTIONAL_USD => self.max_notional_usd,
+            _ => Decimal::ZERO,
+        };
+        to_f64(value)
+    }
+}
+
+fn to_f64(value: Decimal) -> f64 {
+    use rust_decimal::prelude::ToPrimitive;
+    value.to_f64().unwrap_or(0.0)
 }
 
 /// 当前持仓快照，避免模块自己维护状态。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxPositionSnapshot {
     pub symbol: String,
+    pub venue: String,
+    pub side: PositionSide,
     pub notional_usd: Decimal,
+    pub entry_price: Decimal,
     pub opened_at: DateTime<Utc>,
     pub held_secs: u64,
+    /// 已持仓的 K 线根数，供按 bar 计数的策略使用。
+    #[serde(default)]
+    pub held_bars: u32,
+    #[serde(default)]
     pub entry_net_edge_bps: Decimal,
 }
 
@@ -265,19 +464,53 @@ pub struct SandboxInput {
     pub markets: Vec<SandboxMarketSnapshot>,
     #[serde(default)]
     pub position: Option<SandboxPositionSnapshot>,
+    /// 最近可见的事件，按发布时间升序；没有事件时为空。
+    #[serde(default)]
+    pub events: Vec<SandboxEvent>,
 }
 
 /// 模块可输出的唯一动作集合。没有撤单、转账、密钥或任意 HTTP 能力。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum SandboxDecision {
+    /// 单腿方向性开仓；`venue` 为空时使用策略主交易所。
     Open {
+        symbol: String,
+        notional_usd: Decimal,
+        side: PositionSide,
+        #[serde(default)]
+        venue: Option<String>,
+        #[serde(default)]
+        reason: Option<String>,
+    },
+    /// 资金费率配对开仓：现货多 + 永续空。
+    OpenPair {
         symbol: String,
         notional_usd: Decimal,
         #[serde(default)]
         reason: Option<String>,
     },
     Close {
+        symbol: String,
+        #[serde(default)]
+        reason: Option<String>,
+    },
+    /// 网格挂单：先登记一个待触发的限价意图，价格触及时才真正下单。
+    ///
+    /// 执行器不向交易所提交挂单，因此不需要撤单接口，也不会留下无人管理的挂单；
+    /// 触发后的订单与普通开仓一样经过统一风控网关。
+    PlaceLimit {
+        symbol: String,
+        side: PositionSide,
+        price: Decimal,
+        notional_usd: Decimal,
+        #[serde(default)]
+        venue: Option<String>,
+        #[serde(default)]
+        reason: Option<String>,
+    },
+    /// 撤销该策略在某交易对上的全部待触发限价意图（网格重排）。
+    Cancel {
         symbol: String,
         #[serde(default)]
         reason: Option<String>,
@@ -291,7 +524,11 @@ pub enum SandboxDecision {
 impl SandboxDecision {
     pub fn symbol(&self) -> Option<&str> {
         match self {
-            Self::Open { symbol, .. } | Self::Close { symbol, .. } => Some(symbol.as_str()),
+            Self::Open { symbol, .. }
+            | Self::OpenPair { symbol, .. }
+            | Self::Close { symbol, .. }
+            | Self::PlaceLimit { symbol, .. }
+            | Self::Cancel { symbol, .. } => Some(symbol.as_str()),
             Self::Hold { .. } => None,
         }
     }
@@ -300,6 +537,11 @@ impl SandboxDecision {
         let mut issues = Vec::new();
         match self {
             Self::Open {
+                symbol,
+                notional_usd,
+                ..
+            }
+            | Self::OpenPair {
                 symbol,
                 notional_usd,
                 ..
@@ -325,6 +567,43 @@ impl SandboxDecision {
                         path: "decisions.symbol".into(),
                         severity: ValidationSeverity::Error,
                         message: "平仓决策缺少交易对".into(),
+                    });
+                }
+            }
+            Self::PlaceLimit {
+                symbol,
+                price,
+                notional_usd,
+                ..
+            } => {
+                if symbol.trim().is_empty() {
+                    issues.push(ValidationIssue {
+                        path: "decisions.symbol".into(),
+                        severity: ValidationSeverity::Error,
+                        message: "挂单决策缺少交易对".into(),
+                    });
+                }
+                if *price <= Decimal::ZERO {
+                    issues.push(ValidationIssue {
+                        path: "decisions.price".into(),
+                        severity: ValidationSeverity::Error,
+                        message: "挂单价格必须大于 0".into(),
+                    });
+                }
+                if *notional_usd <= Decimal::ZERO {
+                    issues.push(ValidationIssue {
+                        path: "decisions.notional_usd".into(),
+                        severity: ValidationSeverity::Error,
+                        message: "挂单名义价值必须大于 0".into(),
+                    });
+                }
+            }
+            Self::Cancel { symbol, .. } => {
+                if symbol.trim().is_empty() {
+                    issues.push(ValidationIssue {
+                        path: "decisions.symbol".into(),
+                        severity: ValidationSeverity::Error,
+                        message: "撤单决策缺少交易对".into(),
                     });
                 }
             }
@@ -460,6 +739,8 @@ mod tests {
                 SandboxDecision::Open {
                     symbol: "BTCUSDT".into(),
                     notional_usd: dec!(100),
+                    side: PositionSide::Long,
+                    venue: None,
                     reason: None,
                 },
             ],
@@ -476,9 +757,74 @@ mod tests {
         let decision = SandboxDecision::Open {
             symbol: "BTCUSDT".into(),
             notional_usd: Decimal::ZERO,
+            side: PositionSide::Short,
+            venue: None,
             reason: None,
         };
         assert!(!decision.validate().is_empty());
+    }
+
+    #[test]
+    fn missing_indicators_read_as_zero() {
+        let indicators = SandboxIndicators::default();
+        assert_eq!(indicators.by_id(SANDBOX_INDICATOR_ATR), 0.0);
+        assert_eq!(indicators.by_id(SANDBOX_INDICATOR_CHANNEL_HIGH), 0.0);
+    }
+
+    #[test]
+    fn open_pair_requires_positive_notional() {
+        let decision = SandboxDecision::OpenPair {
+            symbol: "BTCUSDT".into(),
+            notional_usd: dec!(0),
+            reason: None,
+        };
+        assert!(!decision.validate().is_empty());
+    }
+
+    #[test]
+    fn place_limit_requires_price_and_notional() {
+        let decision = SandboxDecision::PlaceLimit {
+            symbol: "BTCUSDT".into(),
+            side: PositionSide::Long,
+            price: dec!(0),
+            notional_usd: dec!(100),
+            venue: None,
+            reason: None,
+        };
+        assert!(!decision.validate().is_empty());
+
+        let valid = SandboxDecision::PlaceLimit {
+            symbol: "BTCUSDT".into(),
+            side: PositionSide::Long,
+            price: dec!(9_500),
+            notional_usd: dec!(100),
+            venue: None,
+            reason: None,
+        };
+        assert!(valid.validate().is_empty());
+        assert_eq!(valid.symbol(), Some("BTCUSDT"));
+    }
+
+    #[test]
+    fn market_field_exposes_quote_and_instrument() {
+        let market = SandboxMarketSnapshot {
+            symbol: "BTCUSDT".into(),
+            venue: "binance".into(),
+            instrument: Instrument::Perp,
+            bid: dec!(100),
+            ask: dec!(101),
+            last: None,
+            funding_rate: Some(dec!(0.0005)),
+            next_funding_at: None,
+            max_notional_usd: dec!(1000),
+            observed_at: Utc::now(),
+            candles: Vec::new(),
+            indicators: SandboxIndicators::default(),
+        };
+        assert_eq!(market.field(SANDBOX_FIELD_BID), 100.0);
+        assert_eq!(market.field(SANDBOX_FIELD_LAST), 100.5);
+        assert_eq!(market.field(SANDBOX_FIELD_FUNDING_RATE), 0.0005);
+        assert_eq!(market.field(SANDBOX_FIELD_INSTRUMENT), 1.0);
     }
 
     #[test]

@@ -346,8 +346,17 @@ impl OkxMarketClient {
         make_book(bid, bid_qty, ask, ask_qty)
     }
 
-    pub fn candles(&self, symbol: &str, interval: &str, limit: u32) -> anyhow::Result<Vec<Candle>> {
-        let inst_id = spot_inst_id(symbol)?;
+    pub fn candles(
+        &self,
+        symbol: &str,
+        interval: &str,
+        limit: u32,
+        segment: Segment,
+    ) -> anyhow::Result<Vec<Candle>> {
+        let inst_id = match segment {
+            Segment::Spot => spot_inst_id(symbol)?,
+            Segment::Swap => swap_inst_id(symbol)?,
+        };
         let bar = okx_bar(interval)?;
         let url = format!(
             "{}/api/v5/market/candles?instId={inst_id}&bar={bar}&limit={}",

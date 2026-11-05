@@ -84,6 +84,8 @@ export function useLogout() {
     onSettled: () => {
       setToken(null);
       queryClient.removeQueries({ queryKey: ["account"] });
+      // 令牌清空后 useLicenseSync 会撤销执行器授权，这里刷新一下状态卡。
+      void queryClient.invalidateQueries({ queryKey: ["license"] });
     },
   });
 }

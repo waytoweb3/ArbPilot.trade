@@ -13,6 +13,7 @@ import type {
   EquityHistoryResponse,
   ExecutorLicense,
   LeaderboardEntry,
+  MarketConfig,
   SandboxDryRunRequest,
   SandboxRunReport,
   SettlementStatus,
@@ -28,15 +29,18 @@ import type {
   HealthResponse,
   ImportAccountRequest,
   NewsResponse,
+  NotificationSettings,
   Opportunity,
   Order,
   Position,
+  PublicationBundle,
   RiskLimits,
   StrategyDefinition,
   StrategyRecord,
   StrategyRunsResponse,
   StrategySource,
   StrategyStatus,
+  StrategyTemplateView,
   StrategyVersion,
   StrategyCode,
   StrategyCodeView,
@@ -164,6 +168,14 @@ export const api = {
 
   strategies: () => request<StrategyRecord[]>("/api/v1/strategies"),
 
+  strategyTemplates: () => request<StrategyTemplateView[]>("/api/v1/templates"),
+
+  instantiateTemplate: (key: string, name?: string) =>
+    request<StrategyRecord>(`/api/v1/templates/${encodeURIComponent(key)}/instantiate`, {
+      method: "POST",
+      body: JSON.stringify({ name }),
+    }),
+
   createStrategy: (body: {
     definition?: StrategyDefinition;
     name?: string;
@@ -188,7 +200,14 @@ export const api = {
 
   updateStrategyScope: (
     id: string,
-    body: { spot_venue: string; perp_venue: string; symbols: string[] },
+    body: {
+      spot_venue: string;
+      perp_venue: string;
+      symbols: string[];
+      event_sources?: string[];
+      event_keywords?: string[];
+      event_window_secs?: number;
+    },
   ) =>
     request<StrategyRecord>(`/api/v1/strategies/${id}/scope`, {
       method: "PATCH",
@@ -323,6 +342,19 @@ export const api = {
       `/api/v1/market/subscriptions?subscriber_id=${encodeURIComponent(subscriberId)}`,
     ),
 
+  /** 已订阅策略的交付物：冻结定义 + wasm 模块字节。 */
+  publicationBundle: (publicationId: string, subscriberId: string) =>
+    request<PublicationBundle>(
+      `/api/v1/market/publications/${publicationId}/bundle?subscriber_id=${encodeURIComponent(subscriberId)}`,
+    ),
+
+  /** 把已订阅的策略导入为自己的自托管策略，代码在本机执行器运行。 */
+  importPublication: (publicationId: string, subscriberId: string) =>
+    request<StrategyRecord>(`/api/v1/market/publications/${publicationId}/import`, {
+      method: "POST",
+      body: JSON.stringify({ subscriber_id: subscriberId }),
+    }),
+
   cancelSubscription: (id: string) =>
     request<StrategySubscription>(`/api/v1/market/subscriptions/${id}`, { method: "DELETE" }),
 
@@ -351,6 +383,19 @@ export const api = {
     }),
 
   riskLimits: () => request<RiskLimits>("/api/v1/risk/limits"),
+
+  /** 策略范围可选的交易所与交易对，来自执行器数据库配置。 */
+  marketConfig: () => request<MarketConfig>("/api/v1/config/market"),
+
+  /** 消息通知配置：新闻推送与资金费率套利提醒的开关、阈值与渠道。 */
+  notificationSettings: () =>
+    request<NotificationSettings>("/api/v1/config/notifications"),
+
+  updateNotificationSettings: (settings: NotificationSettings) =>
+    request<NotificationSettings>("/api/v1/config/notifications", {
+      method: "PUT",
+      body: JSON.stringify(settings),
+    }),
 
   updateRiskLimits: (limits: RiskLimits) =>
     request<RiskLimits>("/api/v1/risk/limits", {

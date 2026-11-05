@@ -1,6 +1,9 @@
 use std::{
     collections::HashSet,
-    sync::{Arc, Mutex, RwLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, RwLock,
+    },
     time::Duration,
 };
 
@@ -8,7 +11,7 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::{config::Config, http_client::HttpClient};
+use crate::{config::Config, http_client::HttpClient, notifier::Notifier};
 
 /// 每个来源最多保留的条目，超出后丢弃最旧的。
 const MAX_ITEMS: usize = 400;
@@ -18,6 +21,9 @@ pub const UPBIT: &str = "upbit";
 pub const OKX: &str = "okx";
 pub const BYBIT: &str = "bybit";
 pub const BITGET: &str = "bitget";
+
+/// 全部新闻来源，供通知设置的默认值使用。
+pub const SOURCES: [&str; 5] = [BINANCE, UPBIT, OKX, BYBIT, BITGET];
 
 /// 一条上币公告，供桌面端「新闻订阅」直接展示。
 #[derive(Debug, Clone, Serialize)]
@@ -60,6 +66,10 @@ pub struct NewsFeed {
     items: RwLock<Vec<NewsItem>>,
     seen: Mutex<HashSet<String>>,
     poll: Duration,
+    /// 新抓取到的公告按通知设置推送；未挂载时只入库不推送。
+    notifier: RwLock<Option<Arc<Notifier>>>,
+    /// 首轮采集只建立去重基线，避免重启后把历史公告全部推送一遍。
+    primed: AtomicBool,
 }
 
 impl NewsFeed {
@@ -107,6 +117,8 @@ impl NewsFeed {
             items: RwLock::new(Vec::new()),
             seen: Mutex::new(HashSet::new()),
             poll: Duration::from_secs(config.news_poll_secs.max(30)),
+            notifier: RwLock::new(None),
+            primed: AtomicBool::new(false),
         });
 
         if feed.http.is_none() {
@@ -127,6 +139,8 @@ impl NewsFeed {
     }
 
     async fn sync_once(&self) {
+        // 首轮只建立去重基线：重启后缓存为空，全部公告都算「新增」，此时推送会刷屏。
+        let first_round = !self.primed.swap(true, Ordering::Relaxed);
         let targets: Vec<(&'static str, String)> = self
             .sources
             .read()
@@ -146,9 +160,20 @@ impl NewsFeed {
                 Ok(Ok(payload)) => match self.parse(id, payload) {
                     Ok(parsed) => {
                         let fetched = parsed.len();
-                        self.merge(parsed);
+                        let added = self.merge(parsed);
                         self.mark(id, true, None);
                         tracing::info!(source = id, count = fetched, "上币新闻已更新");
+                        let notifier = self
+                            .notifier
+                            .read()
+                            .expect("新闻通知锁不可用")
+                            .clone();
+                        if let Some(notifier) = notifier {
+                            if !first_round && !added.is_empty() {
+                                // 推送走后台任务，避免 Telegram 请求拖慢采集节奏。
+                                tokio::spawn(async move { notifier.notify_news(&added).await });
+                            }
+                        }
                     }
                     Err(error) => self.mark(id, false, Some(error.to_string())),
                 },
@@ -169,20 +194,28 @@ impl NewsFeed {
         }
     }
 
-    /// 去重后按发布时间倒序写入缓存。
-    fn merge(&self, parsed: Vec<NewsItem>) {
+    /// 绑定通知分发器后，新增公告会按通知设置推送。
+    pub fn attach_notifier(&self, notifier: Arc<Notifier>) {
+        *self.notifier.write().expect("新闻通知锁不可用") = Some(notifier);
+    }
+
+    /// 去重后按发布时间倒序写入缓存，返回本次真正新增的条目。
+    fn merge(&self, parsed: Vec<NewsItem>) -> Vec<NewsItem> {
         if parsed.is_empty() {
-            return;
+            return Vec::new();
         }
         let mut seen = self.seen.lock().expect("新闻去重锁不可用");
         let mut items = self.items.write().expect("新闻缓存锁不可用");
+        let mut added = Vec::new();
         for item in parsed {
             if seen.insert(item.id.clone()) {
+                added.push(item.clone());
                 items.push(item);
             }
         }
         items.sort_by(|left, right| right.published_at.cmp(&left.published_at));
         items.truncate(MAX_ITEMS);
+        added
     }
 
     fn mark(&self, source: &str, ok: bool, error: Option<String>) {
@@ -520,6 +553,8 @@ mod tests {
             items: RwLock::new(Vec::new()),
             seen: Mutex::new(HashSet::new()),
             poll: Duration::from_secs(60),
+            notifier: RwLock::new(None),
+            primed: AtomicBool::new(false),
         };
         let older = NewsItem {
             id: "upbit:1".into(),

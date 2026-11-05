@@ -56,10 +56,16 @@ export default function DevicePage() {
   const [params] = useSearchParams();
   const userCode = (params.get("code") ?? "").toUpperCase();
   const wanted = params.get("provider") ?? "google";
+  /** 桌面端切换账号：忽略浏览器里缓存的旧会话，强制重新登录并选择账号。 */
+  const switching = params.get("switch") === "1";
   const authError = params.get("auth_error");
 
   const [providers, setProviders] = useState<Provider[] | null>(null);
   const [session, setSession] = useState<string | null>(() => {
+    if (switching) {
+      localStorage.removeItem(SESSION_KEY);
+      return null;
+    }
     const fromUrl = params.get("session");
     if (fromUrl) {
       localStorage.setItem(SESSION_KEY, fromUrl);

@@ -555,16 +555,22 @@ impl FundingFeed {
                     return;
                 }
                 symbols.sort();
-                let mut current = venue.symbols.write().expect("资金费率交易对锁不可用");
-                let existing: HashSet<&String> = current.iter().collect();
-                let added = symbols
-                    .iter()
-                    .filter(|item| !existing.contains(item))
-                    .count();
-                let count = symbols.len();
-                let snapshot = symbols.clone();
-                *current = symbols;
-                drop(current);
+                let (added, count, snapshot) = {
+                    let mut current = venue.symbols.write().expect("资金费率交易对锁不可用");
+                    let existing: HashSet<&String> = current.iter().collect();
+                    let added = symbols
+                        .iter()
+                        .filter(|item| !existing.contains(item))
+                        .count();
+                    let count = symbols.len();
+                    let snapshot = symbols.clone();
+                    *current = symbols;
+                    (added, count, snapshot)
+                };
+                // 把交易所实际可交易的合约同步到数据库，供策略范围下拉使用。
+                self.store
+                    .upsert_tradable_symbols(venue.venue, &snapshot)
+                    .await;
                 // OKX 的费率走 WebSocket 全量订阅，新上市的合约需要增量补订阅。
                 if venue.venue == OKX_VENUE {
                     if let Some(realtime) = &self.realtime {

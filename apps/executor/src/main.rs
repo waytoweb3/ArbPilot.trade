@@ -11,6 +11,7 @@ mod license;
 mod llm;
 mod market;
 mod news;
+mod notifier;
 mod realtime;
 mod routes;
 mod sandbox;
@@ -18,6 +19,8 @@ mod state;
 mod store;
 mod strategy_runner;
 mod telegram;
+mod templates;
+mod wasm_backtest;
 mod ws;
 
 use anyhow::Context;
@@ -41,6 +44,8 @@ async fn main() -> anyhow::Result<()> {
 
     let store = store::Store::connect_if_configured(config.database_url.as_deref()).await;
     let state = state::AppState::new(config.clone(), store).await;
+    // 内置模板存数据库：补齐缺失模板并把源码编译成沙箱模块。
+    templates::seed(&state).await;
     // 策略只在「运行中」且执行器未暂停时产生订单意图，并通过统一风控网关下单。
     strategy_runner::spawn(state.clone());
     let app = routes::build(state);

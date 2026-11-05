@@ -5,8 +5,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::risk::RiskLimits;
-use crate::types::OpportunityKind;
+use crate::{risk::RiskLimits, types::PositionSide};
 
 /// 策略运行状态。草稿与已停止的策略不会产生任何订单意图。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -25,6 +24,22 @@ pub enum StrategySource {
     BuiltIn,
     Manual,
     Ai,
+}
+
+/// 策略类型。内置类型由执行器直接实现，其他类型由沙箱代码定义。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StrategyKind {
+    /// 内置资金费率套利：现货多 + 永续空。
+    FundingRate,
+    /// 沙箱代码策略：交易范围、入场与出场都由策略代码决定。
+    Custom,
+}
+
+impl Default for StrategyKind {
+    fn default() -> Self {
+        Self::FundingRate
+    }
 }
 
 /// 策略运行位置：未发布的策略跑在用户自己的执行器，发布到市场后由平台托管执行器运行。
@@ -109,6 +124,136 @@ fn default_cooldown_secs() -> u64 {
     300
 }
 
+/// 策略可调参数：值随定义冻结，沙箱代码通过 `param("key")` 读取。
+///
+/// 每项同时携带前端渲染所需的取值范围，模板与 AI 生成策略都按这套结构声明参数。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StrategyParam {
+    /// 代码里的读取键，只允许字母、数字与下划线。
+    pub key: String,
+    /// 前端展示名。
+    pub label: String,
+    pub value: f64,
+    pub min: f64,
+    pub max: f64,
+    #[serde(default = "default_param_step")]
+    pub step: f64,
+    /// 展示单位，如 `%`、`根`、`倍`。
+    #[serde(default)]
+    pub unit: Option<String>,
+}
+
+fn default_param_step() -> f64 {
+    1.0
+}
+
+impl StrategyParam {
+    /// 键名是否合法：小写字母、数字与下划线，长度不超过 32。
+    pub fn valid_key(&self) -> bool {
+        !self.key.is_empty()
+            && self.key.chars().count() <= 32
+            && self
+                .key
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    }
+
+    /// 取值范围是否自洽。
+    pub fn valid_range(&self) -> bool {
+        self.value.is_finite()
+            && self.min.is_finite()
+            && self.max.is_finite()
+            && self.step.is_finite()
+            && self.min < self.max
+            && self.step > 0.0
+            && self.value >= self.min
+            && self.value <= self.max
+    }
+}
+
+/// 沙箱策略的数据窗口：主机据此拉取 K 线并计算指标。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DataRules {
+    /// K 线周期，见 `SUPPORTED_TIMEFRAMES`。
+    #[serde(default = "default_timeframe")]
+    pub timeframe: String,
+    /// 拉取的 K 线根数，必须覆盖最长的指标窗口。
+    #[serde(default = "default_lookback")]
+    pub lookback: u32,
+    /// 快均线周期。
+    #[serde(default = "default_fast")]
+    pub fast: u32,
+    /// 慢均线周期。
+    #[serde(default = "default_slow")]
+    pub slow: u32,
+    /// ATR 周期。
+    #[serde(default = "default_atr")]
+    pub atr: u32,
+    /// 突破/通道周期。
+    #[serde(default = "default_channel")]
+    pub channel: u32,
+    /// 事件来源白名单（如 binance / okx）；为空表示接受全部来源。
+    #[serde(default)]
+    pub event_sources: Vec<String>,
+    /// 事件关键词：标题包含任一关键词才会进入沙箱；为空表示不按关键词过滤。
+    #[serde(default)]
+    pub event_keywords: Vec<String>,
+    /// 事件窗口（秒）：只注入最近这段时间内发布的公告。
+    #[serde(default = "default_event_window_secs")]
+    pub event_window_secs: u64,
+    /// 策略自己的可调参数，代码通过 `param("key")` 读取。
+    #[serde(default)]
+    pub params: Vec<StrategyParam>,
+}
+
+/// 主机支持的 K 线周期，与行情采集保持一致。
+pub const SUPPORTED_TIMEFRAMES: [&str; 8] = ["1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w"];
+
+fn default_timeframe() -> String {
+    "5m".to_string()
+}
+
+fn default_lookback() -> u32 {
+    200
+}
+
+fn default_fast() -> u32 {
+    20
+}
+
+fn default_slow() -> u32 {
+    55
+}
+
+fn default_atr() -> u32 {
+    20
+}
+
+fn default_channel() -> u32 {
+    20
+}
+
+fn default_event_window_secs() -> u64 {
+    86_400
+}
+
+impl Default for DataRules {
+    fn default() -> Self {
+        Self {
+            timeframe: default_timeframe(),
+            lookback: default_lookback(),
+            fast: default_fast(),
+            slow: default_slow(),
+            atr: default_atr(),
+            channel: default_channel(),
+            event_sources: Vec::new(),
+            event_keywords: Vec::new(),
+            event_window_secs: default_event_window_secs(),
+            params: Vec::new(),
+        }
+    }
+}
+
 /// 回测使用的成本假设，与实盘适配器的手续费/滑点口径保持一致。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CostAssumptions {
@@ -131,22 +276,21 @@ impl Default for CostAssumptions {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StrategyDefinition {
     pub name: String,
-    #[serde(default = "default_kind")]
-    pub kind: OpportunityKind,
+    #[serde(default)]
+    pub kind: StrategyKind,
     pub universe: StrategyUniverse,
     pub entry: EntryRules,
     pub exit: ExitRules,
     pub risk: StrategyRisk,
     pub execution: ExecutionRules,
+    /// 沙箱策略的 K 线与指标窗口；内置套利不读取。
+    #[serde(default)]
+    pub data: DataRules,
     #[serde(default)]
     pub costs: CostAssumptions,
     /// 自然语言说明：解释入场、退出、阻止交易的条件与未决假设。
     #[serde(default)]
     pub notes: Option<String>,
-}
-
-fn default_kind() -> OpportunityKind {
-    OpportunityKind::FundingRate
 }
 
 impl StrategyDefinition {
@@ -166,6 +310,12 @@ impl StrategyDefinition {
             .iter()
             .find(|venue| !venue.ends_with("-spot"))
             .map(String::as_str)
+    }
+
+    /// 单腿策略的默认交易所：优先永续，其次第一家。
+    pub fn trade_venue(&self) -> Option<&str> {
+        self.perp_venue()
+            .or_else(|| self.universe.venues.first().map(String::as_str))
     }
 
     /// 语义校验。结构合法不代表策略正确，仍需回测验证。
@@ -193,13 +343,6 @@ impl StrategyDefinition {
             error("name", "策略名称不能超过 80 个字符".to_string());
         }
 
-        if self.kind != OpportunityKind::FundingRate {
-            error(
-                "kind",
-                "当前执行器仅支持资金费率策略，其他策略类型尚未接入".to_string(),
-            );
-        }
-
         if self.universe.symbols.is_empty() {
             error("universe.symbols", "至少需要一个交易对".to_string());
         }
@@ -215,27 +358,136 @@ impl StrategyDefinition {
             }
         }
 
-        let mut venues = self.universe.venues.clone();
-        venues.sort();
-        venues.dedup();
-        if self.universe.venues.len() != 2 || venues.len() != 2 {
-            error(
-                "universe.venues",
-                "资金费率策略必须使用两个不同交易所（现货腿 + 永续腿）".to_string(),
-            );
+        // 交易所与入场/出场规则按策略类型校验：
+        // 内置套利固定「一现货 + 一永续」；沙箱策略的交易范围由代码自行决定。
+        match self.kind {
+            StrategyKind::FundingRate => {
+                let mut venues = self.universe.venues.clone();
+                venues.sort();
+                venues.dedup();
+                if self.universe.venues.len() != 2 || venues.len() != 2 {
+                    error(
+                        "universe.venues",
+                        "资金费率策略必须使用两个不同交易所（现货腿 + 永续腿）".to_string(),
+                    );
+                }
+                if self.spot_venue().is_none() {
+                    error(
+                        "universe.venues",
+                        "缺少现货腿：请使用以 -spot 结尾的交易所标识".to_string(),
+                    );
+                }
+                if self.perp_venue().is_none() {
+                    error(
+                        "universe.venues",
+                        "缺少永续腿：请提供现货腿之外的交易所标识".to_string(),
+                    );
+                }
+                if !self.universe.instruments.contains(&Instrument::Spot)
+                    || !self.universe.instruments.contains(&Instrument::Perp)
+                {
+                    error(
+                        "universe.instruments",
+                        "资金费率策略需要同时包含现货与永续合约".to_string(),
+                    );
+                }
+
+                if self.entry.funding_spread_min < Decimal::ZERO {
+                    error(
+                        "entry.funding_spread_min",
+                        "资金费率下限不能为负".to_string(),
+                    );
+                } else if self.entry.funding_spread_min == Decimal::ZERO {
+                    warning(
+                        "entry.funding_spread_min",
+                        "资金费率下限为 0，任何非负费率都会触发入场".to_string(),
+                    );
+                }
+                if self.entry.net_edge_min < Decimal::ZERO {
+                    error("entry.net_edge_min", "净收益下限不能为负".to_string());
+                }
+
+                if self.exit.spread_below < Decimal::ZERO {
+                    error("exit.spread_below", "退出阈值不能为负".to_string());
+                }
+                if self.exit.spread_below >= self.entry.funding_spread_min {
+                    error(
+                        "exit.spread_below",
+                        "退出阈值必须小于入场阈值，否则开仓后立即离场".to_string(),
+                    );
+                }
+                if self.exit.max_holding_hours <= Decimal::ZERO {
+                    error(
+                        "exit.max_holding_hours",
+                        "最长持仓时间必须大于 0".to_string(),
+                    );
+                }
+            }
+            StrategyKind::Custom => {
+                if self.universe.venues.is_empty() {
+                    error("universe.venues", "至少需要一个交易所".to_string());
+                }
+                if self.universe.instruments.is_empty() {
+                    error("universe.instruments", "至少需要一种交易品种".to_string());
+                }
+
+                if !SUPPORTED_TIMEFRAMES.contains(&self.data.timeframe.trim()) {
+                    error(
+                        "data.timeframe",
+                        format!("不支持的 K 线周期: {}", self.data.timeframe),
+                    );
+                }
+                if !(20..=1_000).contains(&self.data.lookback) {
+                    error("data.lookback", "K 线根数必须在 20 到 1000 之间".to_string());
+                }
+                if !(60..=604_800).contains(&self.data.event_window_secs) {
+                    error(
+                        "data.event_window_secs",
+                        "事件窗口必须在 60 到 604800 秒之间".to_string(),
+                    );
+                }
+                for (path, window) in [
+                    ("data.fast", self.data.fast),
+                    ("data.slow", self.data.slow),
+                    ("data.atr", self.data.atr),
+                    ("data.channel", self.data.channel),
+                ] {
+                    if !(2..=200).contains(&window) {
+                        error(path, "指标周期必须在 2 到 200 之间".to_string());
+                    } else if window > self.data.lookback {
+                        error(path, "指标周期不能超过 K 线根数".to_string());
+                    }
+                }
+
+                if self.data.params.len() > 24 {
+                    error("data.params", "可调参数最多 24 个".to_string());
+                }
+                let mut keys = std::collections::HashSet::new();
+                for param in &self.data.params {
+                    if !param.valid_key() {
+                        error(
+                            "data.params",
+                            format!("参数键 {} 只能包含字母、数字与下划线", param.key),
+                        );
+                    } else if !keys.insert(param.key.as_str()) {
+                        error("data.params", format!("参数键重复: {}", param.key));
+                    }
+                    if param.label.trim().is_empty() {
+                        error("data.params", format!("参数 {} 缺少展示名", param.key));
+                    }
+                    if !param.valid_range() {
+                        error(
+                            "data.params",
+                            format!(
+                                "参数 {} 的取值范围不合法：{} 不在 [{} , {}] 内或步长为正",
+                                param.key, param.value, param.min, param.max
+                            ),
+                        );
+                    }
+                }
+            }
         }
-        if self.spot_venue().is_none() {
-            error(
-                "universe.venues",
-                "缺少现货腿：请使用以 -spot 结尾的交易所标识".to_string(),
-            );
-        }
-        if self.perp_venue().is_none() {
-            error(
-                "universe.venues",
-                "缺少永续腿：请提供现货腿之外的交易所标识".to_string(),
-            );
-        }
+
         for venue in &self.universe.venues {
             if !limits.allowed_venues.is_empty() && !limits.allowed_venues.contains(venue) {
                 warning(
@@ -243,46 +495,6 @@ impl StrategyDefinition {
                     format!("{venue} 不在执行器允许列表内，开仓会被风控拒绝"),
                 );
             }
-        }
-
-        if !self.universe.instruments.contains(&Instrument::Spot)
-            || !self.universe.instruments.contains(&Instrument::Perp)
-        {
-            error(
-                "universe.instruments",
-                "资金费率策略需要同时包含现货与永续合约".to_string(),
-            );
-        }
-
-        if self.entry.funding_spread_min < Decimal::ZERO {
-            error(
-                "entry.funding_spread_min",
-                "资金费率下限不能为负".to_string(),
-            );
-        } else if self.entry.funding_spread_min == Decimal::ZERO {
-            warning(
-                "entry.funding_spread_min",
-                "资金费率下限为 0，任何非负费率都会触发入场".to_string(),
-            );
-        }
-        if self.entry.net_edge_min < Decimal::ZERO {
-            error("entry.net_edge_min", "净收益下限不能为负".to_string());
-        }
-
-        if self.exit.spread_below < Decimal::ZERO {
-            error("exit.spread_below", "退出阈值不能为负".to_string());
-        }
-        if self.exit.spread_below >= self.entry.funding_spread_min {
-            error(
-                "exit.spread_below",
-                "退出阈值必须小于入场阈值，否则开仓后立即离场".to_string(),
-            );
-        }
-        if self.exit.max_holding_hours <= Decimal::ZERO {
-            error(
-                "exit.max_holding_hours",
-                "最长持仓时间必须大于 0".to_string(),
-            );
         }
 
         if self.risk.max_notional_usd <= Decimal::ZERO {
@@ -299,16 +511,19 @@ impl StrategyDefinition {
                 ),
             );
         }
-        if self.risk.max_unhedged_seconds > 60 {
-            error(
-                "risk.max_unhedged_seconds",
-                "双腿裸露时间上限不能超过 60 秒".to_string(),
-            );
-        } else if self.risk.max_unhedged_seconds > 10 {
-            warning(
-                "risk.max_unhedged_seconds",
-                "裸露时间超过 10 秒，单腿失败时风险较高".to_string(),
-            );
+        // 单腿策略没有双腿裸露概念，该项只对内置套利生效。
+        if self.kind == StrategyKind::FundingRate {
+            if self.risk.max_unhedged_seconds > 60 {
+                error(
+                    "risk.max_unhedged_seconds",
+                    "双腿裸露时间上限不能超过 60 秒".to_string(),
+                );
+            } else if self.risk.max_unhedged_seconds > 10 {
+                warning(
+                    "risk.max_unhedged_seconds",
+                    "裸露时间超过 10 秒，单腿失败时风险较高".to_string(),
+                );
+            }
         }
 
         if self.execution.leverage < Decimal::ONE {
@@ -448,6 +663,14 @@ pub enum BacktestAssumption {
     SettledFundingOnly,
     /// net_edge_min 按单期净费率下限解释。
     NetEdgePerSettlement,
+    /// 逐根 K 线重放沙箱模块，模块每根只能看到窗口内的行情。
+    WasmBarReplay,
+    /// 按每根 K 线收盘价成交，未模拟盘中价格路径。
+    BarCloseFills,
+    /// 影子挂单在 K 线高低点触及时按挂单价成交。
+    LimitFillOnTouch,
+    /// 回测不重放历史公告，事件输入始终为空；依赖事件的策略只能实测。
+    NoEventReplay,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -682,17 +905,67 @@ pub struct StrategyRuntime {
     #[serde(default)]
     pub run_id: Option<Uuid>,
     pub open: Option<StrategyOpenPosition>,
+    /// 尚未触发的限价意图（网格挂单），价格触及时才下单。
+    #[serde(default)]
+    pub pending: Vec<StrategyPendingOrder>,
     pub events: Vec<StrategyEvent>,
+}
+
+/// 策略侧登记的一笔待触发限价意图。
+///
+/// 它只是执行器内存/状态里的影子挂单，不会提交到交易所：价格触及时执行器才通过
+/// 统一风控网关下真实订单，因此不需要交易所撤单接口，也不会遗留无人管理的挂单。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StrategyPendingOrder {
+    pub symbol: String,
+    /// 挂单所在交易所；为空时使用策略的主交易所。
+    #[serde(default)]
+    pub venue: Option<String>,
+    pub side: PositionSide,
+    /// 触发价：买单在卖一跌破该价时触发，卖单在买一涨过该价时触发。
+    pub price: Decimal,
+    pub notional_usd: Decimal,
+    pub created_at: DateTime<Utc>,
+}
+
+impl StrategyPendingOrder {
+    /// 同一交易对、同一方向且价格几乎相同的挂单视为同一个网格档位。
+    pub fn same_level(&self, other: &Self) -> bool {
+        self.symbol == other.symbol
+            && self.side == other.side
+            && self.venue == other.venue
+            && (self.price - other.price).abs() <= self.price.abs() * Decimal::new(1, 4)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StrategyOpenPosition {
     pub symbol: String,
+    /// 配对套利的现货腿；单腿持仓为空。
+    #[serde(default)]
     pub long_venue: String,
+    /// 配对套利的永续腿；单腿持仓为空。
+    #[serde(default)]
     pub short_venue: String,
+    /// 单腿持仓的交易所。
+    #[serde(default)]
+    pub venue: Option<String>,
+    /// 单腿持仓方向；配对套利为空。
+    #[serde(default)]
+    pub side: Option<PositionSide>,
+    /// 单腿持仓的开仓价。
+    #[serde(default)]
+    pub entry_price: Option<Decimal>,
     pub notional_usd: Decimal,
     pub opened_at: DateTime<Utc>,
     pub entry_net_edge_bps: Decimal,
+}
+
+impl StrategyOpenPosition {
+    /// 配对套利持仓需要两条腿；单腿持仓只看 `venue` + `side`。
+    pub fn is_pair(&self) -> bool {
+        !self.long_venue.is_empty() && !self.short_venue.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -713,6 +986,37 @@ pub struct StrategyEvent {
 
 impl StrategyRuntime {
     const MAX_EVENTS: usize = 20;
+    /// 单条策略最多保留的待触发挂单数，避免网格无限累积。
+    pub const MAX_PENDING: usize = 32;
+
+    /// 登记一笔待触发限价意图；同档位已存在时只更新名义价值。
+    ///
+    /// 返回 `true` 表示运行状态发生了变化，调用方需要落库。
+    pub fn upsert_pending(&mut self, order: StrategyPendingOrder) -> bool {
+        if let Some(existing) = self
+            .pending
+            .iter_mut()
+            .find(|existing| existing.same_level(&order))
+        {
+            if existing.notional_usd == order.notional_usd {
+                return false;
+            }
+            existing.notional_usd = order.notional_usd;
+            return true;
+        }
+        if self.pending.len() >= Self::MAX_PENDING {
+            return false;
+        }
+        self.pending.push(order);
+        true
+    }
+
+    /// 撤销某交易对的全部待触发挂单，返回撤销条数。
+    pub fn clear_pending(&mut self, symbol: &str) -> usize {
+        let before = self.pending.len();
+        self.pending.retain(|order| order.symbol != symbol);
+        before - self.pending.len()
+    }
 
     pub fn record(
         &mut self,
@@ -901,14 +1205,13 @@ impl StrategyCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::OpportunityKind;
     use chrono::Duration;
     use rust_decimal_macros::dec;
 
     fn definition() -> StrategyDefinition {
         StrategyDefinition {
             name: "funding_spread".into(),
-            kind: OpportunityKind::FundingRate,
+            kind: StrategyKind::FundingRate,
             universe: StrategyUniverse {
                 venues: vec!["binance-spot".into(), "binance".into()],
                 symbols: vec!["BTCUSDT".into()],
@@ -931,6 +1234,7 @@ mod tests {
                 max_slippage_bps: dec!(10),
                 cooldown_secs: 300,
             },
+            data: DataRules::default(),
             costs: CostAssumptions::default(),
             notes: Some("测试策略".into()),
         }
@@ -948,6 +1252,48 @@ mod tests {
     fn validation_accepts_default_definition() {
         let validation = definition().validate(&RiskLimits::default());
         assert!(!validation.has_errors(), "{:?}", validation.issues);
+    }
+
+    #[test]
+    fn pending_orders_dedupe_and_clear() {
+        let mut runtime = StrategyRuntime::default();
+        let level = |price: Decimal| StrategyPendingOrder {
+            symbol: "BTCUSDT".into(),
+            venue: Some("binance".into()),
+            side: PositionSide::Long,
+            price,
+            notional_usd: dec!(100),
+            created_at: Utc::now(),
+        };
+        assert!(runtime.upsert_pending(level(dec!(9500))));
+        // 同一档位（含微小价差）只更新名义价值，不重复登记。
+        assert!(!runtime.upsert_pending(level(dec!(9500.01))));
+        assert_eq!(runtime.pending.len(), 1);
+        assert!(runtime.upsert_pending(level(dec!(9400))));
+        assert_eq!(runtime.pending.len(), 2);
+        assert_eq!(runtime.clear_pending("BTCUSDT"), 2);
+        assert!(runtime.pending.is_empty());
+    }
+
+    #[test]
+    fn custom_strategy_allows_single_venue_and_instrument() {
+        let mut definition = definition();
+        definition.kind = StrategyKind::Custom;
+        definition.universe = StrategyUniverse {
+            venues: vec!["binance".into()],
+            symbols: vec!["BTCUSDT".into()],
+            instruments: vec![Instrument::Perp],
+        };
+        let validation = definition.validate(&RiskLimits::default());
+        assert!(!validation.has_errors(), "{:?}", validation.issues);
+    }
+
+    #[test]
+    fn funding_strategy_rejects_single_venue() {
+        let mut definition = definition();
+        definition.universe.venues = vec!["binance".into()];
+        let validation = definition.validate(&RiskLimits::default());
+        assert!(validation.has_errors());
     }
 
     #[test]

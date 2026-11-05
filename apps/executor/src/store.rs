@@ -12,7 +12,7 @@ use serde::{de::DeserializeOwned, Serialize};
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 use uuid::Uuid;
 
-use crate::exchange::FundingRate;
+use crate::{exchange::FundingRate, templates::StrategyTemplate};
 
 /// 某个时间窗口内某交易所某交易对的资金费率累计值。
 #[derive(Debug, Clone, Serialize)]
@@ -23,6 +23,50 @@ pub struct FundingSummary {
     pub rate: Decimal,
     /// 窗口内的结算期数。
     pub count: i64,
+}
+
+/// 策略可选的交易所：`segment` 区分现货腿与永续腿。
+#[derive(Debug, Clone, Serialize)]
+pub struct ExchangeVenueConfig {
+    pub venue: String,
+    pub segment: String,
+    pub display_name: String,
+}
+
+/// 某个交易所配置的可交易对。
+#[derive(Debug, Clone, Serialize)]
+pub struct TradableSymbolConfig {
+    pub venue: String,
+    pub symbol: String,
+}
+
+/// 消息通知配置：新闻推送与资金费率套利提醒的开关、阈值与渠道。
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct NotificationSettings {
+    pub news_enabled: bool,
+    /// 参与推送的新闻来源；空列表表示全部来源。
+    pub news_sources: Vec<String>,
+    pub funding_enabled: bool,
+    /// 触发提醒的最小年化资金费率（百分比数值，例如 10 表示 10%）。
+    pub funding_min_annualized_pct: Decimal,
+    /// 同一交易对再次提醒的最小间隔（秒）。
+    pub funding_cooldown_secs: i64,
+    pub telegram_enabled: bool,
+    pub desktop_enabled: bool,
+}
+
+impl Default for NotificationSettings {
+    fn default() -> Self {
+        Self {
+            news_enabled: true,
+            news_sources: crate::news::SOURCES.iter().map(|item| item.to_string()).collect(),
+            funding_enabled: true,
+            funding_min_annualized_pct: Decimal::from(10),
+            funding_cooldown_secs: 6 * 3600,
+            telegram_enabled: true,
+            desktop_enabled: true,
+        }
+    }
 }
 
 /// 某个交易账户在某一时刻的美元权益快照。
@@ -156,6 +200,8 @@ pub struct Store {
     sandbox_artifacts: RwLock<Vec<SandboxArtifact>>,
     /// 沙箱模块字节；仅保存在执行器本机。
     sandbox_modules: RwLock<HashMap<Uuid, Vec<u8>>>,
+    /// 内置策略模板（源码 + 默认定义），重启后从数据库恢复。
+    strategy_templates: RwLock<Vec<StrategyTemplate>>,
 }
 
 impl Store {
@@ -206,6 +252,7 @@ impl Store {
             settlements: RwLock::new(Vec::new()),
             sandbox_artifacts: RwLock::new(Vec::new()),
             sandbox_modules: RwLock::new(HashMap::new()),
+            strategy_templates: RwLock::new(Vec::new()),
         }
     }
 
@@ -252,6 +299,75 @@ impl Store {
 
         if let Err(error) = result {
             tracing::error!(%error, order_id = %order.id, "写入订单失败");
+        }
+    }
+
+    /// 追加一条订单生命周期事件（下单意图、风控、逐腿提交、成交、失败、补偿等）。
+    ///
+    /// 未连接数据库时只写本地日志；事件依赖 `orders` 中存在对应主键，
+    /// 调用方必须先 `save_order`。
+    pub async fn append_order_event(
+        &self,
+        order_id: Uuid,
+        event_type: &str,
+        detail: serde_json::Value,
+    ) {
+        let Some(pool) = &self.pool else {
+            tracing::info!(%order_id, event_type, detail = %detail, "订单事件（内存模式，未落库）");
+            return;
+        };
+
+        let result = sqlx::query(
+            r#"
+            insert into order_events (order_id, event_type, detail)
+            values ($1, $2, $3)
+            "#,
+        )
+        .bind(order_id)
+        .bind(event_type)
+        .bind(detail)
+        .execute(pool)
+        .await;
+
+        if let Err(error) = result {
+            tracing::error!(%error, %order_id, event_type, "写入订单事件失败");
+        }
+    }
+
+    /// 写入审计日志，用于记录尚未生成订单就被拒绝的请求。
+    pub async fn append_audit_log(
+        &self,
+        actor: &str,
+        action: &str,
+        target: Option<&str>,
+        detail: serde_json::Value,
+    ) {
+        let Some(pool) = &self.pool else {
+            tracing::info!(
+                actor,
+                action,
+                target = target.unwrap_or("-"),
+                detail = %detail,
+                "审计日志（内存模式，未落库）"
+            );
+            return;
+        };
+
+        let result = sqlx::query(
+            r#"
+            insert into audit_log (actor, action, target, detail)
+            values ($1, $2, $3, $4)
+            "#,
+        )
+        .bind(actor)
+        .bind(action)
+        .bind(target)
+        .bind(detail)
+        .execute(pool)
+        .await;
+
+        if let Err(error) = result {
+            tracing::error!(%error, actor, action, "写入审计日志失败");
         }
     }
 
@@ -577,6 +693,173 @@ impl Store {
         };
 
         rows.iter().filter_map(decode_strategy_row).collect()
+    }
+
+    /// 读取已启用的现货 / 永续交易所配置。未连接数据库时返回空列表。
+    pub async fn exchange_venues(&self) -> Vec<ExchangeVenueConfig> {
+        let Some(pool) = &self.pool else {
+            return Vec::new();
+        };
+
+        let rows: Vec<sqlx::postgres::PgRow> = match sqlx::query(
+            "select venue, segment, display_name from exchange_venues where enabled order by sort_order asc, venue asc",
+        )
+        .fetch_all(pool)
+        .await
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::error!(%error, "读取交易所配置失败");
+                return Vec::new();
+            }
+        };
+
+        rows.iter()
+            .filter_map(|row| {
+                Some(ExchangeVenueConfig {
+                    venue: row.try_get("venue").ok()?,
+                    segment: row.try_get("segment").ok()?,
+                    display_name: row.try_get("display_name").ok()?,
+                })
+            })
+            .collect()
+    }
+
+    /// 读取已启用的交易对配置；同一交易所的现货与永续共享这份清单。
+    pub async fn tradable_symbols(&self) -> Vec<TradableSymbolConfig> {
+        let Some(pool) = &self.pool else {
+            return Vec::new();
+        };
+
+        let rows: Vec<sqlx::postgres::PgRow> = match sqlx::query(
+            "select venue, symbol from tradable_symbols where enabled order by venue asc, sort_order asc, symbol asc",
+        )
+        .fetch_all(pool)
+        .await
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::error!(%error, "读取交易对配置失败");
+                return Vec::new();
+            }
+        };
+
+        rows.iter()
+            .filter_map(|row| {
+                Some(TradableSymbolConfig {
+                    venue: row.try_get("venue").ok()?,
+                    symbol: row.try_get("symbol").ok()?,
+                })
+            })
+            .collect()
+    }
+
+    /// 资金费率采集器发现新合约后写入配置，已有交易对保持原有启用状态与排序。
+    pub async fn upsert_tradable_symbols(&self, venue: &str, symbols: &[String]) {
+        let Some(pool) = &self.pool else {
+            return;
+        };
+        if symbols.is_empty() {
+            return;
+        }
+
+        let result = sqlx::query(
+            r#"
+            insert into tradable_symbols (venue, symbol, sort_order)
+            select $1, symbol, 1000 from unnest($2::text[]) as symbol
+            on conflict (venue, symbol) do nothing
+            "#,
+        )
+        .bind(venue)
+        .bind(symbols.to_vec())
+        .execute(pool)
+        .await;
+
+        if let Err(error) = result {
+            tracing::error!(%error, venue, "写入交易对配置失败");
+        }
+    }
+
+    /// 读取通知配置；未连接数据库时返回默认值。
+    pub async fn notification_settings(&self) -> NotificationSettings {
+        let Some(pool) = &self.pool else {
+            return NotificationSettings::default();
+        };
+
+        let row = match sqlx::query(
+            r#"
+            select news_enabled, news_sources, funding_enabled, funding_min_annualized_pct,
+                   funding_cooldown_secs, telegram_enabled, desktop_enabled
+            from notification_settings where id = 1
+            "#,
+        )
+        .fetch_optional(pool)
+        .await
+        {
+            Ok(row) => row,
+            Err(error) => {
+                tracing::error!(%error, "读取通知配置失败");
+                return NotificationSettings::default();
+            }
+        };
+        let Some(row) = row else {
+            return NotificationSettings::default();
+        };
+
+        NotificationSettings {
+            news_enabled: row.try_get("news_enabled").unwrap_or(true),
+            news_sources: row.try_get("news_sources").unwrap_or_default(),
+            funding_enabled: row.try_get("funding_enabled").unwrap_or(true),
+            funding_min_annualized_pct: row
+                .try_get("funding_min_annualized_pct")
+                .unwrap_or_else(|_| Decimal::from(10)),
+            // 数据库列是 int4，按 i32 解码后再转 i64。
+            funding_cooldown_secs: row
+                .try_get::<i32, _>("funding_cooldown_secs")
+                .map(i64::from)
+                .unwrap_or(6 * 3600),
+            telegram_enabled: row.try_get("telegram_enabled").unwrap_or(true),
+            desktop_enabled: row.try_get("desktop_enabled").unwrap_or(true),
+        }
+    }
+
+    /// 保存通知配置；内存模式下由调用方自行保存，这里不报错。
+    pub async fn save_notification_settings(&self, settings: &NotificationSettings) {
+        let Some(pool) = &self.pool else {
+            return;
+        };
+
+        let result = sqlx::query(
+            r#"
+            insert into notification_settings (
+                id, news_enabled, news_sources, funding_enabled, funding_min_annualized_pct,
+                funding_cooldown_secs, telegram_enabled, desktop_enabled, updated_at
+            )
+            values (1, $1, $2, $3, $4, $5, $6, $7, now())
+            on conflict (id) do update
+                set news_enabled = excluded.news_enabled,
+                    news_sources = excluded.news_sources,
+                    funding_enabled = excluded.funding_enabled,
+                    funding_min_annualized_pct = excluded.funding_min_annualized_pct,
+                    funding_cooldown_secs = excluded.funding_cooldown_secs,
+                    telegram_enabled = excluded.telegram_enabled,
+                    desktop_enabled = excluded.desktop_enabled,
+                    updated_at = now()
+            "#,
+        )
+        .bind(settings.news_enabled)
+        .bind(settings.news_sources.clone())
+        .bind(settings.funding_enabled)
+        .bind(settings.funding_min_annualized_pct)
+        .bind(settings.funding_cooldown_secs)
+        .bind(settings.telegram_enabled)
+        .bind(settings.desktop_enabled)
+        .execute(pool)
+        .await;
+
+        if let Err(error) = result {
+            tracing::error!(%error, "写入通知配置失败");
+        }
     }
 
     /// 写入策略定义与运行状态快照。
@@ -1290,6 +1573,56 @@ impl Store {
             .await
             .ok()
             .flatten()
+    }
+
+    /// 读取全部策略模板。未连接数据库时返回内存快照。
+    pub async fn strategy_templates(&self) -> Vec<StrategyTemplate> {
+        let Some(pool) = &self.pool else {
+            return self
+                .strategy_templates
+                .read()
+                .expect("模板锁不可用")
+                .clone();
+        };
+        load_payloads(pool, "strategy_templates").await
+    }
+
+    /// 写入策略模板，按 `key` 幂等。
+    pub async fn save_strategy_template(&self, template: &StrategyTemplate) {
+        let Some(pool) = &self.pool else {
+            let mut rows = self.strategy_templates.write().expect("模板锁不可用");
+            match rows.iter_mut().find(|existing| existing.key == template.key) {
+                Some(existing) => *existing = template.clone(),
+                None => rows.push(template.clone()),
+            }
+            return;
+        };
+
+        let payload = match serde_json::to_value(template) {
+            Ok(payload) => payload,
+            Err(error) => {
+                tracing::error!(%error, key = %template.key, "策略模板序列化失败");
+                return;
+            }
+        };
+        if let Err(error) = sqlx::query(
+            r#"
+            insert into strategy_templates (key, name, payload)
+            values ($1, $2, $3)
+            on conflict (key) do update
+                set name = excluded.name,
+                    payload = excluded.payload,
+                    updated_at = now()
+            "#,
+        )
+        .bind(&template.key)
+        .bind(&template.name)
+        .bind(payload)
+        .execute(pool)
+        .await
+        {
+            tracing::error!(%error, key = %template.key, "写入策略模板失败");
+        }
     }
 
     fn upsert_funding_memory(&self, rates: &[FundingRate]) -> usize {

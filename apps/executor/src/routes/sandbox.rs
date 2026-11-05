@@ -149,7 +149,8 @@ pub async fn dry_run(
         record.as_ref(),
         body.symbol.as_deref(),
         body.strategy_id.unwrap_or_else(Uuid::nil),
-    );
+    )
+    .await;
 
     Ok(Json(sandbox::evaluate(artifact, wasm, input, limits).await))
 }

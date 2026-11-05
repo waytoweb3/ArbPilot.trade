@@ -5,9 +5,11 @@ import {
   useAccountSubscriptions,
   useCancelAccountSubscription,
   useExecutorLicense,
+  useLogout,
   useSyncLicense,
 } from "../hooks/useAccount";
 import { useBillingPlans, useCreateCheckout } from "../hooks/useBilling";
+import { useAccountDialog } from "../lib/accountDialog";
 import { BillingError, PAYMENTS_URL, type BillingPlan, type BillingPlanId } from "../lib/billing";
 import { fmt, useI18n } from "../lib/i18n";
 import { useSessionStore } from "../lib/session";
@@ -57,6 +59,18 @@ export function BillingCard() {
   const syncLicense = useSyncLicense();
   const plansQuery = useBillingPlans();
   const checkout = useCreateCheckout();
+  const logout = useLogout();
+  const openAccountDialog = useAccountDialog((state) => state.show);
+
+  /** 退出当前账号后立刻开始新的设备登录，浏览器里换另一个账号确认即可。 */
+  const switchAccount = async () => {
+    try {
+      await logout.mutateAsync();
+    } catch {
+      // 账号服务不可达时本地令牌已清除，仍然允许重新登录。
+    }
+    openAccountDialog(true);
+  };
 
   const plans = plansQuery.data?.length ? plansQuery.data : FALLBACK_PLANS;
   const me = account.data;
@@ -183,7 +197,7 @@ export function BillingCard() {
 
         {token ? (
           <div className="rounded-xl border border-line bg-panel-soft px-4 py-3.5">
-            <div className="flex items-center justify-between">
+            <div className="flex flex-wrap items-center justify-between gap-2">
               <div className="min-w-0">
                 <p className="truncate text-xs font-medium text-fg">
                   {me?.user.name ?? t.settings.accountSignedIn}
@@ -192,14 +206,32 @@ export function BillingCard() {
                   <p className="mt-0.5 truncate text-[11px] text-subtle">{me.user.email}</p>
                 )}
               </div>
-              <Button
-                size="sm"
-                variant="ghost"
-                onClick={() => void account.refetch()}
-                disabled={account.isFetching}
-              >
-                {t.settings.accountRefresh}
-              </Button>
+              <div className="flex flex-wrap items-center gap-1">
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => void switchAccount()}
+                  disabled={logout.isPending}
+                >
+                  {t.settings.accountSwitch}
+                </Button>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => logout.mutate()}
+                  disabled={logout.isPending}
+                >
+                  {t.settings.accountLogout}
+                </Button>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => void account.refetch()}
+                  disabled={account.isFetching}
+                >
+                  {t.settings.accountRefresh}
+                </Button>
+              </div>
             </div>
             <dl className="mt-3 grid grid-cols-3 gap-x-6 gap-y-3 text-xs">
               <div>

@@ -26,18 +26,19 @@ import {
   useCreateStrategy,
   useDeleteStrategy,
   useDeployStrategyCode,
-  useFundingStatus,
   useGenerateStrategyCode,
+  useInstantiateTemplate,
   useMarketAuthors,
+  useMarketConfig,
   usePublicationPerformance,
   usePublications,
-  useRiskLimits,
   useRollbackStrategy,
   useSandboxDryRun,
   useSaveStrategyCode,
   useStrategies,
   useStrategyCode,
   useStrategyRuns,
+  useStrategyTemplates,
   useStrategyVersions,
   useUpdatePublication,
   useUpdateStrategy,
@@ -87,6 +88,17 @@ const inputClass =
   "w-full rounded-md border border-line bg-panel-soft px-2 py-1 text-xs text-body outline-none focus:border-accent/60";
 
 const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error));
+
+/** 现货腿标识去掉 `-spot` 后缀后即为交易所配置里的交易对清单键。 */
+const baseVenue = (venue: string) => venue.replace(/-spot$/, "");
+
+/** 当前值不在配置里时也保留，避免下拉显示为空。 */
+function withCurrent(values: string[], current: string): string[] {
+  if (!current || values.includes(current)) {
+    return values;
+  }
+  return [current, ...values];
+}
 
 interface ChatMessage {
   role: "user" | "assistant";
@@ -387,62 +399,110 @@ function StrategyCodeCard({ record, running }: { record: StrategyRecord; running
 
 function StrategyScopeCard({ record, running }: { record: StrategyRecord; running: boolean }) {
   const { t } = useI18n();
-  const risk = useRiskLimits();
-  const funding = useFundingStatus();
+  const config = useMarketConfig();
   const saveScope = useUpdateStrategyScope();
 
-  const venues =
-    risk.data?.allowed_venues?.length
-      ? risk.data.allowed_venues
-      : ["binance", "binance-spot", "okx", "okx-spot", "bybit"];
-  const spotOptions = venues.filter((venue) => venue.endsWith("-spot"));
-  const perpOptions = venues.filter((venue) => !venue.endsWith("-spot"));
+  const spotOptions = (config.data?.venues ?? []).filter((item) => item.segment === "spot");
+  const perpOptions = (config.data?.venues ?? []).filter((item) => item.segment === "perp");
 
   const currentSpot =
     record.definition.universe.venues.find((venue) => venue.endsWith("-spot")) ?? "";
   const currentPerp =
     record.definition.universe.venues.find((venue) => !venue.endsWith("-spot")) ?? "";
 
-  const [spot, setSpot] = useState(currentSpot || spotOptions[0] || "binance-spot");
-  const [perp, setPerp] = useState(currentPerp || perpOptions[0] || "binance");
-  const [symbols, setSymbols] = useState(record.definition.universe.symbols.join(", "));
+  // 当前策略正在使用的交易所即使后来在数据库里被停用，也保留在下拉中，避免显示为空。
+  const spotValues = withCurrent(spotOptions.map((item) => item.venue), currentSpot);
+  const perpValues = withCurrent(perpOptions.map((item) => item.venue), currentPerp);
+
+  const [spot, setSpot] = useState(currentSpot || spotValues[0] || "");
+  const [perp, setPerp] = useState(currentPerp || perpValues[0] || "");
+  const [selected, setSelected] = useState<string[]>(record.definition.universe.symbols);
+  const [eventSources, setEventSources] = useState(
+    (record.definition.data.event_sources ?? []).join(", "),
+  );
+  const [eventKeywords, setEventKeywords] = useState(
+    (record.definition.data.event_keywords ?? []).join(", "),
+  );
+  const [eventWindow, setEventWindow] = useState(
+    String(record.definition.data.event_window_secs ?? 86_400),
+  );
   const [notice, setNotice] = useState<{ tone: "ok" | "error"; text: string } | null>(null);
 
   // 保存范围或回滚版本后，用最新定义同步表单。
   useEffect(() => {
-    setSpot(currentSpot || spotOptions[0] || "binance-spot");
-    setPerp(currentPerp || perpOptions[0] || "binance");
-    setSymbols(record.definition.universe.symbols.join(", "));
+    setSpot(currentSpot || spotValues[0] || "");
+    setPerp(currentPerp || perpValues[0] || "");
+    setSelected(record.definition.universe.symbols);
+    setEventSources((record.definition.data.event_sources ?? []).join(", "));
+    setEventKeywords((record.definition.data.event_keywords ?? []).join(", "));
+    setEventWindow(String(record.definition.data.event_window_secs ?? 86_400));
   }, [record.id, record.version]);
 
-  const selected = symbols
-    .split(/[,，\s]+/)
-    .map((symbol) => symbol.trim().toUpperCase())
-    .filter(Boolean);
+  // 配置异步加载完成时补齐空选项，避免下拉有选项但值为空。
+  useEffect(() => {
+    setSpot((value) => value || spotValues[0] || "");
+    setPerp((value) => value || perpValues[0] || "");
+  }, [config.data]);
 
-  const suggested = Array.from(
-    new Set([
-      ...(funding.data?.find((item) => item.venue === perp)?.symbols.map((item) => item.symbol) ??
-        []),
-      ...(risk.data?.allowed_symbols ?? []),
-    ]),
-  ).slice(0, 24);
+  const venueLabel = (venue: string) =>
+    (config.data?.venues ?? []).find((item) => item.venue === venue)?.display_name || venue;
+
+  // 现货与永续都配置了清单时取交集；只有一侧有数据时直接用该侧。
+  const symbolOptions = (() => {
+    const all = config.data?.symbols ?? {};
+    const perpSymbols = all[baseVenue(perp)] ?? [];
+    const spotSymbols = all[baseVenue(spot)] ?? [];
+    if (perpSymbols.length > 0 && spotSymbols.length > 0) {
+      const allowed = new Set(spotSymbols);
+      return perpSymbols.filter((symbol) => allowed.has(symbol));
+    }
+    return perpSymbols.length > 0 ? perpSymbols : spotSymbols;
+  })();
+  const availableSymbols = symbolOptions.filter((symbol) => !selected.includes(symbol));
 
   const addSymbol = (symbol: string) => {
-    if (selected.includes(symbol)) {
+    if (!symbol || selected.includes(symbol)) {
       return;
     }
-    setSymbols([...selected, symbol].join(", "));
+    setSelected((previous) => [...previous, symbol]);
   };
 
+  const removeSymbol = (symbol: string) => {
+    setSelected((previous) => previous.filter((item) => item !== symbol));
+  };
+
+  // 逗号分隔的来源与关键词，保存前去掉空白项。
+  const splitList = (value: string) =>
+    value
+      .split(",")
+      .map((item) => item.trim())
+      .filter(Boolean);
+
   const submit = () => {
+    if (!spot || !perp) {
+      setNotice({ tone: "error", text: t.strategies.scopeVenuesEmpty });
+      return;
+    }
     if (selected.length === 0) {
       setNotice({ tone: "error", text: t.strategies.scopeRequired });
       return;
     }
+    const window = Number.parseInt(eventWindow, 10);
+    if (!Number.isFinite(window) || window < 60 || window > 604_800) {
+      setNotice({ tone: "error", text: t.strategies.scopeEventWindowInvalid });
+      return;
+    }
     setNotice(null);
     saveScope.mutate(
-      { id: record.id, spot_venue: spot, perp_venue: perp, symbols: selected },
+      {
+        id: record.id,
+        spot_venue: spot,
+        perp_venue: perp,
+        symbols: selected,
+        event_sources: splitList(eventSources),
+        event_keywords: splitList(eventKeywords),
+        event_window_secs: window,
+      },
       {
         onSuccess: () => setNotice({ tone: "ok", text: t.strategies.scopeSaved }),
         onError: (error) => setNotice({ tone: "error", text: errorText(error) }),
@@ -459,6 +519,12 @@ function StrategyScopeCard({ record, running }: { record: StrategyRecord; runnin
         </div>
       </CardHeader>
       <CardContent className="space-y-3">
+        {config.data && spotOptions.length === 0 && perpOptions.length === 0 && (
+          <p className="rounded-md border border-warning/30 bg-warning/10 px-2 py-1 text-[11px] text-warning">
+            {t.strategies.scopeVenuesEmpty}
+          </p>
+        )}
+
         <div className="grid gap-3 md:grid-cols-2">
           <label className="block space-y-1">
             <span className="text-[11px] text-muted">{t.strategies.scopeSpot}</span>
@@ -468,9 +534,9 @@ function StrategyScopeCard({ record, running }: { record: StrategyRecord; runnin
               disabled={running}
               onChange={(event) => setSpot(event.target.value)}
             >
-              {spotOptions.map((venue) => (
+              {spotValues.map((venue) => (
                 <option key={venue} value={venue}>
-                  {venue}
+                  {venueLabel(venue)}
                 </option>
               ))}
             </select>
@@ -483,9 +549,9 @@ function StrategyScopeCard({ record, running }: { record: StrategyRecord; runnin
               disabled={running}
               onChange={(event) => setPerp(event.target.value)}
             >
-              {perpOptions.map((venue) => (
+              {perpValues.map((venue) => (
                 <option key={venue} value={venue}>
-                  {venue}
+                  {venueLabel(venue)}
                 </option>
               ))}
             </select>
@@ -494,36 +560,81 @@ function StrategyScopeCard({ record, running }: { record: StrategyRecord; runnin
 
         <label className="block space-y-1">
           <span className="text-[11px] text-muted">{t.strategies.scopeSymbols}</span>
-          <input
+          <select
             className={inputClass}
-            value={symbols}
-            disabled={running}
-            placeholder={t.strategies.scopeSymbolsPlaceholder}
-            onChange={(event) => setSymbols(event.target.value)}
-          />
+            value=""
+            disabled={running || availableSymbols.length === 0}
+            onChange={(event) => addSymbol(event.target.value)}
+          >
+            <option value="">
+              {availableSymbols.length === 0
+                ? t.strategies.scopeSymbolsEmpty
+                : t.strategies.scopeSymbolsPlaceholder}
+            </option>
+            {availableSymbols.map((symbol) => (
+              <option key={symbol} value={symbol}>
+                {symbol}
+              </option>
+            ))}
+          </select>
         </label>
 
-        {suggested.length > 0 && (
-          <div className="space-y-1">
-            <p className="text-[11px] text-muted">{t.strategies.scopeSuggest}</p>
-            <div className="flex flex-wrap gap-1">
-              {suggested.map((symbol) => (
-                <button
-                  key={symbol}
-                  type="button"
-                  disabled={running}
-                  onClick={() => addSymbol(symbol)}
-                  className={cn(
-                    "rounded-full border px-2 py-0.5 text-[11px] transition-colors",
-                    selected.includes(symbol)
-                      ? "border-accent/40 bg-accent/10 text-accent"
-                      : "border-line bg-panel-soft text-muted hover:border-accent/30",
-                  )}
-                >
-                  {symbol}
-                </button>
-              ))}
+        {selected.length > 0 && (
+          <div className="flex flex-wrap gap-1">
+            {selected.map((symbol) => (
+              <button
+                key={symbol}
+                type="button"
+                disabled={running}
+                onClick={() => removeSymbol(symbol)}
+                className="rounded-full border border-accent/40 bg-accent/10 px-2 py-0.5 text-[11px] text-accent transition-colors hover:border-danger/40 hover:bg-danger/10 hover:text-danger"
+              >
+                {symbol} <span aria-hidden>×</span>
+              </button>
+            ))}
+          </div>
+        )}
+
+        {record.definition.kind === "custom" && (
+          <div className="space-y-2 rounded-md border border-border/60 p-3">
+            <div>
+              <p className="text-[11px] font-medium">{t.strategies.scopeEventsTitle}</p>
+              <p className="text-[11px] text-muted">{t.strategies.scopeEventsDesc}</p>
             </div>
+            <div className="grid gap-3 md:grid-cols-2">
+              <label className="block space-y-1">
+                <span className="text-[11px] text-muted">{t.strategies.scopeEventSources}</span>
+                <input
+                  className={inputClass}
+                  value={eventSources}
+                  disabled={running}
+                  placeholder={t.strategies.scopeEventSourcesPlaceholder}
+                  onChange={(event) => setEventSources(event.target.value)}
+                />
+              </label>
+              <label className="block space-y-1">
+                <span className="text-[11px] text-muted">{t.strategies.scopeEventKeywords}</span>
+                <input
+                  className={inputClass}
+                  value={eventKeywords}
+                  disabled={running}
+                  placeholder={t.strategies.scopeEventKeywordsPlaceholder}
+                  onChange={(event) => setEventKeywords(event.target.value)}
+                />
+              </label>
+            </div>
+            <label className="block space-y-1 md:w-40">
+              <span className="text-[11px] text-muted">{t.strategies.scopeEventWindow}</span>
+              <input
+                className={inputClass}
+                type="number"
+                min={60}
+                max={604_800}
+                value={eventWindow}
+                disabled={running}
+                onChange={(event) => setEventWindow(event.target.value)}
+              />
+            </label>
           </div>
         )}
 
@@ -1111,8 +1222,10 @@ function StrategyRuntimeCard({ record }: { record: StrategyRecord }) {
             {runtime.open ? (
               <>
                 {copy.openPosition}：{runtime.open.symbol} ·{" "}
-                {runtime.open.long_venue} / {runtime.open.short_venue} ·{" "}
-                {formatUsd(runtime.open.notional_usd)}
+                {runtime.open.long_venue && runtime.open.short_venue
+                  ? `${runtime.open.long_venue} / ${runtime.open.short_venue}`
+                  : runtime.open.venue ?? "—"}{" "}
+                · {formatUsd(runtime.open.notional_usd)}
               </>
             ) : (
               copy.noOpenPosition
@@ -1242,6 +1355,8 @@ export default function StrategiesPage() {
   const strategies = useStrategies();
   const updateStrategy = useUpdateStrategy();
   const createStrategy = useCreateStrategy();
+  const instantiateTemplate = useInstantiateTemplate();
+  const templates = useStrategyTemplates();
   const generateCode = useGenerateStrategyCode();
   const validateStrategy = useValidateStrategy();
   const backtestStrategy = useBacktestStrategy();
@@ -1254,11 +1369,11 @@ export default function StrategiesPage() {
 
   const list = strategies.data ?? [];
   const selected = creating ? null : (list.find((record) => record.id === selectedId) ?? list[0] ?? null);
-  const versions = useStrategyVersions(selected?.id ?? null);
 
   const actionError = [
     updateStrategy.error,
     createStrategy.error,
+    instantiateTemplate.error,
     generateCode.error,
     validateStrategy.error,
     backtestStrategy.error,
@@ -1374,6 +1489,45 @@ export default function StrategiesPage() {
                     )
                   }
                 />
+                {(templates.data ?? []).length > 0 && (
+                  <div className="mt-4 space-y-2 border-t border-line pt-4">
+                    <div>
+                      <p className="text-xs font-medium text-fg">{t.strategies.templatesTitle}</p>
+                      <p className="mt-0.5 text-[11px] text-muted">{t.strategies.templatesDesc}</p>
+                    </div>
+                    <div className="grid gap-2 sm:grid-cols-2">
+                      {(templates.data ?? []).map((template) => (
+                        <button
+                          key={template.key}
+                          type="button"
+                          disabled={instantiateTemplate.isPending}
+                          onClick={() =>
+                            instantiateTemplate.mutate(
+                              { key: template.key },
+                              {
+                                onSuccess: (record) => {
+                                  setCreating(false);
+                                  setSelectedId(record.id);
+                                },
+                              },
+                            )
+                          }
+                          className="rounded-lg border border-line bg-panel-soft px-3 py-2 text-left transition-colors hover:border-accent/30 disabled:opacity-60"
+                        >
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="text-xs font-medium text-fg">{template.name}</span>
+                            <span className="shrink-0 text-[11px] text-accent">
+                              {instantiateTemplate.isPending
+                                ? t.strategies.instantiating
+                                : t.strategies.useTemplate}
+                            </span>
+                          </div>
+                          <p className="mt-1 text-[11px] text-muted">{template.description}</p>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
               </CardContent>
             </Card>
           )}
@@ -1390,7 +1544,6 @@ export default function StrategiesPage() {
             <StrategyDetail
               key={selected.id}
               record={selected}
-              versions={versions.data ?? []}
               backtestDays={backtestDays}
               onBacktestDays={setBacktestDays}
               onToggle={() =>
@@ -1434,7 +1587,6 @@ export default function StrategiesPage() {
 
 function StrategyDetail({
   record,
-  versions,
   backtestDays,
   onBacktestDays,
   onToggle,
@@ -1445,13 +1597,6 @@ function StrategyDetail({
   pending,
 }: {
   record: StrategyRecord;
-  versions: {
-    version: number;
-    saved_at: string;
-    status: StrategyStatus;
-    validation: { issues: { severity: string }[] };
-    backtest: BacktestReport | null;
-  }[];
   backtestDays: number;
   onBacktestDays: (days: number) => void;
   onToggle: () => void;
@@ -1473,6 +1618,19 @@ function StrategyDetail({
   const errors = validation.issues.filter((issue) => issue.severity === "error");
   const warnings = validation.issues.filter((issue) => issue.severity === "warning");
   const winRate = report && report.trades > 0 ? (report.wins / report.trades) * 100 : null;
+
+  // 版本历史默认收起，只有用户点击后才发起请求。
+  const [versionsOpen, setVersionsOpen] = useState(false);
+  const versions = useStrategyVersions(versionsOpen ? record.id : null);
+
+  // 与后端 publish_readiness 保持一致：校验通过且已部署沙箱代码即可发布；
+  // 回测只作为参考信息，事件驱动策略没有历史公告可回放。
+  const publishable = errors.length === 0 && !!record.sandbox;
+  // 发布不再改变运行位置，改为看是否已有对外发布记录；保留卡片便于撤回或更新。
+  const publications = usePublications(true);
+  const published = (publications.data ?? []).some(
+    (item) => item.strategy_id === record.id && item.status !== "private",
+  );
 
   return (
     <>
@@ -1557,7 +1715,21 @@ function StrategyDetail({
 
       <StrategyScopeCard record={record} running={running} />
 
-      <StrategyPublishCard record={record} />
+      {publishable || published ? (
+        <StrategyPublishCard record={record} />
+      ) : (
+        <Card>
+          <CardHeader>
+            <div className="flex items-center gap-2">
+              <ShieldCheck size={15} className="text-muted" />
+              <div>
+                <CardTitle>{t.strategies.publishLockedTitle}</CardTitle>
+                <CardDescription>{t.strategies.publishLockedDesc}</CardDescription>
+              </div>
+            </div>
+          </CardHeader>
+        </Card>
+      )}
 
 
       <Card>
@@ -1649,50 +1821,61 @@ function StrategyDetail({
             <CardTitle>{t.strategies.versionsTitle}</CardTitle>
             <CardDescription>{t.strategies.versionsDesc}</CardDescription>
           </div>
-          <History size={15} className="text-muted" />
+          <Button
+            size="sm"
+            variant="ghost"
+            onClick={() => setVersionsOpen((open) => !open)}
+          >
+            <History size={14} />
+            {versionsOpen ? t.strategies.versionsHide : t.strategies.versionsShow}
+          </Button>
         </CardHeader>
-        <CardContent className="space-y-2">
-          {versions.length === 0 ? (
-            <p className="text-xs text-muted">{t.strategies.versionsEmpty}</p>
-          ) : (
-            versions.map((version) => {
-              const current = version.version === record.version;
-              return (
-                <div
-                  key={version.version}
-                  className="flex flex-wrap items-center gap-2 rounded-md border border-line bg-panel-soft px-2 py-1.5 text-[11px]"
-                >
-                  <span className="font-medium text-fg">
-                    {fmt(t.strategies.version, { version: version.version })}
-                  </span>
-                  <Badge tone={statusTone[version.status]}>
-                    {strategyStatusLabel(version.status)}
-                  </Badge>
-                  {version.backtest && (
-                    <Badge tone="neutral">
-                      {formatUsd(version.backtest.net_pnl_usd)}
+        {versionsOpen && (
+          <CardContent className="space-y-2">
+            {versions.isLoading ? (
+              <p className="text-xs text-muted">{t.strategies.versionsLoading}</p>
+            ) : !versions.data?.length ? (
+              <p className="text-xs text-muted">{t.strategies.versionsEmpty}</p>
+            ) : (
+              versions.data.map((version) => {
+                const current = version.version === record.version;
+                return (
+                  <div
+                    key={version.version}
+                    className="flex flex-wrap items-center gap-2 rounded-md border border-line bg-panel-soft px-2 py-1.5 text-[11px]"
+                  >
+                    <span className="font-medium text-fg">
+                      {fmt(t.strategies.version, { version: version.version })}
+                    </span>
+                    <Badge tone={statusTone[version.status]}>
+                      {strategyStatusLabel(version.status)}
                     </Badge>
-                  )}
-                  <span className="text-muted">{formatDateTime(version.saved_at)}</span>
-                  <span className="ml-auto flex items-center gap-2">
-                    {current ? (
-                      <Badge tone="success">{t.strategies.current}</Badge>
-                    ) : (
-                      <Button
-                        size="sm"
-                        variant="ghost"
-                        disabled={pending.rollback || running}
-                        onClick={() => onRollback(version.version)}
-                      >
-                        {t.strategies.rollback}
-                      </Button>
+                    {version.backtest && (
+                      <Badge tone="neutral">
+                        {formatUsd(version.backtest.net_pnl_usd)}
+                      </Badge>
                     )}
-                  </span>
-                </div>
-              );
-            })
-          )}
-        </CardContent>
+                    <span className="text-muted">{formatDateTime(version.saved_at)}</span>
+                    <span className="ml-auto flex items-center gap-2">
+                      {current ? (
+                        <Badge tone="success">{t.strategies.current}</Badge>
+                      ) : (
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          disabled={pending.rollback || running}
+                          onClick={() => onRollback(version.version)}
+                        >
+                          {t.strategies.rollback}
+                        </Button>
+                      )}
+                    </span>
+                  </div>
+                );
+              })
+            )}
+          </CardContent>
+        )}
       </Card>
     </>
   );

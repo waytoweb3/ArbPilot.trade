@@ -100,8 +100,6 @@ pub struct Config {
     pub accounts_poll_secs: u64,
     /// 策略运行时评估间隔（秒）。
     pub strategy_poll_secs: u64,
-    /// 是否为官方托管执行器：只运行发布到市场的策略。
-    pub hosted: bool,
     /// WASM 策略沙箱的默认资源限额。
     pub sandbox: SandboxLimits,
     /// 策略市场平台服务费（bps），用于作者结算。
@@ -342,10 +340,6 @@ impl Config {
             .unwrap_or_else(|_| "15".to_string())
             .parse()
             .context("解析 ARBPILOT_STRATEGY_POLL_SECS 失败")?;
-        // 官方托管实例只运行已发布到市场的策略；自托管实例只运行用户自己的策略。
-        let hosted = env::var("ARBPILOT_HOSTED")
-            .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-            .unwrap_or(false);
 
         let mut sandbox = SandboxLimits::default();
         if let Ok(value) = env::var("ARBPILOT_SANDBOX_MAX_FUEL") {
@@ -451,7 +445,6 @@ impl Config {
             risk_file,
             accounts_poll_secs,
             strategy_poll_secs,
-            hosted,
             sandbox,
             market_platform_fee_bps,
             llm_base_url,

@@ -39,8 +39,10 @@ services:
       ARBPILOT_LICENSE_REQUIRED: ${ARBPILOT_LICENSE_REQUIRED:-false}
       ARBPILOT_LICENSE_PUBLIC_KEY: ${ARBPILOT_LICENSE_PUBLIC_KEY:-}
       ARBPILOT_LICENSE_GRACE_HOURS: ${ARBPILOT_LICENSE_GRACE_HOURS:-72}
-      # true = 官方托管执行器，只运行已发布到市场的策略；自托管保持 false。
-      ARBPILOT_HOSTED: ${ARBPILOT_HOSTED:-false}
+      # Telegram 机器人：Token 留空则不启用轮询
+      ARBPILOT_TELEGRAM_BOT_TOKEN: ${ARBPILOT_TELEGRAM_BOT_TOKEN:-}
+      ARBPILOT_TELEGRAM_ENABLED: ${ARBPILOT_TELEGRAM_ENABLED:-true}
+      ARBPILOT_TELEGRAM_API_BASE: ${ARBPILOT_TELEGRAM_API_BASE:-https://api.telegram.org}
       RUST_LOG: info,arbpilot_executor=debug
     # 账户凭证、风控限额与 Telegram 绑定都在 data/ 下，必须持久化。
     volumes:

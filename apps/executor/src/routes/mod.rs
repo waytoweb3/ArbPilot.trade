@@ -1,5 +1,6 @@
 mod accounts;
 mod candles;
+mod config;
 mod control;
 mod funding;
 mod health;
@@ -13,6 +14,7 @@ mod sandbox;
 mod strategies;
 mod strategy_code;
 mod telegram;
+mod templates;
 mod ws;
 
 use axum::{
@@ -80,6 +82,11 @@ pub fn build(state: AppState) -> Router {
             "/strategies/{id}/code/deploy",
             post(strategy_code::deploy_code),
         )
+        .route("/templates", get(templates::list))
+        .route(
+            "/templates/{key}/instantiate",
+            post(templates::instantiate),
+        )
         .route(
             "/market/authors",
             get(market::list_authors).post(market::create_author),
@@ -100,6 +107,14 @@ pub fn build(state: AppState) -> Router {
         .route(
             "/market/publications/{id}/subscribe",
             post(market::subscribe),
+        )
+        .route(
+            "/market/publications/{id}/bundle",
+            get(market::publication_bundle),
+        )
+        .route(
+            "/market/publications/{id}/import",
+            post(market::import_publication),
         )
         .route("/market/subscriptions", get(market::list_subscriptions))
         .route(
@@ -123,6 +138,11 @@ pub fn build(state: AppState) -> Router {
         .route("/funding/history", get(funding::history))
         .route("/funding/summary", get(funding::summary))
         .route("/funding/status", get(funding::status))
+        .route("/config/market", get(config::market))
+        .route(
+            "/config/notifications",
+            get(config::notifications).put(config::update_notifications),
+        )
         .route("/news", get(news::list))
         .route(
             "/license",

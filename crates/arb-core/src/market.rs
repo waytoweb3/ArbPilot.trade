@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::strategy::{
-    StrategyRecord, StrategyValidation, ValidationIssue, ValidationSeverity,
+    StrategyDefinition, StrategyRecord, StrategyValidation, ValidationIssue, ValidationSeverity,
 };
 
 /// 策略风险等级，用于作者卡片与订阅前审阅。
@@ -196,6 +196,12 @@ pub struct StrategyPublication {
     pub visibility: MarketVisibility,
     pub pricing: StrategyPricing,
     pub status: PublicationStatus,
+    /// 发布时冻结的沙箱模块哈希；订阅者据此校验交付代码。
+    #[serde(default)]
+    pub artifact_sha256: Option<String>,
+    /// 发布时冻结的策略定义；订阅者导入时直接使用，不受作者后续修改影响。
+    #[serde(default)]
+    pub definition: Option<StrategyDefinition>,
     pub changelog: Vec<StrategyChangelogEntry>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -236,11 +242,11 @@ impl StrategyPublication {
                 "策略逻辑说明至少 40 个字符，需覆盖入场、退出与阻止交易条件",
             ));
         }
-        if self.supported_venues.len() < 2 {
+        if self.supported_venues.is_empty() {
             issues.push(issue(
                 ValidationSeverity::Error,
                 "supported_venues",
-                "资金费率策略需要至少两个交易所（现货腿 + 永续腿）",
+                "至少需要声明一个支持的交易所",
             ));
         }
         if self.supported_symbols.is_empty() {
@@ -370,6 +376,14 @@ pub fn publish_readiness(
             "策略校验未通过，不能发布",
         ));
     }
+    // 订阅者要在自己机器上运行，发布必须带着可执行的沙箱模块。
+    if record.sandbox.is_none() {
+        issues.push(issue(
+            ValidationSeverity::Error,
+            "strategy.sandbox",
+            "发布前必须先编译并部署策略代码",
+        ));
+    }
     if record.status == crate::strategy::StrategyStatus::Running {
         issues.push(issue(
             ValidationSeverity::Warning,
@@ -378,32 +392,33 @@ pub fn publish_readiness(
         ));
     }
 
+    // 回测不再是发布门槛：事件驱动策略没有历史公告可回放，只要代码可执行即可发布。
     match &record.last_backtest {
         None => issues.push(issue(
-            ValidationSeverity::Error,
+            ValidationSeverity::Warning,
             "strategy.backtest",
-            "发布前必须完成一次历史回测",
+            "尚未回测，订阅者只能参考作者自报表现",
         )),
         Some(report) => {
             if report.definition_version != record.version {
                 issues.push(issue(
-                    ValidationSeverity::Error,
+                    ValidationSeverity::Warning,
                     "strategy.backtest",
-                    "回测结果与当前策略版本不一致，请重新回测",
+                    "回测结果与当前策略版本不一致，建议重新回测",
                 ));
             }
             if report.sample_start.is_none() || report.sample_end.is_none() {
                 issues.push(issue(
-                    ValidationSeverity::Error,
+                    ValidationSeverity::Warning,
                     "strategy.backtest",
                     "回测样本为空，无法证明策略可复现",
                 ));
             }
             if report.trades == 0 {
                 issues.push(issue(
-                    ValidationSeverity::Error,
+                    ValidationSeverity::Warning,
                     "strategy.backtest",
-                    "回测没有产生交易，无法评估表现",
+                    "回测没有产生交易；事件驱动策略可忽略此项",
                 ));
             }
         }
@@ -918,6 +933,8 @@ mod tests {
             visibility: MarketVisibility::Public,
             pricing: StrategyPricing::monthly(dec!(19), 7),
             status: PublicationStatus::Published,
+            artifact_sha256: Some("a".repeat(64)),
+            definition: None,
             changelog: vec![StrategyChangelogEntry {
                 version: 3,
                 at: now,

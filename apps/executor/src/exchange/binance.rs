@@ -186,10 +186,19 @@ impl BinanceMarketClient {
         )
     }
 
-    pub fn candles(&self, symbol: &str, interval: &str, limit: u32) -> anyhow::Result<Vec<Candle>> {
+    pub fn candles(
+        &self,
+        symbol: &str,
+        interval: &str,
+        limit: u32,
+        segment: Segment,
+    ) -> anyhow::Result<Vec<Candle>> {
+        let (base, path) = match segment {
+            Segment::Spot => (&self.spot_base_url, "/api/v3/klines"),
+            Segment::Swap => (&self.futures_base_url, "/fapi/v1/klines"),
+        };
         let url = format!(
-            "{}/api/v3/klines?symbol={symbol}&interval={interval}&limit={}",
-            self.spot_base_url,
+            "{base}{path}?symbol={symbol}&interval={interval}&limit={}",
             limit.clamp(1, KLINE_LIMIT)
         );
         let rows: Vec<Vec<Value>> =

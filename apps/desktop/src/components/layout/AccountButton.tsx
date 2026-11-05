@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useMutation } from "@tanstack/react-query";
-import { Loader2, LogOut, UserRound, X } from "lucide-react";
+import { Loader2, LogOut, RefreshCw, UserRound, X } from "lucide-react";
 
 import { useAccount, useLogout } from "../../hooks/useAccount";
+import { useAccountDialog } from "../../lib/accountDialog";
 import {
   ACCOUNTS_URL,
   AccountError,
@@ -32,7 +33,10 @@ export function AccountButton() {
   const logout = useLogout();
 
   const buttonRef = useRef<HTMLButtonElement>(null);
-  const [open, setOpen] = useState(false);
+  const open = useAccountDialog((state) => state.open);
+  const switching = useAccountDialog((state) => state.switching);
+  const showLogin = useAccountDialog((state) => state.show);
+  const closeLogin = useAccountDialog((state) => state.close);
   const [menu, setMenu] = useState<{ top: number; right: number } | null>(null);
   const [device, setDevice] = useState<DeviceCodeStart | null>(null);
   const [state, setState] = useState<PollState>("pending");
@@ -57,7 +61,7 @@ export function AccountButton() {
           if (result.status === "approved" && result.token) {
             setToken(result.token);
             setDevice(null);
-            setOpen(false);
+            closeLogin();
           } else if (result.status === "expired" || result.status === "denied") {
             setState(result.status);
           }
@@ -67,14 +71,34 @@ export function AccountButton() {
       })();
     }, Math.max(device.interval, 2) * 1000);
     return () => window.clearInterval(timer);
-  }, [open, device, state, setToken]);
+  }, [open, device, state, setToken, closeLogin]);
 
-  const openLogin = () => {
-    setOpen(true);
-    setMenu(null);
+  // 弹窗可能由顶栏或设置页打开，打开时就申请新的配对码。
+  useEffect(() => {
+    if (!open) {
+      return;
+    }
     setDevice(null);
+    setState("pending");
     start.reset();
     start.mutate();
+    // start 是稳定引用，只需在弹窗打开时触发一次。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
+
+  const openLogin = () => {
+    setMenu(null);
+    showLogin(false);
+  };
+
+  const switchAccount = async () => {
+    setMenu(null);
+    try {
+      await logout.mutateAsync();
+    } catch {
+      // 账号服务不可达时本地令牌已清除，仍然允许重新登录。
+    }
+    showLogin(true);
   };
 
   const toggleMenu = () => {
@@ -96,6 +120,9 @@ export function AccountButton() {
     : null;
 
   const me = account.data;
+  const loginUrl = device
+    ? `${device.verification_uri_complete}&provider=google${switching ? "&switch=1" : ""}`
+    : "";
   const plan = me?.entitlement.plans[0];
   const planLabel =
     plan === "arbitrage"
@@ -149,11 +176,20 @@ export function AccountButton() {
               <button
                 type="button"
                 role="menuitem"
+                onClick={() => void switchAccount()}
+                className="mt-1 flex w-full items-center gap-1.5 rounded-lg px-2 py-1.5 text-left text-xs text-muted hover:bg-hover hover:text-fg"
+              >
+                <RefreshCw size={13} />
+                {t.settings.accountSwitch}
+              </button>
+              <button
+                type="button"
+                role="menuitem"
                 onClick={() => {
                   setMenu(null);
                   logout.mutate();
                 }}
-                className="mt-3 flex w-full items-center gap-1.5 rounded-lg px-2 py-1.5 text-left text-xs text-muted hover:bg-hover hover:text-fg"
+                className="mt-1 flex w-full items-center gap-1.5 rounded-lg px-2 py-1.5 text-left text-xs text-muted hover:bg-hover hover:text-fg"
               >
                 <LogOut size={13} />
                 {t.settings.accountLogout}
@@ -182,7 +218,7 @@ export function AccountButton() {
                   size="sm"
                   variant="ghost"
                   className="w-7 shrink-0 px-0"
-                  onClick={() => setOpen(false)}
+                  onClick={closeLogin}
                   aria-label={t.accounts.cancel}
                 >
                   <X size={14} />
@@ -201,19 +237,16 @@ export function AccountButton() {
 
                 {device && (
                   <>
+                    {switching && (
+                      <p className="text-warning">{t.settings.accountSwitchHint}</p>
+                    )}
                     <p>{t.settings.accountLoginCodeHint}</p>
                     <div className="break-all rounded-lg border border-line bg-panel-soft px-3 py-2 font-mono text-[11px] text-body">
-                      {device.verification_uri_complete}
+                      {loginUrl}
                     </div>
                     <Button
                       size="sm"
-                      onClick={() =>
-                        window.open(
-                          `${device.verification_uri_complete}&provider=google`,
-                          "_blank",
-                          "noopener,noreferrer",
-                        )
-                      }
+                      onClick={() => window.open(loginUrl, "_blank", "noopener,noreferrer")}
                     >
                       <GoogleMark />
                       {t.settings.accountContinueGoogle}

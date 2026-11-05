@@ -1,7 +1,7 @@
 use arb_core::{
-    BacktestReport, CostAssumptions, EntryRules, ExecutionRules, ExitRules, FundingSample,
-    Instrument, OpportunityKind, StrategyDefinition, StrategyEventLevel, StrategyRecord,
-    StrategyRisk, StrategyRunScope, StrategySource, StrategyStatus, StrategyUniverse,
+    BacktestReport, CostAssumptions, DataRules, EntryRules, ExecutionRules, ExitRules,
+    FundingSample, Instrument, StrategyDefinition, StrategyEventLevel, StrategyKind, StrategyRecord,
+    StrategyRisk, StrategySource, StrategyStatus, StrategyUniverse,
 };
 use axum::{
     extract::{Path, State},
@@ -20,7 +20,8 @@ use crate::{
 };
 
 pub async fn list(State(state): State<AppState>) -> Json<Vec<StrategyRecord>> {
-    let mut strategies = state.strategies.read().expect("策略锁不可用").clone();
+    // 列表以数据库为准：没有保存过策略时返回空列表。
+    let mut strategies = state.store.load_strategies().await;
     strategies.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
     Json(strategies)
 }
@@ -48,7 +49,7 @@ pub async fn create(
 ) -> Result<(StatusCode, Json<StrategyRecord>), ApiError> {
     let definition = match body.definition {
         Some(definition) => definition,
-        None => code_definition(&state, body.name.unwrap_or_default()),
+        None => code_definition(&state, body.name.unwrap_or_default()).await,
     };
     let mut record = StrategyRecord::new(
         definition,
@@ -66,19 +67,52 @@ pub async fn create(
     Ok((StatusCode::CREATED, Json(record)))
 }
 
-/// 代码优先策略的默认定义：提供可交易范围与执行限额，具体逻辑由策略代码决定。
-fn code_definition(state: &AppState, name: String) -> StrategyDefinition {
+/// 代码优先策略的默认定义：交易所与交易对来自数据库配置，具体逻辑由策略代码决定。
+async fn code_definition(state: &AppState, name: String) -> StrategyDefinition {
     let limits = state.risk_limits();
-    let symbols = if state.config.market_symbols.is_empty() {
-        vec!["BTCUSDT".to_string()]
-    } else {
-        state.config.market_symbols.clone()
+    let venues = state.store.exchange_venues().await;
+    let spot = venues
+        .iter()
+        .find(|venue| venue.segment == "spot")
+        .map(|venue| venue.venue.clone());
+    let perp = venues
+        .iter()
+        .find(|venue| venue.segment == "perp")
+        .map(|venue| venue.venue.clone());
+
+    let mut universe_venues = Vec::new();
+    if let Some(spot) = spot {
+        universe_venues.push(spot);
+    }
+    if let Some(perp) = &perp {
+        universe_venues.push(perp.clone());
+    }
+
+    let mut symbols: Vec<String> = match perp {
+        Some(perp) => state
+            .store
+            .tradable_symbols()
+            .await
+            .into_iter()
+            .filter(|row| row.venue == perp)
+            .map(|row| row.symbol)
+            .take(2)
+            .collect(),
+        None => Vec::new(),
     };
+    if symbols.is_empty() {
+        symbols = state.config.market_symbols.clone();
+    }
+    if symbols.is_empty() {
+        symbols.push("BTCUSDT".to_string());
+    }
+
     StrategyDefinition {
         name,
-        kind: OpportunityKind::FundingRate,
+        // 代码优先策略由沙箱决定入场与出场，不再受内置资金费率规则约束。
+        kind: StrategyKind::Custom,
         universe: StrategyUniverse {
-            venues: vec!["binance-spot".to_string(), "binance".to_string()],
+            venues: universe_venues,
             symbols,
             instruments: vec![Instrument::Spot, Instrument::Perp],
         },
@@ -99,6 +133,7 @@ fn code_definition(state: &AppState, name: String) -> StrategyDefinition {
             max_slippage_bps: Decimal::from(10),
             cooldown_secs: 300,
         },
+        data: DataRules::default(),
         costs: CostAssumptions::default(),
         notes: None,
     }
@@ -128,17 +163,6 @@ pub async fn update(
         if record.validation.has_errors() {
             return Err(ApiError::Conflict(
                 "策略校验未通过，请先修复错误再启动".to_string(),
-            ));
-        }
-        // 已发布的策略归平台托管执行器运行，未发布的只在自己的执行器运行。
-        if state.config.hosted && record.run_scope != StrategyRunScope::Platform {
-            return Err(ApiError::Conflict(
-                "该策略尚未发布到市场，请在用户自己的执行器上运行".to_string(),
-            ));
-        }
-        if !state.config.hosted && record.run_scope == StrategyRunScope::Platform {
-            return Err(ApiError::Conflict(
-                "该策略已发布，由 ArbPilot 托管执行器运行".to_string(),
             ));
         }
     }
@@ -244,6 +268,15 @@ pub struct UpdateScopeRequest {
     /// 永续腿交易所，例如 `binance`。
     pub perp_venue: String,
     pub symbols: Vec<String>,
+    /// 事件来源白名单；`None` 表示不修改，空数组表示接受全部来源。
+    #[serde(default)]
+    pub event_sources: Option<Vec<String>>,
+    /// 事件关键词；`None` 表示不修改，空数组表示不按关键词过滤。
+    #[serde(default)]
+    pub event_keywords: Option<Vec<String>>,
+    /// 事件窗口（秒）；`None` 表示不修改。
+    #[serde(default)]
+    pub event_window_secs: Option<u64>,
 }
 
 /// 修改策略的应用范围（交易所与代币）。产生新版本并清空旧校验与回测结果。
@@ -288,6 +321,31 @@ pub async fn update_scope(
         symbols,
         instruments: vec![Instrument::Spot, Instrument::Perp],
     };
+
+    // 事件配置只影响沙箱输入，和交易范围一起保存，避免再开一个接口。
+    if let Some(sources) = body.event_sources {
+        record.definition.data.event_sources = sources
+            .into_iter()
+            .map(|source| source.trim().to_lowercase())
+            .filter(|source| !source.is_empty())
+            .collect();
+    }
+    if let Some(keywords) = body.event_keywords {
+        record.definition.data.event_keywords = keywords
+            .into_iter()
+            .map(|keyword| keyword.trim().to_string())
+            .filter(|keyword| !keyword.is_empty())
+            .collect();
+    }
+    if let Some(window) = body.event_window_secs {
+        if !(60..=604_800).contains(&window) {
+            return Err(ApiError::BadRequest(
+                "事件窗口必须在 60 到 604800 秒之间".to_string(),
+            ));
+        }
+        record.definition.data.event_window_secs = window;
+    }
+
     record.version += 1;
     record.validation = record.definition.validate(&state.risk_limits());
     record.last_backtest = None;
@@ -326,7 +384,7 @@ pub struct BacktestRequest {
     pub days: Option<u32>,
 }
 
-/// 用已入库的历史资金费率回放当前定义，成本与假设写在报告里。
+/// 回测：内置资金费率策略回放历史费率，自定义策略逐根 K 线重放沙箱模块。
 pub async fn backtest(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -336,6 +394,16 @@ pub async fn backtest(
     record.validation = record.definition.validate(&state.risk_limits());
     if record.validation.has_errors() {
         return Err(ApiError::Conflict("策略校验未通过，无法回测".to_string()));
+    }
+    if record.definition.kind == StrategyKind::Custom {
+        let report = crate::wasm_backtest::run(&state, &record, body.days)
+            .await
+            .map_err(ApiError::Conflict)?;
+        record.last_backtest = Some(report.clone());
+        record.updated_at = Utc::now();
+        replace(&state, &record);
+        persist(&state, &record).await;
+        return Ok(Json(report));
     }
 
     let perp_venue = record

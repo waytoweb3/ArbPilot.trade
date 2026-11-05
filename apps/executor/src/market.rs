@@ -19,6 +19,7 @@ use crate::{
         OKX_VENUE, VENUE,
     },
     http_client::HttpClient,
+    notifier::Notifier,
     realtime::RealtimeFeed,
     store::Store,
 };
@@ -63,6 +64,8 @@ pub struct MarketFeed {
     store: Arc<Store>,
     state: RwLock<MarketState>,
     events: broadcast::Sender<ExecutorEvent>,
+    /// 资金费率机会按通知设置推送；未挂载时只入库不推送。
+    notifier: RwLock<Option<Arc<Notifier>>>,
 }
 
 impl MarketFeed {
@@ -102,6 +105,7 @@ impl MarketFeed {
             store,
             state: RwLock::new(MarketState::default()),
             events,
+            notifier: RwLock::new(None),
         });
 
         if feed.symbols.is_empty()
@@ -145,6 +149,11 @@ impl MarketFeed {
             .clone()
     }
 
+    /// 绑定通知分发器后，资金费率机会会按通知设置推送。
+    pub fn attach_notifier(&self, notifier: Arc<Notifier>) {
+        *self.notifier.write().expect("行情通知锁不可用") = Some(notifier);
+    }
+
     pub fn quote(&self, venue: &str, symbol: &str) -> Option<Quote> {
         self.state
             .read()
@@ -154,7 +163,10 @@ impl MarketFeed {
             .map(|book| book.quote.clone())
     }
 
-    /// 现货 K 线，供桌面端图表展示。`venue` 为 `binance-spot` / `okx-spot` 等标识。
+    /// K 线，供桌面端图表与策略指标使用。
+    ///
+    /// `venue` 为 `binance-spot` / `okx-spot` 等标识；以 `-spot` 结尾走现货，
+    /// 其余走永续合约。
     pub async fn candles(
         &self,
         venue: &str,
@@ -168,25 +180,35 @@ impl MarketFeed {
             bail!("不支持的 K 线周期: {interval}");
         }
         let limit = limit.clamp(1, 1_000);
+        let lower = venue.trim().to_ascii_lowercase();
+        let segment = if lower.ends_with("-spot") {
+            Segment::Spot
+        } else {
+            Segment::Swap
+        };
 
-        match venue.trim().to_ascii_lowercase().as_str() {
+        match lower.as_str() {
             OKX_VENUE | OKX_SPOT_VENUE => {
                 let client = self
                     .okx
                     .clone()
                     .ok_or_else(|| anyhow!("OKX 行情客户端未启用"))?;
-                tokio::task::spawn_blocking(move || client.candles(&symbol, &interval, limit))
-                    .await
-                    .map_err(|error| anyhow!("K 线任务异常退出: {error}"))?
+                tokio::task::spawn_blocking(move || {
+                    client.candles(&symbol, &interval, limit, segment)
+                })
+                .await
+                .map_err(|error| anyhow!("K 线任务异常退出: {error}"))?
             }
             _ => {
                 let client = self
                     .binance
                     .clone()
                     .ok_or_else(|| anyhow!("Binance 行情客户端未初始化"))?;
-                tokio::task::spawn_blocking(move || client.candles(&symbol, &interval, limit))
-                    .await
-                    .map_err(|error| anyhow!("K 线任务异常退出: {error}"))?
+                tokio::task::spawn_blocking(move || {
+                    client.candles(&symbol, &interval, limit, segment)
+                })
+                .await
+                .map_err(|error| anyhow!("K 线任务异常退出: {error}"))?
             }
         }
     }
@@ -290,6 +312,18 @@ impl MarketFeed {
         }
 
         let opportunities = funding_opportunities(&latest, &funding, now, self.poll.as_secs());
+
+        // 先按通知设置推送资金费率机会，再把本轮结果写入行情快照。
+        let notifier = self
+            .notifier
+            .read()
+            .expect("行情通知锁不可用")
+            .clone();
+        if let Some(notifier) = notifier {
+            // 推送走后台任务，避免 Telegram 请求拖慢行情刷新。
+            let pending = opportunities.clone();
+            tokio::spawn(async move { notifier.notify_funding(&pending).await });
+        }
 
         {
             let mut state = self.state.write().expect("行情锁不可用");

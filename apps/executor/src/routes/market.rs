@@ -8,18 +8,21 @@
 use arb_core::{
     compute_settlement_from_gross, period_bounds, publish_readiness, rank_publications,
     settlement_period, LeaderboardEntry, MarketVisibility, PerformanceSource, PublicationStatus,
-    RiskLevel, SourceVisibility, StrategyAuthorCard, StrategyChangelogEntry,
-    StrategyPerformanceRecord, StrategyPricing, StrategyPublication, StrategyRunScope, StrategySettlement,
-    StrategySubscription, StrategyStatus, SubscriptionStatus, ValidationSeverity,
+    RiskLevel, SandboxArtifact, SandboxArtifactSource, SandboxBinding, SourceVisibility,
+    StrategyAuthorCard, StrategyChangelogEntry, StrategyDefinition, StrategyEventLevel,
+    StrategyPerformanceRecord, StrategyPricing, StrategyPublication, StrategyRunScope,
+    StrategySettlement, StrategySubscription, StrategyStatus, SubscriptionStatus,
+    ValidationSeverity,
 };
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     Json,
 };
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{error::ApiError, state::AppState};
@@ -219,6 +222,8 @@ pub async fn create_publication(
         pricing: body.pricing,
         // 新建发布始终是私有草稿，发布需要显式调用 publish。
         status: PublicationStatus::Private,
+        artifact_sha256: None,
+        definition: None,
         changelog,
         created_at: now,
         updated_at: now,
@@ -316,14 +321,16 @@ pub async fn update_publication(
             {
                 publication.author_name = author.display_name.clone();
             }
+            // 冻结发布版本的代码与定义：订阅者在自己的执行器导入后运行。
+            let Some(binding) = record.sandbox.as_ref() else {
+                return Err(ApiError::Conflict("策略未部署沙箱模块，无法发布".to_string()));
+            };
+            publication.artifact_sha256 = Some(binding.artifact_hash.clone());
+            publication.definition = Some(record.definition.clone());
             publication.attach_version(&record, body.changelog_summary);
             publication.status = PublicationStatus::Published;
 
-            // 发布后由平台托管执行器运行：切换运行位置并关闭本地运行实例。
-            record.run_scope = StrategyRunScope::Platform;
-            strategies::close_run(&state, &mut record, StrategyStatus::Stopped).await;
-            strategies::replace(&state, &record);
-            strategies::persist(&state, &record).await;
+            // 发布只影响市场曝光；策略仍由作者自己的执行器继续运行。
         }
         Some(PublicationAction::Withdraw) => {
             // 只撤回市场曝光；已有仓位、订单与安全处置能力保持不变。
@@ -570,6 +577,177 @@ pub async fn cancel_subscription(
     subscription.cancel(Utc::now());
     state.store.save_subscription(&subscription).await;
     Ok(Json(subscription))
+}
+
+// ---------------------------------------------------------------------------
+// 订阅交付：把发布版本的代码与定义交付到订阅者自己的执行器
+// ---------------------------------------------------------------------------
+
+/// 一次发布的可运行交付物：冻结的定义 + 沙箱模块。
+#[derive(Debug, Serialize)]
+pub struct PublicationBundle {
+    pub publication_id: Uuid,
+    pub strategy_version: u32,
+    pub definition: StrategyDefinition,
+    pub artifact_sha256: String,
+    pub wasm_base64: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct BundleQuery {
+    /// 订阅者身份；作者本人可省略。
+    pub subscriber_id: Option<Uuid>,
+}
+
+pub async fn publication_bundle(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Query(query): Query<BundleQuery>,
+) -> Result<Json<PublicationBundle>, ApiError> {
+    let publication = find_publication(&state, id).await?;
+    ensure_entitled(&state, &publication, query.subscriber_id).await?;
+    Ok(Json(load_bundle(&state, &publication).await?))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ImportPublicationRequest {
+    pub subscriber_id: Uuid,
+}
+
+/// 订阅者在自己的执行器导入发布版本：校验哈希后落库为一条自托管策略。
+pub async fn import_publication(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<ImportPublicationRequest>,
+) -> Result<(StatusCode, Json<arb_core::StrategyRecord>), ApiError> {
+    let publication = find_publication(&state, id).await?;
+    ensure_entitled(&state, &publication, Some(body.subscriber_id)).await?;
+    let bundle = load_bundle(&state, &publication).await?;
+
+    let wasm = BASE64
+        .decode(bundle.wasm_base64.as_bytes())
+        .map_err(|error| ApiError::BadRequest(format!("交付代码无法解码: {error}")))?;
+    if crate::sandbox::hash_wasm(&wasm) != bundle.artifact_sha256 {
+        return Err(ApiError::Conflict(
+            "交付代码与发布哈希不一致，已拒绝导入".to_string(),
+        ));
+    }
+    let abi_version = crate::sandbox::inspect(&wasm, &state.config.sandbox)
+        .map_err(|error| ApiError::BadRequest(format!("交付代码未通过沙箱检查: {error}")))?;
+
+    let short_hash = &bundle.artifact_sha256[..bundle.artifact_sha256.len().min(12)];
+    let artifact = SandboxArtifact {
+        id: Uuid::new_v4(),
+        name: format!("market-{short_hash}"),
+        sha256: bundle.artifact_sha256.clone(),
+        size_bytes: wasm.len(),
+        abi_version: Some(abi_version),
+        source: SandboxArtifactSource::Uploaded,
+        notes: Some(format!("订阅导入：{}", publication.title)),
+        created_at: Utc::now(),
+    };
+    state
+        .store
+        .save_sandbox_artifact(&artifact, &wasm)
+        .await
+        .map_err(|error| ApiError::Internal(format!("保存沙箱模块失败: {error}")))?;
+
+    let mut definition = bundle.definition;
+    definition.name = publication.title.clone();
+    definition.risk.max_notional_usd = definition
+        .risk
+        .max_notional_usd
+        .min(publication.suggested_max_notional_usd)
+        .min(state.risk_limits().max_order_notional_usd);
+
+    let mut record = arb_core::StrategyRecord::new(
+        definition,
+        arb_core::StrategySource::Manual,
+        StrategyStatus::Stopped,
+    );
+    record.sandbox = Some(SandboxBinding::new(&artifact, state.config.sandbox));
+    record.runtime.record(
+        StrategyEventLevel::Info,
+        format!("从策略市场导入：{}", publication.title),
+        None,
+    );
+    record.validation = record.definition.validate(&state.risk_limits());
+
+    strategies::replace(&state, &record);
+    strategies::persist(&state, &record).await;
+    Ok((StatusCode::CREATED, Json(record)))
+}
+
+/// 只有作者本人或持有效订阅的订阅者可以拿到交付物。
+async fn ensure_entitled(
+    state: &AppState,
+    publication: &StrategyPublication,
+    subscriber_id: Option<Uuid>,
+) -> Result<(), ApiError> {
+    let Some(subscriber_id) = subscriber_id else {
+        return Err(ApiError::BadRequest("缺少订阅者身份".to_string()));
+    };
+    if publication.author_id == subscriber_id {
+        return Ok(());
+    }
+    let entitled = state
+        .store
+        .market_snapshot()
+        .await
+        .subscriptions
+        .iter()
+        .any(|subscription| {
+            subscription.publication_id == publication.id
+                && subscription.subscriber_id == subscriber_id
+                && subscription.status.is_entitled()
+        });
+    if entitled {
+        Ok(())
+    } else {
+        Err(ApiError::PaymentRequired(
+            "该发布尚未订阅或订阅已失效".to_string(),
+        ))
+    }
+}
+
+async fn load_bundle(
+    state: &AppState,
+    publication: &StrategyPublication,
+) -> Result<PublicationBundle, ApiError> {
+    if !matches!(
+        publication.status,
+        PublicationStatus::Published | PublicationStatus::Withdrawn
+    ) {
+        return Err(ApiError::Conflict(
+            "该发布尚未公开发布，暂无可交付内容".to_string(),
+        ));
+    }
+    let sha256 = publication.artifact_sha256.clone().ok_or_else(|| {
+        ApiError::Conflict("该发布没有可交付的沙箱模块，请作者重新发布".to_string())
+    })?;
+    let definition = publication.definition.clone().ok_or_else(|| {
+        ApiError::Conflict("该发布缺少冻结的策略定义，请作者重新发布".to_string())
+    })?;
+    let artifact = state
+        .store
+        .sandbox_artifacts()
+        .await
+        .into_iter()
+        .find(|artifact| artifact.sha256 == sha256)
+        .ok_or_else(|| ApiError::NotFound("发布对应的沙箱模块不存在".to_string()))?;
+    let wasm = state
+        .store
+        .sandbox_module(artifact.id)
+        .await
+        .ok_or_else(|| ApiError::NotFound("沙箱模块内容缺失".to_string()))?;
+
+    Ok(PublicationBundle {
+        publication_id: publication.id,
+        strategy_version: publication.strategy_version,
+        definition,
+        artifact_sha256: sha256,
+        wasm_base64: BASE64.encode(wasm),
+    })
 }
 
 // ---------------------------------------------------------------------------
