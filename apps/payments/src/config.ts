@@ -90,6 +90,9 @@ export const config = {
   /** 本机执行器地址；策略发布定价与订阅状态回写都走这里。 */
   executorUrl: (process.env.EXECUTOR_URL ?? "http://127.0.0.1:8787").replace(/\/$/, ""),
   executorToken: process.env.EXECUTOR_TOKEN ?? "dev-local-token",
+  /** 账号服务地址；置空可退回旧版 ref 授权模式。 */
+  accountsUrl: (process.env.ACCOUNTS_URL ?? "http://127.0.0.1:8789").replace(/\/$/, ""),
+  accountsInternalToken: process.env.ACCOUNTS_INTERNAL_TOKEN ?? "dev-internal-token",
 } as const;
 
 export const plans: PlanDefinition[] = [

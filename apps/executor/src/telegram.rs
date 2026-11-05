@@ -664,6 +664,7 @@ fn describe_error(error: &ApiError) -> String {
         ApiError::BadRequest(message)
         | ApiError::NotFound(message)
         | ApiError::Conflict(message)
+        | ApiError::PaymentRequired(message)
         | ApiError::Internal(message) => message.clone(),
     }
 }

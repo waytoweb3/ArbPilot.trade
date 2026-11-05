@@ -1,42 +1,52 @@
 import {
+  BookOpen,
   Bot,
-  Boxes,
   Languages,
   LayoutDashboard,
   Moon,
   Newspaper,
   PanelLeftClose,
   PanelLeftOpen,
+  PauseCircle,
   Percent,
   Radar,
   Settings as SettingsIcon,
   Store,
   Sun,
   Wallet,
+  Wifi,
+  WifiOff,
 } from "lucide-react";
 import { useCallback, useState } from "react";
 import { NavLink, Outlet } from "react-router-dom";
 
 import { useHealth, useNews } from "../../hooks/useApi";
+import { useLicenseSync } from "../../hooks/useAccount";
 import { useExecutorStream } from "../../hooks/useExecutorStream";
 import { formatUptime } from "../../lib/format";
-import { fmt, useI18n } from "../../lib/i18n";
+import { useI18n } from "../../lib/i18n";
 import { countUnread, useNewsPrefs } from "../../lib/news";
 import { useTheme } from "../../lib/theme";
 import { cn } from "../../lib/utils";
 import { useExecutorStore } from "../../state/executor";
-import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
+import { AccountButton } from "./AccountButton";
 
 const SIDEBAR_KEY = "arbpilot.sidebar.collapsed";
 
 export function AppShell() {
   useExecutorStream();
+  // 登录后把账号授权写入执行器，退出登录时清除。
+  useLicenseSync();
   const health = useHealth();
   const streamConnected = useExecutorStore((state) => state.streamConnected);
   const { t, locale, toggleLocale } = useI18n();
   const { resolved, toggleTheme } = useTheme();
   const [collapsed, setCollapsed] = useState(() => localStorage.getItem(SIDEBAR_KEY) === "1");
+  const [statusHint, setStatusHint] = useState<string | null>(null);
+
+  const toggleStatusHint = (label: string) =>
+    setStatusHint((current) => (current === label ? null : label));
 
   const toggleSidebar = useCallback(() => {
     setCollapsed((current) => {
@@ -66,7 +76,7 @@ export function AppShell() {
     { to: "/news", label: t.nav.news, icon: Newspaper, badge: unread },
     { to: "/strategies", label: t.nav.strategies, icon: Bot },
     { to: "/market", label: t.nav.market, icon: Store },
-    { to: "/sandbox", label: t.nav.sandbox, icon: Boxes },
+    { to: "/docs", label: t.nav.docs, icon: BookOpen },
     { to: "/settings", label: t.nav.settings, icon: SettingsIcon },
   ];
 
@@ -150,27 +160,65 @@ export function AppShell() {
         </nav>
 
         {!collapsed && (
-          <div className="border-t border-line px-4 py-3 font-mono text-[11px] text-subtle">
-            v{health.data?.version ?? "0.1.0"}
+          <div className="relative border-t border-line px-4 py-2 text-[11px] text-subtle">
+            <div className="flex items-center justify-between gap-2 font-mono">
+              <span>v{health.data?.version ?? "0.1.0"}</span>
+              <div className="flex items-center gap-2">
+                {health.data && <span>{formatUptime(health.data.uptime_secs)}</span>}
+                <button
+                  type="button"
+                  title={online ? t.shell.online : t.shell.offline}
+                  aria-label={online ? t.shell.online : t.shell.offline}
+                  onClick={() => toggleStatusHint(online ? t.shell.online : t.shell.offline)}
+                  className="inline-flex items-center"
+                >
+                  <span
+                    className={cn("h-2 w-2 rounded-full", online ? "bg-accent" : "bg-danger")}
+                  />
+                </button>
+                <button
+                  type="button"
+                  title={streamConnected ? t.shell.streamConnected : t.shell.streamDisconnected}
+                  aria-label={streamConnected ? t.shell.streamConnected : t.shell.streamDisconnected}
+                  onClick={() =>
+                    toggleStatusHint(
+                      streamConnected ? t.shell.streamConnected : t.shell.streamDisconnected,
+                    )
+                  }
+                  className="inline-flex items-center"
+                >
+                  {streamConnected ? (
+                    <Wifi size={13} className="text-info" />
+                  ) : (
+                    <WifiOff size={13} />
+                  )}
+                </button>
+                {paused && (
+                  <button
+                    type="button"
+                    title={t.shell.paused}
+                    aria-label={t.shell.paused}
+                    onClick={() => toggleStatusHint(t.shell.paused)}
+                    className="inline-flex items-center"
+                  >
+                    <PauseCircle size={13} className="text-warning" />
+                  </button>
+                )}
+              </div>
+            </div>
+            {statusHint && (
+              <span className="absolute bottom-full left-3 z-10 mb-1 rounded-md border border-line bg-panel px-2 py-1 text-[10px] whitespace-nowrap text-body shadow-sm">
+                {statusHint}
+              </span>
+            )}
           </div>
         )}
       </aside>
 
       <div className="flex min-w-0 flex-1 flex-col">
-        <header className="flex h-14 shrink-0 items-center justify-between gap-3 border-b border-line bg-panel/70 px-6 backdrop-blur">
-          <div className="flex flex-wrap items-center gap-2">
-            <Badge tone={online ? "success" : "danger"}>
-              {online ? t.shell.online : t.shell.offline}
-            </Badge>
-            <Badge tone={streamConnected ? "info" : "neutral"}>
-              {streamConnected ? t.shell.streamConnected : t.shell.streamDisconnected}
-            </Badge>
-            {paused && <Badge tone="warning">{t.shell.paused}</Badge>}
-          </div>
-
+        <header className="flex h-14 shrink-0 items-center justify-end gap-3 border-b border-line bg-panel/70 px-6 backdrop-blur">
           <div className="flex items-center gap-2 text-xs text-muted">
-            {health.data && <span>{fmt(t.shell.uptime, { value: formatUptime(health.data.uptime_secs) })}</span>}
-
+            <AccountButton />
             <Button
               size="sm"
               variant="ghost"

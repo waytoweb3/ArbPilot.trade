@@ -16,9 +16,14 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-RUN useradd --create-home --uid 10001 arbpilot
+RUN useradd --create-home --uid 10001 arbpilot \
+    && mkdir -p /home/arbpilot/data \
+    && chown -R arbpilot:arbpilot /home/arbpilot
+
 COPY --from=builder /app/target/release/arbpilot-executor /usr/local/bin/arbpilot-executor
 
+# 账户凭证、风控限额与 Telegram 绑定默认写在 data/ 下，需挂载卷持久化。
+WORKDIR /home/arbpilot
 USER arbpilot
 EXPOSE 8787
 ENTRYPOINT ["arbpilot-executor"]

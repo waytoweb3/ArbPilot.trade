@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import {
   createServer,
   type IncomingMessage,
@@ -13,6 +13,7 @@ import {
 } from "@waffo/pancake-ts";
 
 import { config, findPlan, plans } from "./config";
+import { notifyCheckout, notifyLicense, resolveUser } from "./accounts";
 import {
   ExecutorError,
   createSettlement,
@@ -68,7 +69,7 @@ function applyCors(req: IncomingMessage, res: ServerResponse): void {
     }
   }
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
   res.setHeader("Access-Control-Max-Age", "600");
 }
 
@@ -118,6 +119,17 @@ function localeOf(value: unknown): CashierLanguage | undefined {
 async function handleCheckout(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const raw = await readRaw(req, 64 * 1024);
   const body = raw ? (JSON.parse(raw) as CheckoutBody) : {};
+  const authorization = req.headers.authorization;
+  const user = await resolveUser(Array.isArray(authorization) ? authorization[0] : authorization);
+
+  // 订阅必须绑定到账号：授权、设备数与跨设备恢复都以账号为准。
+  if (!user) {
+    sendJson(res, 401, {
+      error: "login_required",
+      message: "请先登录 ArbPilot 账号后再订阅",
+    });
+    return;
+  }
 
   const plan = findPlan(typeof body.plan === "string" ? body.plan : "");
   if (!plan) {
@@ -133,7 +145,8 @@ async function handleCheckout(req: IncomingMessage, res: ServerResponse): Promis
   }
 
   const email =
-    typeof body.email === "string" && body.email.includes("@") ? body.email.trim() : undefined;
+    user.email ??
+    (typeof body.email === "string" && body.email.includes("@") ? body.email.trim() : undefined);
   const language = localeOf(body.locale);
   const darkMode = typeof body.darkMode === "boolean" ? body.darkMode : undefined;
 
@@ -145,13 +158,18 @@ async function handleCheckout(req: IncomingMessage, res: ServerResponse): Promis
     currency: config.currency,
     buyerEmail: email,
     successUrl: `${config.siteUrl}/checkout/success?ref=${ref}`,
-    metadata: { arbpilot_ref: ref, plan: plan.id },
+    metadata: {
+      arbpilot_ref: ref,
+      plan: plan.id,
+      user_id: user.id,
+    },
     orderMerchantExternalId: ref,
     language,
     darkMode,
   });
 
   createPendingLicense(ref, plan.id, email ?? null);
+  await notifyCheckout({ ref, userId: user.id, plan: plan.id });
 
   sendJson(res, 201, { ref, checkoutUrl: session.checkoutUrl, expiresAt: session.expiresAt });
 }
@@ -172,14 +190,35 @@ async function handleStrategyCheckout(
 ): Promise<void> {
   const raw = await readRaw(req, 64 * 1024);
   const body = raw ? (JSON.parse(raw) as StrategyCheckoutBody) : {};
+  const authorization = req.headers.authorization;
+  const user = await resolveUser(Array.isArray(authorization) ? authorization[0] : authorization);
 
   const publicationId = text(body.publication_id);
-  const subscriberId = text(body.subscriber_id);
   const subscriptionId = text(body.subscription_id);
-  if (!publicationId || !subscriberId || !subscriptionId) {
+
+  // 策略订阅同样绑定账号，未登录不允许创建收银台。
+  if (!user) {
+    sendJson(res, 401, {
+      error: "login_required",
+      message: "请先登录 ArbPilot 账号后再订阅策略",
+    });
+    return;
+  }
+
+  // 订阅人必须是当前账号，避免替他人付款或买到别人名下。
+  const subscriberId = text(body.subscriber_id) ?? user.id;
+  if (subscriberId !== user.id) {
+    sendJson(res, 409, {
+      error: "subscriber_mismatch",
+      message: "订阅人需要与当前登录账号一致，请在桌面端重新发起订阅",
+    });
+    return;
+  }
+
+  if (!publicationId || !subscriptionId) {
     sendJson(res, 400, {
       error: "invalid_request",
-      message: "publication_id、subscriber_id、subscription_id 均为必填",
+      message: "publication_id、subscription_id 均为必填",
     });
     return;
   }
@@ -216,7 +255,8 @@ async function handleStrategyCheckout(
   const productId = await ensureStrategyProduct(client, publication);
   const ref = randomUUID();
   const email =
-    typeof body.email === "string" && body.email.includes("@") ? body.email.trim() : undefined;
+    user.email ??
+    (typeof body.email === "string" && body.email.includes("@") ? body.email.trim() : undefined);
   const session = await client.checkout.createSession({
     productId,
     currency: config.currency,
@@ -229,6 +269,7 @@ async function handleStrategyCheckout(
       subscription_id: subscriptionId,
       subscriber_id: subscriberId,
       author_id: publication.author_id,
+      user_id: user.id,
     },
     orderMerchantExternalId: ref,
     language: localeOf(body.locale),
@@ -392,6 +433,15 @@ async function handleWebhook(req: IncomingMessage, res: ServerResponse): Promise
       patch.expiresAt = data.currentPeriodEnd;
     }
     upsertLicense(ref, patch);
+    await notifyLicense({
+      ref,
+      userId: data.orderMetadata?.user_id ?? null,
+      plan: planId === "arbitrage" || planId === "strategy" ? planId : null,
+      status,
+      email: data.buyerEmail ?? null,
+      orderId: data.orderId ?? null,
+      currentPeriodEnd: data.currentPeriodEnd ?? null,
+    });
     console.log(`[payments] ${event.eventType} → ${ref} (${status})`);
   } else {
     console.log(`[payments] 忽略事件 ${event.eventType}（ref=${ref ?? "无"}）`);
@@ -445,6 +495,57 @@ async function handleSettlementRun(req: IncomingMessage, res: ServerResponse): P
   }
 
   sendJson(res, 200, { period: period ?? null, results });
+}
+
+function requireInternal(req: IncomingMessage, res: ServerResponse): boolean {
+  const header = req.headers["x-internal-token"];
+  const value = Array.isArray(header) ? header[0] : header;
+  const expected = Buffer.from(config.accountsInternalToken);
+  const actual = Buffer.from(value ?? "");
+  if (expected.length !== actual.length || !timingSafeEqual(expected, actual)) {
+    sendJson(res, 401, { error: "forbidden", message: "内部接口需要有效令牌" });
+    return false;
+  }
+  return true;
+}
+
+interface CancelBody {
+  order_id?: unknown;
+}
+
+/** 账号服务代用户取消订阅；Pancake 返回 canceling 后由 webhook 落最终状态。 */
+async function handleCancelSubscription(
+  req: IncomingMessage,
+  res: ServerResponse,
+): Promise<void> {
+  if (!requireInternal(req, res)) {
+    return;
+  }
+  const raw = await readRaw(req, 32 * 1024);
+  const body = raw ? (JSON.parse(raw) as CancelBody) : {};
+  const orderId = text(body.order_id);
+  if (!orderId) {
+    sendJson(res, 400, { error: "invalid_request", message: "order_id 为必填" });
+    return;
+  }
+  if (!client) {
+    sendJson(res, 503, {
+      error: "payments_not_configured",
+      message: "服务端未配置 WAFFO_PRIVATE_KEY，无法取消订阅",
+    });
+    return;
+  }
+
+  try {
+    const result = await client.orders.cancelSubscription({ orderId });
+    console.log(`[payments] 取消订阅 ${orderId} → ${result.status}`);
+    sendJson(res, 200, result);
+  } catch (error) {
+    sendJson(res, 502, {
+      error: "cancel_failed",
+      message: error instanceof Error ? error.message : "取消订阅失败",
+    });
+  }
 }
 
 const server = createServer((req, res) => {
@@ -508,6 +609,11 @@ const server = createServer((req, res) => {
 
       if (req.method === "POST" && pathname === "/api/market/settlements/run") {
         await handleSettlementRun(req, res);
+        return;
+      }
+
+      if (req.method === "POST" && pathname === "/api/subscriptions/cancel") {
+        await handleCancelSubscription(req, res);
         return;
       }
 

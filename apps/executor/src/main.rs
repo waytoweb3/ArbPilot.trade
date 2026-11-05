@@ -7,6 +7,7 @@ mod exchange;
 mod funding;
 mod gateway;
 mod http_client;
+mod license;
 mod llm;
 mod market;
 mod news;
@@ -34,9 +35,6 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = config::Config::from_env()?;
-    if !config.allow_live_trading {
-        tracing::warn!("实盘下单未开启：设置 ARBPILOT_ALLOW_LIVE_TRADING=true 后才会向交易所提交订单");
-    }
     if config.api_token == "dev-local-token" {
         tracing::warn!("正在使用默认访问令牌，正式部署前请设置 ARBPILOT_API_TOKEN");
     }
@@ -52,7 +50,6 @@ async fn main() -> anyhow::Result<()> {
         .context("绑定执行器端口失败")?;
     tracing::info!(
         addr = %config.bind_addr,
-        live_trading = config.allow_live_trading,
         "ArbPilot 执行器已启动"
     );
 

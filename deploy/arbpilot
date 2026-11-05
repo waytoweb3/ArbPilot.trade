@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# ArbPilot 执行器管理命令，由 deploy/bootstrap.sh 安装到 /usr/local/bin/arbpilot。
+set -euo pipefail
+
+INSTALL_DIR="${ARBPILOT_INSTALL_DIR:-/opt/arbpilot}"
+COMPOSE_FILE="$INSTALL_DIR/deploy/docker-compose.yml"
+ENV_FILE="$INSTALL_DIR/deploy/.env"
+PORT="${ARBPILOT_EXECUTOR_PORT:-8787}"
+
+log() { printf '\033[1;36m[arbpilot]\033[0m %s\n' "$*"; }
+fail() {
+  printf '\033[1;31m[arbpilot]\033[0m %s\n' "$*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<'EOF'
+用法：arbpilot <命令>
+
+  update                  读取最新发布版本并升级执行器（等同重新执行安装脚本）
+  status                  查看容器状态、已安装版本与健康检查
+  logs [服务] [选项]      查看日志，默认 executor，例如 arbpilot logs -f
+  token                   打印执行器访问令牌
+  restart                 重启执行器
+  version                 当前已安装版本
+EOF
+}
+
+command_name="${1:-}"
+[ -n "$command_name" ] || {
+  usage
+  exit 1
+}
+shift
+
+[ -f "$COMPOSE_FILE" ] ||
+  fail "找不到 $COMPOSE_FILE，请先执行一次远程安装命令"
+
+if [ "$(id -u)" -eq 0 ]; then
+  SUDO=""
+else
+  SUDO="sudo"
+fi
+
+compose() {
+  $SUDO docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" "$@"
+}
+
+case "$command_name" in
+  update)
+    [ -f "$INSTALL_DIR/deploy/bootstrap.sh" ] ||
+      fail "安装目录缺少 deploy/bootstrap.sh，请重新执行一次远程安装命令"
+    if [ "$(id -u)" -eq 0 ]; then
+      bash "$INSTALL_DIR/deploy/bootstrap.sh"
+    else
+      sudo bash "$INSTALL_DIR/deploy/bootstrap.sh"
+    fi
+    ;;
+  status)
+    compose ps
+    printf '\n已安装版本：%s\n' "$(cat "$INSTALL_DIR/.arbpilot-version" 2>/dev/null || echo 未知)"
+    if command -v curl >/dev/null 2>&1; then
+      if curl -fsS --max-time 3 "http://127.0.0.1:${PORT}/api/v1/health"; then
+        printf '\n'
+      else
+        printf '健康检查未通过：http://127.0.0.1:%s/api/v1/health\n' "$PORT"
+      fi
+    fi
+    ;;
+  logs)
+    service="executor"
+    if [ $# -gt 0 ] && [ "${1#-}" = "$1" ]; then
+      service="$1"
+      shift
+    fi
+    compose logs --tail 200 "$@" "$service"
+    ;;
+  token)
+    [ -f "$ENV_FILE" ] || fail "找不到 $ENV_FILE，请先执行一次安装脚本"
+    $SUDO sed -n 's/^ARBPILOT_API_TOKEN=//p' "$ENV_FILE" | head -n 1
+    ;;
+  restart)
+    log "重启执行器"
+    compose restart executor
+    ;;
+  version)
+    cat "$INSTALL_DIR/.arbpilot-version" 2>/dev/null || fail "未找到版本文件"
+    ;;
+  *)
+    usage
+    exit 1
+    ;;
+esac

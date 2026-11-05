@@ -1,4 +1,4 @@
-import { Plus, RefreshCw, Trash2, Wallet } from "lucide-react";
+import { RefreshCw, ShieldAlert, Trash2, Wallet } from "lucide-react";
 import { useMemo, useState, type FormEvent } from "react";
 
 import {
@@ -18,7 +18,7 @@ import { Badge } from "./ui/badge";
 import { Button } from "./ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "./ui/card";
 
-/** CEX 用 API Key 签名，DEX 只用钱包地址查询公开接口。 */
+/** CEX 用 API Key 签名；DEX 用钱包地址查询余额，用签名私钥下单。 */
 const VENUES: { id: AccountVenue; kind: AccountKind }[] = [
   { id: "binance", kind: "api_key" },
   { id: "okx", kind: "api_key" },
@@ -66,10 +66,6 @@ export function AccountsPanel() {
           <CardTitle>{t.accounts.title}</CardTitle>
           <CardDescription>{t.accounts.subtitle}</CardDescription>
         </div>
-        <Button size="sm" onClick={() => setDialogOpen(true)}>
-          <Plus size={14} />
-          {t.accounts.import}
-        </Button>
       </CardHeader>
       <CardContent className="space-y-5">
         {accounts.isError ? (
@@ -186,7 +182,11 @@ function AccountCard({
             {venueLabel} ·{" "}
             {fmt(account.kind === "wallet" ? t.accounts.walletLabel : t.accounts.keyLabel, {
               value: account.api_key_preview,
-            })}
+            })}{" "}
+            ·{" "}
+            <span className={account.can_trade ? "text-success" : "text-subtle"}>
+              {account.can_trade ? t.accounts.tradeEnabled : t.accounts.readOnly}
+            </span>
           </p>
         </div>
         <Badge tone={failed ? "danger" : snapshot ? "success" : "neutral"}>
@@ -254,16 +254,36 @@ function ImportAccountDialog({ onClose }: { onClose: () => void }) {
   const [apiSecret, setApiSecret] = useState("");
   const [passphrase, setPassphrase] = useState("");
   const [walletAddress, setWalletAddress] = useState("");
+  const [signerKey, setSignerKey] = useState("");
+  const [keyIndex, setKeyIndex] = useState("");
+  const [accountIndex, setAccountIndex] = useState("");
   const [error, setError] = useState<string | null>(null);
 
   const kind = VENUES.find((item) => item.id === venue)?.kind ?? "api_key";
   const needsWallet = kind === "wallet";
   const needsPassphrase = venue === "okx" || venue === "bitget";
-  const canSubmit = needsWallet
-    ? walletAddress.trim().length > 0
-    : apiKey.trim().length > 0 &&
-      apiSecret.trim().length > 0 &&
-      (!needsPassphrase || passphrase.trim().length > 0);
+  const isLighter = venue === "lighter";
+  const parsedKeyIndex = parseIndex(keyIndex);
+  const parsedAccountIndex = parseIndex(accountIndex);
+  const indexInvalid =
+    isLighter &&
+    ((keyIndex.trim().length > 0 && parsedKeyIndex === undefined) ||
+      (accountIndex.trim().length > 0 && parsedAccountIndex === undefined));
+  // 与执行器的导入校验保持一致：Hyperliquid 32 字节、Lighter API Key 40 字节。
+  const signerKeyInvalid =
+    needsWallet &&
+    signerKey.trim().length > 0 &&
+    !(venue === "lighter"
+      ? /^(0x)?[0-9a-fA-F]{80}$/.test(signerKey.trim())
+      : /^(0x)?[0-9a-fA-F]{64}$/.test(signerKey.trim()));
+  const canSubmit =
+    (needsWallet
+      ? walletAddress.trim().length > 0 && signerKey.trim().length > 0
+      : apiKey.trim().length > 0 &&
+        apiSecret.trim().length > 0 &&
+        (!needsPassphrase || passphrase.trim().length > 0)) &&
+    !indexInvalid &&
+    !signerKeyInvalid;
 
   const submit = (event: FormEvent) => {
     event.preventDefault();
@@ -279,6 +299,10 @@ function ImportAccountDialog({ onClose }: { onClose: () => void }) {
         api_secret: needsWallet ? undefined : apiSecret.trim(),
         passphrase: needsPassphrase ? passphrase.trim() : undefined,
         wallet_address: needsWallet ? walletAddress.trim() : undefined,
+        // DEX 必须提供私钥才能签名下单，导入时即校验。
+        signer_key: needsWallet ? signerKey.trim() : undefined,
+        key_index: isLighter ? parsedKeyIndex : undefined,
+        account_index: isLighter ? parsedAccountIndex : undefined,
       },
       {
         onSuccess: onClose,
@@ -327,22 +351,82 @@ function ImportAccountDialog({ onClose }: { onClose: () => void }) {
           </label>
 
           {needsWallet ? (
-            <label className="block space-y-1.5">
-              <span className="text-xs text-muted">
-                {venue === "lighter" ? t.accounts.lighterAddress : t.accounts.walletAddress}
-              </span>
-              <input
-                className={`${inputClass} font-mono`}
-                value={walletAddress}
-                onChange={(event) => setWalletAddress(event.target.value)}
-                placeholder={venue === "lighter" ? "0x… / 12345" : "0x…"}
-                autoComplete="off"
-                spellCheck={false}
-              />
-              <span className="block text-[11px] leading-relaxed text-muted">
-                {t.accounts.walletHint}
-              </span>
-            </label>
+            <>
+              <label className="block space-y-1.5">
+                <span className="text-xs text-muted">
+                  {venue === "lighter" ? t.accounts.lighterAddress : t.accounts.walletAddress}
+                </span>
+                <input
+                  className={`${inputClass} font-mono`}
+                  value={walletAddress}
+                  onChange={(event) => setWalletAddress(event.target.value)}
+                  placeholder={venue === "lighter" ? "0x… / 12345" : "0x…"}
+                  autoComplete="off"
+                  spellCheck={false}
+                />
+                <span className="block text-[11px] leading-relaxed text-muted">
+                  {t.accounts.walletHint}
+                </span>
+              </label>
+
+              <label className="block space-y-1.5">
+                <span className="text-xs text-muted">{t.accounts.signerKey}</span>
+                <input
+                  className={`${inputClass} font-mono`}
+                  type="password"
+                  value={signerKey}
+                  onChange={(event) => setSignerKey(event.target.value)}
+                  placeholder={t.accounts.signerKeyPlaceholder}
+                  autoComplete="off"
+                  spellCheck={false}
+                />
+                <span className="block text-[11px] leading-relaxed text-muted">
+                  {venue === "lighter" ? t.accounts.signerKeyLighterHint : t.accounts.signerKeyHint}
+                </span>
+                {signerKeyInvalid && (
+                  <span className="block text-[11px] text-danger">
+                    {t.accounts.signerKeyInvalid}
+                  </span>
+                )}
+              </label>
+
+              {isLighter && (
+                <div className="grid grid-cols-2 gap-3">
+                  <label className="block space-y-1.5">
+                    <span className="text-xs text-muted">{t.accounts.lighterKeyIndex}</span>
+                    <input
+                      className={`${inputClass} font-mono`}
+                      value={keyIndex}
+                      onChange={(event) => setKeyIndex(event.target.value)}
+                      placeholder="0"
+                      inputMode="numeric"
+                      autoComplete="off"
+                    />
+                  </label>
+                  <label className="block space-y-1.5">
+                    <span className="text-xs text-muted">{t.accounts.lighterAccountIndex}</span>
+                    <input
+                      className={`${inputClass} font-mono`}
+                      value={accountIndex}
+                      onChange={(event) => setAccountIndex(event.target.value)}
+                      placeholder={t.accounts.lighterAccountIndexPlaceholder}
+                      inputMode="numeric"
+                      autoComplete="off"
+                    />
+                  </label>
+                </div>
+              )}
+              {indexInvalid && (
+                <p className="text-[11px] text-danger">{t.accounts.indexInvalid}</p>
+              )}
+
+              <div className="flex gap-2 rounded-lg border border-warning/30 bg-warning/10 px-3 py-2">
+                <ShieldAlert size={14} className="mt-0.5 shrink-0 text-warning" />
+                <p className="text-[11px] leading-relaxed text-warning">
+                  {t.accounts.signerSecurity}
+                </p>
+              </div>
+            </>
           ) : (
             <>
               <label className="block space-y-1.5">
@@ -403,6 +487,15 @@ function ImportAccountDialog({ onClose }: { onClose: () => void }) {
       </div>
     </div>
   );
+}
+
+function parseIndex(raw: string): number | undefined {
+  const text = raw.trim();
+  if (!text) {
+    return undefined;
+  }
+  const value = Number(text);
+  return Number.isInteger(value) && value >= 0 ? value : undefined;
 }
 
 function computeChange(points: EquityPoint[]): { pct: number } | null {

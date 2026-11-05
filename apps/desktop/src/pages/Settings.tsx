@@ -1,24 +1,40 @@
 import { useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { Users, Wallet } from "lucide-react";
 
 import { Badge } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "../components/ui/card";
 import { BillingCard } from "../components/BillingCard";
+import { checkAppUpdate, currentAppVersion, relaunchApp } from "../lib/appUpdate";
+import type { DownloadProgress, PendingUpdate } from "../lib/appUpdate";
+import { isDesktopRuntime } from "../lib/deploy";
 import {
+  useCreateMarketAuthor,
+  useCreateSettlement,
   useCreateTelegramPairing,
+  useMarketAuthors,
   useRevokeTelegramBinding,
   useRiskLimits,
+  useSettlements,
   useTelegramStatus,
+  useUpdateMarketAuthor,
   useUpdateRiskLimits,
+  useUpdateSettlement,
 } from "../hooks/useApi";
 import { DEFAULT_TOKEN, getApiToken, getExecutorUrl, isLocalExecutor, setApiToken, setExecutorUrl } from "../lib/api";
-import { formatDateTime } from "../lib/format";
+import { formatDateTime, formatUsd } from "../lib/format";
 import { fmt, useI18n } from "../lib/i18n";
-import type { RiskLimits } from "../lib/types";
+import type { RiskLimits, SettlementStatus } from "../lib/types";
+import { cn } from "../lib/utils";
 
 const inputClass =
   "w-full rounded-lg border border-line-strong bg-panel-soft px-3 py-2 text-sm text-fg outline-none transition-colors focus:border-accent/60";
+
+const smallInputClass =
+  "w-full rounded-md border border-line bg-panel-soft px-2 py-1 text-xs text-body outline-none focus:border-accent/60";
+
+type SettingsTab = "connection" | "risk" | "account" | "author" | "notify" | "client";
 
 export default function SettingsPage() {
   const queryClient = useQueryClient();
@@ -27,6 +43,7 @@ export default function SettingsPage() {
   const [saved, setSaved] = useState(false);
   const local = isLocalExecutor();
   const { t } = useI18n();
+  const [tab, setTab] = useState<SettingsTab>("connection");
 
   const save = () => {
     const changed = address.trim().replace(/\/$/, "") !== getExecutorUrl();
@@ -41,6 +58,15 @@ export default function SettingsPage() {
     window.setTimeout(() => setSaved(false), 2_000);
   };
 
+  const tabs: { id: SettingsTab; label: string }[] = [
+    { id: "connection", label: t.settings.tabConnection },
+    { id: "risk", label: t.settings.tabRisk },
+    { id: "account", label: t.settings.tabAccount },
+    { id: "author", label: t.settings.tabAuthor },
+    { id: "notify", label: t.settings.tabNotify },
+    { id: "client", label: t.settings.tabClient },
+  ];
+
   return (
     <div className="space-y-6">
       <header>
@@ -48,7 +74,25 @@ export default function SettingsPage() {
         <p className="mt-1 text-sm text-muted">{t.settings.subtitle}</p>
       </header>
 
-      <div className="grid gap-4 xl:grid-cols-2">
+      <div className="flex flex-wrap gap-1.5">
+        {tabs.map((item) => (
+          <button
+            key={item.id}
+            type="button"
+            onClick={() => setTab(item.id)}
+            className={cn(
+              "rounded-lg border px-3 py-1.5 text-xs transition-colors",
+              tab === item.id
+                ? "border-accent/40 bg-accent/10 font-medium text-fg"
+                : "border-line text-muted hover:bg-hover hover:text-body",
+            )}
+          >
+            {item.label}
+          </button>
+        ))}
+      </div>
+
+      {tab === "connection" && (
         <Card>
           <CardHeader>
             <div>
@@ -89,31 +133,422 @@ export default function SettingsPage() {
             <p className="text-[11px] leading-relaxed text-muted">{t.settings.tokenNote}</p>
           </CardContent>
         </Card>
+      )}
 
-        <RiskLimitsCard />
-      </div>
+      {tab === "risk" && <RiskLimitsCard />}
 
-      <BillingCard />
+      {tab === "account" && <BillingCard />}
 
-      <TelegramCard />
+      {tab === "author" && <AuthorSettings />}
 
-      <Card>
-        <CardHeader>
-          <div>
-            <CardTitle>{t.settings.security}</CardTitle>
-            <CardDescription>{t.settings.securityDesc}</CardDescription>
-          </div>
-        </CardHeader>
-        <CardContent>
-          <ul className="list-disc space-y-1.5 pl-5 text-xs leading-relaxed text-muted">
-            <li>{t.settings.security1}</li>
-            <li>{t.settings.security2}</li>
-            <li>{t.settings.security3}</li>
-            <li>{t.settings.security4}</li>
-          </ul>
-        </CardContent>
-      </Card>
+      {tab === "notify" && <TelegramCard />}
+
+      {tab === "client" && (
+        <div className="space-y-4">
+          <ClientUpdateCard />
+          <Card>
+            <CardHeader>
+              <div>
+                <CardTitle>{t.settings.security}</CardTitle>
+                <CardDescription>{t.settings.securityDesc}</CardDescription>
+              </div>
+            </CardHeader>
+            <CardContent>
+              <ul className="list-disc space-y-1.5 pl-5 text-xs leading-relaxed text-muted">
+                <li>{t.settings.security1}</li>
+                <li>{t.settings.security2}</li>
+                <li>{t.settings.security3}</li>
+                <li>{t.settings.security4}</li>
+              </ul>
+            </CardContent>
+          </Card>
+        </div>
+      )}
     </div>
+  );
+}
+
+/** 作者卡片与结算都只处理平台账户 ID，不接触私钥或银行账号。 */
+function AuthorSettings() {
+  const { t } = useI18n();
+  const copy = t.market;
+  const authors = useMarketAuthors();
+  const createAuthor = useCreateMarketAuthor();
+  const updateAuthor = useUpdateMarketAuthor();
+  const createSettlement = useCreateSettlement();
+  const updateSettlement = useUpdateSettlement();
+
+  const [selectedId, setSelectedId] = useState("");
+  const active =
+    authors.data?.find((author) => author.author_id === selectedId) ?? authors.data?.[0] ?? null;
+  const activeId = active?.author_id ?? "";
+  const settlements = useSettlements(activeId || undefined);
+
+  const [form, setForm] = useState({
+    display_name: "",
+    headline: "",
+    bio: "",
+    payout_account: "",
+  });
+
+  // 切换作者或保存成功后，用最新数据回填表单。
+  useEffect(() => {
+    if (!active) {
+      return;
+    }
+    setForm({
+      display_name: active.display_name,
+      headline: active.headline,
+      bio: active.bio,
+      payout_account: active.payout_account ?? "",
+    });
+  }, [active?.author_id, active?.updated_at]);
+
+  const pending = createAuthor.isPending || updateAuthor.isPending;
+  const error = [createAuthor.error, updateAuthor.error, createSettlement.error, updateSettlement.error]
+    .find(Boolean);
+
+  const saveAuthor = () => {
+    const name = form.display_name.trim();
+    if (!name || pending) {
+      return;
+    }
+    const body = {
+      display_name: name,
+      headline: form.headline,
+      bio: form.bio,
+      payout_account: form.payout_account || undefined,
+    };
+    if (active) {
+      updateAuthor.mutate({ id: active.author_id, body });
+    } else {
+      createAuthor.mutate(body);
+    }
+  };
+
+  const settlementTone: Record<SettlementStatus, "success" | "warning" | "danger"> = {
+    pending: "warning",
+    paid: "success",
+    disputed: "danger",
+  };
+
+  const settlementLabel: Record<SettlementStatus, string> = {
+    pending: copy.statusPending,
+    paid: copy.statusPaid,
+    disputed: copy.statusDisputed,
+  };
+
+  return (
+    <div className="space-y-4">
+      {error && (
+        <p className="rounded-lg border border-danger/30 bg-danger/10 px-3 py-2 text-xs text-danger">
+          {fmt(copy.actionFailed, {
+            message: error instanceof Error ? error.message : String(error),
+          })}
+        </p>
+      )}
+
+      <div className="grid gap-4 xl:grid-cols-2">
+        <Card>
+          <CardHeader>
+            <div className="flex items-center gap-2">
+              <Users size={15} className="text-accent" />
+              <div>
+                <CardTitle>{copy.authorsTitle}</CardTitle>
+                <CardDescription>{copy.authorsDesc}</CardDescription>
+              </div>
+            </div>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            {authors.data?.length ? (
+              <div className="flex flex-wrap gap-2">
+                {authors.data.map((author) => (
+                  <button
+                    key={author.author_id}
+                    type="button"
+                    onClick={() => setSelectedId(author.author_id)}
+                    className={cn(
+                      "rounded-lg border px-3 py-2 text-left text-xs transition-colors",
+                      author.author_id === activeId
+                        ? "border-accent/50 bg-accent/5"
+                        : "border-line hover:bg-hover",
+                    )}
+                  >
+                    <span className="block font-medium text-fg">{author.display_name}</span>
+                    {author.headline && (
+                      <span className="block text-[11px] text-muted">{author.headline}</span>
+                    )}
+                  </button>
+                ))}
+              </div>
+            ) : (
+              <p className="text-xs text-muted">{copy.authorsEmpty}</p>
+            )}
+
+            <div className="grid gap-2 sm:grid-cols-2">
+              <label className="text-[11px] text-muted">
+                {copy.displayName}
+                <input
+                  className={smallInputClass}
+                  value={form.display_name}
+                  onChange={(event) => setForm({ ...form, display_name: event.target.value })}
+                />
+              </label>
+              <label className="text-[11px] text-muted">
+                {copy.headline}
+                <input
+                  className={smallInputClass}
+                  value={form.headline}
+                  onChange={(event) => setForm({ ...form, headline: event.target.value })}
+                />
+              </label>
+              <label className="text-[11px] text-muted sm:col-span-2">
+                {copy.bio}
+                <textarea
+                  className={cn(smallInputClass, "min-h-16")}
+                  value={form.bio}
+                  onChange={(event) => setForm({ ...form, bio: event.target.value })}
+                />
+              </label>
+              <label className="text-[11px] text-muted sm:col-span-2">
+                {copy.payout}
+                <input
+                  className={smallInputClass}
+                  placeholder={copy.payoutHint}
+                  value={form.payout_account}
+                  onChange={(event) => setForm({ ...form, payout_account: event.target.value })}
+                />
+              </label>
+            </div>
+            <Button
+              size="sm"
+              disabled={!form.display_name.trim() || pending}
+              onClick={saveAuthor}
+            >
+              {pending ? copy.creating : copy.saveAuthor}
+            </Button>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <div className="flex items-center gap-2">
+              <Wallet size={15} className="text-accent" />
+              <div>
+                <CardTitle>{copy.settlementsTitle}</CardTitle>
+                <CardDescription>
+                  {copy.settlementsDesc.replace(
+                    "{bps}",
+                    String(settlements.data?.[0]?.platform_fee_bps ?? 2000),
+                  )}
+                </CardDescription>
+              </div>
+            </div>
+            <Button
+              size="sm"
+              variant="secondary"
+              disabled={!activeId || createSettlement.isPending}
+              onClick={() => activeId && createSettlement.mutate({ authorId: activeId })}
+            >
+              {copy.createSettlement}
+            </Button>
+          </CardHeader>
+          <CardContent className="space-y-2">
+            {settlements.data?.length ? (
+              settlements.data.map((settlement) => (
+                <div
+                  key={settlement.id}
+                  className="rounded-lg border border-line px-3 py-2 text-xs"
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-medium text-fg">
+                      {settlement.period} ·{" "}
+                      {fmt(copy.subscriptionCount, { count: settlement.subscription_count })}
+                    </span>
+                    <Badge tone={settlementTone[settlement.status]}>
+                      {settlementLabel[settlement.status]}
+                    </Badge>
+                  </div>
+                  <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-muted">
+                    <span>
+                      {copy.gross} {formatUsd(settlement.gross_usd)}
+                    </span>
+                    <span>
+                      {copy.platformFee} {formatUsd(settlement.platform_fee_usd)}
+                    </span>
+                    <span className="text-body">
+                      {copy.net} {formatUsd(settlement.net_usd)}
+                    </span>
+                  </div>
+                  <div className="mt-1.5 flex gap-1.5">
+                    {settlement.status !== "paid" && (
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        onClick={() =>
+                          updateSettlement.mutate({ id: settlement.id, status: "paid" })
+                        }
+                      >
+                        {copy.markPaid}
+                      </Button>
+                    )}
+                    {settlement.status !== "disputed" && (
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        onClick={() =>
+                          updateSettlement.mutate({ id: settlement.id, status: "disputed" })
+                        }
+                      >
+                        {copy.markDisputed}
+                      </Button>
+                    )}
+                  </div>
+                </div>
+              ))
+            ) : (
+              <p className="text-xs text-muted">{copy.settlementsEmpty}</p>
+            )}
+          </CardContent>
+        </Card>
+      </div>
+    </div>
+  );
+}
+
+
+function ClientUpdateCard() {
+  const { t } = useI18n();
+  const desktop = isDesktopRuntime();
+  const [version, setVersion] = useState("");
+  const [pending, setPending] = useState<PendingUpdate | null>(null);
+  const [checked, setChecked] = useState(false);
+  const [progress, setProgress] = useState<DownloadProgress | null>(null);
+  const [installed, setInstalled] = useState(false);
+  const [busy, setBusy] = useState<"check" | "install" | "restart" | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    currentAppVersion()
+      .then(setVersion)
+      .catch(() => undefined);
+  }, []);
+
+  const check = async () => {
+    setBusy("check");
+    setError(null);
+    setProgress(null);
+    setInstalled(false);
+    try {
+      setPending(await checkAppUpdate());
+      setChecked(true);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const install = async () => {
+    if (!pending) return;
+    setBusy("install");
+    setError(null);
+    try {
+      await pending.install(setProgress);
+      setInstalled(true);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const restart = async () => {
+    setBusy("restart");
+    setError(null);
+    try {
+      await relaunchApp();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+      setBusy(null);
+    }
+  };
+
+  const percent = progress?.total
+    ? Math.min(100, Math.round((progress.downloaded / progress.total) * 100))
+    : null;
+
+  return (
+    <Card>
+      <CardHeader>
+        <div>
+          <CardTitle>{t.settings.update}</CardTitle>
+          <CardDescription>{t.settings.updateDesc}</CardDescription>
+        </div>
+        {version && <Badge tone="neutral">v{version}</Badge>}
+      </CardHeader>
+      <CardContent className="space-y-3">
+        {!desktop ? (
+          <p className="rounded-lg border border-line bg-panel-soft px-3 py-2 text-[11px] text-muted">
+            {t.settings.updateDesktopOnly}
+          </p>
+        ) : (
+          <>
+            <div className="flex flex-wrap items-center gap-3">
+              <Button size="sm" variant="secondary" onClick={check} disabled={busy !== null}>
+                {busy === "check" ? t.settings.updateChecking : t.settings.updateCheck}
+              </Button>
+              {pending && !installed && (
+                <Button size="sm" onClick={install} disabled={busy !== null}>
+                  {busy === "install" ? t.settings.updateInstalling : t.settings.updateAction}
+                </Button>
+              )}
+              {installed && (
+                <Button size="sm" onClick={restart} disabled={busy !== null}>
+                  {busy === "restart" ? t.settings.updateRestarting : t.settings.updateRestart}
+                </Button>
+              )}
+            </div>
+
+            {checked && !pending && (
+              <p className="text-xs text-accent">{t.settings.updateUpToDate}</p>
+            )}
+            {pending && (
+              <div className="rounded-lg border border-line bg-panel-soft px-3 py-2">
+                <p className="text-xs text-body">
+                  {fmt(t.settings.updateAvailable, { version: pending.info.version })}
+                </p>
+                {pending.info.notes && (
+                  <p className="mt-1 whitespace-pre-wrap text-[11px] leading-relaxed text-muted">
+                    {pending.info.notes}
+                  </p>
+                )}
+              </div>
+            )}
+            {progress && (
+              <div className="space-y-1">
+                <div className="h-1.5 overflow-hidden rounded-full bg-panel-soft">
+                  <div
+                    className="h-full rounded-full bg-accent transition-all"
+                    style={{ width: `${percent ?? 5}%` }}
+                  />
+                </div>
+                <p className="text-[11px] text-muted">
+                  {percent !== null
+                    ? fmt(t.settings.updatePercent, { value: percent })
+                    : t.settings.updateInstalling}
+                </p>
+              </div>
+            )}
+            {installed && <p className="text-xs text-accent">{t.settings.updateInstalled}</p>}
+            {error && (
+              <p className="text-xs text-danger">{fmt(t.settings.updateFailed, { message: error })}</p>
+            )}
+            <p className="text-[11px] leading-relaxed text-muted">{t.settings.updateNote}</p>
+          </>
+        )}
+      </CardContent>
+    </Card>
   );
 }
 

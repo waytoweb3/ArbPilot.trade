@@ -177,6 +177,9 @@ pub async fn save_code(
 pub struct GenerateCodeRequest {
     /// 自然语言描述，例如「当资金费率高于 5 bps 时开仓，持仓超过 8 小时平仓」。
     pub prompt: String,
+    /// 多轮对话历史；为空时等价于一次性描述。
+    #[serde(default)]
+    pub history: Vec<llm::ChatTurn>,
 }
 
 /// 根据自然语言描述生成源码并保存；不会自动编译或部署。
@@ -194,10 +197,14 @@ pub async fn generate_code(
         return Err(ApiError::BadRequest("请填写策略描述".to_string()));
     }
 
+    // 带上已有代码，让 AI 在现有逻辑上继续修改，而不是每次从零重写。
+    let current = state.store.strategy_code(id).await;
     let generated = llm::generate(
         state.config.as_ref(),
         prompt,
         &describe(&record),
+        current.as_ref().map(|code| code.source.as_str()),
+        &body.history,
     )
     .await
     .map_err(|message| {

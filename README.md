@@ -51,7 +51,6 @@ pnpm dev:desktop
 |---|---|---|
 | `ARBPILOT_BIND_ADDR` | `127.0.0.1:8787` | 执行器监听地址 |
 | `ARBPILOT_API_TOKEN` | `dev-local-token` | 执行器访问令牌，正式部署必须修改 |
-| `ARBPILOT_ALLOW_LIVE_TRADING` | `false` | 真实交易开关 |
 | `ARBPILOT_RISK_FILE` | `data/risk_limits.json` | 设置页修改的风控限额，存在时优先于环境变量 |
 | `DATABASE_URL` | 空 | 未配置时执行器以内存模式运行 |
 | `ARBPILOT_FUNDING_ENABLED` | `true` | 资金费率采集开关，设为 `false` 关闭 |
@@ -59,6 +58,7 @@ pnpm dev:desktop
 | `ARBPILOT_FUNDING_POLL_SECS` | `60` | 增量采集间隔（秒），最小 15 |
 | `ARBPILOT_BINANCE_FAPI_URL` | `https://fapi.binance.com` | Binance 合约公开行情地址，可指向镜像或本地桩 |
 | `VITE_EXECUTOR_URL` | `http://127.0.0.1:8787` | 桌面端连接的执行器地址 |
+| `VITE_EXECUTOR_TOKEN` | `dev-local-token` | 桌面端默认访问令牌，官方托管版本构建时注入 |
 
 ## 常用命令
 
@@ -69,7 +69,20 @@ pnpm build                        # 桌面端类型检查 + 构建
 pnpm db:up                        # 用 Docker Compose 启动 PostgreSQL
 ```
 
-服务器部署：编辑 `deploy/.env`（或导出环境变量）后执行
+服务器部署：不需要在服务器上敲命令。客户端左侧「文档」页填服务器 IP、账号与密码（或私钥），点「一键部署」即可自动下载发布包、装 Docker、启动执行器与 PostgreSQL，并回填访问令牌；有新版本时同一页点「更新」。也可以登录服务器执行一条命令部署（同样会一并启动 PostgreSQL）：
+
+```bash
+curl -fsSL https://download.arbpilot.trade/executor/install.sh | sudo bash
+sudo arbpilot update    # 后续升级，保留令牌与数据
+```
+
+完整的购买选型、连接与运维步骤见 [自托管部署指南](./docs/自托管部署指南.md)。
+
+发布新版本：`bash deploy/package.sh`，把 `dist/release/` 下的 tar.gz、`manifest.json` 与 `install.sh` 上传到 `https://download.arbpilot.trade/executor/`，客户端即可检查到更新。
+
+客户端自身的更新走独立发布源：`bash deploy/package-desktop.sh` 生成带签名的安装包与 `latest.json`，上传到 `https://download.arbpilot.trade/desktop/` 后，用户在「设置 → 客户端更新 → 检查更新」即可一键升级并重启。
+
+也可以手动执行：
 
 ```bash
 docker compose -f deploy/docker-compose.yml up -d
@@ -79,10 +92,10 @@ docker compose -f deploy/docker-compose.yml up -d
 
 ## 当前实现边界
 
-- 行情与账户余额取自真实交易所公开/私有接口；下单需显式开启 `ARBPILOT_ALLOW_LIVE_TRADING`，CEX 侧已覆盖 Binance / Aster / OKX / Bybit / Bitget / Gate / HTX / MEXC / BingX 的 USDT 本位永续；Hyperliquid、Lighter 目前仅支持钱包地址只读查询，下单需钱包私钥签名。
+- 行情与账户余额取自真实交易所公开/私有接口；订单经统一风控后直接提交到真实交易所，已覆盖 Binance / Aster / OKX / Bybit / Bitget / Gate / HTX / MEXC / BingX 的 USDT 本位永续；Hyperliquid 与 Lighter 用钱包地址查询余额，填入签名私钥（Hyperliquid API Wallet、Lighter API Key）后同样在本机签名下单。
 - Binance 资金费率走公开接口（无需 API Key）：首次启动回填历史，但只保留最近 1 个月的结算记录（超期数据定期清理），之后按结算时间增量入库；未配置 `DATABASE_URL` 时只保留内存数据，重启即丢。
 - 风控、幂等、双腿补偿状态机、订阅不影响仓位管理等约束已在核心层实现。
-- 策略沙箱（WASM）、Telegram、自动更新、订阅支付尚未接入，按路线图留在后续阶段。
+- 策略沙箱（WASM）、Telegram、订阅支付尚未接入；执行器与桌面客户端都已支持「检查更新 + 一键升级」。
 
 ## 安全约定
 

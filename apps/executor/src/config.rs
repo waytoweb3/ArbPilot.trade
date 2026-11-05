@@ -9,8 +9,6 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub struct Config {
     pub bind_addr: SocketAddr,
     pub api_token: String,
-    /// 实盘下单总开关；默认关闭，需显式设置 ARBPILOT_ALLOW_LIVE_TRADING=true。
-    pub allow_live_trading: bool,
     pub database_url: Option<String>,
     pub risk: RiskLimits,
     pub funding_enabled: bool,
@@ -102,6 +100,8 @@ pub struct Config {
     pub accounts_poll_secs: u64,
     /// 策略运行时评估间隔（秒）。
     pub strategy_poll_secs: u64,
+    /// 是否为官方托管执行器：只运行发布到市场的策略。
+    pub hosted: bool,
     /// WASM 策略沙箱的默认资源限额。
     pub sandbox: SandboxLimits,
     /// 策略市场平台服务费（bps），用于作者结算。
@@ -113,6 +113,14 @@ pub struct Config {
     pub llm_model: String,
     /// AI 请求超时（秒）。
     pub llm_timeout_secs: u64,
+    /// 是否强制校验付费授权令牌；默认关闭，便于本地开发与自托管免费使用。
+    pub license_required: bool,
+    /// 账号服务 Ed25519 公钥：32 字节原始键或 SPKI DER 的 base64。
+    pub license_public_key: Option<String>,
+    /// 授权过期后的离线宽限小时数。
+    pub license_grace_hours: u64,
+    /// 授权令牌本地保存路径，文件权限固定为 600。
+    pub license_file: PathBuf,
 }
 
 impl Config {
@@ -123,10 +131,6 @@ impl Config {
             .unwrap_or_else(|_| "127.0.0.1:8787".to_string())
             .parse()
             .context("ARBPILOT_BIND_ADDR 不是合法地址")?;
-
-        let allow_live_trading = env::var("ARBPILOT_ALLOW_LIVE_TRADING")
-            .map(|value| value.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
 
         let api_token = env::var("ARBPILOT_API_TOKEN").unwrap_or_else(|_| "dev-local-token".into());
 
@@ -338,6 +342,10 @@ impl Config {
             .unwrap_or_else(|_| "15".to_string())
             .parse()
             .context("解析 ARBPILOT_STRATEGY_POLL_SECS 失败")?;
+        // 官方托管实例只运行已发布到市场的策略；自托管实例只运行用户自己的策略。
+        let hosted = env::var("ARBPILOT_HOSTED")
+            .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false);
 
         let mut sandbox = SandboxLimits::default();
         if let Ok(value) = env::var("ARBPILOT_SANDBOX_MAX_FUEL") {
@@ -360,7 +368,7 @@ impl Config {
 
         // AI 只负责生成沙箱源码；源码仍需编译、校验并由用户确认后部署。
         let llm_base_url = env::var("ARBPILOT_LLM_BASE_URL")
-            .unwrap_or_else(|_| "https://api.openai.com/v1".to_string())
+            .unwrap_or_else(|_| "https://api.deepseek.com/v1".to_string())
             .trim_end_matches('/')
             .to_string();
         let llm_api_key = env::var("ARBPILOT_LLM_API_KEY")
@@ -368,16 +376,31 @@ impl Config {
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
         let llm_model =
-            env::var("ARBPILOT_LLM_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
+            env::var("ARBPILOT_LLM_MODEL").unwrap_or_else(|_| "deepseek-v4-flash".to_string());
         let llm_timeout_secs = env::var("ARBPILOT_LLM_TIMEOUT_SECS")
             .unwrap_or_else(|_| "60".to_string())
             .parse()
             .context("解析 ARBPILOT_LLM_TIMEOUT_SECS 失败")?;
 
+        // 授权校验默认关闭：只有官方托管或需要按套餐限制时才打开。
+        let license_required = env::var("ARBPILOT_LICENSE_REQUIRED")
+            .map(|value| value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let license_public_key = env::var("ARBPILOT_LICENSE_PUBLIC_KEY")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let license_grace_hours = env::var("ARBPILOT_LICENSE_GRACE_HOURS")
+            .unwrap_or_else(|_| "72".to_string())
+            .parse()
+            .context("解析 ARBPILOT_LICENSE_GRACE_HOURS 失败")?;
+        let license_file = env::var("ARBPILOT_LICENSE_FILE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| accounts_file.with_file_name("license.json"));
+
         Ok(Self {
             bind_addr,
             api_token,
-            allow_live_trading,
             database_url: env::var("DATABASE_URL").ok().filter(|url| !url.is_empty()),
             risk,
             funding_enabled,
@@ -428,12 +451,17 @@ impl Config {
             risk_file,
             accounts_poll_secs,
             strategy_poll_secs,
+            hosted,
             sandbox,
             market_platform_fee_bps,
             llm_base_url,
             llm_api_key,
             llm_model,
             llm_timeout_secs,
+            license_required,
+            license_public_key,
+            license_grace_hours,
+            license_file,
         })
     }
 }

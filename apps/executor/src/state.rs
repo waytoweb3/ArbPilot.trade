@@ -9,8 +9,8 @@ use std::{
 
 use arb_core::{
     CostAssumptions, EntryRules, ExecutionRules, ExitRules, Instrument, OpportunityKind, Order,
-    Position, RiskLimits, StrategyDefinition, StrategyExecutionMode, StrategyRecord, StrategyRisk,
-    StrategySource, StrategyStatus, StrategyUniverse,
+    Position, RiskLimits, StrategyDefinition, StrategyRecord, StrategyRisk, StrategySource,
+    StrategyStatus, StrategyUniverse,
 };
 use chrono::Utc;
 use rust_decimal::Decimal;
@@ -24,6 +24,7 @@ use crate::{
     exchange::{LiveEndpoints, LiveExchange, OkxMarketClient, OKX_VENUE, VENUE},
     funding::FundingFeed,
     http_client::HttpClient,
+    license::LicenseManager,
     market::{MarketFeed, OKX_SPOT_VENUE, SPOT_VENUE},
     news::NewsFeed,
     realtime::RealtimeFeed,
@@ -45,6 +46,8 @@ pub struct AppState {
     pub telegram: Arc<TelegramBot>,
     pub accounts: Arc<Accounts>,
     pub exchange: Arc<LiveExchange>,
+    /// 账号服务签发的授权令牌；只做离线校验，不联网。
+    pub license: Arc<LicenseManager>,
     pub orders: Arc<RwLock<Vec<Order>>>,
     pub positions: Arc<RwLock<Vec<Position>>>,
     pub strategies: Arc<RwLock<Vec<StrategyRecord>>>,
@@ -113,6 +116,8 @@ impl AppState {
             htx: config.htx_base_url.clone(),
             mexc: config.mexc_base_url.clone(),
             bingx: config.bingx_base_url.clone(),
+            hyperliquid: config.hyperliquid_base_url.clone(),
+            lighter: config.lighter_base_url.clone(),
         };
         let accounts = Accounts::start(
             http.clone(),
@@ -138,6 +143,14 @@ impl AppState {
             }
         }
 
+        // 授权令牌在启动时从本地恢复，过期后仍需回桌面端重新登录换取。
+        let license = Arc::new(LicenseManager::start(
+            config.license_required,
+            config.license_public_key.as_deref(),
+            config.license_grace_hours,
+            config.license_file.clone(),
+        ));
+
         let risk_limits = config.risk.clone();
         let state = Self {
             config,
@@ -148,6 +161,7 @@ impl AppState {
             telegram,
             accounts,
             exchange,
+            license,
             orders: Arc::new(RwLock::new(Vec::new())),
             positions: Arc::new(RwLock::new(Vec::new())),
             strategies: Arc::new(RwLock::new(strategies)),
@@ -275,7 +289,6 @@ fn builtin_funding_record(
             max_unhedged_seconds: 3,
         },
         execution: ExecutionRules {
-            mode: StrategyExecutionMode::Live,
             leverage: Decimal::ONE,
             max_slippage_bps: Decimal::from(10),
             cooldown_secs: 300,

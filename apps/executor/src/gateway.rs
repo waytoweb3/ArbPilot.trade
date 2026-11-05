@@ -46,12 +46,6 @@ pub async fn submit_pair(
     state: &AppState,
     request: PairOrderRequest,
 ) -> Result<PairOrderOutcome, ApiError> {
-    if !state.config.allow_live_trading {
-        return Err(ApiError::Conflict(
-            "实盘下单未开启：设置 ARBPILOT_ALLOW_LIVE_TRADING=true 后才会向交易所提交订单"
-                .to_string(),
-        ));
-    }
     if request.notional_usd <= Decimal::ZERO {
         return Err(ApiError::BadRequest("notional_usd 必须大于 0".to_string()));
     }

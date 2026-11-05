@@ -1,7 +1,6 @@
 import type {
   AccountsResponse,
   BacktestReport,
-  BindSandboxRequest,
   Candle,
   CompileStrategyCodeResponse,
   ControlResponse,
@@ -12,8 +11,8 @@ import type {
   Decimal,
   DeployStrategyCodeResponse,
   EquityHistoryResponse,
+  ExecutorLicense,
   LeaderboardEntry,
-  SandboxArtifact,
   SandboxDryRunRequest,
   SandboxRunReport,
   SettlementStatus,
@@ -35,6 +34,7 @@ import type {
   RiskLimits,
   StrategyDefinition,
   StrategyRecord,
+  StrategyRunsResponse,
   StrategySource,
   StrategyStatus,
   StrategyVersion,
@@ -71,7 +71,9 @@ export function isLocalExecutor(): boolean {
 }
 
 const TOKEN_STORAGE_KEY = "arbpilot.executor.token";
-export const DEFAULT_TOKEN = "dev-local-token";
+/** 官方托管模式在构建时注入默认令牌；源码本地运行回退到开发令牌。 */
+export const DEFAULT_TOKEN =
+  (import.meta.env.VITE_EXECUTOR_TOKEN as string | undefined) ?? "dev-local-token";
 
 export function getApiToken(): string {
   return localStorage.getItem(TOKEN_STORAGE_KEY) || DEFAULT_TOKEN;
@@ -184,6 +186,15 @@ export const api = {
       body: JSON.stringify({ definition }),
     }),
 
+  updateStrategyScope: (
+    id: string,
+    body: { spot_venue: string; perp_venue: string; symbols: string[] },
+  ) =>
+    request<StrategyRecord>(`/api/v1/strategies/${id}/scope`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+    }),
+
   validateStrategy: (id: string) =>
     request<StrategyRecord>(`/api/v1/strategies/${id}/validate`, { method: "POST" }),
 
@@ -214,10 +225,14 @@ export const api = {
       body: JSON.stringify(body),
     }),
 
-  generateStrategyCode: (id: string, prompt: string) =>
+  generateStrategyCode: (
+    id: string,
+    prompt: string,
+    history?: { role: "user" | "assistant"; content: string }[],
+  ) =>
     request<StrategyCode>(`/api/v1/strategies/${id}/code/generate`, {
       method: "POST",
-      body: JSON.stringify({ prompt }),
+      body: JSON.stringify({ prompt, history: history ?? [] }),
     }),
 
   compileStrategyCode: (id: string) =>
@@ -229,6 +244,10 @@ export const api = {
     request<DeployStrategyCodeResponse>(`/api/v1/strategies/${id}/code/deploy`, {
       method: "POST",
     }),
+
+  /** 运行实例与事件：策略在哪个交易所组合上跑、跑了多久、期间发生了什么。 */
+  strategyRuns: (id: string) =>
+    request<StrategyRunsResponse>(`/api/v1/strategies/${id}/runs`),
 
   // 策略市场：作者卡片、发布、订阅、表现与结算。
   marketAuthors: () => request<StrategyAuthorCard[]>("/api/v1/market/authors"),
@@ -324,33 +343,12 @@ export const api = {
       body: JSON.stringify({ status, note: note ?? null }),
     }),
 
-  // WASM 沙箱：上传的模块只存在执行器本机，没有 WASI 与任何密钥。
-  sandboxArtifacts: () => request<SandboxArtifact[]>("/api/v1/sandbox/artifacts"),
-
-  uploadSandboxArtifact: (name: string, bytes: ArrayBuffer) =>
-    request<SandboxArtifact>(
-      `/api/v1/sandbox/artifacts?name=${encodeURIComponent(name)}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/octet-stream" },
-        body: bytes,
-      },
-    ),
-
+  // 沙箱试运行：用当前行情快照执行一次已部署的模块，不产生任何订单。
   sandboxDryRun: (artifactId: string, body: SandboxDryRunRequest) =>
     request<SandboxRunReport>(`/api/v1/sandbox/artifacts/${artifactId}/dry-run`, {
       method: "POST",
       body: JSON.stringify(body),
     }),
-
-  bindSandbox: (strategyId: string, body: BindSandboxRequest) =>
-    request<StrategyRecord>(`/api/v1/strategies/${strategyId}/sandbox`, {
-      method: "POST",
-      body: JSON.stringify(body),
-    }),
-
-  unbindSandbox: (strategyId: string) =>
-    request<StrategyRecord>(`/api/v1/strategies/${strategyId}/sandbox`, { method: "DELETE" }),
 
   riskLimits: () => request<RiskLimits>("/api/v1/risk/limits"),
 
@@ -378,6 +376,17 @@ export const api = {
   news: (limit = 200) => request<NewsResponse>(`/api/v1/news?limit=${limit}`),
 
   telegramStatus: () => request<TelegramStatus>("/api/v1/telegram"),
+
+  /** 执行器的离线授权状态；授权令牌由账号服务签发后写入执行器。 */
+  licenseStatus: () => request<ExecutorLicense>("/api/v1/license"),
+
+  installLicense: (token: string) =>
+    request<ExecutorLicense>("/api/v1/license", {
+      method: "POST",
+      body: JSON.stringify({ token }),
+    }),
+
+  clearLicense: () => request<ExecutorLicense>("/api/v1/license", { method: "DELETE" }),
 
   createTelegramPairing: () =>
     request<TelegramPairingCode>("/api/v1/telegram/pairing", { method: "POST" }),

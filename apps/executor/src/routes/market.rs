@@ -9,8 +9,8 @@ use arb_core::{
     compute_settlement_from_gross, period_bounds, publish_readiness, rank_publications,
     settlement_period, LeaderboardEntry, MarketVisibility, PerformanceSource, PublicationStatus,
     RiskLevel, SourceVisibility, StrategyAuthorCard, StrategyChangelogEntry,
-    StrategyPerformanceRecord, StrategyPricing, StrategyPublication, StrategySettlement,
-    StrategySubscription, SubscriptionStatus, ValidationSeverity,
+    StrategyPerformanceRecord, StrategyPricing, StrategyPublication, StrategyRunScope, StrategySettlement,
+    StrategySubscription, StrategyStatus, SubscriptionStatus, ValidationSeverity,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -23,6 +23,8 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::{error::ApiError, state::AppState};
+
+use super::strategies;
 
 // ---------------------------------------------------------------------------
 // 作者卡片
@@ -316,10 +318,25 @@ pub async fn update_publication(
             }
             publication.attach_version(&record, body.changelog_summary);
             publication.status = PublicationStatus::Published;
+
+            // 发布后由平台托管执行器运行：切换运行位置并关闭本地运行实例。
+            record.run_scope = StrategyRunScope::Platform;
+            strategies::close_run(&state, &mut record, StrategyStatus::Stopped).await;
+            strategies::replace(&state, &record);
+            strategies::persist(&state, &record).await;
         }
         Some(PublicationAction::Withdraw) => {
             // 只撤回市场曝光；已有仓位、订单与安全处置能力保持不变。
             publication.status = PublicationStatus::Withdrawn;
+
+            // 撤回后回到用户自己的执行器运行。
+            let mut record = find_strategy(&state, publication.strategy_id)?;
+            if record.run_scope != StrategyRunScope::SelfHosted {
+                record.run_scope = StrategyRunScope::SelfHosted;
+                strategies::close_run(&state, &mut record, StrategyStatus::Stopped).await;
+                strategies::replace(&state, &record);
+                strategies::persist(&state, &record).await;
+            }
         }
         None => {}
     }

@@ -19,6 +19,7 @@ hex = "0.4"
 hmac = "0.12"
 k256 = { version = "0.13", features = ["ecdsa"] }
 lighters = { version = "0.1", default-features = false }
+ring = "0.17"
 rust_decimal = { version = "1", features = ["serde", "maths"] }
 rust_decimal_macros = "1"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }

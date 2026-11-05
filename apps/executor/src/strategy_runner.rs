@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use arb_core::{
     Opportunity, OpportunityKind, OrderOrigin, OrderStatus, SandboxDecision, SandboxRunStatus,
-    StrategyEventLevel, StrategyOpenPosition, StrategyRecord, StrategyStatus,
+    StrategyEventLevel, StrategyOpenPosition, StrategyRecord, StrategyRunScope, StrategyStatus,
 };
 use chrono::{Duration as ChronoDuration, Utc};
 use rust_decimal::Decimal;
@@ -10,6 +10,7 @@ use rust_decimal::Decimal;
 use crate::{
     gateway::{self, PairOrderRequest},
     state::AppState,
+    store::{StrategyRun, StrategyRunEvent},
 };
 
 /// 策略运行时：只把「运行中」的策略翻译成订单意图，再交给统一风控网关。
@@ -29,12 +30,18 @@ pub fn spawn(state: AppState) {
 }
 
 async fn evaluate(state: &AppState) -> anyhow::Result<()> {
+    // 开启授权校验时，没有 strategy 套餐就不产生新的订单意图（默认关闭）。
+    if !state.license.allows("strategy") {
+        tracing::debug!("授权不足，跳过策略运行评估");
+        return Ok(());
+    }
+
     let records: Vec<StrategyRecord> = state
         .strategies
         .read()
         .expect("策略锁不可用")
         .iter()
-        .filter(|record| record.status == StrategyStatus::Running)
+        .filter(|record| record.status == StrategyStatus::Running && runs_here(record, state))
         .cloned()
         .collect();
 
@@ -44,10 +51,20 @@ async fn evaluate(state: &AppState) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 官方托管实例只跑已发布到市场的策略，自托管实例只跑用户自己的策略。
+fn runs_here(record: &StrategyRecord, state: &AppState) -> bool {
+    if state.config.hosted {
+        record.run_scope == StrategyRunScope::Platform
+    } else {
+        record.run_scope == StrategyRunScope::SelfHosted
+    }
+}
+
 async fn evaluate_one(state: &AppState, mut record: StrategyRecord) {
     let now = Utc::now();
     record.last_heartbeat_at = Some(now);
     record.runtime.last_evaluated_at = Some(now);
+    let events_before = record.runtime.events.len();
 
     // 校验未通过的策略不允许运行：直接暂停，避免带着错误定义下单。
     if !record.can_run() {
@@ -55,11 +72,13 @@ async fn evaluate_one(state: &AppState, mut record: StrategyRecord) {
         record
             .runtime
             .record(StrategyEventLevel::Error, "校验未通过，策略已暂停", None);
+        sync_run(state, &mut record, events_before).await;
         commit(state, record, true).await;
         return;
     }
 
     if state.is_paused() {
+        sync_run(state, &mut record, events_before).await;
         commit(state, record, false).await;
         return;
     }
@@ -82,7 +101,57 @@ async fn evaluate_one(state: &AppState, mut record: StrategyRecord) {
             true
         }
     };
+    sync_run(state, &mut record, events_before).await;
     commit(state, record, persist).await;
+}
+
+/// 维护运行实例：运行中的策略补齐实例与心跳，本轮新增事件写入运行事件表。
+async fn sync_run(state: &AppState, record: &mut StrategyRecord, events_before: usize) {
+    if record.status != StrategyStatus::Running {
+        if let Some(run_id) = record.runtime.run_id.take() {
+            if let Some(mut run) = state.store.strategy_run(run_id).await {
+                run.status = record.status;
+                run.stopped_at = Some(Utc::now());
+                run.last_heartbeat_at = Some(Utc::now());
+                state.store.save_strategy_run(&run).await;
+            }
+        }
+        return;
+    }
+
+    let run_id = match record.runtime.run_id {
+        Some(id) => id,
+        None => {
+            let run = StrategyRun::new(record);
+            let id = run.id;
+            state.store.save_strategy_run(&run).await;
+            record.runtime.run_id = Some(id);
+            id
+        }
+    };
+
+    if let Some(mut run) = state.store.strategy_run(run_id).await {
+        run.strategy_version = record.version;
+        run.status = StrategyStatus::Running;
+        run.last_heartbeat_at = Some(Utc::now());
+        state.store.save_strategy_run(&run).await;
+    }
+
+    // 上限裁剪会丢掉最早的事件，取不到原下标时按最新事件全量补写。
+    let start = events_before.min(record.runtime.events.len());
+    for event in record.runtime.events[start..].iter() {
+        state
+            .store
+            .append_strategy_run_event(&StrategyRunEvent {
+                run_id,
+                strategy_id: record.id,
+                level: event.level,
+                message: event.message.clone(),
+                order_id: event.order_id,
+                created_at: event.at,
+            })
+            .await;
+    }
 }
 
 /// 入场：匹配策略交易对与双腿交易所的资金费率机会，产出开仓意图。

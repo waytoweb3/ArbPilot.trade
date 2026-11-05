@@ -2,6 +2,7 @@ packages:
   - "apps/desktop"
   - "apps/site"
   - "apps/payments"
+  - "apps/accounts"
 minimumReleaseAgeExclude:
   - lucide-react@1.68.0
 allowBuilds:

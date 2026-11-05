@@ -44,9 +44,10 @@ pub use sandbox::{
 pub use strategy::{
     run_backtest, BacktestAssumption, BacktestReport, CostAssumptions, EntryRules, EquityPoint,
     ExecutionRules, ExitRules, FundingSample, Instrument, StrategyCode, StrategyCodeLanguage,
-    StrategyCodeOrigin, StrategyDefinition, StrategyEvent, StrategyEventLevel, StrategyExecutionMode,
-    StrategyOpenPosition, StrategyRecord, StrategyRisk, StrategyRuntime, StrategySource,
-    StrategyStatus, StrategyUniverse, StrategyValidation, ValidationIssue, ValidationSeverity,
+    StrategyCodeOrigin, StrategyDefinition, StrategyEvent, StrategyEventLevel,
+    StrategyOpenPosition, StrategyRecord, StrategyRisk, StrategyRunScope, StrategyRuntime,
+    StrategySource, StrategyStatus, StrategyUniverse, StrategyValidation, ValidationIssue,
+    ValidationSeverity,
 };
 pub use types::{
     Balance, LegStatus, Opportunity, OpportunityKind, Order, OrderIntent, OrderLeg, OrderLegIntent,

@@ -2,8 +2,9 @@ use std::{collections::HashMap, sync::RwLock};
 
 use arb_core::{
     BacktestReport, Order, SandboxArtifact, StrategyAuthorCard, StrategyCode, StrategyDefinition,
-    StrategyExecutionMode, StrategyPerformanceRecord, StrategyPublication, StrategyRecord,
-    StrategySettlement, StrategySource, StrategyStatus, StrategySubscription, StrategyValidation,
+    StrategyEventLevel, StrategyPerformanceRecord, StrategyPublication, StrategyRecord,
+    StrategyRunScope, StrategySettlement, StrategySource, StrategyStatus, StrategySubscription,
+    StrategyValidation,
 };
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
@@ -40,7 +41,6 @@ pub struct StrategyVersion {
     pub version: u32,
     pub status: StrategyStatus,
     pub source: StrategySource,
-    pub execution_mode: StrategyExecutionMode,
     pub definition: StrategyDefinition,
     pub validation: StrategyValidation,
     pub backtest: Option<BacktestReport>,
@@ -54,7 +54,6 @@ impl StrategyVersion {
             version: record.version,
             status: record.status,
             source: record.source,
-            execution_mode: record.execution_mode,
             definition: record.definition.clone(),
             validation: record.validation.clone(),
             backtest: record.last_backtest.clone(),
@@ -63,10 +62,59 @@ impl StrategyVersion {
     }
 }
 
+/// 一次策略运行实例：策略 × 交易所组合 × 运行位置，用于查看「当前策略跑在哪、跑了多久」。
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct StrategyRun {
+    pub id: Uuid,
+    pub strategy_id: Uuid,
+    pub strategy_version: u32,
+    pub scope: StrategyRunScope,
+    pub status: StrategyStatus,
+    pub long_venue: String,
+    pub short_venue: String,
+    pub symbols: Vec<String>,
+    pub started_at: DateTime<Utc>,
+    pub stopped_at: Option<DateTime<Utc>>,
+    pub last_heartbeat_at: Option<DateTime<Utc>>,
+}
+
+impl StrategyRun {
+    pub fn new(record: &StrategyRecord) -> Self {
+        let now = Utc::now();
+        let venues = &record.definition.universe.venues;
+        Self {
+            id: Uuid::new_v4(),
+            strategy_id: record.id,
+            strategy_version: record.version,
+            scope: record.run_scope,
+            status: StrategyStatus::Running,
+            long_venue: venues.first().cloned().unwrap_or_default(),
+            short_venue: venues.get(1).cloned().unwrap_or_default(),
+            symbols: record.definition.universe.symbols.clone(),
+            started_at: now,
+            stopped_at: None,
+            last_heartbeat_at: Some(now),
+        }
+    }
+}
+
+/// 运行事件：策略侧产生的评估、信号、订单与错误，不含任何凭证。
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct StrategyRunEvent {
+    pub run_id: Uuid,
+    pub strategy_id: Uuid,
+    pub level: StrategyEventLevel,
+    pub message: String,
+    pub order_id: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+}
+
 /// 内存模式下最多保留的资金费率条数，避免长时间运行无限增长。
 const MAX_MEMORY_FUNDING_ROWS: usize = 50_000;
 /// 内存模式下最多保留的权益快照条数。
 const MAX_MEMORY_EQUITY_ROWS: usize = 20_000;
+/// 内存模式下最多保留的运行事件条数。
+const MAX_MEMORY_RUN_EVENTS: usize = 2_000;
 
 /// 策略市场的一次完整读取结果，供 API 计算榜单与结算。
 #[derive(Debug, Clone, Default)]
@@ -92,6 +140,10 @@ pub struct Store {
     strategies: RwLock<Vec<StrategyRecord>>,
     /// 内存降级时的策略版本历史，重启即丢。
     strategy_versions: RwLock<Vec<StrategyVersion>>,
+    /// 内存降级时的策略运行实例，重启即丢。
+    strategy_runs: RwLock<Vec<StrategyRun>>,
+    /// 内存降级时的运行事件，重启即丢。
+    strategy_run_events: RwLock<Vec<StrategyRunEvent>>,
     /// 内存降级时的策略代码，重启即丢。
     strategy_codes: RwLock<HashMap<Uuid, StrategyCode>>,
     /// 内存降级时的市场数据，重启即丢。
@@ -144,6 +196,8 @@ impl Store {
             equity: RwLock::new(Vec::new()),
             strategies: RwLock::new(Vec::new()),
             strategy_versions: RwLock::new(Vec::new()),
+            strategy_runs: RwLock::new(Vec::new()),
+            strategy_run_events: RwLock::new(Vec::new()),
             strategy_codes: RwLock::new(HashMap::new()),
             authors: RwLock::new(Vec::new()),
             publications: RwLock::new(Vec::new()),
@@ -546,13 +600,12 @@ impl Store {
         let kind = enum_label(&record.definition.kind);
         let status = enum_label(&record.status);
         let source = enum_label(&record.source);
-        let execution_mode = enum_label(&record.execution_mode);
 
         let result = sqlx::query(
             r#"
             insert into strategies
-                (id, name, kind, status, version, payload, source, execution_mode)
-            values ($1, $2, $3, $4, $5, $6, $7, $8)
+                (id, name, kind, status, version, payload, source)
+            values ($1, $2, $3, $4, $5, $6, $7)
             on conflict (id) do update
                 set name = excluded.name,
                     kind = excluded.kind,
@@ -560,7 +613,6 @@ impl Store {
                     version = excluded.version,
                     payload = excluded.payload,
                     source = excluded.source,
-                    execution_mode = excluded.execution_mode,
                     updated_at = now()
             "#,
         )
@@ -571,7 +623,6 @@ impl Store {
         .bind(record.version as i32)
         .bind(payload)
         .bind(source)
-        .bind(execution_mode)
         .execute(pool)
         .await;
 
@@ -618,6 +669,188 @@ impl Store {
         if let Err(error) = result {
             tracing::error!(%error, strategy_id = %record.id, "写入策略版本失败");
         }
+    }
+
+    /// 写入运行实例；重复写入只更新状态、停止时间与心跳。
+    pub async fn save_strategy_run(&self, run: &StrategyRun) {
+        let Some(pool) = &self.pool else {
+            let mut rows = self.strategy_runs.write().expect("运行实例锁不可用");
+            match rows.iter_mut().find(|existing| existing.id == run.id) {
+                Some(existing) => *existing = run.clone(),
+                None => rows.push(run.clone()),
+            }
+            return;
+        };
+
+        let payload = match serde_json::to_value(run) {
+            Ok(payload) => payload,
+            Err(error) => {
+                tracing::error!(%error, run_id = %run.id, "运行实例序列化失败");
+                return;
+            }
+        };
+        let result = sqlx::query(
+            r#"
+            insert into strategy_runs
+                (id, strategy_id, strategy_version, scope, status, long_venue, short_venue,
+                 symbols, payload, started_at, stopped_at, last_heartbeat_at)
+            values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            on conflict (id) do update
+                set status = excluded.status,
+                    payload = excluded.payload,
+                    stopped_at = excluded.stopped_at,
+                    last_heartbeat_at = excluded.last_heartbeat_at
+            "#,
+        )
+        .bind(run.id)
+        .bind(run.strategy_id)
+        .bind(run.strategy_version as i32)
+        .bind(enum_label(&run.scope))
+        .bind(enum_label(&run.status))
+        .bind(&run.long_venue)
+        .bind(&run.short_venue)
+        .bind(&run.symbols)
+        .bind(payload)
+        .bind(run.started_at)
+        .bind(run.stopped_at)
+        .bind(run.last_heartbeat_at)
+        .execute(pool)
+        .await;
+
+        if let Err(error) = result {
+            tracing::error!(%error, run_id = %run.id, "写入运行实例失败");
+        }
+    }
+
+    /// 按开始时间倒序返回策略的运行实例。
+    pub async fn strategy_runs(&self, strategy_id: Uuid, limit: i64) -> Vec<StrategyRun> {
+        let Some(pool) = &self.pool else {
+            let rows = self.strategy_runs.read().expect("运行实例锁不可用");
+            let mut runs: Vec<StrategyRun> = rows
+                .iter()
+                .filter(|run| run.strategy_id == strategy_id)
+                .cloned()
+                .collect();
+            runs.sort_by(|left, right| right.started_at.cmp(&left.started_at));
+            runs.truncate(limit.max(1) as usize);
+            return runs;
+        };
+
+        let rows: Vec<sqlx::postgres::PgRow> = match sqlx::query(
+            "select payload from strategy_runs where strategy_id = $1 order by started_at desc limit $2",
+        )
+        .bind(strategy_id)
+        .bind(limit.max(1))
+        .fetch_all(pool)
+        .await
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::error!(%error, %strategy_id, "读取运行实例失败");
+                return Vec::new();
+            }
+        };
+        decode_payload_rows(&rows)
+    }
+
+    /// 按 id 读取单个运行实例。
+    pub async fn strategy_run(&self, run_id: Uuid) -> Option<StrategyRun> {
+        let Some(pool) = &self.pool else {
+            return self
+                .strategy_runs
+                .read()
+                .expect("运行实例锁不可用")
+                .iter()
+                .find(|run| run.id == run_id)
+                .cloned();
+        };
+
+        let row = match sqlx::query("select payload from strategy_runs where id = $1")
+            .bind(run_id)
+            .fetch_optional(pool)
+            .await
+        {
+            Ok(row) => row,
+            Err(error) => {
+                tracing::error!(%error, %run_id, "读取运行实例失败");
+                return None;
+            }
+        };
+        row.and_then(|row| {
+            let payload: serde_json::Value = row.try_get("payload").ok()?;
+            serde_json::from_value(payload).ok()
+        })
+    }
+
+    /// 追加一条运行事件。
+    pub async fn append_strategy_run_event(&self, event: &StrategyRunEvent) {
+        let Some(pool) = &self.pool else {
+            let mut rows = self.strategy_run_events.write().expect("运行事件锁不可用");
+            rows.push(event.clone());
+            let excess = rows.len().saturating_sub(MAX_MEMORY_RUN_EVENTS);
+            if excess > 0 {
+                rows.drain(0..excess);
+            }
+            return;
+        };
+
+        let payload = match serde_json::to_value(event) {
+            Ok(payload) => payload,
+            Err(error) => {
+                tracing::error!(%error, run_id = %event.run_id, "运行事件序列化失败");
+                return;
+            }
+        };
+        let result = sqlx::query(
+            r#"
+            insert into strategy_run_events (run_id, strategy_id, level, payload)
+            values ($1, $2, $3, $4)
+            "#,
+        )
+        .bind(event.run_id)
+        .bind(event.strategy_id)
+        .bind(enum_label(&event.level))
+        .bind(payload)
+        .execute(pool)
+        .await;
+
+        if let Err(error) = result {
+            tracing::error!(%error, run_id = %event.run_id, "写入运行事件失败");
+        }
+    }
+
+    /// 按时间正序返回运行实例的事件。
+    pub async fn strategy_run_events(&self, run_id: Uuid, limit: i64) -> Vec<StrategyRunEvent> {
+        let Some(pool) = &self.pool else {
+            let rows = self.strategy_run_events.read().expect("运行事件锁不可用");
+            let mut events: Vec<StrategyRunEvent> = rows
+                .iter()
+                .filter(|event| event.run_id == run_id)
+                .cloned()
+                .collect();
+            events.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+            events.truncate(limit.max(1) as usize);
+            events.reverse();
+            return events;
+        };
+
+        let rows: Vec<sqlx::postgres::PgRow> = match sqlx::query(
+            "select payload from strategy_run_events where run_id = $1 order by created_at desc limit $2",
+        )
+        .bind(run_id)
+        .bind(limit.max(1))
+        .fetch_all(pool)
+        .await
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::error!(%error, %run_id, "读取运行事件失败");
+                return Vec::new();
+            }
+        };
+        let mut events: Vec<StrategyRunEvent> = decode_payload_rows(&rows);
+        events.reverse();
+        events
     }
 
     /// 按版本号倒序返回历史快照。
@@ -1137,6 +1370,16 @@ fn enum_label<T: Serialize>(value: &T) -> String {
 fn decode_strategy_row(row: &sqlx::postgres::PgRow) -> Option<StrategyRecord> {
     let payload: serde_json::Value = row.try_get("payload").ok()?;
     serde_json::from_value(payload).ok()
+}
+
+/// 从 `select payload ...` 的结果里解码业务对象，单行失败不影响其余行。
+fn decode_payload_rows<T: DeserializeOwned>(rows: &[sqlx::postgres::PgRow]) -> Vec<T> {
+    rows.iter()
+        .filter_map(|row| {
+            let payload: serde_json::Value = row.try_get("payload").ok()?;
+            serde_json::from_value(payload).ok()
+        })
+        .collect()
 }
 
 fn decode_funding_row(row: &sqlx::postgres::PgRow, venue: &str) -> anyhow::Result<FundingRate> {

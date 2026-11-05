@@ -11,6 +11,8 @@ pub enum ApiError {
     BadRequest(String),
     NotFound(String),
     Conflict(String),
+    /// 套餐未授权：需要登录账号或升级订阅。
+    PaymentRequired(String),
     Internal(String),
 }
 
@@ -25,6 +27,11 @@ impl ApiError {
             Self::BadRequest(message) => (StatusCode::BAD_REQUEST, "bad_request", message.clone()),
             Self::NotFound(message) => (StatusCode::NOT_FOUND, "not_found", message.clone()),
             Self::Conflict(message) => (StatusCode::CONFLICT, "conflict", message.clone()),
+            Self::PaymentRequired(message) => (
+                StatusCode::PAYMENT_REQUIRED,
+                "license_required",
+                message.clone(),
+            ),
             Self::Internal(message) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal_error",

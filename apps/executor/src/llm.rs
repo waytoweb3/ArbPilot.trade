@@ -6,6 +6,7 @@
 
 use std::time::Duration;
 
+use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::{config::Config, http_client::HttpClient};
@@ -15,6 +16,13 @@ use crate::{config::Config, http_client::HttpClient};
 pub struct GeneratedCode {
     pub source: String,
     pub notes: Option<String>,
+}
+
+/// 一轮对话历史。只接受 user / assistant 两种角色。
+#[derive(Debug, Clone, Deserialize)]
+pub struct ChatTurn {
+    pub role: String,
+    pub content: String,
 }
 
 const SYSTEM_PROMPT: &str = r#"你是 ArbPilot 的策略代码生成器。只输出一个 WebAssembly Text (WAT) 代码块，不要输出解释性文字。
@@ -53,10 +61,15 @@ market 字段编号：
 - 不要使用浮点 NaN 或无限循环。"#;
 
 /// 调用 OpenAI 兼容的 chat completions 接口生成 WAT 源码。
+///
+/// `source` 是当前已保存的代码（如果存在），用于让 AI 在原有逻辑上继续修改；
+/// `history` 是之前的对话轮次，便于多轮沟通后逐步收敛策略。
 pub async fn generate(
     config: &Config,
     description: &str,
     context: &str,
+    source: Option<&str>,
+    history: &[ChatTurn],
 ) -> Result<GeneratedCode, String> {
     let key = config
         .llm_api_key
@@ -72,18 +85,38 @@ pub async fn generate(
         "{}/chat/completions",
         config.llm_base_url.trim_end_matches('/')
     );
+
+    let mut messages = vec![json!({ "role": "system", "content": SYSTEM_PROMPT })];
+    let mut seed = format!("当前策略定义：\n{context}\n\n");
+    if let Some(source) = source.filter(|source| !source.trim().is_empty()) {
+        seed.push_str(&format!("当前代码：\n```wat\n{source}\n```\n\n"));
+    }
+    seed.push_str("请结合已有代码与对话继续完善策略。");
+    messages.push(json!({ "role": "user", "content": seed }));
+
+    // 只保留最近的对话轮次，并限制单条长度，避免请求体无限增长。
+    let start = history.len().saturating_sub(20);
+    for turn in &history[start..] {
+        let role = match turn.role.as_str() {
+            "assistant" => "assistant",
+            "user" => "user",
+            _ => continue,
+        };
+        let content: String = turn.content.chars().take(4_000).collect();
+        messages.push(json!({ "role": role, "content": content }));
+    }
+
+    messages.push(json!({
+        "role": "user",
+        "content": format!(
+            "用户描述：\n{description}\n\n请只输出一个 ```wat 代码块。"
+        )
+    }));
+
     let body = json!({
         "model": config.llm_model,
         "temperature": 0.2,
-        "messages": [
-            { "role": "system", "content": SYSTEM_PROMPT },
-            {
-                "role": "user",
-                "content": format!(
-                    "当前策略定义：\n{context}\n\n用户描述：\n{description}\n\n请只输出一个 ```wat 代码块。"
-                )
-            }
-        ],
+        "messages": messages,
     });
     let body = serde_json::to_string(&body).map_err(|error| format!("构造 AI 请求失败: {error}"))?;
     let timeout = Duration::from_secs(config.llm_timeout_secs.max(5));

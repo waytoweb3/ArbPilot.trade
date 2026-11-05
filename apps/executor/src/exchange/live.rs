@@ -10,6 +10,10 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     accounts::{AccountCredentials, Accounts},
+    exchange::dex::{
+        hyperliquid_cloid, sign_hyperliquid_action, sign_lighter_order, HyperliquidOrder,
+        LighterOrder, LIGHTER_MAINNET_CHAIN_ID,
+    },
     http_client::HttpClient,
 };
 
@@ -25,6 +29,9 @@ pub struct LiveEndpoints {
     pub htx: String,
     pub mexc: String,
     pub bingx: String,
+    /// Hyperliquid 与 Lighter 的接口根地址，签名在本机完成后提交。
+    pub hyperliquid: String,
+    pub lighter: String,
 }
 
 /// 实盘交易所路由：按合约腿所属交易所取已导入的凭证，调用对应私有下单接口。
@@ -92,9 +99,20 @@ fn place(
         "htx" => htx_place(http, &endpoints.htx, credentials, request, &client_order_id),
         "mexc" => mexc_place(http, &endpoints.mexc, credentials, request, &client_order_id),
         "bingx" => bingx_place(http, &endpoints.bingx, credentials, request, &client_order_id),
-        "hyperliquid" | "lighter" => Err(ExchangeError::Unsupported(format!(
-            "{venue} 合约下单需要钱包私钥签名，当前仅支持钱包地址只读查询"
-        ))),
+        "hyperliquid" => hyperliquid_place(
+            http,
+            &endpoints.hyperliquid,
+            credentials,
+            request,
+            &client_order_id,
+        ),
+        "lighter" => lighter_place(
+            http,
+            &endpoints.lighter,
+            credentials,
+            request,
+            &client_order_id,
+        ),
         other => Err(ExchangeError::Unsupported(format!(
             "{other} 暂未接入实盘下单"
         ))),
@@ -657,6 +675,178 @@ fn bingx_place(
         .or_else(|| value["data"]["order"]["orderId"].as_str().map(str::to_string))
         .ok_or_else(|| ExchangeError::Rejected(format!("BingX 响应缺少订单号: {value}")))?;
     Ok(ack(order_id, client_order_id))
+}
+
+/// Hyperliquid 永续限价单：签名完全在本地完成，提交的只有已签名 action。
+fn hyperliquid_place(
+    http: &HttpClient,
+    base_url: &str,
+    credentials: &AccountCredentials,
+    request: &PlaceOrderRequest,
+    client_order_id: &str,
+) -> Result<VenueOrderAck, ExchangeError> {
+    let private_key = credentials.signer_key.as_deref().ok_or_else(|| {
+        ExchangeError::Credentials(
+            "Hyperliquid 下单需要 API Wallet（Agent）私钥，仅填写钱包地址只能查询余额".to_string(),
+        )
+    })?;
+    let base_url = base_url.trim_end_matches('/');
+    let coin = base_asset(request)?;
+
+    // `asset` 索引与 `szDecimals` 都在 meta.universe 的下标里，下单前必须查一次。
+    let meta = http
+        .post_json(&format!("{base_url}/info"), &json!({ "type": "meta" }))
+        .map_err(transport)?;
+    let universe = meta["universe"]
+        .as_array()
+        .ok_or_else(|| ExchangeError::Rejected(format!("Hyperliquid meta 响应异常: {meta}")))?;
+    let entry = universe
+        .iter()
+        .enumerate()
+        .find(|(_, entry)| entry["name"].as_str() == Some(coin.as_str()))
+        .ok_or_else(|| {
+            ExchangeError::Rejected(format!("Hyperliquid 未上架该合约: {coin}"))
+        })?;
+    let asset = entry.0 as u32;
+    let size_decimals = entry.1["szDecimals"].as_u64().unwrap_or(0) as u32;
+
+    let order = HyperliquidOrder {
+        coin: &coin,
+        asset,
+        size_decimals,
+        is_buy: request.side == Side::Buy,
+        price: request.limit_price,
+        size: request.quantity,
+        reduce_only: request.reduce_only,
+        cloid: Some(hyperliquid_cloid(client_order_id)),
+    };
+    let action = order.action().map_err(ExchangeError::Rejected)?;
+    let action_value = order.action_value().map_err(ExchangeError::Rejected)?;
+    let nonce = now_millis() as u64;
+    let mainnet = !base_url.contains("testnet");
+    let signature = sign_hyperliquid_action(&action, nonce, private_key, mainnet)
+        .map_err(|error| ExchangeError::Credentials(error.to_string()))?;
+
+    let body = json!({
+        "action": action_value,
+        "nonce": nonce,
+        "signature": {
+            "r": signature.r,
+            "s": signature.s,
+            "v": signature.v,
+        },
+        "vaultAddress": Value::Null,
+    })
+    .to_string();
+    let value = http
+        .post_body_with_headers(&format!("{base_url}/exchange"), &[], &body)
+        .map_err(transport)?;
+
+    if value["status"].as_str() != Some("ok") {
+        let detail = value["response"]
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| value.to_string());
+        return Err(ExchangeError::Rejected(format!(
+            "Hyperliquid 拒单: {detail}"
+        )));
+    }
+    let status = &value["response"]["data"]["statuses"][0];
+    if let Some(error) = status["error"].as_str() {
+        return Err(ExchangeError::Rejected(format!(
+            "Hyperliquid 拒单: {error}"
+        )));
+    }
+    let order_id = status["resting"]["oid"]
+        .as_i64()
+        .or_else(|| status["filled"]["oid"].as_i64())
+        .ok_or_else(|| ExchangeError::Rejected(format!("Hyperliquid 响应缺少 oid: {value}")))?;
+    Ok(ack(order_id.to_string(), client_order_id))
+}
+
+/// Lighter 永续限价单：市场精度取自 `orderBookDetails`，签名后按表单提交。
+fn lighter_place(
+    http: &HttpClient,
+    base_url: &str,
+    credentials: &AccountCredentials,
+    request: &PlaceOrderRequest,
+    client_order_id: &str,
+) -> Result<VenueOrderAck, ExchangeError> {
+    let private_key = credentials.signer_key.as_deref().ok_or_else(|| {
+        ExchangeError::Credentials(
+            "Lighter 下单需要 API Key 私钥，仅填写钱包地址只能查询余额".to_string(),
+        )
+    })?;
+    let account_index = credentials.account_index.ok_or_else(|| {
+        ExchangeError::Credentials("Lighter 账户缺少数字账户索引".to_string())
+    })?;
+    let base_url = base_url.trim_end_matches('/');
+    let coin = base_asset(request)?;
+
+    let details = http
+        .get_json(&format!("{base_url}/api/v1/orderBookDetails"))
+        .map_err(transport)?;
+    let rows = details["order_book_details"].as_array().ok_or_else(|| {
+        ExchangeError::Rejected(format!("Lighter 合约列表响应异常: {details}"))
+    })?;
+    let row = rows
+        .iter()
+        .find(|row| {
+            row["symbol"].as_str() == Some(coin.as_str())
+                && row["market_type"].as_str().unwrap_or("perp") == "perp"
+        })
+        .ok_or_else(|| ExchangeError::Rejected(format!("Lighter 未上架该合约: {coin}")))?;
+    let market_index = row["market_id"]
+        .as_i64()
+        .and_then(|value| i16::try_from(value).ok())
+        .ok_or_else(|| ExchangeError::Rejected("Lighter 合约索引超出范围".to_string()))?;
+    let size_decimals = row["size_decimals"].as_u64().unwrap_or(0) as u32;
+    let price_decimals = row["price_decimals"].as_u64().unwrap_or(0) as u32;
+
+    let nonce = now_millis();
+    // 限价单挂单有效期 24 小时，避免旧签名长期有效。
+    let expired_at = nonce + 24 * 60 * 60 * 1000;
+    let order = LighterOrder {
+        account_index,
+        api_key_index: credentials.key_index.unwrap_or(0),
+        market_index,
+        size_decimals,
+        price_decimals,
+        is_ask: request.side == Side::Sell,
+        price: request.limit_price,
+        size: request.quantity,
+        reduce_only: request.reduce_only,
+        nonce,
+        expired_at,
+    };
+    let chain_id = if base_url.contains("testnet") {
+        300
+    } else {
+        LIGHTER_MAINNET_CHAIN_ID
+    };
+    let signed = sign_lighter_order(&order, private_key, chain_id)
+        .map_err(|error| ExchangeError::Credentials(error.to_string()))?;
+
+    let form = format!("tx_type={}&tx_info={}", signed.tx_type, pct(&signed.tx_info));
+    let value = http
+        .post_body_with_headers(
+            &format!("{base_url}/api/v1/sendTx"),
+            &[("Content-Type", "application/x-www-form-urlencoded")],
+            &form,
+        )
+        .map_err(transport)?;
+
+    if value["code"].as_i64().unwrap_or(0) != 200 {
+        return Err(ExchangeError::Rejected(format!(
+            "Lighter 拒单: {}",
+            value["message"].as_str().unwrap_or("未知错误")
+        )));
+    }
+    let tx_hash = value["tx_hash"]
+        .as_str()
+        .filter(|hash| !hash.is_empty())
+        .ok_or_else(|| ExchangeError::Rejected(format!("Lighter 响应缺少 tx_hash: {value}")))?;
+    Ok(ack(tx_hash, client_order_id))
 }
 
 fn key_pair(credentials: &AccountCredentials) -> Result<(&str, &str), ExchangeError> {

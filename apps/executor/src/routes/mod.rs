@@ -3,6 +3,7 @@ mod candles;
 mod control;
 mod funding;
 mod health;
+mod license;
 mod market;
 mod news;
 mod opportunities;
@@ -50,9 +51,14 @@ pub fn build(state: AppState) -> Router {
             "/strategies/{id}/definition",
             patch(strategies::update_definition),
         )
+        .route(
+            "/strategies/{id}/scope",
+            patch(strategies::update_scope),
+        )
         .route("/strategies/{id}/validate", post(strategies::validate))
         .route("/strategies/{id}/backtest", post(strategies::backtest))
         .route("/strategies/{id}/versions", get(strategies::versions))
+        .route("/strategies/{id}/runs", get(strategies::runs))
         .route("/strategies/{id}/rollback", post(strategies::rollback))
         .route(
             "/strategies/{id}/sandbox",
@@ -118,6 +124,12 @@ pub fn build(state: AppState) -> Router {
         .route("/funding/summary", get(funding::summary))
         .route("/funding/status", get(funding::status))
         .route("/news", get(news::list))
+        .route(
+            "/license",
+            get(license::status)
+                .post(license::install)
+                .delete(license::clear),
+        )
         .route("/telegram", get(telegram::status))
         .route("/telegram/pairing", post(telegram::pairing))
         .route("/telegram/bindings/{user_id}", delete(telegram::revoke))
@@ -128,6 +140,11 @@ pub fn build(state: AppState) -> Router {
         .route("/control/pause", post(control::pause))
         .route("/control/resume", post(control::resume))
         .route("/events", get(ws::handler))
+        // 先鉴权再校验套餐：内层先执行，因此授权中间件放在鉴权层之前声明。
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::license::require_plan,
+        ))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             crate::auth::require_token,

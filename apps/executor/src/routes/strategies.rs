@@ -1,7 +1,7 @@
 use arb_core::{
     BacktestReport, CostAssumptions, EntryRules, ExecutionRules, ExitRules, FundingSample,
-    Instrument, OpportunityKind, StrategyDefinition, StrategyExecutionMode, StrategyRecord,
-    StrategyRisk, StrategySource, StrategyStatus, StrategyUniverse,
+    Instrument, OpportunityKind, StrategyDefinition, StrategyEventLevel, StrategyRecord,
+    StrategyRisk, StrategyRunScope, StrategySource, StrategyStatus, StrategyUniverse,
 };
 use axum::{
     extract::{Path, State},
@@ -10,10 +10,14 @@ use axum::{
 };
 use chrono::{Duration, Utc};
 use rust_decimal::Decimal;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{error::ApiError, state::AppState, store::StrategyVersion};
+use crate::{
+    error::ApiError,
+    state::AppState,
+    store::{StrategyRun, StrategyRunEvent, StrategyVersion},
+};
 
 pub async fn list(State(state): State<AppState>) -> Json<Vec<StrategyRecord>> {
     let mut strategies = state.strategies.read().expect("策略锁不可用").clone();
@@ -91,7 +95,6 @@ fn code_definition(state: &AppState, name: String) -> StrategyDefinition {
             max_unhedged_seconds: 3,
         },
         execution: ExecutionRules {
-            mode: StrategyExecutionMode::Live,
             leverage: Decimal::ONE,
             max_slippage_bps: Decimal::from(10),
             cooldown_secs: 300,
@@ -113,6 +116,7 @@ pub async fn update(
     Json(body): Json<UpdateStrategyRequest>,
 ) -> Result<Json<StrategyRecord>, ApiError> {
     let mut record = find(&state, id)?;
+    let previous = record.status;
 
     if body.status == StrategyStatus::Running {
         if record.sandbox.is_none() {
@@ -126,14 +130,88 @@ pub async fn update(
                 "策略校验未通过，请先修复错误再启动".to_string(),
             ));
         }
+        // 已发布的策略归平台托管执行器运行，未发布的只在自己的执行器运行。
+        if state.config.hosted && record.run_scope != StrategyRunScope::Platform {
+            return Err(ApiError::Conflict(
+                "该策略尚未发布到市场，请在用户自己的执行器上运行".to_string(),
+            ));
+        }
+        if !state.config.hosted && record.run_scope == StrategyRunScope::Platform {
+            return Err(ApiError::Conflict(
+                "该策略已发布，由 ArbPilot 托管执行器运行".to_string(),
+            ));
+        }
     }
 
     record.status = body.status;
     record.last_heartbeat_at = Some(Utc::now());
     record.updated_at = Utc::now();
+
+    // 启动时建立运行实例，暂停/停止时关闭，便于按实例回看运行情况。
+    if body.status == StrategyStatus::Running && record.runtime.run_id.is_none() {
+        let run = StrategyRun::new(&record);
+        state.store.save_strategy_run(&run).await;
+        let message = format!("开始运行：{} / {}", run.long_venue, run.short_venue);
+        record
+            .runtime
+            .record(StrategyEventLevel::Info, message.clone(), None);
+        state
+            .store
+            .append_strategy_run_event(&StrategyRunEvent {
+                run_id: run.id,
+                strategy_id: record.id,
+                level: StrategyEventLevel::Info,
+                message,
+                order_id: None,
+                created_at: Utc::now(),
+            })
+            .await;
+        record.runtime.run_id = Some(run.id);
+    } else if previous == StrategyStatus::Running && body.status != StrategyStatus::Running {
+        close_run(&state, &mut record, body.status).await;
+    }
+
     replace(&state, &record);
     persist(&state, &record).await;
     Ok(Json(record))
+}
+
+/// 关闭当前运行实例：记录停止时间与最终状态，等待下一次启动重新建实例。
+pub(crate) async fn close_run(
+    state: &AppState,
+    record: &mut StrategyRecord,
+    status: StrategyStatus,
+) {
+    let Some(run_id) = record.runtime.run_id.take() else {
+        return;
+    };
+    if let Some(mut run) = state.store.strategy_run(run_id).await {
+        run.status = status;
+        run.stopped_at = Some(Utc::now());
+        run.last_heartbeat_at = Some(Utc::now());
+        state.store.save_strategy_run(&run).await;
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct StrategyRunsResponse {
+    pub runs: Vec<StrategyRun>,
+    /// 最近一次运行实例的事件，按时间正序。
+    pub events: Vec<StrategyRunEvent>,
+}
+
+/// 运行实例与事件：交易所组合、状态、心跳与最近发生的信号/订单/错误。
+pub async fn runs(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<StrategyRunsResponse>, ApiError> {
+    find(&state, id)?;
+    let runs = state.store.strategy_runs(id, 20).await;
+    let events = match runs.first() {
+        Some(run) => state.store.strategy_run_events(run.id, 50).await,
+        None => Vec::new(),
+    };
+    Ok(Json(StrategyRunsResponse { runs, events }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -153,6 +231,77 @@ pub async fn update_definition(
     }
     record.apply_definition(body.definition);
     record.validation = record.definition.validate(&state.risk_limits());
+
+    replace(&state, &record);
+    persist(&state, &record).await;
+    Ok(Json(record))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateScopeRequest {
+    /// 现货腿交易所，例如 `binance-spot`。
+    pub spot_venue: String,
+    /// 永续腿交易所，例如 `binance`。
+    pub perp_venue: String,
+    pub symbols: Vec<String>,
+}
+
+/// 修改策略的应用范围（交易所与代币）。产生新版本并清空旧校验与回测结果。
+pub async fn update_scope(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<UpdateScopeRequest>,
+) -> Result<Json<StrategyRecord>, ApiError> {
+    let mut record = find(&state, id)?;
+    if record.status == StrategyStatus::Running {
+        return Err(ApiError::Conflict(
+            "请先停止策略再修改应用范围".to_string(),
+        ));
+    }
+
+    let spot_venue = body.spot_venue.trim();
+    let perp_venue = body.perp_venue.trim();
+    if !spot_venue.ends_with("-spot") {
+        return Err(ApiError::BadRequest(
+            "现货交易所标识必须以 -spot 结尾".to_string(),
+        ));
+    }
+    if perp_venue.is_empty() || perp_venue.ends_with("-spot") || perp_venue == spot_venue {
+        return Err(ApiError::BadRequest(
+            "永续交易所标识不能为空，也不能与现货腿相同".to_string(),
+        ));
+    }
+
+    let mut symbols: Vec<String> = Vec::new();
+    for symbol in &body.symbols {
+        let symbol = symbol.trim().to_uppercase();
+        if !symbol.is_empty() && !symbols.contains(&symbol) {
+            symbols.push(symbol);
+        }
+    }
+    if symbols.is_empty() {
+        return Err(ApiError::BadRequest("请至少选择一个交易对".to_string()));
+    }
+
+    record.definition.universe = StrategyUniverse {
+        venues: vec![spot_venue.to_string(), perp_venue.to_string()],
+        symbols,
+        instruments: vec![Instrument::Spot, Instrument::Perp],
+    };
+    record.version += 1;
+    record.validation = record.definition.validate(&state.risk_limits());
+    record.last_backtest = None;
+    record.updated_at = Utc::now();
+    record.runtime.record(
+        arb_core::StrategyEventLevel::Info,
+        format!(
+            "应用范围已更新：{} / {} · {}",
+            spot_venue,
+            perp_venue,
+            record.definition.universe.symbols.join(", ")
+        ),
+        None,
+    );
 
     replace(&state, &record);
     persist(&state, &record).await;

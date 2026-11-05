@@ -1,16 +1,16 @@
 import { useState } from "react";
 
-import { useBillingPlans, useCreateCheckout, useLicense } from "../hooks/useBilling";
 import {
-  BillingError,
-  getLicenseRef,
-  PAYMENTS_URL,
-  setLicenseRef,
-  type BillingPlan,
-  type BillingPlanId,
-  type LicenseStatus,
-} from "../lib/billing";
+  useAccount,
+  useAccountSubscriptions,
+  useCancelAccountSubscription,
+  useExecutorLicense,
+  useSyncLicense,
+} from "../hooks/useAccount";
+import { useBillingPlans, useCreateCheckout } from "../hooks/useBilling";
+import { BillingError, PAYMENTS_URL, type BillingPlan, type BillingPlanId } from "../lib/billing";
 import { fmt, useI18n } from "../lib/i18n";
+import { useSessionStore } from "../lib/session";
 import { useTheme } from "../lib/theme";
 import { Badge } from "./ui/badge";
 import { Button } from "./ui/button";
@@ -33,47 +33,81 @@ const FALLBACK_PLANS: BillingPlan[] = [
 
 type Tone = "success" | "warning" | "danger" | "neutral" | "info";
 
-const statusTones: Record<LicenseStatus, Tone> = {
+const statusTones: Record<string, Tone> = {
   pending: "info",
   active: "success",
   canceling: "warning",
   canceled: "neutral",
   past_due: "danger",
   expired: "neutral",
-  unknown: "neutral",
 };
 
 export function BillingCard() {
   const { t, locale } = useI18n();
   const { resolved } = useTheme();
-  const [ref, setRef] = useState<string | null>(() => getLicenseRef());
+  const token = useSessionStore((state) => state.token);
   const [checkoutUrl, setCheckoutUrl] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  const account = useAccount();
+  const subscriptions = useAccountSubscriptions();
+  const cancelSubscription = useCancelAccountSubscription();
+  const licenseQuery = useExecutorLicense();
+  const syncLicense = useSyncLicense();
   const plansQuery = useBillingPlans();
-  const licenseQuery = useLicense(ref);
   const checkout = useCreateCheckout();
 
   const plans = plansQuery.data?.length ? plansQuery.data : FALLBACK_PLANS;
+  const me = account.data;
+  const entitlement = me?.entitlement;
   const license = licenseQuery.data;
-  const status: LicenseStatus = license?.status ?? (ref ? "pending" : "unknown");
-  const statusLabel = t.settings.billingStatuses[status];
+  const plan = entitlement?.plans[0];
+  const dateText = (value: string | null | undefined) =>
+    value ? new Date(value).toLocaleDateString(locale === "zh" ? "zh-CN" : "en-US") : "—";
+  const secondsText = (value: number | null | undefined) =>
+    value ? new Date(value * 1000).toLocaleDateString(locale === "zh" ? "zh-CN" : "en-US") : "—";
+
+  const planLabel = (id: string | null | undefined) =>
+    id === "arbitrage"
+      ? t.settings.billingArbitrage
+      : id === "strategy"
+        ? t.settings.billingStrategy
+        : t.settings.accountPlanNone;
+
+  const entitlementStatus =
+    entitlement && entitlement.status !== "none"
+      ? t.settings.billingStatuses[entitlement.status]
+      : t.settings.accountPlanNone;
+
+  const licenseText = !license
+    ? "—"
+    : !license.installed
+      ? t.settings.billingLicenseMissing
+      : license.in_grace
+        ? fmt(t.settings.billingLicenseGrace, { value: secondsText(license.grace_until) })
+        : license.valid
+          ? fmt(t.settings.billingLicenseValid, { value: secondsText(license.expires_at) })
+          : t.settings.billingLicenseExpired;
 
   const subscribe = (plan: BillingPlanId) => {
     setError(null);
     setCopied(false);
+    if (!token) {
+      setError(t.settings.billingRequireLogin);
+      return;
+    }
     checkout.mutate(
-      { plan, locale, darkMode: resolved === "dark" },
+      { plan, locale, darkMode: resolved === "dark", session: token },
       {
-        onSuccess: ({ ref: nextRef, checkoutUrl: nextUrl }) => {
-          setLicenseRef(nextRef);
-          setRef(nextRef);
+        onSuccess: ({ checkoutUrl: nextUrl }) => {
           setCheckoutUrl(nextUrl);
           window.open(nextUrl, "_blank", "noopener,noreferrer");
         },
         onError: (cause) => {
-          if (cause instanceof BillingError && cause.status === 503) {
+          if (cause instanceof BillingError && cause.status === 401) {
+            setError(t.settings.billingRequireLogin);
+          } else if (cause instanceof BillingError && cause.status === 503) {
             setError(t.settings.billingNeedsKey);
           } else if (cause instanceof BillingError && cause.status === 0) {
             setError(fmt(t.settings.billingUnreachable, { url: PAYMENTS_URL }));
@@ -98,12 +132,14 @@ export function BillingCard() {
     }
   };
 
-  const planLabel = (id: string | null | undefined) =>
-    id === "arbitrage"
-      ? t.settings.billingArbitrage
-      : id === "strategy"
-        ? t.settings.billingStrategy
-        : "—";
+  const cancelError = cancelSubscription.error
+    ? fmt(t.settings.accountSubFailed, {
+        message:
+          cancelSubscription.error instanceof Error
+            ? cancelSubscription.error.message
+            : String(cancelSubscription.error),
+      })
+    : null;
 
   return (
     <Card>
@@ -112,7 +148,9 @@ export function BillingCard() {
           <CardTitle>{t.settings.billing}</CardTitle>
           <CardDescription>{t.settings.billingDesc}</CardDescription>
         </div>
-        {ref && <Badge tone={statusTones[status]}>{statusLabel}</Badge>}
+        {token && (
+          <Badge tone={plan ? "success" : "neutral"}>{planLabel(plan)}</Badge>
+        )}
       </CardHeader>
       <CardContent className="space-y-5">
         <div className="rounded-xl border border-line bg-panel-soft px-4 py-3.5">
@@ -129,73 +167,177 @@ export function BillingCard() {
           </ul>
         </div>
 
-        {ref ? (
+        <div className="rounded-xl border border-line bg-panel-soft px-4 py-3.5">
+          <p className="text-[11px] uppercase tracking-[0.14em] text-subtle">
+            {t.settings.billingLoginTitle}
+          </p>
+          <ul className="mt-2 space-y-1.5 text-[11.5px] leading-relaxed text-muted">
+            {t.settings.billingLoginReasons.map((item) => (
+              <li key={item} className="flex gap-2">
+                <span className="mt-[6px] h-1 w-1 shrink-0 rounded-full bg-accent-solid" />
+                {item}
+              </li>
+            ))}
+          </ul>
+        </div>
+
+        {token ? (
           <div className="rounded-xl border border-line bg-panel-soft px-4 py-3.5">
             <div className="flex items-center justify-between">
-              <p className="text-[11px] uppercase tracking-[0.14em] text-subtle">
-                {t.settings.billingStatus}
-              </p>
+              <div className="min-w-0">
+                <p className="truncate text-xs font-medium text-fg">
+                  {me?.user.name ?? t.settings.accountSignedIn}
+                </p>
+                {me?.user.email && (
+                  <p className="mt-0.5 truncate text-[11px] text-subtle">{me.user.email}</p>
+                )}
+              </div>
               <Button
                 size="sm"
                 variant="ghost"
-                onClick={() => void licenseQuery.refetch()}
-                disabled={licenseQuery.isFetching}
+                onClick={() => void account.refetch()}
+                disabled={account.isFetching}
               >
-                {t.settings.billingRefresh}
+                {t.settings.accountRefresh}
               </Button>
             </div>
             <dl className="mt-3 grid grid-cols-3 gap-x-6 gap-y-3 text-xs">
               <div>
                 <dt className="text-[11px] text-muted">{t.settings.billingPlan}</dt>
-                <dd className="mt-0.5 text-body">{planLabel(license?.plan)}</dd>
+                <dd className="mt-0.5 text-body">{planLabel(plan)}</dd>
               </div>
               <div>
                 <dt className="text-[11px] text-muted">{t.settings.billingStatus}</dt>
-                <dd className="mt-0.5 text-body">{statusLabel}</dd>
+                <dd className="mt-0.5 text-body">{entitlementStatus}</dd>
               </div>
               <div>
                 <dt className="text-[11px] text-muted">{t.settings.billingExpires}</dt>
                 <dd className="mt-0.5 font-mono text-[11px] text-body">
-                  {license?.expiresAt
-                    ? new Date(license.expiresAt).toLocaleDateString(
-                        locale === "zh" ? "zh-CN" : "en-US",
-                      )
-                    : "—"}
+                  {dateText(entitlement?.expiresAt)}
                 </dd>
-              </div>
-              <div className="col-span-3">
-                <dt className="text-[11px] text-muted">{t.settings.billingRef}</dt>
-                <dd className="mt-0.5 break-all font-mono text-[10.5px] text-subtle">{ref}</dd>
               </div>
             </dl>
           </div>
         ) : (
-          <p className="text-xs text-muted">{t.settings.billingNone}</p>
+          <p className="rounded-xl border border-line bg-panel-soft px-4 py-3 text-[11.5px] leading-relaxed text-muted">
+            {t.settings.billingLoginPrompt}
+          </p>
         )}
 
+        <div className="rounded-xl border border-line bg-panel-soft px-4 py-3.5">
+          <div className="flex items-center justify-between">
+            <p className="text-[11px] uppercase tracking-[0.14em] text-subtle">
+              {t.settings.billingLicenseTitle}
+            </p>
+            <div className="flex items-center gap-2">
+              {license && (
+                <Badge tone={license.valid ? "success" : license.installed ? "warning" : "neutral"}>
+                  {license.required
+                    ? t.settings.billingLicenseEnforced
+                    : t.settings.billingLicenseOptional}
+                </Badge>
+              )}
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => syncLicense.mutate(token)}
+                disabled={syncLicense.isPending || licenseQuery.isFetching}
+              >
+                {syncLicense.isPending
+                  ? t.settings.billingLicenseSyncing
+                  : t.settings.billingLicenseSync}
+              </Button>
+            </div>
+          </div>
+          <dl className="mt-3 grid grid-cols-3 gap-x-6 gap-y-3 text-xs">
+            <div>
+              <dt className="text-[11px] text-muted">{t.settings.billingStatus}</dt>
+              <dd className="mt-0.5 text-body">{licenseText}</dd>
+            </div>
+            <div>
+              <dt className="text-[11px] text-muted">{t.settings.billingPlan}</dt>
+              <dd className="mt-0.5 text-body">
+                {license?.plans.length ? license.plans.map(planLabel).join(" · ") : "—"}
+              </dd>
+            </div>
+            <div>
+              <dt className="text-[11px] text-muted">{t.settings.accountSignedIn}</dt>
+              <dd className="mt-0.5 truncate font-mono text-[11px] text-body">
+                {license?.email ?? "—"}
+              </dd>
+            </div>
+          </dl>
+          <p className="mt-3 text-[11px] leading-relaxed text-subtle">
+            {t.settings.billingLicenseSyncDesc}
+          </p>
+          {license?.error && <p className="mt-2 text-[11px] text-danger">{license.error}</p>}
+        </div>
+
+        <div className="rounded-xl border border-line bg-panel-soft px-4 py-3.5">
+          <p className="text-[11px] uppercase tracking-[0.14em] text-subtle">
+            {t.settings.accountSubscriptions}
+          </p>
+          {subscriptions.data?.subscriptions.length ? (
+            <ul className="mt-2 divide-y divide-line text-xs">
+              {subscriptions.data.subscriptions.map((item) => (
+                <li key={item.id} className="flex items-center justify-between gap-3 py-2">
+                  <div className="min-w-0">
+                    <p className="truncate text-body">{planLabel(item.plan)}</p>
+                    <p className="mt-0.5 text-[11px] text-subtle">
+                      {t.settings.accountExpires} {dateText(item.currentPeriodEnd)}
+                    </p>
+                  </div>
+                  <div className="flex shrink-0 items-center gap-2">
+                    <Badge tone={statusTones[item.status] ?? "neutral"}>
+                      {t.settings.billingStatuses[
+                        item.status as keyof typeof t.settings.billingStatuses
+                      ] ?? item.status}
+                    </Badge>
+                    {item.status === "active" && !item.cancelAtPeriodEnd && (
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        onClick={() => cancelSubscription.mutate(item.id)}
+                        disabled={cancelSubscription.isPending}
+                      >
+                        {cancelSubscription.isPending
+                          ? t.settings.accountSubCanceling
+                          : t.settings.accountSubCancel}
+                      </Button>
+                    )}
+                  </div>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="mt-2 text-xs text-muted">{t.settings.accountSubEmpty}</p>
+          )}
+          {cancelError && <p className="mt-2 text-[11px] text-danger">{cancelError}</p>}
+        </div>
+
         <div className="grid gap-3 sm:grid-cols-2">
-          {plans.map((plan) => {
-            const featured = plan.id === "strategy";
-            const label = planLabel(plan.id);
+          {plans.map((item) => {
+            const featured = item.id === "strategy";
+            const label = planLabel(item.id);
             return (
               <div
-                key={plan.id}
+                key={item.id}
                 className={`flex flex-col justify-between rounded-xl border px-4 py-3.5 ${
                   featured ? "border-accent/30 bg-accent/[0.04]" : "border-line bg-panel-soft"
                 }`}
               >
                 <div className="flex items-baseline justify-between">
                   <span className="text-[11px] text-muted">{label}</span>
-                  <span className="font-mono text-sm text-fg">${plan.amount}</span>
+                  <span className="font-mono text-sm text-fg">${item.amount}</span>
                 </div>
                 <Button
                   size="sm"
                   variant={featured ? "primary" : "secondary"}
                   className="mt-3"
-                  onClick={() => subscribe(plan.id)}
+                  onClick={() => subscribe(item.id)}
                   disabled={checkout.isPending}
                 >
-                  {checkout.isPending && checkout.variables?.plan === plan.id
+                  {checkout.isPending && checkout.variables?.plan === item.id
                     ? t.settings.billingOpening
                     : fmt(t.settings.billingSubscribe, { plan: label })}
                 </Button>

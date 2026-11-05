@@ -11,6 +11,7 @@ import {
   Save,
   ShieldCheck,
   Sparkles,
+  Store,
   Trash2,
 } from "lucide-react";
 
@@ -20,16 +21,27 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "../co
 import {
   useBacktestStrategy,
   useCompileStrategyCode,
+  useCreatePerformance,
+  useCreatePublication,
   useCreateStrategy,
   useDeleteStrategy,
   useDeployStrategyCode,
+  useFundingStatus,
   useGenerateStrategyCode,
+  useMarketAuthors,
+  usePublicationPerformance,
+  usePublications,
+  useRiskLimits,
   useRollbackStrategy,
+  useSandboxDryRun,
   useSaveStrategyCode,
   useStrategies,
   useStrategyCode,
+  useStrategyRuns,
   useStrategyVersions,
+  useUpdatePublication,
   useUpdateStrategy,
+  useUpdateStrategyScope,
   useValidateStrategy,
 } from "../hooks/useApi";
 import { toNumber } from "../lib/api";
@@ -43,6 +55,14 @@ import {
 import { fmt, useI18n } from "../lib/i18n";
 import type {
   BacktestReport,
+  MarketVisibility,
+  PerformanceSource,
+  PricingModel,
+  PublicationStatus,
+  RiskLevel,
+  SandboxDecision,
+  SandboxRunStatus,
+  SourceVisibility,
   StrategyEventLevel,
   StrategyRecord,
   StrategySource,
@@ -65,6 +85,35 @@ const eventTone: Record<StrategyEventLevel, string> = {
 
 const inputClass =
   "w-full rounded-md border border-line bg-panel-soft px-2 py-1 text-xs text-body outline-none focus:border-accent/60";
+
+const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error));
+
+interface ChatMessage {
+  role: "user" | "assistant";
+  content: string;
+}
+
+const chatStorageKey = (id: string) => `arbpilot.strategy-chat.${id}`;
+
+/** 读取该策略的 AI 对话记录；解析失败时按空对话处理。 */
+function loadChat(id: string): ChatMessage[] {
+  try {
+    const parsed: unknown = JSON.parse(window.localStorage.getItem(chatStorageKey(id)) ?? "[]");
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+    return parsed.filter(
+      (item): item is ChatMessage =>
+        typeof item === "object" &&
+        item !== null &&
+        typeof (item as ChatMessage).content === "string" &&
+        ((item as ChatMessage).role === "user" || (item as ChatMessage).role === "assistant"),
+    );
+  } catch {
+    return [];
+  }
+}
+
 
 interface CreateDraft {
   name: string;
@@ -130,7 +179,8 @@ function StrategyCodeCard({ record, running }: { record: StrategyRecord; running
   const deployCode = useDeployStrategyCode();
 
   const [source, setSource] = useState("");
-  const [prompt, setPrompt] = useState("");
+  const [input, setInput] = useState("");
+  const [chat, setChat] = useState<ChatMessage[]>(() => loadChat(record.id));
   const [notice, setNotice] = useState<{ tone: "ok" | "error"; text: string } | null>(null);
 
   const view = codeQuery.data;
@@ -145,22 +195,34 @@ function StrategyCodeCard({ record, running }: { record: StrategyRecord; running
     setSource(view.code?.source ?? view.template);
   }, [record.id, codeUpdatedAt, template]);
 
+  useEffect(() => {
+    window.localStorage.setItem(chatStorageKey(record.id), JSON.stringify(chat));
+  }, [record.id, chat]);
+
   const dirty = code ? source !== code.source : source !== template;
   const pending =
     saveCode.isPending || generateCode.isPending || compileCode.isPending || deployCode.isPending;
 
-  const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error));
-
-  const generate = async () => {
-    setNotice(null);
-    if (!prompt.trim()) {
+  const send = async () => {
+    const text = input.trim();
+    if (!text) {
       setNotice({ tone: "error", text: t.strategies.codePromptRequired });
       return;
     }
+    setNotice(null);
+    setInput("");
+    // 把历史对话一并提交，让 AI 在现有代码上继续迭代。
+    const history = chat;
+    setChat((current) => [...current, { role: "user", content: text }]);
     try {
-      await generateCode.mutateAsync({ id: record.id, prompt: prompt.trim() });
+      await generateCode.mutateAsync({ id: record.id, prompt: text, history });
+      setChat((current) => [
+        ...current,
+        { role: "assistant", content: t.strategies.chatAssistant },
+      ]);
     } catch (error) {
       setNotice({ tone: "error", text: errorText(error) });
+      setInput(text);
     }
   };
 
@@ -231,18 +293,46 @@ function StrategyCodeCard({ record, running }: { record: StrategyRecord; running
         </div>
       </CardHeader>
       <CardContent className="space-y-3">
-        <div className="space-y-1">
+        <div className="space-y-2">
           <span className="text-[11px] text-muted">{t.strategies.codePrompt}</span>
+          <div className="max-h-56 space-y-2 overflow-y-auto rounded-md border border-line bg-panel-soft p-2">
+            {chat.length === 0 ? (
+              <p className="text-[11px] text-muted">{t.strategies.chatEmpty}</p>
+            ) : (
+              chat.map((message, index) => (
+                <div
+                  key={`${message.role}-${index}`}
+                  className={cn(
+                    "flex",
+                    message.role === "user" ? "justify-end" : "justify-start",
+                  )}
+                >
+                  <p
+                    className={cn(
+                      "max-w-[85%] whitespace-pre-wrap rounded-lg px-2 py-1 text-[11px] text-body",
+                      message.role === "user" ? "bg-accent/15" : "bg-panel",
+                    )}
+                  >
+                    {message.content}
+                  </p>
+                </div>
+              ))
+            )}
+            {generateCode.isPending && (
+              <p className="text-[11px] text-muted">{t.strategies.chatSending}</p>
+            )}
+          </div>
           <div className="flex flex-col gap-2 md:flex-row md:items-end">
             <textarea
               className={cn(inputClass, "h-20 flex-1 resize-y")}
-              value={prompt}
+              value={input}
               placeholder={t.strategies.codePromptPlaceholder}
-              onChange={(event) => setPrompt(event.target.value)}
+              disabled={running}
+              onChange={(event) => setInput(event.target.value)}
             />
-            <Button size="sm" variant="secondary" disabled={running || pending} onClick={generate}>
+            <Button size="sm" variant="secondary" disabled={running || pending} onClick={send}>
               <Sparkles size={13} />
-              {generateCode.isPending ? t.strategies.codeGenerating : t.strategies.codeGenerate}
+              {generateCode.isPending ? t.strategies.chatSending : t.strategies.chatSend}
             </Button>
           </div>
         </div>
@@ -289,6 +379,600 @@ function StrategyCodeCard({ record, running }: { record: StrategyRecord; running
           >
             {notice.text}
           </p>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+function StrategyScopeCard({ record, running }: { record: StrategyRecord; running: boolean }) {
+  const { t } = useI18n();
+  const risk = useRiskLimits();
+  const funding = useFundingStatus();
+  const saveScope = useUpdateStrategyScope();
+
+  const venues =
+    risk.data?.allowed_venues?.length
+      ? risk.data.allowed_venues
+      : ["binance", "binance-spot", "okx", "okx-spot", "bybit"];
+  const spotOptions = venues.filter((venue) => venue.endsWith("-spot"));
+  const perpOptions = venues.filter((venue) => !venue.endsWith("-spot"));
+
+  const currentSpot =
+    record.definition.universe.venues.find((venue) => venue.endsWith("-spot")) ?? "";
+  const currentPerp =
+    record.definition.universe.venues.find((venue) => !venue.endsWith("-spot")) ?? "";
+
+  const [spot, setSpot] = useState(currentSpot || spotOptions[0] || "binance-spot");
+  const [perp, setPerp] = useState(currentPerp || perpOptions[0] || "binance");
+  const [symbols, setSymbols] = useState(record.definition.universe.symbols.join(", "));
+  const [notice, setNotice] = useState<{ tone: "ok" | "error"; text: string } | null>(null);
+
+  // 保存范围或回滚版本后，用最新定义同步表单。
+  useEffect(() => {
+    setSpot(currentSpot || spotOptions[0] || "binance-spot");
+    setPerp(currentPerp || perpOptions[0] || "binance");
+    setSymbols(record.definition.universe.symbols.join(", "));
+  }, [record.id, record.version]);
+
+  const selected = symbols
+    .split(/[,，\s]+/)
+    .map((symbol) => symbol.trim().toUpperCase())
+    .filter(Boolean);
+
+  const suggested = Array.from(
+    new Set([
+      ...(funding.data?.find((item) => item.venue === perp)?.symbols.map((item) => item.symbol) ??
+        []),
+      ...(risk.data?.allowed_symbols ?? []),
+    ]),
+  ).slice(0, 24);
+
+  const addSymbol = (symbol: string) => {
+    if (selected.includes(symbol)) {
+      return;
+    }
+    setSymbols([...selected, symbol].join(", "));
+  };
+
+  const submit = () => {
+    if (selected.length === 0) {
+      setNotice({ tone: "error", text: t.strategies.scopeRequired });
+      return;
+    }
+    setNotice(null);
+    saveScope.mutate(
+      { id: record.id, spot_venue: spot, perp_venue: perp, symbols: selected },
+      {
+        onSuccess: () => setNotice({ tone: "ok", text: t.strategies.scopeSaved }),
+        onError: (error) => setNotice({ tone: "error", text: errorText(error) }),
+      },
+    );
+  };
+
+  return (
+    <Card>
+      <CardHeader>
+        <div>
+          <CardTitle>{t.strategies.scopeTitle}</CardTitle>
+          <CardDescription>{t.strategies.scopeDesc}</CardDescription>
+        </div>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        <div className="grid gap-3 md:grid-cols-2">
+          <label className="block space-y-1">
+            <span className="text-[11px] text-muted">{t.strategies.scopeSpot}</span>
+            <select
+              className={inputClass}
+              value={spot}
+              disabled={running}
+              onChange={(event) => setSpot(event.target.value)}
+            >
+              {spotOptions.map((venue) => (
+                <option key={venue} value={venue}>
+                  {venue}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="block space-y-1">
+            <span className="text-[11px] text-muted">{t.strategies.scopePerp}</span>
+            <select
+              className={inputClass}
+              value={perp}
+              disabled={running}
+              onChange={(event) => setPerp(event.target.value)}
+            >
+              {perpOptions.map((venue) => (
+                <option key={venue} value={venue}>
+                  {venue}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
+
+        <label className="block space-y-1">
+          <span className="text-[11px] text-muted">{t.strategies.scopeSymbols}</span>
+          <input
+            className={inputClass}
+            value={symbols}
+            disabled={running}
+            placeholder={t.strategies.scopeSymbolsPlaceholder}
+            onChange={(event) => setSymbols(event.target.value)}
+          />
+        </label>
+
+        {suggested.length > 0 && (
+          <div className="space-y-1">
+            <p className="text-[11px] text-muted">{t.strategies.scopeSuggest}</p>
+            <div className="flex flex-wrap gap-1">
+              {suggested.map((symbol) => (
+                <button
+                  key={symbol}
+                  type="button"
+                  disabled={running}
+                  onClick={() => addSymbol(symbol)}
+                  className={cn(
+                    "rounded-full border px-2 py-0.5 text-[11px] transition-colors",
+                    selected.includes(symbol)
+                      ? "border-accent/40 bg-accent/10 text-accent"
+                      : "border-line bg-panel-soft text-muted hover:border-accent/30",
+                  )}
+                >
+                  {symbol}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {running && <p className="text-[11px] text-warning">{t.strategies.scopeNeedStop}</p>}
+
+        <div className="flex flex-wrap items-center gap-2">
+          <Button size="sm" disabled={running || saveScope.isPending} onClick={submit}>
+            <Play size={13} />
+            {saveScope.isPending ? t.strategies.scopeSaving : t.strategies.scopeSave}
+          </Button>
+          {notice && (
+            <p
+              className={cn(
+                "rounded-md border px-2 py-1 text-[11px]",
+                notice.tone === "ok"
+                  ? "border-accent/30 bg-accent/10 text-accent"
+                  : "border-danger/30 bg-danger/10 text-danger",
+              )}
+            >
+              {notice.text}
+            </p>
+          )}
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+function StrategyPublishCard({ record }: { record: StrategyRecord }) {
+  const { t } = useI18n();
+  const copy = t.market;
+  const authors = useMarketAuthors();
+  const publications = usePublications(true);
+  const createPublication = useCreatePublication();
+  const updatePublication = useUpdatePublication();
+  const createPerformance = useCreatePerformance();
+
+  const own = (publications.data ?? []).filter((item) => item.strategy_id === record.id);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const selected = own.find((item) => item.id === selectedId) ?? own[0] ?? null;
+  const performance = usePublicationPerformance(selected?.id ?? null);
+
+  const [authorId, setAuthorId] = useState("");
+  const activeAuthorId = authorId || authors.data?.[0]?.author_id || "";
+
+  const [draft, setDraft] = useState({
+    title: "",
+    summary: "",
+    logic: "",
+    risk: "medium" as RiskLevel,
+    notional: "1000",
+    visibility: "invite_only" as MarketVisibility,
+    sourceVisibility: "open_source" as SourceVisibility,
+    pricing: "monthly" as PricingModel,
+    price: "19",
+    trial: "7",
+    limits: "",
+  });
+
+  const [perfForm, setPerfForm] = useState({
+    source: "author_backtest" as PerformanceSource,
+    trades: "30",
+    sample: "30",
+    winRate: "55",
+    returnPct: "4",
+    drawdown: "3",
+    netPnl: "120",
+  });
+
+  const error = [createPublication.error, updatePublication.error, createPerformance.error].find(
+    Boolean,
+  );
+
+  const statusLabel: Record<PublicationStatus, string> = {
+    private: copy.statusPrivate,
+    published: copy.statusPublished,
+    withdrawn: copy.statusWithdrawn,
+  };
+
+  const statusTone: Record<PublicationStatus, "success" | "warning" | "neutral"> = {
+    private: "neutral",
+    published: "success",
+    withdrawn: "warning",
+  };
+
+  const sourceLabel: Record<PerformanceSource, string> = {
+    author_backtest: copy.sourceAuthorBacktest,
+    platform_replay: copy.sourcePlatformReplay,
+    authorized_live: copy.sourceLive,
+  };
+
+  return (
+    <Card>
+      <CardHeader>
+        <div className="flex items-center gap-2">
+          <Store size={15} className="text-accent" />
+          <div>
+            <CardTitle>{copy.publishTitle}</CardTitle>
+            <CardDescription>{copy.publishDesc}</CardDescription>
+          </div>
+        </div>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        {error && (
+          <p className="rounded-md border border-danger/30 bg-danger/10 px-2 py-1 text-[11px] text-danger">
+            {errorText(error)}
+          </p>
+        )}
+
+        {!authors.data?.length ? (
+          <p className="rounded-md border border-line bg-panel-soft px-2 py-1.5 text-[11px] text-muted">
+            {copy.authorMissing}
+          </p>
+        ) : (
+          <>
+            <div className="grid gap-2 sm:grid-cols-2">
+              <label className="text-[11px] text-muted">
+                {copy.authorCard}
+                <select
+                  className={inputClass}
+                  value={activeAuthorId}
+                  onChange={(event) => setAuthorId(event.target.value)}
+                >
+                  {(authors.data ?? []).map((author) => (
+                    <option key={author.author_id} value={author.author_id}>
+                      {author.display_name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="text-[11px] text-muted">
+                {copy.titleLabel}
+                <input
+                  className={inputClass}
+                  value={draft.title}
+                  onChange={(event) => setDraft({ ...draft, title: event.target.value })}
+                />
+              </label>
+              <label className="text-[11px] text-muted sm:col-span-2">
+                {copy.summaryLabel}
+                <input
+                  className={inputClass}
+                  value={draft.summary}
+                  onChange={(event) => setDraft({ ...draft, summary: event.target.value })}
+                />
+              </label>
+              <label className="text-[11px] text-muted sm:col-span-2">
+                {copy.logicLabel}
+                <textarea
+                  className={cn(inputClass, "min-h-20")}
+                  value={draft.logic}
+                  onChange={(event) => setDraft({ ...draft, logic: event.target.value })}
+                />
+              </label>
+              <label className="text-[11px] text-muted">
+                {copy.riskLevel}
+                <select
+                  className={inputClass}
+                  value={draft.risk}
+                  onChange={(event) => setDraft({ ...draft, risk: event.target.value as RiskLevel })}
+                >
+                  <option value="low">{copy.riskLow}</option>
+                  <option value="medium">{copy.riskMedium}</option>
+                  <option value="high">{copy.riskHigh}</option>
+                </select>
+              </label>
+              <label className="text-[11px] text-muted">
+                {copy.suggestedNotionalLabel}
+                <input
+                  className={inputClass}
+                  value={draft.notional}
+                  onChange={(event) => setDraft({ ...draft, notional: event.target.value })}
+                />
+              </label>
+              <label className="text-[11px] text-muted">
+                {copy.visibilityLabel}
+                <select
+                  className={inputClass}
+                  value={draft.visibility}
+                  onChange={(event) =>
+                    setDraft({ ...draft, visibility: event.target.value as MarketVisibility })
+                  }
+                >
+                  <option value="invite_only">{copy.visibilityInvite}</option>
+                  <option value="public">{copy.visibilityPublic}</option>
+                </select>
+              </label>
+              <label className="text-[11px] text-muted">
+                {copy.sourceVisibility}
+                <select
+                  className={inputClass}
+                  value={draft.sourceVisibility}
+                  onChange={(event) =>
+                    setDraft({ ...draft, sourceVisibility: event.target.value as SourceVisibility })
+                  }
+                >
+                  <option value="open_source">{copy.openSource}</option>
+                  <option value="black_box">{copy.blackBox}</option>
+                </select>
+              </label>
+              <label className="text-[11px] text-muted">
+                {copy.pricingLabel}
+                <select
+                  className={inputClass}
+                  value={draft.pricing}
+                  onChange={(event) =>
+                    setDraft({ ...draft, pricing: event.target.value as PricingModel })
+                  }
+                >
+                  <option value="free">{copy.freePlan}</option>
+                  <option value="monthly">{copy.monthlyPlan}</option>
+                </select>
+              </label>
+              <label className="text-[11px] text-muted">
+                {copy.priceLabel}
+                <input
+                  className={inputClass}
+                  value={draft.price}
+                  disabled={draft.pricing === "free"}
+                  onChange={(event) => setDraft({ ...draft, price: event.target.value })}
+                />
+              </label>
+              <label className="text-[11px] text-muted">
+                {copy.trialLabel}
+                <input
+                  className={inputClass}
+                  value={draft.trial}
+                  onChange={(event) => setDraft({ ...draft, trial: event.target.value })}
+                />
+              </label>
+              <label className="text-[11px] text-muted sm:col-span-2">
+                {copy.knownLimitsLabel}
+                <textarea
+                  className={cn(inputClass, "min-h-16")}
+                  value={draft.limits}
+                  onChange={(event) => setDraft({ ...draft, limits: event.target.value })}
+                />
+              </label>
+            </div>
+            <Button
+              size="sm"
+              disabled={
+                createPublication.isPending ||
+                !activeAuthorId ||
+                !draft.title.trim() ||
+                !draft.summary.trim() ||
+                draft.logic.trim().length < 40
+              }
+              onClick={() => {
+                createPublication.mutate(
+                  {
+                    strategy_id: record.id,
+                    author_id: activeAuthorId,
+                    title: draft.title.trim(),
+                    summary: draft.summary.trim(),
+                    logic_summary: draft.logic.trim(),
+                    risk_level: draft.risk,
+                    suggested_max_notional_usd: Number(draft.notional) || 0,
+                    known_limits: draft.limits
+                      .split("\n")
+                      .map((line) => line.trim())
+                      .filter(Boolean),
+                    source_visibility: draft.sourceVisibility,
+                    visibility: draft.visibility,
+                    pricing: {
+                      model: draft.pricing,
+                      monthly_price_usd:
+                        draft.pricing === "free" ? 0 : Number(draft.price) || 0,
+                      trial_days: draft.pricing === "free" ? 0 : Number(draft.trial) || 0,
+                    },
+                  },
+                  {
+                    onSuccess: (publication) => {
+                      setSelectedId(publication.id);
+                      setDraft({ ...draft, title: "", summary: "", logic: "", limits: "" });
+                    },
+                  },
+                );
+              }}
+            >
+              <Plus size={13} />
+              {createPublication.isPending ? copy.creating : copy.createDraft}
+            </Button>
+          </>
+        )}
+
+        {own.length > 0 && (
+          <div className="space-y-1.5 border-t border-line pt-3">
+            <p className="text-[11px] text-muted">{copy.myPublications}</p>
+            {own.map((publication) => (
+              <button
+                key={publication.id}
+                type="button"
+                onClick={() => setSelectedId(publication.id)}
+                className={cn(
+                  "w-full rounded-md border px-2 py-1.5 text-left transition-colors",
+                  publication.id === selected?.id
+                    ? "border-accent/50 bg-accent/5"
+                    : "border-line hover:bg-hover",
+                )}
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <span className="truncate text-xs font-medium text-fg">
+                    {publication.title}
+                  </span>
+                  <Badge tone={statusTone[publication.status]}>
+                    {statusLabel[publication.status]}
+                  </Badge>
+                </div>
+                <p className="text-[11px] text-muted">
+                  {fmt(copy.versionTag, { version: publication.strategy_version })} ·{" "}
+                  {publication.pricing.model === "free"
+                    ? copy.free
+                    : fmt(copy.monthly, {
+                        price: formatUsd(publication.pricing.monthly_price_usd),
+                      })}
+                </p>
+              </button>
+            ))}
+          </div>
+        )}
+
+        {selected && (
+          <div className="flex flex-wrap items-center gap-2 border-t border-line pt-3">
+            {selected.status !== "published" ? (
+              <Button
+                size="sm"
+                onClick={() =>
+                  updatePublication.mutate({ id: selected.id, body: { action: "publish" } })
+                }
+                disabled={updatePublication.isPending}
+              >
+                {copy.publish}
+              </Button>
+            ) : (
+              <Button
+                size="sm"
+                variant="danger"
+                onClick={() =>
+                  updatePublication.mutate({ id: selected.id, body: { action: "withdraw" } })
+                }
+                disabled={updatePublication.isPending}
+              >
+                {copy.withdraw}
+              </Button>
+            )}
+          </div>
+        )}
+
+        {selected && (
+          <div className="border-t border-line pt-3">
+            <p className="text-xs font-medium text-fg">{copy.performanceTitle}</p>
+            <p className="mt-0.5 text-[11px] text-muted">{copy.performanceDesc}</p>
+            <div className="mt-2 space-y-1.5">
+              {performance.data?.length ? (
+                performance.data.map((item) => (
+                  <div
+                    key={item.id}
+                    className="rounded-md border border-line bg-panel-soft px-2 py-1.5 text-[11px]"
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-body">
+                        {sourceLabel[item.source]} · v{item.strategy_version}
+                      </span>
+                      <Badge tone={item.reproducible ? "success" : "neutral"}>
+                        {item.reproducible ? copy.reproducible : copy.notReproducible}
+                      </Badge>
+                    </div>
+                    <p className="mt-0.5 text-muted">
+                      {fmt(copy.periodRange, {
+                        start: formatDateTime(item.period_start),
+                        end: formatDateTime(item.period_end),
+                      })}
+                    </p>
+                    <p className="mt-0.5 text-muted">
+                      {formatPercentValue(item.return_pct)} · {copy.fields.drawdown} -{" "}
+                      {formatNumber(item.max_drawdown_pct, 2)}% ·{" "}
+                      {fmt(copy.totalTrades, { count: item.trades })}
+                    </p>
+                  </div>
+                ))
+              ) : (
+                <p className="text-[11px] text-muted">{copy.performanceEmpty}</p>
+              )}
+            </div>
+
+            <div className="mt-3 grid grid-cols-3 gap-2">
+              <label className="col-span-3 text-[11px] text-muted">
+                {copy.addPerformance}
+                <select
+                  className={inputClass}
+                  value={perfForm.source}
+                  onChange={(event) =>
+                    setPerfForm({ ...perfForm, source: event.target.value as PerformanceSource })
+                  }
+                >
+                  <option value="author_backtest">{copy.sourceAuthorBacktest}</option>
+                  <option value="platform_replay">{copy.sourcePlatformReplay}</option>
+                </select>
+              </label>
+              {(
+                [
+                  ["trades", copy.fields.trades],
+                  ["sample", copy.fields.sample],
+                  ["winRate", copy.fields.winRate],
+                  ["returnPct", copy.fields.returnPct],
+                  ["drawdown", copy.fields.drawdown],
+                  ["netPnl", copy.fields.netPnl],
+                ] as const
+              ).map(([key, label]) => (
+                <label key={key} className="text-[11px] text-muted">
+                  {label}
+                  <input
+                    className={inputClass}
+                    value={perfForm[key]}
+                    onChange={(event) => setPerfForm({ ...perfForm, [key]: event.target.value })}
+                  />
+                </label>
+              ))}
+            </div>
+            <Button
+              size="sm"
+              variant="secondary"
+              className="mt-2"
+              disabled={createPerformance.isPending}
+              onClick={() => {
+                const now = new Date();
+                const start = new Date(now.getTime() - 30 * 24 * 3_600_000);
+                createPerformance.mutate({
+                  id: selected.id,
+                  body: {
+                    source: perfForm.source,
+                    period_start: start.toISOString(),
+                    period_end: now.toISOString(),
+                    trades: Number(perfForm.trades) || 0,
+                    win_rate_pct: Number(perfForm.winRate) || 0,
+                    net_pnl_usd: Number(perfForm.netPnl) || 0,
+                    return_pct: Number(perfForm.returnPct) || 0,
+                    max_drawdown_pct: Number(perfForm.drawdown) || 0,
+                    fee_bps_per_leg: 4,
+                    slippage_bps: 1,
+                    sample_size: Number(perfForm.sample) || 0,
+                  },
+                });
+              }}
+            >
+              {copy.addPerformance}
+            </Button>
+          </div>
         )}
       </CardContent>
     </Card>
@@ -349,6 +1033,208 @@ function SourceBadge({ source }: { source: StrategySource }) {
         ? t.strategies.sourceAi
         : t.strategies.sourceManual;
   return <Badge tone="neutral">{label}</Badge>;
+}
+
+const dryRunTone: Record<SandboxRunStatus, "success" | "warning" | "danger"> = {
+  ok: "success",
+  invalid: "warning",
+  error: "danger",
+  timeout: "danger",
+};
+
+function decisionText(decision: SandboxDecision): string {
+  switch (decision.action) {
+    case "open":
+      return `Open ${decision.symbol} · ${formatUsd(decision.notional_usd)}`;
+    case "close":
+      return `Close ${decision.symbol}`;
+    default:
+      return decision.reason ? `Hold · ${decision.reason}` : "Hold";
+  }
+}
+
+/// 运行情况：跑在哪个交易所组合、托管在哪台执行器、最近事件与试运行结果。
+function StrategyRuntimeCard({ record }: { record: StrategyRecord }) {
+  const { t } = useI18n();
+  const copy = t.strategies;
+  const { runtime } = record;
+  const runsQuery = useStrategyRuns(record.id);
+  const dryRun = useSandboxDryRun();
+
+  const runs = runsQuery.data?.runs ?? [];
+  const runEvents = runsQuery.data?.events ?? [];
+  // 已入库的运行事件优先；老数据没有实例时回落到策略自身的运行事件。
+  const events = runEvents.length
+    ? [...runEvents].reverse().map((event) => ({
+        at: event.created_at,
+        level: event.level,
+        message: event.message,
+      }))
+    : [...runtime.events].reverse();
+  const artifactId = record.sandbox?.artifact_id ?? null;
+  const report = dryRun.data ?? null;
+  const hosted = (record.run_scope ?? "self_hosted") === "platform";
+
+  const dryRunStatusLabel: Record<SandboxRunStatus, string> = {
+    ok: copy.dryRunOk,
+    invalid: copy.dryRunInvalid,
+    error: copy.dryRunError,
+    timeout: copy.dryRunTimeout,
+  };
+
+  return (
+    <Card>
+      <CardHeader className="flex-wrap">
+        <div>
+          <CardTitle>{copy.runtimeTitle}</CardTitle>
+          <CardDescription>{copy.runtimeDesc}</CardDescription>
+        </div>
+        <div className="flex flex-wrap items-center gap-1">
+          <Badge tone={hosted ? "info" : "neutral"}>
+            {hosted ? copy.runScopePlatform : copy.runScopeSelfHosted}
+          </Badge>
+          <Badge tone="info">{fmt(copy.signals, { count: runtime.signals })}</Badge>
+          <Badge tone="neutral">{fmt(copy.orders, { count: runtime.orders })}</Badge>
+        </div>
+      </CardHeader>
+      <CardContent className="space-y-3 text-xs text-muted">
+        <p className="text-[11px] text-subtle">
+          {copy.runScope}：{copy.runScopeDesc}
+        </p>
+        <div className="grid gap-2 md:grid-cols-2">
+          <span>
+            {fmt(copy.lastEvaluated, {
+              value: formatDateTime(runtime.last_evaluated_at),
+            })}
+          </span>
+          <span>
+            {runtime.open ? (
+              <>
+                {copy.openPosition}：{runtime.open.symbol} ·{" "}
+                {runtime.open.long_venue} / {runtime.open.short_venue} ·{" "}
+                {formatUsd(runtime.open.notional_usd)}
+              </>
+            ) : (
+              copy.noOpenPosition
+            )}
+          </span>
+        </div>
+        {runtime.last_error && (
+          <p className="text-danger">{fmt(copy.lastError, { message: runtime.last_error })}</p>
+        )}
+
+        <div>
+          <p className="mb-1 text-[11px] text-muted">{copy.runsTitle}</p>
+          {runs.length === 0 ? (
+            <p className="text-[11px] text-muted">{copy.runsEmpty}</p>
+          ) : (
+            <ul className="space-y-1">
+              {runs.slice(0, 5).map((run) => (
+                <li
+                  key={run.id}
+                  className="flex flex-wrap items-center gap-2 rounded-md border border-line bg-panel-soft px-2 py-1 text-[11px]"
+                >
+                  <span className="font-mono text-body">
+                    {run.long_venue} / {run.short_venue}
+                  </span>
+                  <span className="text-muted">v{run.strategy_version}</span>
+                  <Badge tone={statusTone[run.status]}>{strategyStatusLabel(run.status)}</Badge>
+                  <Badge tone={run.scope === "platform" ? "info" : "neutral"}>
+                    {run.scope === "platform" ? copy.runScopePlatform : copy.runScopeSelfHosted}
+                  </Badge>
+                  <span className="text-muted">
+                    {fmt(copy.runStarted, { value: formatDateTime(run.started_at) })}
+                  </span>
+                  <span className="text-subtle">
+                    {run.stopped_at
+                      ? fmt(copy.runStopped, { value: formatDateTime(run.stopped_at) })
+                      : fmt(copy.runHeartbeat, { value: formatDateTime(run.last_heartbeat_at) })}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+
+        <div>
+          <p className="mb-1 text-[11px] text-muted">{copy.events}</p>
+          {events.length === 0 ? (
+            <p className="text-[11px] text-muted">{copy.eventsEmpty}</p>
+          ) : (
+            <ul className="space-y-1">
+              {events.slice(0, 20).map((event, index) => (
+                <li
+                  key={`${event.at}-${index}`}
+                  className="flex items-start gap-2 rounded-md border border-line bg-panel-soft px-2 py-1 text-[11px]"
+                >
+                  <span
+                    className={cn("mt-1 h-1.5 w-1.5 shrink-0 rounded-full", eventTone[event.level])}
+                  />
+                  <span className="font-mono text-muted">{formatDateTime(event.at)}</span>
+                  <span className="text-body">{event.message}</span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+
+        <div className="space-y-2 border-t border-line pt-3">
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              size="sm"
+              variant="secondary"
+              disabled={!artifactId || dryRun.isPending}
+              onClick={() => artifactId && dryRun.mutate({ artifactId, body: { strategy_id: record.id } })}
+            >
+              <FlaskConical size={13} />
+              {dryRun.isPending ? copy.dryRunning : copy.dryRun}
+            </Button>
+            <span className="text-[11px] text-subtle">
+              {artifactId ? copy.dryRunDesc : copy.dryRunNeedDeploy}
+            </span>
+          </div>
+          {report && (
+            <div className="space-y-1 rounded-lg border border-line bg-panel-soft p-2 text-[11px]">
+              <div className="flex items-center gap-2">
+                <span className="text-muted">{copy.dryRunStatus}</span>
+                <Badge tone={dryRunTone[report.status]}>{dryRunStatusLabel[report.status]}</Badge>
+                <span className="text-muted">
+                  {fmt(copy.dryRunFuel, {
+                    used: formatNumber(report.fuel_consumed, 0),
+                    limit: formatNumber(report.fuel_limit, 0),
+                  })}
+                </span>
+                <span className="text-muted">
+                  {fmt(copy.dryRunDuration, { value: report.duration_ms })}
+                </span>
+              </div>
+              {report.error && <p className="text-danger">{report.error}</p>}
+              <p className="font-medium text-fg">{copy.dryRunDecisions}</p>
+              {report.decisions.length ? (
+                <ul className="space-y-0.5 text-body">
+                  {report.decisions.map((decision, index) => (
+                    <li key={`${decision.action}-${index}`}>{decisionText(decision)}</li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="text-muted">{copy.dryRunEmpty}</p>
+              )}
+              {report.logs.length > 0 && (
+                <>
+                  <p className="font-medium text-fg">{copy.dryRunLogs}</p>
+                  <ul className="max-h-28 space-y-0.5 overflow-y-auto font-mono text-subtle">
+                    {report.logs.map((line, index) => (
+                      <li key={`${index}-${line}`}>{line}</li>
+                    ))}
+                  </ul>
+                </>
+              )}
+            </div>
+          )}
+        </div>
+      </CardContent>
+    </Card>
+  );
 }
 
 export default function StrategiesPage() {
@@ -582,7 +1468,7 @@ function StrategyDetail({
   };
 }) {
   const { t } = useI18n();
-  const { definition, validation, runtime, last_backtest: report } = record;
+  const { definition, validation, last_backtest: report } = record;
   const running = record.status === "running";
   const errors = validation.issues.filter((issue) => issue.severity === "error");
   const warnings = validation.issues.filter((issue) => issue.severity === "warning");
@@ -669,6 +1555,11 @@ function StrategyDetail({
 
       <StrategyCodeCard record={record} running={running} />
 
+      <StrategyScopeCard record={record} running={running} />
+
+      <StrategyPublishCard record={record} />
+
+
       <Card>
         <CardHeader>
           <div>
@@ -750,64 +1641,7 @@ function StrategyDetail({
         </CardContent>
       </Card>
 
-      <Card>
-        <CardHeader>
-          <div>
-            <CardTitle>{t.strategies.runtimeTitle}</CardTitle>
-            <CardDescription>{t.strategies.runtimeDesc}</CardDescription>
-          </div>
-          <div className="flex items-center gap-2 text-[11px] text-muted">
-            <Badge tone="info">{fmt(t.strategies.signals, { count: runtime.signals })}</Badge>
-            <Badge tone="neutral">{fmt(t.strategies.orders, { count: runtime.orders })}</Badge>
-          </div>
-        </CardHeader>
-        <CardContent className="space-y-3 text-xs text-muted">
-          <div className="grid gap-2 md:grid-cols-2">
-            <span>
-              {fmt(t.strategies.lastEvaluated, {
-                value: formatDateTime(runtime.last_evaluated_at),
-              })}
-            </span>
-            <span>
-              {runtime.open ? (
-                <>
-                  {t.strategies.openPosition}：{runtime.open.symbol} ·{" "}
-                  {runtime.open.long_venue} / {runtime.open.short_venue} ·{" "}
-                  {formatUsd(runtime.open.notional_usd)}
-                </>
-              ) : (
-                t.strategies.noOpenPosition
-              )}
-            </span>
-          </div>
-          {runtime.last_error && (
-            <p className="text-danger">
-              {fmt(t.strategies.lastError, { message: runtime.last_error })}
-            </p>
-          )}
-          <div>
-            <p className="mb-1 text-[11px] text-muted">{t.strategies.events}</p>
-            {runtime.events.length === 0 ? (
-              <p className="text-[11px] text-muted">{t.strategies.eventsEmpty}</p>
-            ) : (
-              <ul className="space-y-1">
-                {[...runtime.events].reverse().map((event, index) => (
-                  <li
-                    key={`${event.at}-${index}`}
-                    className="flex items-start gap-2 rounded-md border border-line bg-panel-soft px-2 py-1 text-[11px]"
-                  >
-                    <span
-                      className={cn("mt-1 h-1.5 w-1.5 shrink-0 rounded-full", eventTone[event.level])}
-                    />
-                    <span className="font-mono text-muted">{formatDateTime(event.at)}</span>
-                    <span className="text-body">{event.message}</span>
-                  </li>
-                ))}
-              </ul>
-            )}
-          </div>
-        </CardContent>
-      </Card>
+      <StrategyRuntimeCard record={record} />
 
       <Card>
         <CardHeader>

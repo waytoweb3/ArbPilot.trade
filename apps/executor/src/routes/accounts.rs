@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
-    accounts::AccountView,
+    accounts::{AccountView, ImportRequest},
     error::ApiError,
     state::AppState,
     store::EquityPoint,
@@ -29,6 +29,16 @@ pub struct ImportAccountRequest {
     /// DEX 钱包地址或 Lighter 账户索引；CEX 账户留空。
     #[serde(default)]
     pub wallet_address: Option<String>,
+    /// DEX 签名私钥：Hyperliquid 的 API Wallet 私钥，或 Lighter 的 API Key 私钥。
+    /// 留空时该账户只能查询余额，不能下单。
+    #[serde(default)]
+    pub signer_key: Option<String>,
+    /// Lighter 的 API Key 序号（0-254），默认 0。
+    #[serde(default)]
+    pub key_index: Option<u8>,
+    /// Lighter 的数字账户索引，留空时由钱包地址自动解析。
+    #[serde(default)]
+    pub account_index: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -78,14 +88,17 @@ pub async fn import(
 ) -> Result<(StatusCode, Json<AccountView>), ApiError> {
     let view = state
         .accounts
-        .import(
-            body.venue,
-            body.label,
-            body.api_key.unwrap_or_default(),
-            body.api_secret.unwrap_or_default(),
-            body.passphrase,
-            body.wallet_address,
-        )
+        .import(ImportRequest {
+            venue: body.venue,
+            label: body.label,
+            api_key: body.api_key.unwrap_or_default(),
+            api_secret: body.api_secret.unwrap_or_default(),
+            passphrase: body.passphrase,
+            wallet_address: body.wallet_address,
+            signer_key: body.signer_key,
+            key_index: body.key_index,
+            account_index: body.account_index,
+        })
         .await
         .map_err(|error| ApiError::BadRequest(error.to_string()))?;
     Ok((StatusCode::CREATED, Json(view)))

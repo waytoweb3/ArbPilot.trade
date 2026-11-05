@@ -38,26 +38,6 @@ export async function fetchPlans(): Promise<{ currency: string; plans: PlanInfo[
   return (await response.json()) as { currency: string; plans: PlanInfo[] };
 }
 
-export async function createCheckout(input: {
-  plan: PlanId;
-  email?: string;
-  locale: "zh" | "en";
-  darkMode: boolean;
-}): Promise<{ ref: string; checkoutUrl: string; expiresAt: string }> {
-  const response = await fetch(`${PAYMENTS_URL}/api/checkout`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(input),
-  });
-  const payload = (await response.json().catch(() => null)) as
-    | { ref?: string; checkoutUrl?: string; expiresAt?: string; message?: string }
-    | null;
-  if (!response.ok || !payload?.checkoutUrl || !payload.ref) {
-    throw new Error(payload?.message ?? `checkout: ${response.status}`);
-  }
-  return { ref: payload.ref, checkoutUrl: payload.checkoutUrl, expiresAt: payload.expiresAt ?? "" };
-}
-
 export async function fetchLicense(ref: string): Promise<LicenseInfo> {
   const response = await fetch(`${PAYMENTS_URL}/api/licenses/${encodeURIComponent(ref)}`);
   if (response.status === 404) {

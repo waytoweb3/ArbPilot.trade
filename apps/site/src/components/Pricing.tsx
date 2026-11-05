@@ -1,14 +1,7 @@
 import { useEffect, useState, type ReactNode } from "react";
 
-import { fmt, useI18n } from "../lib/i18n";
-import {
-  createCheckout,
-  fetchPlans,
-  PAYMENTS_URL,
-  type PlanId,
-  type PlanInfo,
-} from "../lib/payments";
-import { useTheme } from "../lib/theme";
+import { useI18n } from "../lib/i18n";
+import { fetchPlans, type PlanId, type PlanInfo } from "../lib/payments";
 
 const FALLBACK_PLANS: PlanInfo[] = [
   {
@@ -91,17 +84,15 @@ function PlanCard({
 }
 
 const primaryCta =
-  "inline-flex w-full items-center justify-center rounded-full bg-accent-solid px-5 py-2.5 text-[13px] font-semibold text-on-accent transition-colors hover:bg-accent-solid-hover disabled:cursor-not-allowed disabled:opacity-60";
+  "inline-flex w-full items-center justify-center rounded-full bg-accent-solid px-5 py-2.5 text-[13px] font-semibold text-on-accent transition-colors hover:bg-accent-solid-hover";
 const secondaryCta =
-  "inline-flex w-full items-center justify-center rounded-full border border-line-strong px-5 py-2.5 text-[13px] font-semibold text-body transition-colors hover:border-accent/50 hover:text-fg disabled:cursor-not-allowed disabled:opacity-60";
+  "inline-flex w-full items-center justify-center rounded-full border border-line-strong px-5 py-2.5 text-[13px] font-semibold text-body transition-colors hover:border-accent/50 hover:text-fg";
 
+/** 官网只展示价格，订阅与支付都在桌面端完成。 */
 export default function Pricing() {
-  const { t, locale } = useI18n();
-  const { resolved } = useTheme();
+  const { t } = useI18n();
   const [plans, setPlans] = useState<PlanInfo[]>(FALLBACK_PLANS);
   const [loadFailed, setLoadFailed] = useState(false);
-  const [pending, setPending] = useState<PlanId | null>(null);
-  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     let alive = true;
@@ -120,27 +111,6 @@ export default function Pricing() {
       alive = false;
     };
   }, []);
-
-  const subscribe = async (plan: PlanId) => {
-    setPending(plan);
-    setError(null);
-    try {
-      const session = await createCheckout({
-        plan,
-        locale,
-        darkMode: resolved === "dark",
-      });
-      window.location.href = session.checkoutUrl;
-    } catch (cause) {
-      const message = cause instanceof Error ? cause.message : String(cause);
-      setError(
-        message === "Failed to fetch"
-          ? fmt(t.pricing.unavailable, { url: PAYMENTS_URL })
-          : fmt(t.pricing.failed, { message }),
-      );
-      setPending(null);
-    }
-  };
 
   const amountFor = (id: PlanId) =>
     plans.find((plan) => plan.id === id)?.amount ??
@@ -198,14 +168,9 @@ export default function Pricing() {
               amount={amountFor(id)}
               recommended={id === "strategy"}
               action={
-                <button
-                  type="button"
-                  onClick={() => void subscribe(id)}
-                  disabled={pending !== null}
-                  className={id === "strategy" ? primaryCta : secondaryCta}
-                >
-                  {pending === id ? t.pricing.ctaLoading : copy[id].cta}
-                </button>
+                <a href="#download" className={id === "strategy" ? primaryCta : secondaryCta}>
+                  {copy[id].cta}
+                </a>
               }
             />
           ))}
@@ -218,12 +183,6 @@ export default function Pricing() {
         </div>
 
         {loadFailed && <p className="mt-3 text-[11px] text-warning">{t.pricing.loadFailed}</p>}
-
-        {error && (
-          <p className="mt-6 rounded-xl border border-danger/30 bg-danger/10 px-4 py-3 text-[12px] text-danger">
-            {error}
-          </p>
-        )}
       </div>
     </section>
   );

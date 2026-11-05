@@ -2,7 +2,6 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { api } from "../lib/api";
 import type {
-  BindSandboxRequest,
   CreateOrderRequest,
   CreatePerformanceRequest,
   CreatePublicationRequest,
@@ -227,7 +226,11 @@ export function useUpdateStrategy() {
   return useMutation({
     mutationFn: ({ id, status }: { id: string; status: StrategyStatus }) =>
       api.updateStrategy(id, status),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["strategies"] }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["strategies"] });
+      // 启停会新建或关闭运行实例。
+      queryClient.invalidateQueries({ queryKey: ["strategy-runs"] });
+    },
   });
 }
 
@@ -237,6 +240,15 @@ export function useStrategyVersions(id: string | null) {
     queryKey: ["strategy-versions", id],
     queryFn: () => api.strategyVersions(id ?? ""),
     enabled: Boolean(id),
+  });
+}
+
+export function useStrategyRuns(id: string | null, enabled = true) {
+  return useQuery({
+    queryKey: ["strategy-runs", id],
+    queryFn: () => api.strategyRuns(id ?? ""),
+    enabled: Boolean(id) && enabled,
+    refetchInterval: 15_000,
   });
 }
 
@@ -260,6 +272,27 @@ export function useUpdateStrategyDefinition() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["strategies"] });
       queryClient.invalidateQueries({ queryKey: ["strategy-versions"] });
+    },
+  });
+}
+
+/** 修改策略的应用范围（交易所与代币），会产生新版本。 */
+export function useUpdateStrategyScope() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      id,
+      ...body
+    }: {
+      id: string;
+      spot_venue: string;
+      perp_venue: string;
+      symbols: string[];
+    }) => api.updateStrategyScope(id, body),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["strategies"] });
+      queryClient.invalidateQueries({ queryKey: ["strategy-versions"] });
+      queryClient.invalidateQueries({ queryKey: ["strategy-code"] });
     },
   });
 }
@@ -334,8 +367,15 @@ export function useSaveStrategyCode() {
 export function useGenerateStrategyCode() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: ({ id, prompt }: { id: string; prompt: string }) =>
-      api.generateStrategyCode(id, prompt),
+    mutationFn: ({
+      id,
+      prompt,
+      history,
+    }: {
+      id: string;
+      prompt: string;
+      history?: { role: "user" | "assistant"; content: string }[];
+    }) => api.generateStrategyCode(id, prompt, history),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["strategy-code"] });
       queryClient.invalidateQueries({ queryKey: ["strategies"] });
@@ -438,6 +478,9 @@ export function useUpdatePublication() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["market"] });
       queryClient.invalidateQueries({ queryKey: ["market", "leaderboard"] });
+      // 发布 / 撤回会切换策略的运行位置（平台托管 ↔ 自己的执行器）。
+      queryClient.invalidateQueries({ queryKey: ["strategies"] });
+      queryClient.invalidateQueries({ queryKey: ["strategy-runs"] });
     },
   });
 }
@@ -528,52 +571,12 @@ export function useUpdateSettlement() {
 }
 
 // ---------------------------------------------------------------------------
-// WASM 沙箱
+// 沙箱试运行
 // ---------------------------------------------------------------------------
-
-export function useSandboxArtifacts() {
-  return useQuery({
-    queryKey: ["sandbox", "artifacts"],
-    queryFn: api.sandboxArtifacts,
-    refetchInterval: 30_000,
-  });
-}
-
-export function useUploadSandboxArtifact() {
-  const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: ({ name, bytes }: { name: string; bytes: ArrayBuffer }) =>
-      api.uploadSandboxArtifact(name, bytes),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["sandbox"] }),
-  });
-}
 
 export function useSandboxDryRun() {
   return useMutation({
     mutationFn: ({ artifactId, body }: { artifactId: string; body: SandboxDryRunRequest }) =>
       api.sandboxDryRun(artifactId, body),
-  });
-}
-
-export function useBindSandbox() {
-  const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: ({ strategyId, body }: { strategyId: string; body: BindSandboxRequest }) =>
-      api.bindSandbox(strategyId, body),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["sandbox"] });
-      queryClient.invalidateQueries({ queryKey: ["strategies"] });
-    },
-  });
-}
-
-export function useUnbindSandbox() {
-  const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: (strategyId: string) => api.unbindSandbox(strategyId),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["sandbox"] });
-      queryClient.invalidateQueries({ queryKey: ["strategies"] });
-    },
   });
 }

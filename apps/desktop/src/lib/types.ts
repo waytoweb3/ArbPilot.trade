@@ -26,9 +26,6 @@ export type StrategyStatus = "draft" | "running" | "paused" | "stopped";
 /** 策略来源：内置、用户手写或 AI 生成，用于审计与复现。 */
 export type StrategySource = "built_in" | "manual" | "ai";
 
-/** 策略统一按实盘执行，订单经风控后提交到真实交易所。 */
-export type StrategyExecutionMode = "live";
-
 export type Instrument = "spot" | "perp";
 
 export type ValidationSeverity = "error" | "warning";
@@ -60,7 +57,6 @@ export interface StrategyRisk {
 }
 
 export interface ExecutionRules {
-  mode: StrategyExecutionMode;
   leverage: Decimal;
   max_slippage_bps: Decimal;
   cooldown_secs: number;
@@ -156,6 +152,41 @@ export interface StrategyRuntime {
   orders: number;
   open: StrategyOpenPosition | null;
   events: StrategyEvent[];
+  /** 当前运行实例；运行中才有值。 */
+  run_id?: string | null;
+}
+
+/** 策略运行位置：未发布跑在用户自己的执行器，发布后由平台托管执行器运行。 */
+export type StrategyRunScope = "platform" | "self_hosted";
+
+/** 一次运行实例：策略在某个交易所组合上的运行。 */
+export interface StrategyRun {
+  id: string;
+  strategy_id: string;
+  strategy_version: number;
+  scope: StrategyRunScope;
+  status: StrategyStatus;
+  long_venue: string;
+  short_venue: string;
+  symbols: string[];
+  started_at: string;
+  stopped_at: string | null;
+  last_heartbeat_at: string | null;
+}
+
+/** 运行事件：信号、下单、错误等，按时间正序返回。 */
+export interface StrategyRunEvent {
+  run_id: string;
+  strategy_id: string;
+  level: StrategyEventLevel;
+  message: string;
+  order_id: string | null;
+  created_at: string;
+}
+
+export interface StrategyRunsResponse {
+  runs: StrategyRun[];
+  events: StrategyRunEvent[];
 }
 
 export interface StrategyRecord {
@@ -163,13 +194,14 @@ export interface StrategyRecord {
   status: StrategyStatus;
   source: StrategySource;
   version: number;
-  execution_mode: StrategyExecutionMode;
   definition: StrategyDefinition;
   validation: StrategyValidation;
   last_backtest: BacktestReport | null;
   runtime: StrategyRuntime;
   /** 可选 WASM 沙箱绑定；存在时由模块替代内置入场/出场判断。 */
   sandbox?: SandboxBinding | null;
+  /** 运行位置，由发布 / 撤回自动切换。 */
+  run_scope?: StrategyRunScope;
   last_heartbeat_at: string | null;
   created_at: string;
   updated_at: string;
@@ -181,7 +213,6 @@ export interface StrategyVersion {
   version: number;
   status: StrategyStatus;
   source: StrategySource;
-  execution_mode: StrategyExecutionMode;
   definition: StrategyDefinition;
   validation: StrategyValidation;
   backtest: BacktestReport | null;
@@ -300,7 +331,7 @@ export interface Position {
   updated_at: string;
 }
 
-/** API Key 型 CEX，以及用钱包地址只读查询的 DEX。 */
+/** API Key 型 CEX，以及用钱包地址查询、用签名私钥下单的 DEX。 */
 export type AccountVenue =
   | "binance"
   | "okx"
@@ -339,6 +370,8 @@ export interface TradingAccount {
   kind: AccountKind | string;
   label: string;
   api_key_preview: string;
+  /** 是否具备下单所需凭证：CEX 的 Key/Secret，或 DEX 的签名私钥。 */
+  can_trade: boolean;
   created_at: string;
   snapshot: AccountSnapshotView | null;
 }
@@ -368,6 +401,12 @@ export interface ImportAccountRequest {
   api_secret?: string;
   passphrase?: string;
   wallet_address?: string;
+  /** DEX 签名私钥；留空则该账户只能查询余额。 */
+  signer_key?: string;
+  /** Lighter 的 API Key 序号，默认 0。 */
+  key_index?: number;
+  /** Lighter 的数字账户索引，留空时按钱包地址自动解析。 */
+  account_index?: number;
 }
 
 export interface RiskLimits {
@@ -513,6 +552,24 @@ export interface TelegramStatus {
 export interface TelegramPairingCode {
   code: string;
   expires_at: string;
+}
+
+/** 执行器维护的离线授权状态，不含令牌本身。 */
+export interface ExecutorLicense {
+  /** 执行器是否强制校验授权（ARBPILOT_LICENSE_REQUIRED）。 */
+  required: boolean;
+  installed: boolean;
+  valid: boolean;
+  /** 已过期但仍在离线宽限期内。 */
+  in_grace: boolean;
+  plans: string[];
+  status: "active" | "canceling" | "past_due" | "expired" | "none";
+  email: string | null;
+  subject: string | null;
+  device: string | null;
+  expires_at: number | null;
+  grace_until: number | null;
+  error: string | null;
 }
 
 // ---------------------------------------------------------------------------

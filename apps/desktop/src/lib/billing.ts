@@ -4,29 +4,11 @@ export const PAYMENTS_URL = (
 
 export type BillingPlanId = "arbitrage" | "strategy";
 
-export type LicenseStatus =
-  | "pending"
-  | "active"
-  | "canceling"
-  | "canceled"
-  | "past_due"
-  | "expired"
-  | "unknown";
-
 export interface BillingPlan {
   id: BillingPlanId;
   amount: string;
   billingPeriod: "monthly";
   name: { zh: string; en: string };
-}
-
-export interface License {
-  ref: string;
-  status: LicenseStatus;
-  plan: BillingPlanId | null;
-  email: string | null;
-  expiresAt: string | null;
-  updatedAt: string;
 }
 
 export class BillingError extends Error {
@@ -36,20 +18,6 @@ export class BillingError extends Error {
   ) {
     super(message);
     this.name = "BillingError";
-  }
-}
-
-const REF_KEY = "arbpilot.license.ref";
-
-export function getLicenseRef(): string | null {
-  return localStorage.getItem(REF_KEY);
-}
-
-export function setLicenseRef(ref: string | null): void {
-  if (ref) {
-    localStorage.setItem(REF_KEY, ref);
-  } else {
-    localStorage.removeItem(REF_KEY);
   }
 }
 
@@ -80,13 +48,16 @@ export async function createCheckout(input: {
   email?: string;
   locale: "zh" | "en";
   darkMode: boolean;
+  /** 账号服务签发的会话令牌；收银台会绑定到该账号，未登录将被拒绝。 */
+  session: string;
 }): Promise<{ ref: string; checkoutUrl: string }> {
+  const { session, ...body } = input;
   let response: Response;
   try {
     response = await fetch(`${PAYMENTS_URL}/api/checkout`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(input),
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${session}` },
+      body: JSON.stringify(body),
     });
   } catch {
     throw new BillingError(0, "payments service unreachable");
@@ -99,23 +70,6 @@ export async function createCheckout(input: {
     throw new BillingError(response.status, message);
   }
   return { ref, checkoutUrl };
-}
-
-export async function fetchLicense(ref: string): Promise<License> {
-  let response: Response;
-  try {
-    response = await fetch(`${PAYMENTS_URL}/api/licenses/${encodeURIComponent(ref)}`);
-  } catch {
-    throw new BillingError(0, "payments service unreachable");
-  }
-  if (response.status === 404) {
-    return { ref, status: "unknown", plan: null, email: null, expiresAt: null, updatedAt: "" };
-  }
-  const payload = await readJson(response);
-  if (!response.ok || !payload) {
-    throw new BillingError(response.status, `license: ${response.status}`);
-  }
-  return payload as unknown as License;
 }
 
 export interface StrategyCheckout {
@@ -131,12 +85,14 @@ export async function createStrategyCheckout(input: {
   subscriberId: string;
   subscriptionId: string;
   locale: "zh" | "en";
+  /** 账号服务签发的会话令牌；订阅人必须与登录账号一致。 */
+  session: string;
 }): Promise<StrategyCheckout> {
   let response: Response;
   try {
     response = await fetch(`${PAYMENTS_URL}/api/strategy-checkout`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${input.session}` },
       body: JSON.stringify({
         publication_id: input.publicationId,
         subscriber_id: input.subscriberId,

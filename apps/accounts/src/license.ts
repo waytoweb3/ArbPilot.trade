@@ -1,0 +1,75 @@
+import { sign } from "node:crypto";
+
+import { config, licenseKeys } from "./config";
+import type { Entitlement } from "./store";
+
+export const LICENSE_TOKEN_PREFIX = "arb1";
+
+export interface LicenseClaims {
+  /** 用户 ID */
+  sub: string;
+  email: string | null;
+  /** 当前有效的套餐列表；为空表示免费用户 */
+  plans: string[];
+  status: Entitlement["status"];
+  /** 已激活且未撤销的设备 ID，执行器可用于校验设备绑定 */
+  devices: string[];
+  /** 当前设备的指纹；为空表示令牌来自网页端 */
+  device: string | null;
+  iat: number;
+  exp: number;
+  v: 1;
+}
+
+export interface IssuedLicense {
+  token: string;
+  claims: LicenseClaims;
+  expiresAt: string;
+}
+
+/**
+ * 签发 Ed25519 签名令牌。私钥只留在账号服务，执行器只需内置公钥即可离线校验，
+ * 因此用户本机无法伪造权益。
+ */
+export function issueLicenseToken(input: {
+  userId: string;
+  email: string | null;
+  entitlement: Entitlement;
+  devices: string[];
+  deviceFingerprint: string | null;
+}): IssuedLicense {
+  const now = Math.floor(Date.now() / 1000);
+  const exp = now + Math.round(config.licenseTtlHours * 3600);
+  const claims: LicenseClaims = {
+    sub: input.userId,
+    email: input.email,
+    plans: input.entitlement.plans,
+    status: input.entitlement.status,
+    devices: input.devices,
+    device: input.deviceFingerprint,
+    iat: now,
+    exp,
+    v: 1,
+  };
+
+  const payload = Buffer.from(JSON.stringify(claims)).toString("base64url");
+  const message = `${LICENSE_TOKEN_PREFIX}.${payload}`;
+  const signature = sign(null, Buffer.from(message), licenseKeys.privateKey);
+  return {
+    token: `${message}.${signature.toString("base64url")}`,
+    claims,
+    expiresAt: new Date(exp * 1000).toISOString(),
+  };
+}
+
+export function publicKeyInfo(): {
+  algorithm: "ed25519";
+  publicKey: string;
+  ephemeral: boolean;
+} {
+  return {
+    algorithm: "ed25519",
+    publicKey: licenseKeys.publicKeyDer,
+    ephemeral: licenseKeys.ephemeral,
+  };
+}

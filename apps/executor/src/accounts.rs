@@ -20,7 +20,7 @@ use crate::{
     store::{EquityPoint, Store},
 };
 
-/// 支持导入 API Key 的 CEX，以及用钱包地址只读查询的 DEX。
+/// 支持导入 API Key 的 CEX，以及用钱包地址查询、用签名私钥下单的 DEX。
 pub const SUPPORTED_VENUES: [&str; 11] = [
     "binance",
     "okx",
@@ -35,7 +35,7 @@ pub const SUPPORTED_VENUES: [&str; 11] = [
     "lighter",
 ];
 
-/// 这些 DEX 没有 API Key，只用钱包地址（Lighter 也可用账户索引）查询公开接口。
+/// 这些 DEX 用钱包地址（Lighter 也可用账户索引）查询公开接口，用签名私钥下单。
 pub const WALLET_VENUES: [&str; 2] = ["hyperliquid", "lighter"];
 
 /// 这些交易所在签名之外还需要 passphrase。
@@ -92,7 +92,7 @@ pub struct AccountCredentials {
     pub id: Uuid,
     pub venue: String,
     pub label: String,
-    /// DEX 只读账户没有密钥，这两个字段为空字符串。
+    /// CEX 的 API Key；DEX 只读账户为空字符串。
     #[serde(default)]
     pub api_key: String,
     #[serde(default)]
@@ -102,7 +102,31 @@ pub struct AccountCredentials {
     /// DEX 钱包地址；Lighter 也接受数字账户索引。
     #[serde(default)]
     pub wallet_address: Option<String>,
+    /// DEX 签名私钥：Hyperliquid 的 API Wallet（Agent）私钥或 Lighter 的 API Key 私钥。
+    /// 只保存在本机，且无法提现；为空时该账户仅能查询余额。
+    #[serde(default)]
+    pub signer_key: Option<String>,
+    /// Lighter 的 API Key 序号（0-254），Hyperliquid 不使用。
+    #[serde(default)]
+    pub key_index: Option<u8>,
+    /// Lighter 的数字账户索引，签名下单时必须，导入时可由钱包地址自动解析。
+    #[serde(default)]
+    pub account_index: Option<i64>,
     pub created_at: DateTime<Utc>,
+}
+
+/// 导入账户的入参，DEX 与 CEX 共用。
+#[derive(Debug, Clone, Default)]
+pub struct ImportRequest {
+    pub venue: String,
+    pub label: Option<String>,
+    pub api_key: String,
+    pub api_secret: String,
+    pub passphrase: Option<String>,
+    pub wallet_address: Option<String>,
+    pub signer_key: Option<String>,
+    pub key_index: Option<u8>,
+    pub account_index: Option<i64>,
 }
 
 /// 单个资产的余额，`usd_value` 在缺少价格时为 null。
@@ -129,10 +153,12 @@ pub struct AccountSnapshotView {
 pub struct AccountView {
     pub id: Uuid,
     pub venue: String,
-    /// `wallet` 表示钱包地址只读账户，`api_key` 表示密钥账户。
+    /// `wallet` 表示钱包地址账户，`api_key` 表示密钥账户。
     pub kind: &'static str,
     pub label: String,
     pub api_key_preview: String,
+    /// 是否具备下单所需凭证：CEX 的 Key/Secret，或 DEX 的签名私钥。
+    pub can_trade: bool,
     pub created_at: DateTime<Utc>,
     pub snapshot: Option<AccountSnapshotView>,
 }
@@ -192,13 +218,13 @@ impl Accounts {
             .collect()
     }
 
-    /// 实盘下单使用的账户凭证；同一交易所取第一个已导入的账户。
+    /// 实盘下单使用的账户凭证；同一交易所优先取已配置签名凭证的账户。
     pub fn credentials_for(&self, venue: &str) -> Option<AccountCredentials> {
-        self.accounts
-            .read()
-            .expect("账户锁不可用")
+        let accounts = self.accounts.read().expect("账户锁不可用");
+        accounts
             .iter()
-            .find(|account| account.venue == venue)
+            .find(|account| account.venue == venue && has_trading_credentials(account))
+            .or_else(|| accounts.iter().find(|account| account.venue == venue))
             .cloned()
     }
 
@@ -212,36 +238,59 @@ impl Accounts {
     }
 
     /// 导入前先用私有接口验证一次，失败则不落盘。
-    pub async fn import(
-        &self,
-        venue: String,
-        label: Option<String>,
-        api_key: String,
-        api_secret: String,
-        passphrase: Option<String>,
-        wallet_address: Option<String>,
-    ) -> anyhow::Result<AccountView> {
-        let venue = venue.trim().to_ascii_lowercase();
+    pub async fn import(&self, request: ImportRequest) -> anyhow::Result<AccountView> {
+        let venue = request.venue.trim().to_ascii_lowercase();
         if !is_supported(&venue) {
             bail!("暂不支持该交易所: {venue}");
         }
         let wallet = is_wallet_venue(&venue);
-        let wallet_address = wallet_address
+        let wallet_address = request
+            .wallet_address
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
-        let api_key = if wallet { String::new() } else { api_key.trim().to_string() };
-        let api_secret = if wallet { String::new() } else { api_secret.trim().to_string() };
+        // DEX 的签名私钥用于下单，导入时必填。
+        let signer_key = request
+            .signer_key
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let api_key = if wallet { String::new() } else { request.api_key.trim().to_string() };
+        let api_secret = if wallet {
+            String::new()
+        } else {
+            request.api_secret.trim().to_string()
+        };
 
+        let mut account_index = None;
+        let mut key_index = None;
         if wallet {
-            if wallet_address.is_none() {
-                bail!("该交易所需要填写钱包地址或账户索引");
+            let address = wallet_address
+                .as_deref()
+                .ok_or_else(|| anyhow!("该交易所需要填写钱包地址或账户索引"))?;
+            // 下单必须在本地签名，缺少私钥的账户无法交易，因此导入时直接要求必填。
+            let key = signer_key
+                .as_deref()
+                .ok_or_else(|| anyhow!("DEX 账户需要填写签名私钥，否则无法下单"))?;
+            // 私钥格式错误时直接拒绝导入，避免下单时才暴露。
+            crate::exchange::dex::validate_signer_key(&venue, key)?;
+            if venue == "lighter" {
+                key_index = Some(request.key_index.unwrap_or(0));
+                // 签名交易必须带上数字账户索引，钱包地址可直接解析出唯一主账户。
+                account_index = Some(match request.account_index {
+                    Some(index) => index,
+                    None => self.resolve_lighter_account(address).await?,
+                });
             }
         } else {
             if api_key.is_empty() || api_secret.is_empty() {
                 bail!("API Key 与 Secret 不能为空");
             }
             if requires_passphrase(&venue)
-                && passphrase.as_deref().map(str::trim).unwrap_or_default().is_empty()
+                && request
+                    .passphrase
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or_default()
+                    .is_empty()
             {
                 bail!("该交易所需要填写 Passphrase");
             }
@@ -249,15 +298,22 @@ impl Accounts {
 
         let credentials = AccountCredentials {
             id: Uuid::new_v4(),
-            label: label
+            label: request
+                .label
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty())
                 .unwrap_or_else(|| venue.to_ascii_uppercase()),
             venue,
             api_key,
             api_secret,
-            passphrase: passphrase.map(|value| value.trim().to_string()).filter(|v| !v.is_empty()),
+            passphrase: request
+                .passphrase
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
             wallet_address,
+            signer_key,
+            key_index,
+            account_index,
             created_at: Utc::now(),
         };
 
@@ -275,6 +331,42 @@ impl Accounts {
 
         let snapshots = self.snapshots.read().expect("快照锁不可用");
         Ok(view_of(&credentials, snapshots.get(&credentials.id).cloned()))
+    }
+
+    /// 把 Lighter 的钱包地址或账户索引解析成数字账户索引。
+    async fn resolve_lighter_account(&self, target: &str) -> anyhow::Result<i64> {
+        if let Ok(index) = target.trim().parse::<i64>() {
+            return Ok(index);
+        }
+        let http = self
+            .http
+            .clone()
+            .ok_or_else(|| anyhow!("行情 HTTP 客户端不可用，无法解析 Lighter 账户索引"))?;
+        let base_url = self
+            .endpoints
+            .get("lighter")
+            .ok_or_else(|| anyhow!("缺少 Lighter 接口地址"))?
+            .trim_end_matches('/')
+            .to_string();
+        let target = target.trim().to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let value = http.get_json(&format!(
+                "{base_url}/api/v1/account?by=l1_address&value={target}"
+            ))?;
+            let account = value["accounts"]
+                .as_array()
+                .and_then(|rows| rows.first())
+                .ok_or_else(|| {
+                    anyhow!("Lighter 未找到该钱包的账户，请确认地址或改填账户索引")
+                })?;
+            account["account_index"]
+                .as_i64()
+                .or_else(|| account["index"].as_i64())
+                .ok_or_else(|| anyhow!("Lighter 响应缺少 account_index"))
+        })
+        .await
+        .context("解析 Lighter 账户索引任务失败")?
     }
 
     pub async fn remove(&self, id: Uuid) -> anyhow::Result<()> {
@@ -448,6 +540,15 @@ impl Accounts {
     }
 }
 
+/// 该账户是否具备下单所需凭证：CEX 的 Key/Secret，或 DEX 的签名私钥。
+fn has_trading_credentials(credentials: &AccountCredentials) -> bool {
+    if is_wallet_venue(&credentials.venue) {
+        credentials.signer_key.is_some()
+    } else {
+        !credentials.api_key.is_empty() && !credentials.api_secret.is_empty()
+    }
+}
+
 fn view_of(credentials: &AccountCredentials, snapshot: Option<AccountSnapshotView>) -> AccountView {
     let wallet = is_wallet_venue(&credentials.venue);
     AccountView {
@@ -460,6 +561,7 @@ fn view_of(credentials: &AccountCredentials, snapshot: Option<AccountSnapshotVie
         } else {
             &credentials.api_key
         }),
+        can_trade: has_trading_credentials(credentials),
         created_at: credentials.created_at,
         snapshot,
     }
@@ -935,7 +1037,7 @@ fn fetch_aster(
     Ok((balances, equity))
 }
 
-/// Hyperliquid 只读：永续账户权益走 `clearinghouseState`，现货余额走 `spotClearinghouseState`。
+/// Hyperliquid 余额查询：永续账户权益走 `clearinghouseState`，现货余额走 `spotClearinghouseState`。
 fn fetch_hyperliquid(
     http: &HttpClient,
     base_url: &str,
@@ -983,7 +1085,7 @@ fn fetch_hyperliquid(
     Ok((balances, None))
 }
 
-/// Lighter 只读：按 L1 地址或数字账户索引查询全部子账户的资产。
+/// Lighter 余额查询：按 L1 地址或数字账户索引查询全部子账户的资产。
 fn fetch_lighter(
     http: &HttpClient,
     base_url: &str,

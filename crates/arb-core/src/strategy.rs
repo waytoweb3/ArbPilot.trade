@@ -18,13 +18,6 @@ pub enum StrategyStatus {
     Stopped,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum StrategyExecutionMode {
-    /// 实盘：订单经统一风控后提交到真实交易所。
-    Live,
-}
-
 /// 策略来源，用于审计 AI 生成与用户手写的差异。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -32,6 +25,17 @@ pub enum StrategySource {
     BuiltIn,
     Manual,
     Ai,
+}
+
+/// 策略运行位置：未发布的策略跑在用户自己的执行器，发布到市场后由平台托管执行器运行。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StrategyRunScope {
+    /// 已发布到市场，归平台托管执行器运行。
+    Platform,
+    /// 默认：运行在用户自己的执行器。
+    #[default]
+    SelfHosted,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,7 +88,6 @@ fn default_unhedged_seconds() -> u64 {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionRules {
-    pub mode: StrategyExecutionMode,
     #[serde(default = "default_leverage")]
     pub leverage: Decimal,
     #[serde(default = "default_slippage_bps")]
@@ -675,6 +678,9 @@ pub struct StrategyRuntime {
     pub last_error: Option<String>,
     pub signals: u64,
     pub orders: u64,
+    /// 当前运行实例；重启后由运行器重新建立。
+    #[serde(default)]
+    pub run_id: Option<Uuid>,
     pub open: Option<StrategyOpenPosition>,
     pub events: Vec<StrategyEvent>,
 }
@@ -738,11 +744,13 @@ pub struct StrategyRecord {
     pub status: StrategyStatus,
     pub source: StrategySource,
     pub version: u32,
-    pub execution_mode: StrategyExecutionMode,
     pub definition: StrategyDefinition,
     pub validation: StrategyValidation,
     pub last_backtest: Option<BacktestReport>,
     pub runtime: StrategyRuntime,
+    /// 运行位置：默认自托管，发布到市场后改为平台托管。
+    #[serde(default)]
+    pub run_scope: StrategyRunScope,
     /// 可选 WASM 沙箱绑定。存在时由沙箱模块替代内置入场/出场判断，
     /// 但输出仍只能通过统一风控网关下单。
     #[serde(default)]
@@ -764,11 +772,11 @@ impl StrategyRecord {
             status,
             source,
             version: 1,
-            execution_mode: definition.execution.mode,
             definition,
             validation: StrategyValidation::default(),
             last_backtest: None,
             runtime: StrategyRuntime::default(),
+            run_scope: StrategyRunScope::SelfHosted,
             sandbox: None,
             last_heartbeat_at: Some(now),
             created_at: now,
@@ -783,7 +791,6 @@ impl StrategyRecord {
     /// 更新定义即产生新版本；旧版本的回测结果不再代表新定义。
     pub fn apply_definition(&mut self, definition: StrategyDefinition) {
         self.version += 1;
-        self.execution_mode = definition.execution.mode;
         self.definition = definition;
         self.validation = StrategyValidation::default();
         self.last_backtest = None;
@@ -920,7 +927,6 @@ mod tests {
                 max_unhedged_seconds: 3,
             },
             execution: ExecutionRules {
-                mode: StrategyExecutionMode::Live,
                 leverage: dec!(1),
                 max_slippage_bps: dec!(10),
                 cooldown_secs: 300,

@@ -2,6 +2,7 @@ pub mod binance;
 pub mod bingx;
 pub mod bitget;
 pub mod bybit;
+pub mod dex;
 pub mod gate;
 pub mod htx;
 pub mod hyperliquid;

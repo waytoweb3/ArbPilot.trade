@@ -7,6 +7,7 @@
     "dev": "pnpm --filter @arbpilot/desktop dev",
     "dev:site": "pnpm --filter @arbpilot/site dev",
     "dev:payments": "pnpm --filter @arbpilot/payments dev",
+    "dev:accounts": "pnpm --filter @arbpilot/accounts dev",
     "dev:desktop": "pnpm --filter @arbpilot/desktop tauri dev",
     "dev:executor": "cargo run -p arbpilot-executor",
     "build": "pnpm --filter @arbpilot/desktop build",

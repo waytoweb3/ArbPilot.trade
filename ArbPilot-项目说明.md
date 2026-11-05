@@ -111,7 +111,9 @@ risk:
   max_notional_usd: 500
   max_unhedged_seconds: 3
 execution:
-  mode: paper
+  leverage: 2
+  max_slippage_bps: 5
+  cooldown_secs: 60
 ```
 
 AI 需同时生成自然语言说明，解释入场、退出、阻止交易的条件及未决假设。结构符合 Schema 不等于策略正确；还需进行语义校验、回放和风控检查。
