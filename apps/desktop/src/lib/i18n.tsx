@@ -1060,6 +1060,13 @@ const en: typeof zh = {
     codeCompileOk: "Compiled and passed the sandbox static checks.",
     codeDeployOk: "Deployed to the sandbox; every runtime order still goes through the risk gateway.",
     codePromptRequired: "Describe the strategy first.",
+    createDesc:
+      "Create with just a name. You can describe the strategy in natural language first, then review, edit and deploy the generated code.",
+    createName: "Strategy name",
+    createNamePlaceholder: "e.g. BTC funding rate arbitrage",
+    creating: "Creating…",
+    createSubmit: "Create strategy",
+    createNameRequired: "Enter a strategy name.",
   },
   market: {
     title: "Strategy market",
