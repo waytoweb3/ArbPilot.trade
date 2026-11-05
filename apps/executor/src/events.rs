@@ -1,8 +1,6 @@
-use chrono::{DateTime, Utc};
 use arb_core::{Order, OrderStatus};
+use chrono::{DateTime, Utc};
 use serde::Serialize;
-
-use crate::config::TradingMode;
 
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -25,7 +23,6 @@ pub enum ExecutorEvent {
     },
     ExecutorStatus {
         paused: bool,
-        mode: TradingMode,
         uptime_secs: u64,
         server_time: DateTime<Utc>,
     },
