@@ -184,12 +184,7 @@ pub struct Order {
 
 impl Order {
     pub fn from_intent(intent: OrderIntent, status: OrderStatus) -> Self {
-        let legs = intent
-            .legs
-            .iter()
-            .cloned()
-            .map(OrderLeg::pending)
-            .collect();
+        let legs = intent.legs.iter().cloned().map(OrderLeg::pending).collect();
         let now = Utc::now();
         Self {
             id: Uuid::new_v4(),
@@ -206,6 +201,9 @@ impl Order {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Position {
     pub id: Uuid,
+    /// 来自策略的仓位记录来源策略，手动下单为 None。
+    #[serde(default)]
+    pub strategy_id: Option<Uuid>,
     pub venue: String,
     pub symbol: String,
     pub side: Side,
@@ -228,26 +226,4 @@ pub struct Balance {
     pub asset: String,
     pub free: Decimal,
     pub locked: Decimal,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum StrategyStatus {
-    Draft,
-    Running,
-    Paused,
-    Stopped,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StrategyRecord {
-    pub id: Uuid,
-    pub name: String,
-    pub kind: OpportunityKind,
-    pub status: StrategyStatus,
-    pub venues: Vec<String>,
-    pub symbols: Vec<String>,
-    /// 最近一次心跳；用于识别策略 Worker 失联。
-    pub last_heartbeat_at: Option<DateTime<Utc>>,
-    pub updated_at: DateTime<Utc>,
 }

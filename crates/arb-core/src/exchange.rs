@@ -70,13 +70,10 @@ pub trait ExchangeAdapter: Send + Sync {
 
     async fn account_snapshot(&self) -> Result<AccountSnapshot, ExchangeError>;
 
-    async fn place_order(&self, request: PlaceOrderRequest) -> Result<VenueOrderAck, ExchangeError>;
+    async fn place_order(&self, request: PlaceOrderRequest)
+        -> Result<VenueOrderAck, ExchangeError>;
 
-    async fn cancel_order(
-        &self,
-        symbol: &str,
-        venue_order_id: &str,
-    ) -> Result<(), ExchangeError>;
+    async fn cancel_order(&self, symbol: &str, venue_order_id: &str) -> Result<(), ExchangeError>;
 
     async fn order_status(
         &self,

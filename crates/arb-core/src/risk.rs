@@ -32,7 +32,9 @@ impl Default for RiskLimits {
             allowed_symbols: vec!["BTCUSDT".to_string(), "ETHUSDT".to_string()],
             allowed_venues: vec![
                 "binance".to_string(),
+                "binance-spot".to_string(),
                 "okx".to_string(),
+                "okx-spot".to_string(),
                 "bybit".to_string(),
             ],
             max_legs: 2,
@@ -134,17 +136,13 @@ impl RiskEngine {
                     format!("订单腿数量或价格无效: {} {}", leg.venue, leg.symbol),
                 ));
             }
-            if !limits.allowed_venues.is_empty()
-                && !limits.allowed_venues.contains(&leg.venue)
-            {
+            if !limits.allowed_venues.is_empty() && !limits.allowed_venues.contains(&leg.venue) {
                 violations.push(RiskViolation::new(
                     RiskViolationCode::VenueNotAllowed,
                     format!("交易所 {} 不在允许列表内", leg.venue),
                 ));
             }
-            if !limits.allowed_symbols.is_empty()
-                && !limits.allowed_symbols.contains(&leg.symbol)
-            {
+            if !limits.allowed_symbols.is_empty() && !limits.allowed_symbols.contains(&leg.symbol) {
                 violations.push(RiskViolation::new(
                     RiskViolationCode::SymbolNotAllowed,
                     format!("交易对 {} 不在允许列表内", leg.symbol),
@@ -155,10 +153,7 @@ impl RiskEngine {
         if intent.leverage > limits.max_leverage {
             violations.push(RiskViolation::new(
                 RiskViolationCode::LeverageTooHigh,
-                format!(
-                    "杠杆 {} 超过上限 {}",
-                    intent.leverage, limits.max_leverage
-                ),
+                format!("杠杆 {} 超过上限 {}", intent.leverage, limits.max_leverage),
             ));
         }
 
