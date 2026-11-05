@@ -12,6 +12,10 @@ apps/desktop/src-tauri/gen/
 *.pem
 *.key
 .credentials/
+# 收款服务的本地授权/商品缓存
+apps/payments/.data/
+# 执行器运行期数据（账户凭证、风控限额、Telegram 绑定）
+data/
 
 # 日志与临时文件
 *.log

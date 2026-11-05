@@ -1,4 +1,8 @@
 packages:
   - "apps/desktop"
+  - "apps/site"
+  - "apps/payments"
 minimumReleaseAgeExclude:
   - lucide-react@1.68.0
+allowBuilds:
+  esbuild: true

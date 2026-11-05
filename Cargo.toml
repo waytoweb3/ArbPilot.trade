@@ -12,16 +12,22 @@ arb-core = { path = "crates/arb-core" }
 anyhow = "1"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["ws"] }
+base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 dotenvy = "0.15"
+hex = "0.4"
+hmac = "0.12"
 rust_decimal = { version = "1", features = ["serde", "maths"] }
 rust_decimal_macros = "1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono", "json", "macros", "migrate"] }
+sha2 = "0.10"
+sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono", "json", "macros", "migrate", "rust_decimal"] }
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.6", features = ["cors", "trace", "limit"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+webpki-roots = "0.26"

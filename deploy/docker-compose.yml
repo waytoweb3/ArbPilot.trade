@@ -30,9 +30,12 @@ services:
     environment:
       ARBPILOT_BIND_ADDR: 0.0.0.0:8787
       ARBPILOT_API_TOKEN: ${ARBPILOT_API_TOKEN:?请先设置 ARBPILOT_API_TOKEN}
-      ARBPILOT_MODE: paper
       ARBPILOT_ALLOW_LIVE_TRADING: "false"
       DATABASE_URL: postgres://arbpilot:${POSTGRES_PASSWORD:-arbpilot}@postgres:5432/arbpilot
+      ARBPILOT_FUNDING_ENABLED: ${ARBPILOT_FUNDING_ENABLED:-true}
+      ARBPILOT_FUNDING_SYMBOLS: ${ARBPILOT_FUNDING_SYMBOLS:-BTCUSDT,ETHUSDT}
+      ARBPILOT_FUNDING_POLL_SECS: ${ARBPILOT_FUNDING_POLL_SECS:-60}
+      ARBPILOT_BINANCE_FAPI_URL: ${ARBPILOT_BINANCE_FAPI_URL:-https://fapi.binance.com}
       RUST_LOG: info,arbpilot_executor=debug
     # 管理端口仅绑定回环地址，桌面端通过 SSH 隧道连接。
     ports:

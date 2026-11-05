@@ -5,6 +5,8 @@
   "packageManager": "pnpm@12.16.1",
   "scripts": {
     "dev": "pnpm --filter @arbpilot/desktop dev",
+    "dev:site": "pnpm --filter @arbpilot/site dev",
+    "dev:payments": "pnpm --filter @arbpilot/payments dev",
     "dev:desktop": "pnpm --filter @arbpilot/desktop tauri dev",
     "dev:executor": "cargo run -p arbpilot-executor",
     "build": "pnpm --filter @arbpilot/desktop build",
