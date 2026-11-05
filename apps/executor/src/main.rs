@@ -1,18 +1,27 @@
+mod accounts;
 mod auth;
 mod config;
 mod error;
 mod events;
 mod exchange;
+mod funding;
+mod gateway;
+mod http_client;
+mod llm;
 mod market;
+mod news;
+mod realtime;
 mod routes;
+mod sandbox;
 mod state;
 mod store;
+mod strategy_runner;
+mod telegram;
+mod ws;
 
 use anyhow::Context;
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
-
-use crate::config::TradingMode;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -25,18 +34,17 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = config::Config::from_env()?;
-    if config.mode == TradingMode::Live && !config.allow_live_trading {
-        anyhow::bail!("ARBPILOT_MODE=live 时必须显式设置 ARBPILOT_ALLOW_LIVE_TRADING=true");
-    }
-    if config.mode == TradingMode::Live {
-        tracing::warn!("真实交易模式已开启，但当前构建仅包含模拟交易所适配器");
+    if !config.allow_live_trading {
+        tracing::warn!("实盘下单未开启：设置 ARBPILOT_ALLOW_LIVE_TRADING=true 后才会向交易所提交订单");
     }
     if config.api_token == "dev-local-token" {
         tracing::warn!("正在使用默认访问令牌，正式部署前请设置 ARBPILOT_API_TOKEN");
     }
 
     let store = store::Store::connect_if_configured(config.database_url.as_deref()).await;
-    let state = state::AppState::new(config.clone(), store);
+    let state = state::AppState::new(config.clone(), store).await;
+    // 策略只在「运行中」且执行器未暂停时产生订单意图，并通过统一风控网关下单。
+    strategy_runner::spawn(state.clone());
     let app = routes::build(state);
 
     let listener = TcpListener::bind(config.bind_addr)
@@ -44,7 +52,7 @@ async fn main() -> anyhow::Result<()> {
         .context("绑定执行器端口失败")?;
     tracing::info!(
         addr = %config.bind_addr,
-        mode = ?config.mode,
+        live_trading = config.allow_live_trading,
         "ArbPilot 执行器已启动"
     );
 

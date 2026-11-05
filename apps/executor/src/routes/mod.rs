@@ -1,14 +1,22 @@
+mod accounts;
+mod candles;
 mod control;
+mod funding;
 mod health;
+mod market;
+mod news;
 mod opportunities;
 mod orders;
 mod portfolio;
+mod sandbox;
 mod strategies;
+mod strategy_code;
+mod telegram;
 mod ws;
 
 use axum::{
     middleware,
-    routing::{get, patch, post},
+    routing::{delete, get, patch, post},
     Router,
 };
 use tower_http::{
@@ -21,12 +29,102 @@ use crate::state::AppState;
 pub fn build(state: AppState) -> Router {
     let protected = Router::new()
         .route("/opportunities", get(opportunities::list))
+        .route("/candles", get(candles::list))
         .route("/orders", get(orders::list).post(orders::create))
         .route("/positions", get(portfolio::positions))
-        .route("/account", get(portfolio::account))
-        .route("/strategies", get(strategies::list))
-        .route("/strategies/{id}", patch(strategies::update))
-        .route("/risk/limits", get(control::limits))
+        .route("/accounts", get(accounts::list).post(accounts::import))
+        .route("/accounts/history", get(accounts::history))
+        .route("/accounts/{id}", delete(accounts::remove))
+        .route("/accounts/{id}/refresh", post(accounts::refresh))
+        .route(
+            "/strategies",
+            get(strategies::list).post(strategies::create),
+        )
+        .route(
+            "/strategies/{id}",
+            get(strategies::detail)
+                .patch(strategies::update)
+                .delete(strategies::remove),
+        )
+        .route(
+            "/strategies/{id}/definition",
+            patch(strategies::update_definition),
+        )
+        .route("/strategies/{id}/validate", post(strategies::validate))
+        .route("/strategies/{id}/backtest", post(strategies::backtest))
+        .route("/strategies/{id}/versions", get(strategies::versions))
+        .route("/strategies/{id}/rollback", post(strategies::rollback))
+        .route(
+            "/strategies/{id}/sandbox",
+            post(sandbox::bind).delete(sandbox::unbind),
+        )
+        .route(
+            "/strategies/{id}/code",
+            get(strategy_code::get_code).put(strategy_code::save_code),
+        )
+        .route(
+            "/strategies/{id}/code/generate",
+            post(strategy_code::generate_code),
+        )
+        .route(
+            "/strategies/{id}/code/compile",
+            post(strategy_code::compile_code),
+        )
+        .route(
+            "/strategies/{id}/code/deploy",
+            post(strategy_code::deploy_code),
+        )
+        .route(
+            "/market/authors",
+            get(market::list_authors).post(market::create_author),
+        )
+        .route("/market/authors/{id}", patch(market::update_author))
+        .route(
+            "/market/publications",
+            get(market::list_publications).post(market::create_publication),
+        )
+        .route(
+            "/market/publications/{id}",
+            get(market::publication_detail).patch(market::update_publication),
+        )
+        .route(
+            "/market/publications/{id}/performance",
+            get(market::list_performance).post(market::create_performance),
+        )
+        .route(
+            "/market/publications/{id}/subscribe",
+            post(market::subscribe),
+        )
+        .route("/market/subscriptions", get(market::list_subscriptions))
+        .route(
+            "/market/subscriptions/{id}",
+            patch(market::update_subscription).delete(market::cancel_subscription),
+        )
+        .route("/market/leaderboard", get(market::leaderboard))
+        .route(
+            "/market/settlements",
+            get(market::list_settlements).post(market::create_settlement),
+        )
+        .route(
+            "/market/settlements/{id}",
+            patch(market::update_settlement),
+        )
+        .route(
+            "/sandbox/artifacts",
+            get(sandbox::list_artifacts).post(sandbox::upload_artifact),
+        )
+        .route("/sandbox/artifacts/{id}/dry-run", post(sandbox::dry_run))
+        .route("/funding/history", get(funding::history))
+        .route("/funding/summary", get(funding::summary))
+        .route("/funding/status", get(funding::status))
+        .route("/news", get(news::list))
+        .route("/telegram", get(telegram::status))
+        .route("/telegram/pairing", post(telegram::pairing))
+        .route("/telegram/bindings/{user_id}", delete(telegram::revoke))
+        .route(
+            "/risk/limits",
+            get(control::limits).put(control::update_limits),
+        )
         .route("/control/pause", post(control::pause))
         .route("/control/resume", post(control::resume))
         .route("/events", get(ws::handler))
