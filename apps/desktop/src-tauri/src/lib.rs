@@ -3,8 +3,7 @@ use tauri::Manager;
 /// 桌面端只暴露执行器地址，不接触任何交易所密钥。
 #[tauri::command]
 fn executor_base_url() -> String {
-    std::env::var("ARBPILOT_EXECUTOR_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:8787".to_string())
+    std::env::var("ARBPILOT_EXECUTOR_URL").unwrap_or_else(|_| "http://127.0.0.1:8787".to_string())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

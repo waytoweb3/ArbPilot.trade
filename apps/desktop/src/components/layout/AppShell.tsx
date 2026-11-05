@@ -1,119 +1,197 @@
 import {
   Bot,
+  Boxes,
+  Languages,
   LayoutDashboard,
+  Moon,
+  Newspaper,
+  PanelLeftClose,
+  PanelLeftOpen,
+  Percent,
   Radar,
   Settings as SettingsIcon,
-  ShieldAlert,
+  Store,
+  Sun,
   Wallet,
 } from "lucide-react";
+import { useCallback, useState } from "react";
 import { NavLink, Outlet } from "react-router-dom";
 
-import { useHealth, usePauseExecutor, useResumeExecutor } from "../../hooks/useApi";
+import { useHealth, useNews } from "../../hooks/useApi";
 import { useExecutorStream } from "../../hooks/useExecutorStream";
 import { formatUptime } from "../../lib/format";
+import { fmt, useI18n } from "../../lib/i18n";
+import { countUnread, useNewsPrefs } from "../../lib/news";
+import { useTheme } from "../../lib/theme";
 import { cn } from "../../lib/utils";
 import { useExecutorStore } from "../../state/executor";
 import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
 
-const navItems = [
-  { to: "/", label: "总览", icon: LayoutDashboard, end: true },
-  { to: "/opportunities", label: "套利机会", icon: Radar },
-  { to: "/positions", label: "仓位与订单", icon: Wallet },
-  { to: "/strategies", label: "策略", icon: Bot },
-  { to: "/settings", label: "设置", icon: SettingsIcon },
-];
+const SIDEBAR_KEY = "arbpilot.sidebar.collapsed";
 
 export function AppShell() {
   useExecutorStream();
   const health = useHealth();
-  const pauseExecutor = usePauseExecutor();
-  const resumeExecutor = useResumeExecutor();
   const streamConnected = useExecutorStore((state) => state.streamConnected);
+  const { t, locale, toggleLocale } = useI18n();
+  const { resolved, toggleTheme } = useTheme();
+  const [collapsed, setCollapsed] = useState(() => localStorage.getItem(SIDEBAR_KEY) === "1");
+
+  const toggleSidebar = useCallback(() => {
+    setCollapsed((current) => {
+      const next = !current;
+      localStorage.setItem(SIDEBAR_KEY, next ? "1" : "0");
+      return next;
+    });
+  }, []);
 
   const online = Boolean(health.data) && !health.isError;
   const paused = health.data?.paused ?? false;
 
+  const news = useNews(100);
+  const newsPrefs = useNewsPrefs();
+  const unread = countUnread(newsPrefs, news.data?.items ?? []);
+
+  const navItems: {
+    to: string;
+    label: string;
+    icon: typeof LayoutDashboard;
+    end?: boolean;
+    badge?: number;
+  }[] = [
+    { to: "/", label: t.nav.overview, icon: LayoutDashboard, end: true },
+    { to: "/positions", label: t.nav.positions, icon: Wallet },
+    { to: "/funding", label: t.nav.funding, icon: Percent },
+    { to: "/news", label: t.nav.news, icon: Newspaper, badge: unread },
+    { to: "/strategies", label: t.nav.strategies, icon: Bot },
+    { to: "/market", label: t.nav.market, icon: Store },
+    { to: "/sandbox", label: t.nav.sandbox, icon: Boxes },
+    { to: "/settings", label: t.nav.settings, icon: SettingsIcon },
+  ];
+
   return (
     <div className="flex h-full min-h-0">
-      <aside className="flex w-60 shrink-0 flex-col border-r border-ink-700/70 bg-ink-900/50">
-        <div className="px-5 py-5">
-          <div className="flex items-center gap-2.5">
-            <div className="grid h-9 w-9 place-items-center rounded-lg bg-emerald-500/15 text-emerald-300">
+      <aside
+        className={cn(
+          "flex shrink-0 flex-col border-r border-line bg-panel transition-[width] duration-200",
+          collapsed ? "w-14" : "w-60",
+        )}
+      >
+        <div className={cn("pt-5 pb-3", collapsed ? "px-2" : "px-5")}>
+          <div className={cn("flex items-center", collapsed ? "justify-center" : "gap-2.5")}>
+            <div className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-accent/15 text-accent">
               <Radar size={18} />
             </div>
-            <div>
-              <p className="text-sm font-semibold tracking-wide text-white">ArbPilot</p>
-              <p className="text-[10px] tracking-[0.2em] text-slate-500 uppercase">
-                self-hosted
-              </p>
-            </div>
+            {!collapsed && (
+              <>
+                <div className="min-w-0 flex-1">
+                  <p className="truncate text-sm font-semibold tracking-wide text-fg">ArbPilot</p>
+                  <p className="truncate text-[10px] tracking-[0.2em] text-subtle uppercase">
+                    {t.app.tagline}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={toggleSidebar}
+                  title={t.app.collapseSidebar}
+                  aria-label={t.app.collapseSidebar}
+                  className="rounded-md p-1 text-subtle transition-colors hover:bg-hover hover:text-body"
+                >
+                  <PanelLeftClose size={15} />
+                </button>
+              </>
+            )}
           </div>
+          {collapsed && (
+            <button
+              type="button"
+              onClick={toggleSidebar}
+              title={t.app.expandSidebar}
+              aria-label={t.app.expandSidebar}
+              className="mt-2 flex w-full items-center justify-center rounded-md py-1 text-subtle transition-colors hover:bg-hover hover:text-body"
+            >
+              <PanelLeftOpen size={15} />
+            </button>
+          )}
         </div>
 
-        <nav className="flex-1 space-y-1 px-3">
+        <nav className={cn("flex-1 space-y-1", collapsed ? "px-2" : "px-3")}>
           {navItems.map((item) => (
             <NavLink
               key={item.to}
               to={item.to}
               end={item.end}
+              title={collapsed ? item.label : undefined}
               className={({ isActive }) =>
                 cn(
-                  "flex items-center gap-2.5 rounded-lg px-3 py-2 text-sm transition-colors",
+                  "flex items-center rounded-lg py-2 text-sm transition-colors",
+                  collapsed ? "justify-center px-0" : "gap-2.5 px-3",
                   isActive
-                    ? "bg-ink-800 text-white"
-                    : "text-slate-400 hover:bg-ink-800/60 hover:text-slate-200",
+                    ? "bg-accent/10 font-medium text-fg"
+                    : "text-muted hover:bg-hover hover:text-body",
                 )
               }
             >
-              <item.icon size={16} />
-              {item.label}
+              <span className="relative shrink-0">
+                <item.icon size={16} />
+                {collapsed && Boolean(item.badge) && (
+                  <span className="absolute -top-0.5 -right-0.5 h-1.5 w-1.5 rounded-full bg-accent" />
+                )}
+              </span>
+              {!collapsed && <span className="truncate">{item.label}</span>}
+              {!collapsed && Boolean(item.badge) && (
+                <span className="ml-auto rounded-full bg-accent/15 px-1.5 py-0.5 text-[10px] font-medium text-accent">
+                  {item.badge! > 99 ? "99+" : item.badge}
+                </span>
+              )}
             </NavLink>
           ))}
         </nav>
 
-        <div className="border-t border-ink-700/60 p-4 text-[11px] leading-relaxed text-slate-500">
-          <p>不托管资金 · 密钥留在执行器</p>
-          <p className="mt-1">v{health.data?.version ?? "0.1.0"} · 模拟盘优先</p>
-        </div>
+        {!collapsed && (
+          <div className="border-t border-line px-4 py-3 font-mono text-[11px] text-subtle">
+            v{health.data?.version ?? "0.1.0"}
+          </div>
+        )}
       </aside>
 
       <div className="flex min-w-0 flex-1 flex-col">
-        <header className="flex h-14 shrink-0 items-center justify-between gap-3 border-b border-ink-700/70 bg-ink-900/40 px-6">
+        <header className="flex h-14 shrink-0 items-center justify-between gap-3 border-b border-line bg-panel/70 px-6 backdrop-blur">
           <div className="flex flex-wrap items-center gap-2">
             <Badge tone={online ? "success" : "danger"}>
-              {online ? "执行器在线" : "执行器离线"}
+              {online ? t.shell.online : t.shell.offline}
             </Badge>
             <Badge tone={streamConnected ? "info" : "neutral"}>
-              {streamConnected ? "事件流已连接" : "事件流断开"}
+              {streamConnected ? t.shell.streamConnected : t.shell.streamDisconnected}
             </Badge>
-            <Badge tone="neutral">
-              {health.data?.mode === "live" ? "真实交易" : "模拟盘"}
-            </Badge>
-            {paused && <Badge tone="warning">已暂停开仓</Badge>}
+            {paused && <Badge tone="warning">{t.shell.paused}</Badge>}
           </div>
 
-          <div className="flex items-center gap-4 text-xs text-slate-500">
-            {health.data && <span>持续 {formatUptime(health.data.uptime_secs)}</span>}
-            {paused ? (
-              <Button
-                size="sm"
-                onClick={() => resumeExecutor.mutate()}
-                disabled={resumeExecutor.isPending || !online}
-              >
-                恢复开仓
-              </Button>
-            ) : (
-              <Button
-                size="sm"
-                variant="danger"
-                onClick={() => pauseExecutor.mutate("桌面端手动暂停")}
-                disabled={pauseExecutor.isPending || !online}
-              >
-                <ShieldAlert size={13} />
-                暂停开仓
-              </Button>
-            )}
+          <div className="flex items-center gap-2 text-xs text-muted">
+            {health.data && <span>{fmt(t.shell.uptime, { value: formatUptime(health.data.uptime_secs) })}</span>}
+
+            <Button
+              size="sm"
+              variant="ghost"
+              className="w-8 px-0"
+              title={locale === "zh" ? "English" : "中文"}
+              aria-label={t.app.language}
+              onClick={toggleLocale}
+            >
+              <Languages size={15} />
+            </Button>
+
+            <Button
+              size="sm"
+              variant="ghost"
+              className="w-8 px-0"
+              title={resolved === "dark" ? t.app.light : t.app.dark}
+              aria-label={t.app.theme}
+              onClick={toggleTheme}
+            >
+              {resolved === "dark" ? <Sun size={15} /> : <Moon size={15} />}
+            </Button>
           </div>
         </header>
 

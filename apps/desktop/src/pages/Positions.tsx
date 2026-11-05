@@ -1,6 +1,7 @@
 import { Badge } from "../components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "../components/ui/card";
 import { useOrders, usePositions } from "../hooks/useApi";
+import { toNumber } from "../lib/api";
 import {
   formatNumber,
   formatTime,
@@ -8,10 +9,12 @@ import {
   orderStatusLabel,
   orderStatusTone,
 } from "../lib/format";
-import { toNumber } from "../lib/api";
+import { fmt, useI18n } from "../lib/i18n";
+
 export default function PositionsPage() {
   const positions = usePositions();
   const orders = useOrders();
+  const { t } = useI18n();
 
   const totalNotional = (positions.data ?? []).reduce(
     (sum, position) => sum + toNumber(position.quantity) * toNumber(position.mark_price),
@@ -21,62 +24,63 @@ export default function PositionsPage() {
   return (
     <div className="space-y-6">
       <header>
-        <h1 className="text-xl font-semibold text-white">仓位与订单</h1>
-        <p className="mt-1 text-sm text-slate-500">
-          订阅过期或执行器暂停时，查看仓位与撤单能力始终保留。
-        </p>
+        <h1 className="text-xl font-semibold text-fg">{t.positions.title}</h1>
+        <p className="mt-1 text-sm text-muted">{t.positions.subtitle}</p>
       </header>
 
       <Card>
         <CardHeader>
           <div>
-            <CardTitle>当前仓位</CardTitle>
+            <CardTitle>{t.positions.current}</CardTitle>
             <CardDescription>
-              {positions.data?.length ?? 0} 条 · 名义价值合计 {formatUsd(totalNotional)}
+              {fmt(t.positions.summary, {
+                count: positions.data?.length ?? 0,
+                value: formatUsd(totalNotional),
+              })}
             </CardDescription>
           </div>
         </CardHeader>
         <CardContent className="p-0">
           {(positions.data ?? []).length === 0 ? (
-            <EmptyState text="暂无仓位。模拟开仓成交后会出现在这里。" />
+            <EmptyState text={t.positions.empty} />
           ) : (
             <div className="overflow-x-auto">
               <table className="w-full min-w-[820px] border-collapse text-sm">
                 <thead>
-                  <tr className="text-left text-[11px] tracking-wide text-slate-500 uppercase">
-                    <th className="px-4 py-2 font-medium">交易所</th>
-                    <th className="px-4 py-2 font-medium">交易对</th>
-                    <th className="px-4 py-2 font-medium">方向</th>
-                    <th className="px-4 py-2 text-right font-medium">数量</th>
-                    <th className="px-4 py-2 text-right font-medium">开仓价</th>
-                    <th className="px-4 py-2 text-right font-medium">标记价</th>
-                    <th className="px-4 py-2 text-right font-medium">杠杆</th>
-                    <th className="px-4 py-2 text-right font-medium">名义价值</th>
+                  <tr className="text-left text-[11px] tracking-wide text-muted uppercase">
+                    <th className="px-4 py-2 font-medium">{t.positions.venue}</th>
+                    <th className="px-4 py-2 font-medium">{t.positions.symbol}</th>
+                    <th className="px-4 py-2 font-medium">{t.positions.side}</th>
+                    <th className="px-4 py-2 text-right font-medium">{t.positions.quantity}</th>
+                    <th className="px-4 py-2 text-right font-medium">{t.positions.entry}</th>
+                    <th className="px-4 py-2 text-right font-medium">{t.positions.mark}</th>
+                    <th className="px-4 py-2 text-right font-medium">{t.positions.leverage}</th>
+                    <th className="px-4 py-2 text-right font-medium">{t.positions.notional}</th>
                   </tr>
                 </thead>
                 <tbody>
                   {(positions.data ?? []).map((position) => (
-                    <tr key={position.id} className="border-t border-ink-700/50">
-                      <td className="px-4 py-2.5 text-slate-300">{position.venue}</td>
-                      <td className="px-4 py-2.5 font-medium text-slate-100">{position.symbol}</td>
+                    <tr key={position.id} className="border-t border-line">
+                      <td className="px-4 py-2.5 text-body">{position.venue}</td>
+                      <td className="px-4 py-2.5 font-medium text-fg">{position.symbol}</td>
                       <td className="px-4 py-2.5">
                         <Badge tone={position.side === "buy" ? "success" : "danger"}>
-                          {position.side === "buy" ? "多" : "空"}
+                          {position.side === "buy" ? t.positions.long : t.positions.short}
                         </Badge>
                       </td>
-                      <td className="px-4 py-2.5 text-right font-mono text-xs text-slate-300">
+                      <td className="px-4 py-2.5 text-right font-mono text-xs text-body">
                         {formatNumber(position.quantity, 6)}
                       </td>
-                      <td className="px-4 py-2.5 text-right font-mono text-xs text-slate-400">
+                      <td className="px-4 py-2.5 text-right font-mono text-xs text-muted">
                         {formatUsd(position.entry_price)}
                       </td>
-                      <td className="px-4 py-2.5 text-right font-mono text-xs text-slate-400">
+                      <td className="px-4 py-2.5 text-right font-mono text-xs text-muted">
                         {formatUsd(position.mark_price)}
                       </td>
-                      <td className="px-4 py-2.5 text-right font-mono text-xs text-slate-400">
+                      <td className="px-4 py-2.5 text-right font-mono text-xs text-muted">
                         {formatNumber(position.leverage, 2)}x
                       </td>
-                      <td className="px-4 py-2.5 text-right font-mono text-xs text-slate-300">
+                      <td className="px-4 py-2.5 text-right font-mono text-xs text-body">
                         {formatUsd(toNumber(position.quantity) * toNumber(position.mark_price))}
                       </td>
                     </tr>
@@ -91,44 +95,45 @@ export default function PositionsPage() {
       <Card>
         <CardHeader>
           <div>
-            <CardTitle>订单历史</CardTitle>
-            <CardDescription>包含风控拒绝与补偿中的订单</CardDescription>
+            <CardTitle>{t.positions.history}</CardTitle>
+            <CardDescription>{t.positions.historyDesc}</CardDescription>
           </div>
         </CardHeader>
         <CardContent className="p-0">
           {(orders.data ?? []).length === 0 ? (
-            <EmptyState text="暂无订单记录。" />
+            <EmptyState text={t.positions.ordersEmpty} />
           ) : (
             <div className="overflow-x-auto">
               <table className="w-full min-w-[900px] border-collapse text-sm">
                 <thead>
-                  <tr className="text-left text-[11px] tracking-wide text-slate-500 uppercase">
-                    <th className="px-4 py-2 font-medium">订单</th>
-                    <th className="px-4 py-2 font-medium">交易对</th>
-                    <th className="px-4 py-2 font-medium">双腿</th>
-                    <th className="px-4 py-2 font-medium">来源</th>
-                    <th className="px-4 py-2 text-right font-medium">名义价值</th>
-                    <th className="px-4 py-2 font-medium">状态</th>
-                    <th className="px-4 py-2 text-right font-medium">时间</th>
-                    <th className="px-4 py-2 font-medium">备注</th>
+                  <tr className="text-left text-[11px] tracking-wide text-muted uppercase">
+                    <th className="px-4 py-2 font-medium">{t.positions.order}</th>
+                    <th className="px-4 py-2 font-medium">{t.positions.symbol}</th>
+                    <th className="px-4 py-2 font-medium">{t.positions.legs}</th>
+                    <th className="px-4 py-2 font-medium">{t.positions.origin}</th>
+                    <th className="px-4 py-2 text-right font-medium">{t.positions.notional}</th>
+                    <th className="px-4 py-2 font-medium">{t.positions.status}</th>
+                    <th className="px-4 py-2 text-right font-medium">{t.positions.time}</th>
+                    <th className="px-4 py-2 font-medium">{t.positions.note}</th>
                   </tr>
                 </thead>
                 <tbody>
                   {(orders.data ?? []).map((order) => (
-                    <tr key={order.id} className="border-t border-ink-700/50 align-top">
-                      <td className="px-4 py-2.5 font-mono text-[11px] text-slate-500">
+                    <tr key={order.id} className="border-t border-line align-top">
+                      <td className="px-4 py-2.5 font-mono text-[11px] text-muted">
                         {order.id.slice(0, 8)}
                       </td>
-                      <td className="px-4 py-2.5 text-slate-200">
-                        {order.intent.legs[0]?.symbol ?? "—"}
-                      </td>
-                      <td className="px-4 py-2.5 font-mono text-[11px] text-slate-400">
+                      <td className="px-4 py-2.5 text-body">{order.intent.legs[0]?.symbol ?? "—"}</td>
+                      <td className="px-4 py-2.5 font-mono text-[11px] text-muted">
                         {order.intent.legs
-                          .map((leg) => `${leg.venue} ${leg.side === "buy" ? "买" : "卖"}`)
+                          .map(
+                            (leg) =>
+                              `${leg.venue} ${leg.side === "buy" ? t.positions.buy : t.positions.sell}`,
+                          )
                           .join(" / ")}
                       </td>
-                      <td className="px-4 py-2.5 text-xs text-slate-400">{order.intent.origin}</td>
-                      <td className="px-4 py-2.5 text-right font-mono text-xs text-slate-300">
+                      <td className="px-4 py-2.5 text-xs text-muted">{order.intent.origin}</td>
+                      <td className="px-4 py-2.5 text-right font-mono text-xs text-body">
                         {formatUsd(
                           order.intent.legs.reduce(
                             (sum, leg) => sum + toNumber(leg.quantity) * toNumber(leg.limit_price),
@@ -137,14 +142,12 @@ export default function PositionsPage() {
                         )}
                       </td>
                       <td className="px-4 py-2.5">
-                        <Badge tone={orderStatusTone[order.status]}>
-                          {orderStatusLabel[order.status]}
-                        </Badge>
+                        <Badge tone={orderStatusTone[order.status]}>{orderStatusLabel(order.status)}</Badge>
                       </td>
-                      <td className="px-4 py-2.5 text-right font-mono text-[11px] text-slate-500">
+                      <td className="px-4 py-2.5 text-right font-mono text-[11px] text-muted">
                         {formatTime(order.created_at)}
                       </td>
-                      <td className="max-w-[220px] px-4 py-2.5 text-[11px] text-amber-300/90">
+                      <td className="max-w-[220px] px-4 py-2.5 text-[11px] text-warning">
                         {order.note ?? "—"}
                       </td>
                     </tr>
@@ -160,5 +163,5 @@ export default function PositionsPage() {
 }
 
 function EmptyState({ text }: { text: string }) {
-  return <p className="px-4 py-10 text-center text-sm text-slate-500">{text}</p>;
+  return <p className="px-4 py-10 text-center text-sm text-muted">{text}</p>;
 }

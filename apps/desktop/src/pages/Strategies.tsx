@@ -1,11 +1,54 @@
-import { Bot, Pause, Play } from "lucide-react";
+import { useEffect, useState } from "react";
+import {
+  Bot,
+  Code2,
+  FlaskConical,
+  History,
+  Pause,
+  Play,
+  Plus,
+  Rocket,
+  Save,
+  ShieldCheck,
+  Sparkles,
+  Trash2,
+} from "lucide-react";
 
 import { Badge } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "../components/ui/card";
-import { useStrategies, useUpdateStrategy } from "../hooks/useApi";
-import { formatDateTime, opportunityKindLabel, strategyStatusLabel } from "../lib/format";
-import type { StrategyStatus } from "../lib/types";
+import {
+  useBacktestStrategy,
+  useCompileStrategyCode,
+  useCreateStrategy,
+  useDeleteStrategy,
+  useDeployStrategyCode,
+  useGenerateStrategyCode,
+  useRollbackStrategy,
+  useSaveStrategyCode,
+  useStrategies,
+  useStrategyCode,
+  useStrategyVersions,
+  useUpdateStrategy,
+  useValidateStrategy,
+} from "../hooks/useApi";
+import { toNumber } from "../lib/api";
+import {
+  formatDateTime,
+  formatNumber,
+  formatPercentValue,
+  formatUsd,
+  strategyStatusLabel,
+} from "../lib/format";
+import { fmt, useI18n } from "../lib/i18n";
+import type {
+  BacktestReport,
+  StrategyEventLevel,
+  StrategyRecord,
+  StrategySource,
+  StrategyStatus,
+} from "../lib/types";
+import { cn } from "../lib/utils";
 
 const statusTone: Record<StrategyStatus, "success" | "warning" | "neutral" | "danger"> = {
   running: "success",
@@ -14,75 +57,809 @@ const statusTone: Record<StrategyStatus, "success" | "warning" | "neutral" | "da
   stopped: "danger",
 };
 
+const eventTone: Record<StrategyEventLevel, string> = {
+  info: "bg-accent",
+  warning: "bg-warning",
+  error: "bg-danger",
+};
+
+const inputClass =
+  "w-full rounded-md border border-line bg-panel-soft px-2 py-1 text-xs text-body outline-none focus:border-accent/60";
+
+interface CreateDraft {
+  name: string;
+  prompt: string;
+}
+
+function CreateStrategyForm({
+  pending,
+  onCreate,
+}: {
+  pending: boolean;
+  onCreate: (name: string, prompt: string) => void;
+}) {
+  const { t } = useI18n();
+  const [draft, setDraft] = useState<CreateDraft>({ name: "", prompt: "" });
+  const [error, setError] = useState<string | null>(null);
+
+  const submit = () => {
+    const name = draft.name.trim();
+    if (!name) {
+      setError(t.strategies.createNameRequired);
+      return;
+    }
+    setError(null);
+    onCreate(name, draft.prompt.trim());
+  };
+
+  return (
+    <div className="space-y-3">
+      <label className="block space-y-1">
+        <span className="text-[11px] text-muted">{t.strategies.createName}</span>
+        <input
+          className={inputClass}
+          value={draft.name}
+          placeholder={t.strategies.createNamePlaceholder}
+          onChange={(event) => setDraft((current) => ({ ...current, name: event.target.value }))}
+        />
+      </label>
+      <label className="block space-y-1">
+        <span className="text-[11px] text-muted">{t.strategies.codePrompt}</span>
+        <textarea
+          className={cn(inputClass, "h-24 resize-y")}
+          value={draft.prompt}
+          placeholder={t.strategies.codePromptPlaceholder}
+          onChange={(event) => setDraft((current) => ({ ...current, prompt: event.target.value }))}
+        />
+      </label>
+      {error && <p className="text-[11px] text-danger">{error}</p>}
+      <Button size="sm" disabled={pending} onClick={submit}>
+        <Sparkles size={13} />
+        {pending ? t.strategies.creating : t.strategies.createSubmit}
+      </Button>
+    </div>
+  );
+}
+
+function StrategyCodeCard({ record, running }: { record: StrategyRecord; running: boolean }) {
+  const { t } = useI18n();
+  const codeQuery = useStrategyCode(record.id);
+  const saveCode = useSaveStrategyCode();
+  const generateCode = useGenerateStrategyCode();
+  const compileCode = useCompileStrategyCode();
+  const deployCode = useDeployStrategyCode();
+
+  const [source, setSource] = useState("");
+  const [prompt, setPrompt] = useState("");
+  const [notice, setNotice] = useState<{ tone: "ok" | "error"; text: string } | null>(null);
+
+  const view = codeQuery.data;
+  const code = view?.code ?? null;
+  const template = view?.template ?? "";
+  const codeUpdatedAt = code?.updated_at ?? null;
+
+  useEffect(() => {
+    if (!view) {
+      return;
+    }
+    setSource(view.code?.source ?? view.template);
+  }, [record.id, codeUpdatedAt, template]);
+
+  const dirty = code ? source !== code.source : source !== template;
+  const pending =
+    saveCode.isPending || generateCode.isPending || compileCode.isPending || deployCode.isPending;
+
+  const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error));
+
+  const generate = async () => {
+    setNotice(null);
+    if (!prompt.trim()) {
+      setNotice({ tone: "error", text: t.strategies.codePromptRequired });
+      return;
+    }
+    try {
+      await generateCode.mutateAsync({ id: record.id, prompt: prompt.trim() });
+    } catch (error) {
+      setNotice({ tone: "error", text: errorText(error) });
+    }
+  };
+
+  const save = async () => {
+    setNotice(null);
+    try {
+      await saveCode.mutateAsync({ id: record.id, source });
+      setNotice({ tone: "ok", text: t.strategies.saved });
+    } catch (error) {
+      setNotice({ tone: "error", text: errorText(error) });
+    }
+  };
+
+  const compile = async () => {
+    setNotice(null);
+    try {
+      if (dirty) {
+        await saveCode.mutateAsync({ id: record.id, source });
+      }
+      await compileCode.mutateAsync(record.id);
+      setNotice({ tone: "ok", text: t.strategies.codeCompileOk });
+    } catch (error) {
+      setNotice({ tone: "error", text: errorText(error) });
+    }
+  };
+
+  const deploy = async () => {
+    setNotice(null);
+    try {
+      if (dirty) {
+        await saveCode.mutateAsync({ id: record.id, source });
+      }
+      await deployCode.mutateAsync(record.id);
+      setNotice({ tone: "ok", text: t.strategies.codeDeployOk });
+    } catch (error) {
+      setNotice({ tone: "error", text: errorText(error) });
+    }
+  };
+
+  const originLabel = !code
+    ? t.strategies.codeOriginTemplate
+    : code.origin === "ai"
+      ? t.strategies.codeOriginAi
+      : t.strategies.codeOriginUser;
+
+  return (
+    <Card>
+      <CardHeader className="flex-wrap">
+        <div>
+          <CardTitle>{t.strategies.codeTitle}</CardTitle>
+          <CardDescription>{t.strategies.codeDesc}</CardDescription>
+        </div>
+        <div className="flex flex-wrap items-center gap-1">
+          <Badge tone="neutral">{originLabel}</Badge>
+          {code?.artifact_sha256 && (
+            <Badge tone="info">
+              {fmt(t.strategies.codeArtifact, { hash: code.artifact_sha256.slice(0, 12) })}
+            </Badge>
+          )}
+          {code &&
+            (code.deployed_at ? (
+              <Badge tone="success">
+                {fmt(t.strategies.codeDeployedAt, { value: formatDateTime(code.deployed_at) })}
+              </Badge>
+            ) : (
+              <Badge tone="warning">{t.strategies.codeNotDeployed}</Badge>
+            ))}
+        </div>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        <div className="space-y-1">
+          <span className="text-[11px] text-muted">{t.strategies.codePrompt}</span>
+          <div className="flex flex-col gap-2 md:flex-row md:items-end">
+            <textarea
+              className={cn(inputClass, "h-20 flex-1 resize-y")}
+              value={prompt}
+              placeholder={t.strategies.codePromptPlaceholder}
+              onChange={(event) => setPrompt(event.target.value)}
+            />
+            <Button size="sm" variant="secondary" disabled={running || pending} onClick={generate}>
+              <Sparkles size={13} />
+              {generateCode.isPending ? t.strategies.codeGenerating : t.strategies.codeGenerate}
+            </Button>
+          </div>
+        </div>
+
+        <div className="space-y-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-[11px] text-muted">{t.strategies.codeSource}</span>
+            <Code2 size={13} className="text-muted" />
+            {!code && <span className="text-[11px] text-muted">{t.strategies.codeTemplateHint}</span>}
+          </div>
+          <textarea
+            className={cn(inputClass, "h-80 resize-y font-mono text-[11px] leading-relaxed")}
+            spellCheck={false}
+            value={source}
+            onChange={(event) => setSource(event.target.value)}
+          />
+        </div>
+
+        {running && <p className="text-[11px] text-warning">{t.strategies.codeNeedStop}</p>}
+
+        <div className="flex flex-wrap items-center gap-2">
+          <Button size="sm" variant="secondary" disabled={running || pending} onClick={save}>
+            <Save size={13} />
+            {saveCode.isPending ? t.strategies.codeSaving : t.strategies.codeSave}
+          </Button>
+          <Button size="sm" variant="secondary" disabled={running || pending} onClick={compile}>
+            <ShieldCheck size={13} />
+            {compileCode.isPending ? t.strategies.codeCompiling : t.strategies.codeCompile}
+          </Button>
+          <Button size="sm" disabled={running || pending} onClick={deploy}>
+            <Rocket size={13} />
+            {deployCode.isPending ? t.strategies.codeDeploying : t.strategies.codeDeploy}
+          </Button>
+        </div>
+
+        {notice && (
+          <p
+            className={cn(
+              "rounded-md border px-2 py-1 text-[11px]",
+              notice.tone === "ok"
+                ? "border-accent/30 bg-accent/10 text-accent"
+                : "border-danger/30 bg-danger/10 text-danger",
+            )}
+          >
+            {notice.text}
+          </p>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+function EquityCurve({ report }: { report: BacktestReport }) {
+  const { t } = useI18n();
+  const points = report.equity_curve;
+  if (points.length < 2) {
+    return <p className="text-xs text-muted">{t.strategies.report.noCurve}</p>;
+  }
+
+  const values = points.map((point) => toNumber(point.cumulative_pnl_usd));
+  const min = Math.min(...values, 0);
+  const max = Math.max(...values, 0);
+  const span = max - min || 1;
+  const polyline = values
+    .map((value, index) => {
+      const x = (index / (values.length - 1)) * 100;
+      const y = 100 - ((value - min) / span) * 100;
+      return `${x.toFixed(2)},${y.toFixed(2)}`;
+    })
+    .join(" ");
+  const positive = values[values.length - 1] >= 0;
+
+  return (
+    <div className="rounded-lg border border-line bg-panel-soft p-2">
+      <svg viewBox="0 0 100 100" preserveAspectRatio="none" className="h-40 w-full">
+        <polyline
+          points={polyline}
+          fill="none"
+          stroke="currentColor"
+          strokeWidth={1.4}
+          vectorEffect="non-scaling-stroke"
+          className={positive ? "text-accent" : "text-danger"}
+        />
+      </svg>
+    </div>
+  );
+}
+
+function Metric({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="space-y-0.5">
+      <p className="text-[11px] text-muted">{label}</p>
+      <p className="font-mono text-xs text-body">{value}</p>
+    </div>
+  );
+}
+
+function SourceBadge({ source }: { source: StrategySource }) {
+  const { t } = useI18n();
+  const label =
+    source === "built_in"
+      ? t.strategies.sourceBuiltIn
+      : source === "ai"
+        ? t.strategies.sourceAi
+        : t.strategies.sourceManual;
+  return <Badge tone="neutral">{label}</Badge>;
+}
+
 export default function StrategiesPage() {
+  const { t } = useI18n();
   const strategies = useStrategies();
   const updateStrategy = useUpdateStrategy();
+  const createStrategy = useCreateStrategy();
+  const generateCode = useGenerateStrategyCode();
+  const validateStrategy = useValidateStrategy();
+  const backtestStrategy = useBacktestStrategy();
+  const rollbackStrategy = useRollbackStrategy();
+  const deleteStrategy = useDeleteStrategy();
+
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [creating, setCreating] = useState(false);
+  const [backtestDays, setBacktestDays] = useState(30);
+
+  const list = strategies.data ?? [];
+  const selected = creating ? null : (list.find((record) => record.id === selectedId) ?? list[0] ?? null);
+  const versions = useStrategyVersions(selected?.id ?? null);
+
+  const actionError = [
+    updateStrategy.error,
+    createStrategy.error,
+    generateCode.error,
+    validateStrategy.error,
+    backtestStrategy.error,
+    rollbackStrategy.error,
+    deleteStrategy.error,
+  ].find(Boolean);
+
+  const startCreate = () => {
+    setCreating(true);
+    setSelectedId(null);
+  };
 
   return (
     <div className="space-y-6">
-      <header>
-        <h1 className="text-xl font-semibold text-white">策略</h1>
-        <p className="mt-1 text-sm text-slate-500">
-          策略只输出订单意图，无法直接访问密钥或绕过执行器风控。
-        </p>
+      <header className="flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <h1 className="text-xl font-semibold text-fg">{t.strategies.title}</h1>
+          <p className="mt-1 text-sm text-muted">{t.strategies.subtitle}</p>
+        </div>
+        <Button size="sm" onClick={startCreate}>
+          <Plus size={13} />
+          {t.strategies.create}
+        </Button>
       </header>
 
-      <div className="grid gap-4 lg:grid-cols-2 2xl:grid-cols-3">
-        {(strategies.data ?? []).map((strategy) => {
-          const isRunning = strategy.status === "running";
-          return (
-            <Card key={strategy.id}>
-              <CardHeader>
-                <div className="flex items-start gap-2">
-                  <div className="grid h-8 w-8 place-items-center rounded-lg bg-ink-800 text-slate-300">
-                    <Bot size={16} />
-                  </div>
-                  <div>
-                    <CardTitle>{strategy.name}</CardTitle>
-                    <CardDescription>
-                      {opportunityKindLabel[strategy.kind] ?? strategy.kind}
-                    </CardDescription>
-                  </div>
-                </div>
-                <Badge tone={statusTone[strategy.status]}>
-                  {strategyStatusLabel[strategy.status]}
-                </Badge>
-              </CardHeader>
-              <CardContent className="space-y-3 text-xs text-slate-400">
-                <div className="grid grid-cols-2 gap-2">
-                  <span>交易所：{strategy.venues.join(" / ") || "—"}</span>
-                  <span>交易对：{strategy.symbols.join(" / ") || "—"}</span>
-                  <span className="col-span-2">
-                    最近心跳：{formatDateTime(strategy.last_heartbeat_at)}
-                  </span>
-                </div>
-                <Button
-                  size="sm"
-                  variant={isRunning ? "secondary" : "primary"}
-                  disabled={updateStrategy.isPending}
-                  onClick={() =>
-                    updateStrategy.mutate({
-                      id: strategy.id,
-                      status: isRunning ? "paused" : "running",
-                    })
-                  }
-                >
-                  {isRunning ? <Pause size={13} /> : <Play size={13} />}
-                  {isRunning ? "暂停策略" : "启动策略"}
-                </Button>
-              </CardContent>
-            </Card>
-          );
-        })}
-      </div>
+      {actionError && (
+        <p className="rounded-lg border border-danger/30 bg-danger/10 px-3 py-2 text-xs text-danger">
+          {actionError.message}
+        </p>
+      )}
 
-      {(strategies.data ?? []).length === 0 && (
-        <Card>
-          <CardContent className="py-12 text-center text-sm text-slate-500">
-            暂无策略。自定义策略沙箱（WASM + Wasmtime）将在 Phase 3 接入。
+      <div className="grid gap-4 lg:grid-cols-[300px_minmax(0,1fr)]">
+        <Card className="h-fit">
+          <CardHeader>
+            <div>
+              <CardTitle>{t.strategies.listTitle}</CardTitle>
+              <CardDescription>{t.strategies.listDesc}</CardDescription>
+            </div>
+          </CardHeader>
+          <CardContent className="space-y-2 p-2">
+            {list.length === 0 && (
+              <p className="px-2 py-6 text-center text-xs text-muted">{t.strategies.empty}</p>
+            )}
+            {list.map((record) => {
+              const active = !creating && selected?.id === record.id;
+              return (
+                <button
+                  key={record.id}
+                  type="button"
+                  onClick={() => {
+                    setCreating(false);
+                    setSelectedId(record.id);
+                  }}
+                  className={cn(
+                    "w-full space-y-2 rounded-lg border px-3 py-2 text-left transition-colors",
+                    active
+                      ? "border-accent/40 bg-accent/10"
+                      : "border-line bg-panel-soft hover:border-accent/30",
+                  )}
+                >
+                  <div className="flex items-center gap-2">
+                    <span className="grid h-7 w-7 shrink-0 place-items-center rounded-md bg-panel text-body">
+                      <Bot size={14} />
+                    </span>
+                    <span className="min-w-0 flex-1 truncate text-xs font-medium text-fg">
+                      {record.definition.name}
+                    </span>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-1">
+                    <Badge tone={statusTone[record.status]}>
+                      {strategyStatusLabel(record.status)}
+                    </Badge>
+                    <span className="text-[11px] text-muted">
+                      {fmt(t.strategies.version, { version: record.version })}
+                    </span>
+                  </div>
+                  <p className="text-[11px] text-muted">
+                    {fmt(t.strategies.heartbeat, {
+                      value: formatDateTime(record.last_heartbeat_at),
+                    })}
+                  </p>
+                </button>
+              );
+            })}
           </CardContent>
         </Card>
-      )}
+
+        <div className="space-y-4">
+          {creating && (
+            <Card>
+              <CardHeader>
+                <div>
+                  <CardTitle>{t.strategies.createTitle}</CardTitle>
+                  <CardDescription>{t.strategies.createDesc}</CardDescription>
+                </div>
+              </CardHeader>
+              <CardContent>
+                <CreateStrategyForm
+                  key="new"
+                  pending={createStrategy.isPending}
+                  onCreate={(name, prompt) =>
+                    createStrategy.mutate(
+                      { name, source: prompt ? "ai" : "manual" },
+                      {
+                        onSuccess: (record) => {
+                          setCreating(false);
+                          setSelectedId(record.id);
+                          if (prompt) {
+                            generateCode.mutate({ id: record.id, prompt });
+                          }
+                        },
+                      },
+                    )
+                  }
+                />
+              </CardContent>
+            </Card>
+          )}
+
+          {!creating && !selected && (
+            <Card>
+              <CardContent className="py-16 text-center text-sm text-muted">
+                {t.strategies.empty}
+              </CardContent>
+            </Card>
+          )}
+
+          {!creating && selected && (
+            <StrategyDetail
+              key={selected.id}
+              record={selected}
+              versions={versions.data ?? []}
+              backtestDays={backtestDays}
+              onBacktestDays={setBacktestDays}
+              onToggle={() =>
+                updateStrategy.mutate({
+                  id: selected.id,
+                  status: selected.status === "running" ? "paused" : "running",
+                })
+              }
+              onValidate={() => validateStrategy.mutate(selected.id)}
+              onBacktest={() =>
+                backtestStrategy.mutate({ id: selected.id, days: backtestDays })
+              }
+              onRollback={(version) => {
+                if (!window.confirm(t.strategies.rollbackConfirm)) {
+                  return;
+                }
+                rollbackStrategy.mutate({ id: selected.id, version });
+              }}
+              onDelete={() => {
+                if (!window.confirm(t.strategies.deleteConfirm)) {
+                  return;
+                }
+                deleteStrategy.mutate(selected.id, {
+                  onSuccess: () => setSelectedId(null),
+                });
+              }}
+              pending={{
+                toggle: updateStrategy.isPending,
+                validate: validateStrategy.isPending,
+                backtest: backtestStrategy.isPending,
+                rollback: rollbackStrategy.isPending,
+                remove: deleteStrategy.isPending,
+              }}
+            />
+          )}
+        </div>
+      </div>
     </div>
+  );
+}
+
+function StrategyDetail({
+  record,
+  versions,
+  backtestDays,
+  onBacktestDays,
+  onToggle,
+  onValidate,
+  onBacktest,
+  onRollback,
+  onDelete,
+  pending,
+}: {
+  record: StrategyRecord;
+  versions: {
+    version: number;
+    saved_at: string;
+    status: StrategyStatus;
+    validation: { issues: { severity: string }[] };
+    backtest: BacktestReport | null;
+  }[];
+  backtestDays: number;
+  onBacktestDays: (days: number) => void;
+  onToggle: () => void;
+  onValidate: () => void;
+  onBacktest: () => void;
+  onRollback: (version: number) => void;
+  onDelete: () => void;
+  pending: {
+    toggle: boolean;
+    validate: boolean;
+    backtest: boolean;
+    rollback: boolean;
+    remove: boolean;
+  };
+}) {
+  const { t } = useI18n();
+  const { definition, validation, runtime, last_backtest: report } = record;
+  const running = record.status === "running";
+  const errors = validation.issues.filter((issue) => issue.severity === "error");
+  const warnings = validation.issues.filter((issue) => issue.severity === "warning");
+  const winRate = report && report.trades > 0 ? (report.wins / report.trades) * 100 : null;
+
+  return (
+    <>
+      <Card>
+        <CardHeader className="flex-wrap">
+          <div className="space-y-1">
+            <CardTitle>{definition.name}</CardTitle>
+            <div className="flex flex-wrap items-center gap-1">
+              <Badge tone={statusTone[record.status]}>{strategyStatusLabel(record.status)}</Badge>
+              <SourceBadge source={record.source} />
+              <span className="text-[11px] text-muted">
+                {fmt(t.strategies.version, { version: record.version })}
+              </span>
+            </div>
+            <CardDescription>
+              {definition.universe.venues.join(" / ")} · {definition.universe.symbols.join(" / ")}
+            </CardDescription>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <Button size="sm" variant={running ? "secondary" : "primary"} disabled={pending.toggle} onClick={onToggle}>
+              {running ? <Pause size={13} /> : <Play size={13} />}
+              {running ? t.strategies.pause : t.strategies.start}
+            </Button>
+            <Button size="sm" variant="secondary" disabled={pending.validate} onClick={onValidate}>
+              <ShieldCheck size={13} />
+              {pending.validate ? t.strategies.validating : t.strategies.validate}
+            </Button>
+            <Button size="sm" variant="secondary" disabled={pending.backtest} onClick={onBacktest}>
+              <FlaskConical size={13} />
+              {pending.backtest ? t.strategies.backtesting : t.strategies.backtest}
+            </Button>
+            <Button size="sm" variant="danger" disabled={pending.remove} onClick={onDelete}>
+              <Trash2 size={13} />
+              {t.strategies.delete}
+            </Button>
+          </div>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div>
+            <div className="mb-1.5 flex items-center gap-2">
+              <p className="text-xs font-medium text-fg">{t.strategies.validationTitle}</p>
+              {errors.length > 0 ? (
+                <Badge tone="danger">
+                  {fmt(t.strategies.validationErrors, { count: errors.length })}
+                </Badge>
+              ) : (
+                <Badge tone="success">{t.strategies.validationPass}</Badge>
+              )}
+              {warnings.length > 0 && (
+                <Badge tone="warning">
+                  {fmt(t.strategies.validationWarnings, { count: warnings.length })}
+                </Badge>
+              )}
+              <span className="text-[11px] text-muted">
+                {fmt(t.strategies.validatedAt, {
+                  value: formatDateTime(validation.validated_at),
+                })}
+              </span>
+            </div>
+            <p className="mb-2 text-[11px] text-muted">{t.strategies.validationDesc}</p>
+            {validation.issues.length > 0 && (
+              <ul className="space-y-1">
+                {validation.issues.map((issue, index) => (
+                  <li
+                    key={`${issue.path}-${index}`}
+                    className="flex items-start gap-2 rounded-md border border-line bg-panel-soft px-2 py-1 text-[11px]"
+                  >
+                    <Badge tone={issue.severity === "error" ? "danger" : "warning"}>
+                      {issue.severity}
+                    </Badge>
+                    <span className="font-mono text-muted">{issue.path}</span>
+                    <span className="text-body">{issue.message}</span>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        </CardContent>
+      </Card>
+
+      <StrategyCodeCard record={record} running={running} />
+
+      <Card>
+        <CardHeader>
+          <div>
+            <CardTitle>{t.strategies.backtestTitle}</CardTitle>
+            <CardDescription>{t.strategies.backtestDesc}</CardDescription>
+          </div>
+          <label className="flex items-center gap-2 text-[11px] text-muted">
+            {t.strategies.backtestDays}
+            <input
+              type="number"
+              min={1}
+              max={365}
+              value={backtestDays}
+              onChange={(event) => onBacktestDays(Number(event.target.value) || 30)}
+              className={cn(inputClass, "w-20")}
+            />
+          </label>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          {!report ? (
+            <p className="text-xs text-muted">{t.strategies.backtestEmpty}</p>
+          ) : (
+            <>
+              <div className="grid grid-cols-2 gap-3 md:grid-cols-4 xl:grid-cols-6">
+                <Metric
+                  label={t.strategies.report.window}
+                  value={`${formatDateTime(report.sample_start)} → ${formatDateTime(report.sample_end)}`}
+                />
+                <Metric
+                  label={t.strategies.report.settlements}
+                  value={formatNumber(report.settlements, 0)}
+                />
+                <Metric label={t.strategies.report.trades} value={formatNumber(report.trades, 0)} />
+                <Metric
+                  label={t.strategies.report.winRate}
+                  value={winRate === null ? "—" : `${winRate.toFixed(0)}%`}
+                />
+                <Metric
+                  label={t.strategies.report.grossFunding}
+                  value={formatUsd(report.gross_funding_usd)}
+                />
+                <Metric label={t.strategies.report.fees} value={formatUsd(report.fees_usd)} />
+                <Metric label={t.strategies.report.slippage} value={formatUsd(report.slippage_usd)} />
+                <Metric label={t.strategies.report.netPnl} value={formatUsd(report.net_pnl_usd)} />
+                <Metric
+                  label={t.strategies.report.return}
+                  value={formatPercentValue(report.return_pct)}
+                />
+                <Metric
+                  label={t.strategies.report.drawdown}
+                  value={formatPercentValue(report.max_drawdown_pct)}
+                />
+                <Metric
+                  label={t.strategies.report.inSample}
+                  value={formatUsd(report.in_sample_net_pnl_usd)}
+                />
+                <Metric
+                  label={t.strategies.report.outOfSample}
+                  value={formatUsd(report.out_of_sample_net_pnl_usd)}
+                />
+              </div>
+              <div className="space-y-1">
+                <p className="text-[11px] text-muted">{t.strategies.report.assumptions}</p>
+                <div className="flex flex-wrap gap-1">
+                  {report.assumptions.map((assumption) => (
+                    <Badge key={assumption} tone="neutral">
+                      {t.strategies.assumptions[assumption]}
+                    </Badge>
+                  ))}
+                </div>
+              </div>
+              <div className="space-y-1">
+                <p className="text-[11px] text-muted">{t.strategies.report.curve}</p>
+                <EquityCurve report={report} />
+              </div>
+              <p className="text-[11px] text-warning">{t.strategies.report.overfitting}</p>
+            </>
+          )}
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <div>
+            <CardTitle>{t.strategies.runtimeTitle}</CardTitle>
+            <CardDescription>{t.strategies.runtimeDesc}</CardDescription>
+          </div>
+          <div className="flex items-center gap-2 text-[11px] text-muted">
+            <Badge tone="info">{fmt(t.strategies.signals, { count: runtime.signals })}</Badge>
+            <Badge tone="neutral">{fmt(t.strategies.orders, { count: runtime.orders })}</Badge>
+          </div>
+        </CardHeader>
+        <CardContent className="space-y-3 text-xs text-muted">
+          <div className="grid gap-2 md:grid-cols-2">
+            <span>
+              {fmt(t.strategies.lastEvaluated, {
+                value: formatDateTime(runtime.last_evaluated_at),
+              })}
+            </span>
+            <span>
+              {runtime.open ? (
+                <>
+                  {t.strategies.openPosition}：{runtime.open.symbol} ·{" "}
+                  {runtime.open.long_venue} / {runtime.open.short_venue} ·{" "}
+                  {formatUsd(runtime.open.notional_usd)}
+                </>
+              ) : (
+                t.strategies.noOpenPosition
+              )}
+            </span>
+          </div>
+          {runtime.last_error && (
+            <p className="text-danger">
+              {fmt(t.strategies.lastError, { message: runtime.last_error })}
+            </p>
+          )}
+          <div>
+            <p className="mb-1 text-[11px] text-muted">{t.strategies.events}</p>
+            {runtime.events.length === 0 ? (
+              <p className="text-[11px] text-muted">{t.strategies.eventsEmpty}</p>
+            ) : (
+              <ul className="space-y-1">
+                {[...runtime.events].reverse().map((event, index) => (
+                  <li
+                    key={`${event.at}-${index}`}
+                    className="flex items-start gap-2 rounded-md border border-line bg-panel-soft px-2 py-1 text-[11px]"
+                  >
+                    <span
+                      className={cn("mt-1 h-1.5 w-1.5 shrink-0 rounded-full", eventTone[event.level])}
+                    />
+                    <span className="font-mono text-muted">{formatDateTime(event.at)}</span>
+                    <span className="text-body">{event.message}</span>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <div>
+            <CardTitle>{t.strategies.versionsTitle}</CardTitle>
+            <CardDescription>{t.strategies.versionsDesc}</CardDescription>
+          </div>
+          <History size={15} className="text-muted" />
+        </CardHeader>
+        <CardContent className="space-y-2">
+          {versions.length === 0 ? (
+            <p className="text-xs text-muted">{t.strategies.versionsEmpty}</p>
+          ) : (
+            versions.map((version) => {
+              const current = version.version === record.version;
+              return (
+                <div
+                  key={version.version}
+                  className="flex flex-wrap items-center gap-2 rounded-md border border-line bg-panel-soft px-2 py-1.5 text-[11px]"
+                >
+                  <span className="font-medium text-fg">
+                    {fmt(t.strategies.version, { version: version.version })}
+                  </span>
+                  <Badge tone={statusTone[version.status]}>
+                    {strategyStatusLabel(version.status)}
+                  </Badge>
+                  {version.backtest && (
+                    <Badge tone="neutral">
+                      {formatUsd(version.backtest.net_pnl_usd)}
+                    </Badge>
+                  )}
+                  <span className="text-muted">{formatDateTime(version.saved_at)}</span>
+                  <span className="ml-auto flex items-center gap-2">
+                    {current ? (
+                      <Badge tone="success">{t.strategies.current}</Badge>
+                    ) : (
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        disabled={pending.rollback || running}
+                        onClick={() => onRollback(version.version)}
+                      >
+                        {t.strategies.rollback}
+                      </Button>
+                    )}
+                  </span>
+                </div>
+              );
+            })
+          )}
+        </CardContent>
+      </Card>
+    </>
   );
 }

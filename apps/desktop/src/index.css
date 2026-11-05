@@ -1,13 +1,87 @@
 @import "tailwindcss";
 
-@theme {
-  --color-ink-950: #05080c;
-  --color-ink-900: #0a0f15;
-  --color-ink-850: #0e141c;
-  --color-ink-800: #121a24;
-  --color-ink-700: #1b2532;
-  --color-ink-600: #27364a;
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme inline {
   --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  --color-canvas: var(--canvas);
+  --color-panel: var(--panel);
+  --color-panel-soft: var(--panel-soft);
+  --color-hover: var(--hover);
+
+  --color-line: var(--line);
+  --color-line-strong: var(--line-strong);
+
+  --color-fg: var(--fg);
+  --color-body: var(--body);
+  --color-muted: var(--muted);
+  --color-subtle: var(--subtle);
+
+  --color-accent: var(--accent);
+  --color-accent-strong: var(--accent-strong);
+  --color-accent-solid: var(--accent-solid);
+  --color-accent-solid-hover: var(--accent-solid-hover);
+  --color-on-accent: var(--on-accent);
+
+  --color-danger: var(--danger);
+  --color-warning: var(--warning);
+  --color-info: var(--info);
+}
+
+/* 浅色为默认，深色通过 html.dark 切换 */
+:root {
+  color-scheme: light;
+
+  --canvas: #f3f5f9;
+  --panel: #ffffff;
+  --panel-soft: #f8fafc;
+  --hover: #eef2f7;
+
+  --line: #e2e8f0;
+  --line-strong: #cbd5e1;
+
+  --fg: #0b1220;
+  --body: #334155;
+  --muted: #64748b;
+  --subtle: #94a3b8;
+
+  --accent: #047857;
+  --accent-strong: #065f46;
+  --accent-solid: #059669;
+  --accent-solid-hover: #047857;
+  --on-accent: #ffffff;
+
+  --danger: #be123c;
+  --warning: #b45309;
+  --info: #0369a1;
+}
+
+.dark {
+  color-scheme: dark;
+
+  --canvas: #05080c;
+  --panel: #0a0f15;
+  --panel-soft: #0e141c;
+  --hover: #121a24;
+
+  --line: #1b2532;
+  --line-strong: #27364a;
+
+  --fg: #f1f5f9;
+  --body: #cbd5e1;
+  --muted: #94a3b8;
+  --subtle: #64748b;
+
+  --accent: #6ee7b7;
+  --accent-strong: #a7f3d0;
+  --accent-solid: #34d399;
+  --accent-solid-hover: #6ee7b7;
+  --on-accent: #05080c;
+
+  --danger: #fda4af;
+  --warning: #fcd34d;
+  --info: #7dd3fc;
 }
 
 @layer base {
@@ -18,7 +92,7 @@
   }
 
   body {
-    @apply bg-ink-950 text-slate-200 antialiased;
+    @apply bg-canvas text-body antialiased;
     font-family:
       "Inter",
       -apple-system,
@@ -29,7 +103,7 @@
   }
 
   ::selection {
-    @apply bg-emerald-400/30 text-white;
+    @apply bg-accent/25 text-fg;
   }
 
   ::-webkit-scrollbar {
@@ -38,10 +112,53 @@
   }
 
   ::-webkit-scrollbar-thumb {
-    @apply rounded-full bg-ink-700;
+    @apply rounded-full bg-line-strong;
   }
 
   ::-webkit-scrollbar-track {
     background: transparent;
   }
+}
+
+/* 资金费率实时变动：费率上涨闪绿、下跌闪红，动画结束后底色自动淡出。 */
+@keyframes funding-flash-up {
+  from {
+    background-color: color-mix(in srgb, var(--accent) 24%, transparent);
+  }
+  to {
+    background-color: transparent;
+  }
+}
+
+@keyframes funding-flash-down {
+  from {
+    background-color: color-mix(in srgb, var(--danger) 24%, transparent);
+  }
+  to {
+    background-color: transparent;
+  }
+}
+
+.funding-flash-up {
+  animation: funding-flash-up 1.4s ease-out;
+}
+
+.funding-flash-down {
+  animation: funding-flash-down 1.4s ease-out;
+}
+
+@keyframes live-pulse {
+  0%,
+  100% {
+    opacity: 1;
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 45%, transparent);
+  }
+  50% {
+    opacity: 0.55;
+    box-shadow: 0 0 0 3px transparent;
+  }
+}
+
+.live-dot {
+  animation: live-pulse 1.8s ease-in-out infinite;
 }

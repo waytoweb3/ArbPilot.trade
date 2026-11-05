@@ -1,31 +1,44 @@
 import { useState } from "react";
 
 import { useCreateOrder } from "../hooks/useApi";
-import { formatBps, orderStatusLabel, orderStatusTone } from "../lib/format";
-import type { CreateOrderResponse, Opportunity } from "../lib/types";
+import {
+  formatFundingRate,
+  formatPercentValue,
+  orderStatusLabel,
+  orderStatusTone,
+} from "../lib/format";
+import { fmt, useI18n } from "../lib/i18n";
+import type { CreateOrderResponse } from "../lib/types";
 import { newIdempotencyKey } from "../lib/utils";
 import { Badge } from "./ui/badge";
 import { Button } from "./ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "./ui/card";
 
 interface TradePanelProps {
-  opportunity: Opportunity | null;
+  symbol: string;
+  longVenue: string;
+  shortVenue: string;
+  netRate: number | null;
+  netAnnualizedPct: number | null;
 }
 
 const inputClass =
-  "w-full rounded-lg border border-ink-600 bg-ink-850 px-3 py-2 text-sm text-slate-100 outline-none transition-colors focus:border-emerald-400/60";
+  "w-full rounded-lg border border-line-strong bg-panel-soft px-3 py-2 text-sm text-fg outline-none transition-colors focus:border-accent/60";
 
 /** 开仓前必须二次确认；提交后由执行器重新做风控校验。 */
-export function TradePanel({ opportunity }: TradePanelProps) {
+export function TradePanel({ symbol, longVenue, shortVenue, netRate, netAnnualizedPct }: TradePanelProps) {
   const mutation = useCreateOrder();
   const [notional, setNotional] = useState("500");
   const [leverage, setLeverage] = useState("1");
   const [confirmed, setConfirmed] = useState(false);
   const [result, setResult] = useState<CreateOrderResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const { t } = useI18n();
+
+  const ready = Boolean(symbol) && Boolean(longVenue) && Boolean(shortVenue);
 
   const submit = () => {
-    if (!opportunity) {
+    if (!ready) {
       return;
     }
     setError(null);
@@ -34,9 +47,9 @@ export function TradePanel({ opportunity }: TradePanelProps) {
     mutation.mutate(
       {
         body: {
-          symbol: opportunity.symbol,
-          long_venue: opportunity.long_venue,
-          short_venue: opportunity.short_venue,
+          symbol,
+          long_venue: longVenue,
+          short_venue: shortVenue,
           notional_usd: Number(notional),
           leverage: Number(leverage),
         },
@@ -48,7 +61,7 @@ export function TradePanel({ opportunity }: TradePanelProps) {
           setConfirmed(false);
         },
         onError: (mutationError) => {
-          setError(mutationError instanceof Error ? mutationError.message : "下单失败");
+          setError(mutationError instanceof Error ? mutationError.message : t.errors.unknown);
         },
       },
     );
@@ -58,35 +71,26 @@ export function TradePanel({ opportunity }: TradePanelProps) {
     <Card>
       <CardHeader>
         <div>
-          <CardTitle>下单确认</CardTitle>
-          <CardDescription>所有订单都经过执行器风控，无法绕过。</CardDescription>
+          <CardTitle>{t.trade.title}</CardTitle>
+          <CardDescription>{t.trade.desc}</CardDescription>
         </div>
-        <Badge tone="info">模拟盘</Badge>
       </CardHeader>
       <CardContent className="space-y-4">
-        {opportunity ? (
-          <div className="rounded-lg border border-ink-700 bg-ink-850/70 p-3 text-xs">
-            <div className="flex items-center justify-between">
-              <span className="font-medium text-slate-200">{opportunity.symbol}</span>
-              <span className="font-mono text-emerald-300">
-                {formatBps(opportunity.net_edge_bps)} 净收益
-              </span>
-            </div>
-            <div className="mt-2 grid grid-cols-2 gap-2 text-slate-400">
-              <span>多头：{opportunity.long_venue}</span>
-              <span>空头：{opportunity.short_venue}</span>
-              <span>费用：{formatBps(opportunity.estimated_fee_bps)}</span>
-              <span>滑点：{formatBps(opportunity.estimated_slippage_bps)}</span>
-            </div>
+        <div className="rounded-lg border border-line bg-panel-soft p-3 text-xs">
+          <div className="flex items-center justify-between">
+            <span className="font-medium text-body">{symbol || "—"}</span>
+            <span className="font-mono text-accent">{formatPercentValue(netAnnualizedPct)}</span>
           </div>
-        ) : (
-          <p className="rounded-lg border border-dashed border-ink-600 px-3 py-6 text-center text-xs text-slate-500">
-            先在机会列表中选择一行，再填写下单参数。
-          </p>
-        )}
+          <div className="mt-2 grid grid-cols-2 gap-2 text-muted">
+            <span>{fmt(t.trade.long, { value: longVenue.toUpperCase() || "—" })}</span>
+            <span>{fmt(t.trade.short, { value: shortVenue.toUpperCase() || "—" })}</span>
+            <span>{t.trade.netPerSettleLabel}</span>
+            <span className="font-mono text-body">{formatFundingRate(netRate)}</span>
+          </div>
+        </div>
 
         <label className="block space-y-1.5">
-          <span className="text-xs text-slate-400">每条腿名义价值（USD）</span>
+          <span className="text-xs text-muted">{t.trade.notional}</span>
           <input
             className={inputClass}
             type="number"
@@ -98,7 +102,7 @@ export function TradePanel({ opportunity }: TradePanelProps) {
         </label>
 
         <label className="block space-y-1.5">
-          <span className="text-xs text-slate-400">杠杆</span>
+          <span className="text-xs text-muted">{t.trade.leverage}</span>
           <input
             className={inputClass}
             type="number"
@@ -110,47 +114,49 @@ export function TradePanel({ opportunity }: TradePanelProps) {
           />
         </label>
 
-        <label className="flex items-start gap-2 text-xs text-slate-400">
+        <label className="flex items-start gap-2 text-xs text-muted">
           <input
             type="checkbox"
-            className="mt-0.5 accent-emerald-500"
+            className="mt-0.5 accent-emerald-600 dark:accent-emerald-400"
             checked={confirmed}
             onChange={(event) => setConfirmed(event.target.checked)}
           />
-          我已核对交易所、方向、金额与杠杆，并理解套利存在滑点与双腿成交风险。
+          {t.trade.confirm}
         </label>
 
         <Button
           className="w-full"
-          disabled={!opportunity || !confirmed || mutation.isPending}
+          disabled={!ready || !confirmed || mutation.isPending}
           onClick={submit}
         >
-          {mutation.isPending ? "提交中…" : "二次确认并开仓"}
+          {mutation.isPending ? t.trade.submitting : t.trade.submit}
         </Button>
 
         {error && (
-          <p className="rounded-lg border border-rose-400/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-300">
+          <p className="rounded-lg border border-danger/30 bg-danger/10 px-3 py-2 text-xs text-danger">
             {error}
           </p>
         )}
 
         {result && (
-          <div className="space-y-2 rounded-lg border border-ink-700 bg-ink-850/70 p-3 text-xs">
+          <div className="space-y-2 rounded-lg border border-line bg-panel-soft p-3 text-xs">
             <div className="flex items-center justify-between">
-              <span className="text-slate-400">订单状态</span>
+              <span className="text-muted">{t.trade.orderStatus}</span>
               <Badge tone={orderStatusTone[result.order.status]}>
-                {orderStatusLabel[result.order.status]}
+                {orderStatusLabel(result.order.status)}
               </Badge>
             </div>
-            <p className="font-mono text-slate-500">{result.order.id}</p>
-            {result.order.note && <p className="text-amber-300">{result.order.note}</p>}
+            <p className="font-mono text-muted">{result.order.id}</p>
+            {result.order.note && <p className="text-warning">{result.order.note}</p>}
             {result.decision?.decision === "approved" && (
-              <p className="text-emerald-300">
-                风控通过，预计名义价值 {Number(result.decision.estimated_notional_usd).toFixed(2)} USD
+              <p className="text-accent">
+                {fmt(t.trade.approved, {
+                  value: Number(result.decision.estimated_notional_usd).toFixed(2),
+                })}
               </p>
             )}
             {result.decision?.decision === "rejected" && (
-              <ul className="list-disc space-y-1 pl-4 text-rose-300">
+              <ul className="list-disc space-y-1 pl-4 text-danger">
                 {result.decision.violations.map((violation) => (
                   <li key={violation.code}>{violation.message}</li>
                 ))}
