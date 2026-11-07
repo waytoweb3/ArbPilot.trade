@@ -26,7 +26,7 @@ export default function Nav() {
 
   const links = [
     { to: "/#top", label: t.nav.home },
-    { to: "/#funding", label: t.nav.funding },
+    { to: "/funding", label: t.nav.funding },
     { to: "/#news", label: t.nav.news },
     { to: "/#strategy", label: t.nav.strategy },
     { to: "/#pricing", label: t.nav.pricing },

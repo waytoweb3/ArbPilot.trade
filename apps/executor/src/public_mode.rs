@@ -25,6 +25,17 @@ fn is_public_read(path: &str) -> bool {
         || path.starts_with("/market/")
 }
 
+/// 官网资金费用页无需令牌即可读取的公共路径（不含 `/api/v1` 前缀）。
+///
+/// 只放行公开市场数据，且仅限只读请求；账户、下单与策略写入仍然必须带令牌。
+pub fn allows_anonymous(method: &Method, path: &str) -> bool {
+    if !matches!(*method, Method::GET | Method::HEAD) {
+        return false;
+    }
+    let path = path.strip_prefix("/api/v1").unwrap_or(path);
+    path == "/funding/status"
+}
+
 /// 中间件：托管实例只提供只读公共数据。
 ///
 /// 账户密钥、下单、策略、风控与 Telegram 等写操作全部拒绝，
@@ -52,7 +63,26 @@ pub async fn require_public_reads(
 
 #[cfg(test)]
 mod tests {
-    use super::is_public_read;
+    use super::{allows_anonymous, is_public_read};
+
+    #[test]
+    fn allows_anonymous_only_for_public_funding_reads() {
+        use axum::http::Method;
+        assert!(allows_anonymous(
+            &Method::GET,
+            "/api/v1/funding/status"
+        ));
+        assert!(allows_anonymous(&Method::GET, "/funding/status"));
+        assert!(!allows_anonymous(
+            &Method::POST,
+            "/api/v1/funding/status"
+        ));
+        assert!(!allows_anonymous(
+            &Method::GET,
+            "/api/v1/funding/history"
+        ));
+        assert!(!allows_anonymous(&Method::GET, "/api/v1/accounts"));
+    }
 
     #[test]
     fn allows_market_data_and_blocks_trading_paths() {

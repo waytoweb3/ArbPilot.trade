@@ -4,6 +4,7 @@ import Layout from "./components/Layout";
 import AdminPage from "./pages/AdminPage";
 import CheckoutSuccessPage from "./pages/CheckoutSuccessPage";
 import DevicePage from "./pages/DevicePage";
+import FundingPage from "./pages/FundingPage";
 import HomePage from "./pages/HomePage";
 import LegalPage from "./pages/LegalPage";
 
@@ -14,6 +15,7 @@ export default function App() {
       <Route path="admin" element={<AdminPage />} />
       <Route element={<Layout />}>
         <Route index element={<HomePage />} />
+        <Route path="funding" element={<FundingPage />} />
         <Route path="pricing" element={<HomePage />} />
         <Route path="privacy" element={<LegalPage slug="privacy" />} />
         <Route path="terms" element={<LegalPage slug="terms" />} />

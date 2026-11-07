@@ -441,6 +441,12 @@ pub async fn require_plan(
     if !state.license.required() {
         return Ok(next.run(request).await);
     }
+    // 官网匿名读取的公开市场数据不校验套餐。
+    if state.config.public_mode
+        && crate::public_mode::allows_anonymous(request.method(), request.uri().path())
+    {
+        return Ok(next.run(request).await);
+    }
     let Some(plan) = required_plan(request.method().as_str(), request.uri().path()) else {
         return Ok(next.run(request).await);
     };

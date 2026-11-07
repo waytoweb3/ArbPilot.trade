@@ -16,6 +16,13 @@ pub async fn require_token(
     request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
+    // 官网资金费用页直接读取官方只读实例的公开资金费率，无需令牌。
+    if state.config.public_mode
+        && crate::public_mode::allows_anonymous(request.method(), request.uri().path())
+    {
+        return Ok(next.run(request).await);
+    }
+
     let provided = request
         .headers()
         .get(AUTHORIZATION)

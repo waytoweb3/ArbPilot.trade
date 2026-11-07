@@ -15,8 +15,11 @@ export type PageMeta = {
   noindex: boolean;
 };
 
-/** 法律页与价格页的独立描述；首页沿用 i18n 里的站点描述。 */
-const DESCRIPTIONS: Record<Locale, Record<"pricing" | "privacy" | "terms", string>> = {
+/** 法律页、价格页与资金费用页的独立描述；首页沿用 i18n 里的站点描述。 */
+const DESCRIPTIONS: Record<
+  Locale,
+  Record<"pricing" | "privacy" | "terms" | "funding", string>
+> = {
   zh: {
     pricing:
       "ArbPilot 价格：Google 登录后可免费查看行情；自托管部署 $49/月，每个计费周期含 7 天策略创建试用，之后 +$50/月，策略市场由作者定价，可免费或按月收费。",
@@ -24,6 +27,8 @@ const DESCRIPTIONS: Record<Locale, Record<"pricing" | "privacy" | "terms", strin
       "ArbPilot 隐私政策：说明订阅与访问官网时我们收集哪些信息、如何使用与共享，以及自托管架构下 API 密钥、订单与交易数据为何始终留在你的设备。",
     terms:
       "ArbPilot 服务条款：订阅与计费、许可范围、退款、风险提示与责任限制，适用于自托管套利终端及其模块。",
+    funding:
+      "ArbPilot 全市场资金费率看板：实时聚合 8 家交易所的 USDT 本位永续资金费率，币种为行、交易所为列，支持搜索、按年化排序与下次结算倒计时。",
   },
   en: {
     pricing:
@@ -32,6 +37,8 @@ const DESCRIPTIONS: Record<Locale, Record<"pricing" | "privacy" | "terms", strin
       "ArbPilot privacy policy: what we collect when you subscribe or browse the site, how it is used, and why API keys, orders and trading data stay on your device.",
     terms:
       "ArbPilot terms of service: subscriptions and billing, license scope, refunds, risk disclosures and liability limits for the self-hosted arbitrage terminal.",
+    funding:
+      "ArbPilot market-wide funding dashboard: live USDT-margined perpetual funding rates from 8 venues, coins as rows and venues as columns, with search, annualised sorting and next-settlement countdowns.",
   },
 };
 
@@ -44,6 +51,15 @@ export function metaForPath(pathname: string, locale: Locale): PageMeta {
     const slug = path === "/privacy" ? "privacy" : "terms";
     const doc = legalDocs[locale][slug];
     return build(path, `${doc.title} · ArbPilot`, DESCRIPTIONS[locale][slug], {});
+  }
+
+  if (path === "/funding") {
+    return build(
+      path,
+      `${copy.fundingPage.title} · ArbPilot`,
+      DESCRIPTIONS[locale].funding,
+      {},
+    );
   }
 
   if (path === "/pricing") {
