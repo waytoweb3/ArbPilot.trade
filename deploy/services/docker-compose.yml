@@ -21,9 +21,10 @@ services:
       timeout: 5s
       retries: 5
 
+  # 账号服务：镜像由 GitHub Actions 构建并推送到 GHCR（.github/workflows/accounts-image.yml），
+  # 服务器只 pull，不再需要同步源码；可用 ARBPILOT_ACCOUNTS_IMAGE 固定到某个 sha-<commit>。
   accounts:
-    build:
-      context: ./accounts
+    image: ${ARBPILOT_ACCOUNTS_IMAGE:-ghcr.io/waytoweb3/arbpilot-accounts:latest}
     restart: unless-stopped
     depends_on:
       postgres:
@@ -37,9 +38,10 @@ services:
       - internal
       - edge
 
+  # 支付服务：镜像由 GitHub Actions 构建并推送到 GHCR（.github/workflows/payments-image.yml），
+  # 服务器只 pull，不再需要同步源码；可用 ARBPILOT_PAYMENTS_IMAGE 固定到某个 sha-<commit>。
   payments:
-    build:
-      context: ./payments
+    image: ${ARBPILOT_PAYMENTS_IMAGE:-ghcr.io/waytoweb3/arbpilot-payments:latest}
     restart: unless-stopped
     env_file:
       - ./payments.env

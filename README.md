@@ -50,12 +50,13 @@
 
 ## 官方托管实例镜像
 
-执行器镜像由 GitHub Actions 在 amd64 runner 上构建并推送到 GHCR，服务器只拉取、不保存源码：
+执行器、账号与支付三个服务都由 GitHub Actions 在 amd64 runner 上构建并推送到 GHCR，服务器只拉取镜像，不保存任何源码：
 
-- 工作流：`.github/workflows/executor-image.yml`，`main` 上执行器相关路径变更时自动构建，也可手动触发；
-- 标签：`latest` 与 `sha-<完整 commit>`，回滚时把 `ARBPILOT_EXECUTOR_IMAGE` 指到旧 sha 即可；
-- 部署：`docker compose pull executor && docker compose up -d executor`；
-- 仓库是私有的，镜像包默认也私有，服务器需 `docker login ghcr.io`（`read:packages` 令牌），或把该包设为 public。
+- 工作流：`.github/workflows/executor-image.yml`、`accounts-image.yml`、`payments-image.yml`，`main` 上对应路径变更时自动构建，也可手动触发；
+- 镜像：`ghcr.io/waytoweb3/arbpilot-executor`、`arbpilot-accounts`、`arbpilot-payments`；
+- 标签：`latest` 与 `sha-<完整 commit>`，回滚时把 `ARBPILOT_EXECUTOR_IMAGE` / `ARBPILOT_ACCOUNTS_IMAGE` / `ARBPILOT_PAYMENTS_IMAGE` 指到旧 sha 即可；
+- 部署（`deploy/services` 目录内）：`docker compose pull && docker compose up -d`；
+- 仓库是私有的，镜像包默认也私有，服务器需 `docker login ghcr.io`（`read:packages` 令牌），或把这三个包设为 public。
 
 ## 本地启动
 

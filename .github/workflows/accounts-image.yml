@@ -1,0 +1,54 @@
+name: accounts-image
+
+# 账号服务镜像在 GitHub 的 amd64 runner 上构建，推送到 GHCR；
+# 服务器只 pull 镜像，不保存账号服务源码。
+on:
+  push:
+    branches: [main]
+    paths:
+      - "apps/accounts/**"
+      - "deploy/services/Dockerfile"
+      - ".github/workflows/accounts-image.yml"
+  workflow_dispatch:
+
+env:
+  IMAGE: ghcr.io/waytoweb3/arbpilot-accounts
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=latest
+            type=sha,format=long,prefix=sha-
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/services/Dockerfile
+          platforms: linux/amd64
+          build-args: |
+            SERVICE=accounts
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # 各服务用独立 cache scope，避免多个工作流互相覆盖缓存。
+          cache-from: type=gha,scope=accounts
+          cache-to: type=gha,mode=max,scope=accounts
