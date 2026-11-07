@@ -73,9 +73,6 @@ export function VenuesStrip() {
     "ASTER",
     "HYPERLIQUID",
     "LIGHTER",
-    "HTX",
-    "MEXC",
-    "BINGX",
   ];
   const { t } = useI18n();
 

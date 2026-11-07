@@ -41,7 +41,7 @@ const zh = {
   },
   venues: {
     eyebrow: "已接入的衍生品市场",
-    note: "资金费率采集已接入 Binance、OKX、Bybit、Bitget、Gate、Aster、Hyperliquid、Lighter、HTX、MEXC 与 BingX，覆盖 2,500+ USDT 本位永续交易对。",
+    note: "资金费率采集已接入 Binance、OKX、Bybit、Bitget、Gate、Aster、Hyperliquid 与 Lighter，覆盖 2,500+ USDT 本位永续交易对。",
   },
   live: {
     header: "Order Book → Execution",
@@ -60,9 +60,9 @@ const zh = {
     eyebrow: "Funding Rates",
     title1: "全市场资金费率，",
     title2: "实时看得见。",
-    desc: "执行器持续采集 11 家交易所的 USDT 本位永续资金费率，覆盖 2,500+ 交易对。当期费率、下次结算倒计时与历史结算记录集中在同一张表，币种为行、交易所为列，点击任意列头即可排序。",
+    desc: "执行器持续采集 8 家交易所的 USDT 本位永续资金费率，覆盖 2,500+ 交易对。当期费率、下次结算倒计时与历史结算记录集中在同一张表，币种为行、交易所为列，点击任意列头即可排序。",
     bullets: [
-      "全市场采集：一次拉齐 11 家交易所的永续合约清单",
+      "全市场采集：一次拉齐 8 家交易所的永续合约清单",
       "费率变动实时高亮，上涨闪绿、下跌闪红",
       "历史结算记录用于区间累计与年化换算",
       "正负费率之差，就是资金费率套利空间",
@@ -74,7 +74,7 @@ const zh = {
     stat1: "覆盖合约",
     stat1Value: "2,500+",
     stat2: "接入交易所",
-    stat2Value: "11",
+    stat2Value: "8",
     stat3: "刷新间隔",
     stat3Value: "30s",
   },
@@ -134,7 +134,7 @@ const zh = {
     metricSharpe: "夏普比率",
     metricWinRate: "胜率",
     templates: [
-      { name: "资金费率中性", body: "现货买入 + 永续做空，收取正向费率" },
+      { name: "永续费率差", body: "同一标的两家永续对冲，做空高费率、做多低费率" },
       { name: "跨所价差", body: "价差突破阈值后双腿建仓，回归时平仓" },
       { name: "事件驱动", body: "新闻命中后按标的与方向快速建仓" },
     ],
@@ -268,7 +268,7 @@ const en: typeof zh = {
   },
   venues: {
     eyebrow: "Connected derivatives venues",
-    note: "Funding-rate collection covers Binance, OKX, Bybit, Bitget, Gate, Aster, Hyperliquid, Lighter, HTX, MEXC and BingX — 2,500+ USDT-margined perpetual pairs.",
+    note: "Funding-rate collection covers Binance, OKX, Bybit, Bitget, Gate, Aster, Hyperliquid and Lighter — 2,500+ USDT-margined perpetual pairs.",
   },
   live: {
     header: "Order Book → Execution",
@@ -287,9 +287,9 @@ const en: typeof zh = {
     eyebrow: "Funding Rates",
     title1: "Market-wide funding rates,",
     title2: "visible in real time.",
-    desc: "The executor continuously collects USDT-margined perpetual funding rates from 11 venues, covering 2,500+ pairs. Current rates, next-settlement countdowns and settled history share one table — coins as rows, venues as columns, sortable from any header.",
+    desc: "The executor continuously collects USDT-margined perpetual funding rates from 8 venues, covering 2,500+ pairs. Current rates, next-settlement countdowns and settled history share one table — coins as rows, venues as columns, sortable from any header.",
     bullets: [
-      "Market-wide collection: every perpetual listed on all 11 venues",
+      "Market-wide collection: every perpetual listed on all 8 venues",
       "Rates flash green on a rise and red on a fall as they change",
       "Settled history powers interval totals and annualised rates",
       "The gap between positive and negative rates is the funding arbitrage",
@@ -301,7 +301,7 @@ const en: typeof zh = {
     stat1: "Contracts",
     stat1Value: "2,500+",
     stat2: "Venues",
-    stat2Value: "11",
+    stat2Value: "8",
     stat3: "Refresh",
     stat3Value: "30s",
   },
@@ -361,7 +361,7 @@ const en: typeof zh = {
     metricSharpe: "Sharpe",
     metricWinRate: "Win rate",
     templates: [
-      { name: "Funding-neutral", body: "Buy spot, short the perpetual, collect positive funding" },
+      { name: "Perp funding spread", body: "Hedge the same pair across two perpetuals: short the higher rate, long the lower" },
       { name: "Cross-venue spread", body: "Enter both legs when the spread breaks a threshold, exit on reversion" },
       { name: "Event-driven", body: "Open quickly on the mapped instrument and direction once news hits" },
     ],
@@ -478,13 +478,13 @@ export function copyFor(locale: Locale): Copy {
 function detectLocale(): Locale {
   // 构建期预渲染在 Node 中执行，没有 localStorage / navigator。
   if (typeof window === "undefined") {
-    return "zh";
+    return "en";
   }
   const stored = localStorage.getItem(STORAGE_KEY);
   if (stored === "zh" || stored === "en") {
     return stored;
   }
-  return navigator.language.toLowerCase().startsWith("zh") ? "zh" : "en";
+  return "en";
 }
 
 export function getLocale(): Locale {

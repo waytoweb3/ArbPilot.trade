@@ -26,9 +26,6 @@ const VENUES: { id: AccountVenue; kind: AccountKind }[] = [
   { id: "bitget", kind: "api_key" },
   { id: "gate", kind: "api_key" },
   { id: "aster", kind: "api_key" },
-  { id: "htx", kind: "api_key" },
-  { id: "mexc", kind: "api_key" },
-  { id: "bingx", kind: "api_key" },
   { id: "hyperliquid", kind: "wallet" },
   { id: "lighter", kind: "wallet" },
 ];

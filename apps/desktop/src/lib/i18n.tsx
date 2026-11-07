@@ -26,6 +26,7 @@ const zh = {
     overview: "总览",
     opportunities: "套利机会",
     funding: "资金费率",
+    basis: "交割基差",
     news: "新闻订阅",
     positions: "仓位与订单",
     strategies: "策略",
@@ -197,16 +198,13 @@ const zh = {
       bitget: "Bitget",
       gate: "Gate.io",
       aster: "Aster",
-      htx: "HTX",
-      mexc: "MEXC",
-      bingx: "BingX",
       hyperliquid: "Hyperliquid",
       lighter: "Lighter",
     },
   },
   opportunities: {
     title: "套利机会",
-    subtitle: "Binance 与 OKX 现货/永续的资金费率扫描结果。点击任意一行填入右侧下单面板。",
+    subtitle: "永续-永续资金费率差扫描结果。点击任意一行填入右侧下单面板。",
     error: "无法获取机会列表，请确认执行器已启动且访问令牌正确。",
     listTitle: "机会列表",
     count: "共 {count} 条 · 每 2 秒刷新",
@@ -221,7 +219,7 @@ const zh = {
     net: "净收益",
     notional: "可执行额度",
     observed: "观测时间",
-    empty: "暂无可用机会。执行器会持续刷新 Binance 与 OKX 的现货/永续盘口，正资金费率出现时显示在这里。",
+    empty: "暂无可用机会。执行器会持续刷新各交易所的永续盘口，永续-永续费率差出现时显示在这里。",
   },
   trade: {
     title: "下单确认",
@@ -634,7 +632,7 @@ const zh = {
   funding: {
     title: "资金费率",
     subtitle:
-      "Binance、OKX、Bybit、Bitget、Gate、Aster、Hyperliquid、Lighter、HTX、MEXC、BingX 全市场永续资金费率横向对比：当期费率、区间累计与结算历史，费率变动实时高亮。负值表示空头向多头收取。",
+      "Binance、OKX、Bybit、Bitget、Gate、Aster、Hyperliquid、Lighter 全市场永续资金费率横向对比：当期费率、区间累计与结算历史，费率变动实时高亮。负值表示空头向多头收取。",
     tableTitle: "永续合约资金费率",
     tableDesc:
       "行为币种、列为交易所，点击任意列头（含各交易所资金费率）排序，点击费率单元格查看该交易所的历史与走势；费率变化时闪烁提示",
@@ -696,6 +694,35 @@ const zh = {
     pageInfo: "第 {page} / {pages} 页",
     prevPage: "上一页",
     nextPage: "下一页",
+  },
+  basis: {
+    title: "交割基差",
+    subtitle:
+      "现货多 + 季度交割合约空：买入现货、卖出交割合约，持有到到期收敛吃基差。按年化基差排序，仅统计交割升水（正向市场）的机会。",
+    tableTitle: "年化基差排行",
+    tableDesc:
+      "年化 = 基差 ÷ 剩余天数 × 365，便于与资金费率年化横向比较；剩余不足一天的合约不参与排行",
+    highest: "最高年化基差",
+    nearest: "最近到期",
+    searchPlaceholder: "搜索交易对 / 合约",
+    rowsCount: "共 {count} 条机会",
+    daysLeft: "剩 {days} 天",
+    rankAnnualized: "年化 {value}",
+    colSymbol: "交易对",
+    colContract: "交割合约",
+    colExpiry: "到期",
+    colBasis: "基差",
+    colAnnualized: "年化基差",
+    colNet: "净收益",
+    colNotional: "可执行额度",
+    colObserved: "观测时间",
+    perPage: "每页 {count} 条",
+    pageInfo: "第 {page} / {pages} 页",
+    prevPage: "上一页",
+    nextPage: "下一页",
+    empty: "暂无交割基差机会：需要同交易所的现货与交割合约同时有盘口，且交割价格高于现货。",
+    noMatch: "没有符合条件的交易对。",
+    unavailable: "无法读取交割基差数据，请确认执行器已启动。",
   },
   news: {
     title: "新闻订阅",
@@ -907,7 +934,7 @@ const zh = {
     notifyNewsHint: "交易所上币公告出现新条目时推送。",
     notifyNewsSources: "新闻来源",
     notifyFunding: "资金费率套利通知",
-    notifyFundingHint: "资金费率年化达到阈值时推送现货多 / 永续空机会。",
+    notifyFundingHint: "资金费率差年化达到阈值时推送永续-永续机会。",
     notifyThreshold: "最小年化阈值（%）",
     notifyThresholdHint: "例如 10 表示年化 10% 才提醒。",
     notifyCooldown: "提醒冷却（小时）",
@@ -958,6 +985,8 @@ const zh = {
     },
     kind: {
       funding_rate: "资金费率",
+      perp_perp_funding: "永续-永续资金费率差",
+      delivery_basis: "交割基差",
       cex_cex_spread: "跨所价差",
       cex_dex_spread: "CEX-DEX",
     },
@@ -983,6 +1012,7 @@ const en: typeof zh = {
     overview: "Overview",
     opportunities: "Opportunities",
     funding: "Funding",
+    basis: "Basis",
     news: "News",
     positions: "Positions & Orders",
     strategies: "Strategies",
@@ -1161,9 +1191,6 @@ const en: typeof zh = {
       bitget: "Bitget",
       gate: "Gate.io",
       aster: "Aster",
-      htx: "HTX",
-      mexc: "MEXC",
-      bingx: "BingX",
       hyperliquid: "Hyperliquid",
       lighter: "Lighter",
     },
@@ -1171,7 +1198,7 @@ const en: typeof zh = {
   opportunities: {
     title: "Opportunities",
     subtitle:
-      "Funding-rate scan across Binance and OKX spot/perpetual books. Select a row to fill the order panel.",
+      "Perp-perp funding-spread scan across the enabled venues. Select a row to fill the order panel.",
     error: "Unable to load opportunities. Check that the executor is running and the token is correct.",
     listTitle: "Opportunity list",
     count: "{count} items · refreshed every 2s",
@@ -1187,7 +1214,7 @@ const en: typeof zh = {
     notional: "Executable",
     observed: "Observed",
     empty:
-      "No opportunities right now. The executor keeps polling Binance and OKX spot/perpetual books and lists positive funding rates here.",
+      "No opportunities right now. The executor keeps polling perpetual books across enabled venues and lists perp-perp funding spreads here.",
   },
   trade: {
     title: "Order confirmation",
@@ -1616,7 +1643,7 @@ const en: typeof zh = {
   funding: {
     title: "Funding Rate",
     subtitle:
-      "Compare funding rates across every perpetual on Binance, OKX, Bybit, Bitget, Gate, Aster, Hyperliquid, Lighter, HTX, MEXC and BingX: current rate, period totals and settlement history, with live change highlights. Negative means shorts are paid.",
+      "Compare funding rates across every perpetual on Binance, OKX, Bybit, Bitget, Gate, Aster, Hyperliquid and Lighter: current rate, period totals and settlement history, with live change highlights. Negative means shorts are paid.",
     tableTitle: "Perpetual funding rates",
     tableDesc:
       "Symbols as rows, exchanges as columns. Click any header (including each exchange's funding column) to sort, a rate cell to open that exchange's history. Rate changes flash briefly.",
@@ -1678,6 +1705,36 @@ const en: typeof zh = {
     pageInfo: "Page {page} / {pages}",
     prevPage: "Previous page",
     nextPage: "Next page",
+  },
+  basis: {
+    title: "Delivery Basis",
+    subtitle:
+      "Long spot + short quarterly delivery futures: buy spot, sell the delivery contract and hold to expiry to collect the basis. Ranked by annualized basis; contango only.",
+    tableTitle: "Annualized basis ranking",
+    tableDesc:
+      "Annualized = basis ÷ days to expiry × 365 for comparison with annualized funding. Contracts with less than a day remaining are excluded.",
+    highest: "Highest annualized basis",
+    nearest: "Nearest expiry",
+    searchPlaceholder: "Search symbol / contract",
+    rowsCount: "{count} opportunities",
+    daysLeft: "{days}d left",
+    rankAnnualized: "Ann. {value}",
+    colSymbol: "Symbol",
+    colContract: "Delivery contract",
+    colExpiry: "Expiry",
+    colBasis: "Basis",
+    colAnnualized: "Annualized",
+    colNet: "Net edge",
+    colNotional: "Executable",
+    colObserved: "Observed",
+    perPage: "{count} per page",
+    pageInfo: "Page {page} / {pages}",
+    prevPage: "Previous page",
+    nextPage: "Next page",
+    empty:
+      "No delivery basis yet: the same exchange needs both a spot and a delivery book, with the delivery price above spot.",
+    noMatch: "No symbols match the filters.",
+    unavailable: "Unable to load delivery basis. Check that the executor is running.",
   },
   news: {
     title: "Listing news",
@@ -1899,8 +1956,7 @@ const en: typeof zh = {
     notifyNewsHint: "Push when a new exchange listing announcement appears.",
     notifyNewsSources: "News sources",
     notifyFunding: "Funding arbitrage alerts",
-    notifyFundingHint:
-      "Push spot-long / perp-short opportunities once annualized funding reaches the threshold.",
+    notifyFundingHint: "Push perp-perp opportunities once the annualized funding spread reaches the threshold.",
     notifyThreshold: "Min annualized (%)",
     notifyThresholdHint: "For example 10 means only alert when annualized funding is above 10%.",
     notifyCooldown: "Alert cooldown (hours)",
@@ -1952,6 +2008,8 @@ const en: typeof zh = {
     },
     kind: {
       funding_rate: "Funding rate",
+      perp_perp_funding: "Perp-perp funding spread",
+      delivery_basis: "Delivery basis",
       cex_cex_spread: "CEX-CEX spread",
       cex_dex_spread: "CEX-DEX",
     },
@@ -1972,7 +2030,7 @@ function detectLocale(): Locale {
   if (stored === "zh" || stored === "en") {
     return stored;
   }
-  return navigator.language.toLowerCase().startsWith("zh") ? "zh" : "en";
+  return "en";
 }
 
 let currentLocale: Locale = detectLocale();

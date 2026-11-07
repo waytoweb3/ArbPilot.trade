@@ -1,7 +1,12 @@
 /** 与 Rust 端 rust_decimal 序列化保持一致：可能是数字或字符串。 */
 export type Decimal = number | string;
 
-export type OpportunityKind = "funding_rate" | "cex_cex_spread" | "cex_dex_spread";
+export type OpportunityKind =
+  | "funding_rate"
+  | "perp_perp_funding"
+  | "delivery_basis"
+  | "cex_cex_spread"
+  | "cex_dex_spread";
 
 /** 策略类型：内置资金费率套利，或由沙箱代码定义的自定义策略。 */
 export type StrategyKind = "funding_rate" | "custom";
@@ -345,6 +350,14 @@ export interface Opportunity {
   net_edge_bps: Decimal;
   max_notional_usd: Decimal;
   funding_rate: Decimal | null;
+  /** 年化资金费率收益率（百分比），跨所比较一律用它。 */
+  funding_annualized_pct: Decimal | null;
+  /** 交割基差机会：交割合约代码，如 `BTCUSDT_251226`。 */
+  delivery_contract?: string | null;
+  /** 交割基差机会：交割合约到期时间。 */
+  expiry?: string | null;
+  /** 交割基差年化收益率（百分比，`10.95` 表示 10.95%/年）。 */
+  annualized_basis_pct?: Decimal | null;
   observed_at: string;
   expires_at: string;
 }
@@ -410,9 +423,6 @@ export type AccountVenue =
   | "bitget"
   | "gate"
   | "aster"
-  | "htx"
-  | "mexc"
-  | "bingx"
   | "hyperliquid"
   | "lighter";
 

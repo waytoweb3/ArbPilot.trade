@@ -93,6 +93,9 @@ const errorText = (error: unknown) => (error instanceof Error ? error.message : 
 /** 现货腿标识去掉 `-spot` 后缀后即为交易所配置里的交易对清单键。 */
 const baseVenue = (venue: string) => venue.replace(/-spot$/, "");
 
+/** 仅界面隐藏的交易所；后端适配器与配置仍然保留。 */
+const HIDDEN_VENUES = new Set(["htx", "mexc", "bingx"]);
+
 /** 当前值不在配置里时也保留，避免下拉显示为空。 */
 function withCurrent(values: string[], current: string): string[] {
   if (!current || values.includes(current)) {
@@ -403,8 +406,12 @@ function StrategyScopeCard({ record, running }: { record: StrategyRecord; runnin
   const config = useMarketConfig();
   const saveScope = useUpdateStrategyScope();
 
-  const spotOptions = (config.data?.venues ?? []).filter((item) => item.segment === "spot");
-  const perpOptions = (config.data?.venues ?? []).filter((item) => item.segment === "perp");
+  const spotOptions = (config.data?.venues ?? []).filter(
+    (item) => item.segment === "spot" && !HIDDEN_VENUES.has(item.venue),
+  );
+  const perpOptions = (config.data?.venues ?? []).filter(
+    (item) => item.segment === "perp" && !HIDDEN_VENUES.has(item.venue),
+  );
 
   const currentSpot =
     record.definition.universe.venues.find((venue) => venue.endsWith("-spot")) ?? "";
