@@ -10,9 +10,7 @@ use sha2::{Digest as _, Sha256};
 use sha3::Keccak256;
 
 use lighters::{
-    constants::{
-        GOOD_TILL_TIME, LIMIT_ORDER, MAX_ORDER_EXPIRY, TX_TYPE_L2_CREATE_ORDER,
-    },
+    constants::{GOOD_TILL_TIME, LIMIT_ORDER, MAX_ORDER_EXPIRY, TX_TYPE_L2_CREATE_ORDER},
     signer::KeyManager,
     transactions::{sign_tx, CreateOrder, OrderInfo, TxInfo},
 };
@@ -75,7 +73,10 @@ impl HyperliquidOrder<'_> {
         let max_decimals = 6u32.saturating_sub(self.size_decimals);
         let text = format!("{:.*}", max_decimals as usize, self.price);
         let (int_part, frac_part) = text.split_once('.').unwrap_or((text.as_str(), ""));
-        let int_digits = int_part.trim_start_matches('-').trim_start_matches('0').len();
+        let int_digits = int_part
+            .trim_start_matches('-')
+            .trim_start_matches('0')
+            .len();
         let allowed = if int_digits > 0 {
             (5i64 - int_digits as i64).max(0) as u32
         } else {
@@ -85,9 +86,9 @@ impl HyperliquidOrder<'_> {
             }
         };
         let decimals = max_decimals.min(allowed);
-        let rounded =
-            self.price
-                .round_dp_with_strategy(decimals, RoundingStrategy::MidpointAwayFromZero);
+        let rounded = self
+            .price
+            .round_dp_with_strategy(decimals, RoundingStrategy::MidpointAwayFromZero);
         if rounded <= Decimal::ZERO {
             return Err(format!("{} 价格精度不足，四舍五入后为 0", self.coin));
         }
@@ -356,12 +357,7 @@ pub fn sign_lighter_order(
         .round_dp(0)
         .to_i64()
         .filter(|value| *value > 0)
-        .ok_or_else(|| {
-            anyhow!(
-                "Lighter 数量小于最小精度 1e-{}",
-                order.size_decimals
-            )
-        })?;
+        .ok_or_else(|| anyhow!("Lighter 数量小于最小精度 1e-{}", order.size_decimals))?;
     let price = (order.price * price_scale)
         .round_dp(0)
         .to_u64()
@@ -393,8 +389,7 @@ pub fn sign_lighter_order(
         attributes: None,
     };
 
-    sign_tx(&mut tx, &key, chain_id)
-        .map_err(|error| anyhow!("Lighter 签名失败: {error}"))?;
+    sign_tx(&mut tx, &key, chain_id).map_err(|error| anyhow!("Lighter 签名失败: {error}"))?;
 
     Ok(LighterSigned {
         tx_type: TX_TYPE_L2_CREATE_ORDER,

@@ -10,7 +10,10 @@ use rust_decimal::Decimal;
 use serde::Deserialize;
 use serde_json::Value;
 
-use super::{parse_decimal, parse_json_decimal, FundingRate, FundingSnapshot, FundingVenueClient};
+use super::{
+    make_book, parse_decimal, parse_json_decimal, BookSnapshot, FundingRate, FundingSnapshot,
+    FundingVenueClient,
+};
 use crate::http_client::HttpClient;
 
 /// Lighter 的交易所标识。
@@ -45,6 +48,35 @@ fn internal_symbol(name: &str) -> Option<String> {
 fn next_hour(now: DateTime<Utc>) -> Option<DateTime<Utc>> {
     Utc.timestamp_opt((now.timestamp() / 3600 + 1) * 3600, 0)
         .single()
+}
+
+/// 从 `orderBookOrders` 解析买一/卖一；订单簿按价格优先排序，首条即最优。
+fn book_from_orders(value: &Value, market_id: i64) -> anyhow::Result<BookSnapshot> {
+    let code = value.get("code").and_then(Value::as_i64).unwrap_or(0);
+    if code != 200 {
+        let message = value
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        bail!("Lighter orderBookOrders 返回错误 {code}: {message}");
+    }
+    let level = |key: &str, label: &str| -> anyhow::Result<(Decimal, Decimal)> {
+        let order = value
+            .get(key)
+            .and_then(Value::as_array)
+            .and_then(|rows| rows.first())
+            .ok_or_else(|| anyhow!("Lighter 盘口缺少{label}: market_id={market_id}"))?;
+        let price = order
+            .get("price")
+            .ok_or_else(|| anyhow!("Lighter 盘口{label}缺少 price"))?;
+        let size = order
+            .get("remaining_base_amount")
+            .ok_or_else(|| anyhow!("Lighter 盘口{label}缺少 remaining_base_amount"))?;
+        Ok((parse_json_decimal(price)?, parse_json_decimal(size)?))
+    };
+    let (bid, bid_size) = level("bids", "买一")?;
+    let (ask, ask_size) = level("asks", "卖一")?;
+    make_book(bid, bid_size, ask, ask_size)
 }
 
 #[derive(Debug, Deserialize)]
@@ -178,8 +210,8 @@ impl LighterFundingClient {
 
     fn books(&self) -> anyhow::Result<Vec<MarketRow>> {
         let url = format!("{}/api/v1/orderBookDetails", self.base_url);
-        let envelope: BooksEnvelope =
-            serde_json::from_value(self.fetch(&url)?).context("解析 Lighter orderBookDetails 失败")?;
+        let envelope: BooksEnvelope = serde_json::from_value(self.fetch(&url)?)
+            .context("解析 Lighter orderBookDetails 失败")?;
         if envelope.code != 200 {
             bail!(
                 "Lighter orderBookDetails 返回错误 {}: {}",
@@ -217,6 +249,20 @@ impl LighterFundingClient {
             }
         }
         Ok(self.remember(&self.books()?))
+    }
+
+    /// 永续的买一/卖一档；`remaining_base_amount` 单位是币。
+    pub fn book(&self, symbol: &str) -> anyhow::Result<BookSnapshot> {
+        let mut market_id = self.market_ids(false)?.get(symbol).copied();
+        if market_id.is_none() {
+            market_id = self.market_ids(true)?.get(symbol).copied();
+        }
+        let market_id = market_id.ok_or_else(|| anyhow!("Lighter 未找到交易对: {symbol}"))?;
+        let url = format!(
+            "{}/api/v1/orderBookOrders?market_id={market_id}&limit=1",
+            self.base_url
+        );
+        book_from_orders(&self.fetch(&url)?, market_id)
     }
 
     fn current_rates(&self) -> anyhow::Result<HashMap<i64, Decimal>> {
@@ -298,10 +344,7 @@ impl LighterFundingClient {
         symbol: &str,
         start: Option<DateTime<Utc>>,
     ) -> anyhow::Result<Vec<FundingRate>> {
-        let mut market_id = self
-            .market_ids(false)?
-            .get(symbol)
-            .copied();
+        let mut market_id = self.market_ids(false)?.get(symbol).copied();
         if market_id.is_none() {
             market_id = self.market_ids(true)?.get(symbol).copied();
         }
@@ -421,5 +464,18 @@ mod tests {
             parse_json_decimal(envelope.fundings[0].rate.as_ref().unwrap()).unwrap(),
             rust_decimal_macros::dec!(0.0013)
         );
+    }
+
+    #[test]
+    fn builds_book_from_orders() {
+        let value = serde_json::json!({
+            "code": 200,
+            "bids": [{ "price": "75730.2", "remaining_base_amount": "1.2" }],
+            "asks": [{ "price": "75732.4", "remaining_base_amount": "0.8" }]
+        });
+        let book = book_from_orders(&value, 1).unwrap();
+        assert_eq!(book.bid, rust_decimal_macros::dec!(75730.2));
+        assert_eq!(book.bid_notional_usd, rust_decimal_macros::dec!(90876.24));
+        assert_eq!(book.ask_notional_usd, rust_decimal_macros::dec!(60585.92));
     }
 }

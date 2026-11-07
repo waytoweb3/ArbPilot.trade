@@ -154,8 +154,7 @@ impl NewsFeed {
             let Some(http) = self.http.clone() else {
                 return;
             };
-            let result =
-                tokio::task::spawn_blocking(move || http.get_json(&base_url)).await;
+            let result = tokio::task::spawn_blocking(move || http.get_json(&base_url)).await;
             match result {
                 Ok(Ok(payload)) => match self.parse(id, payload) {
                     Ok(parsed) => {
@@ -163,11 +162,7 @@ impl NewsFeed {
                         let added = self.merge(parsed);
                         self.mark(id, true, None);
                         tracing::info!(source = id, count = fetched, "上币新闻已更新");
-                        let notifier = self
-                            .notifier
-                            .read()
-                            .expect("新闻通知锁不可用")
-                            .clone();
+                        let notifier = self.notifier.read().expect("新闻通知锁不可用").clone();
                         if let Some(notifier) = notifier {
                             if !first_round && !added.is_empty() {
                                 // 推送走后台任务，避免 Telegram 请求拖慢采集节奏。
@@ -542,7 +537,10 @@ mod tests {
         let items = parse_bitget(&payload).unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].id, "bitget:12560603899630");
-        assert_eq!(items[0].url.as_deref(), Some("https://www.bitget.com/en/support/articles/12560603899630"));
+        assert_eq!(
+            items[0].url.as_deref(),
+            Some("https://www.bitget.com/en/support/articles/12560603899630")
+        );
     }
 
     #[test]

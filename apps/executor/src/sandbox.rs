@@ -14,7 +14,7 @@ use std::{
 };
 
 use arb_core::{
-    DataRules, Instrument, OpportunityKind, SandboxArtifact, SandboxCandle, SandboxDecision,
+    DataRules, Instrument, SandboxArtifact, SandboxCandle, SandboxDecision,
     SandboxEvent, SandboxInput, SandboxLimits, SandboxMarketSnapshot, SandboxOrderLimits,
     SandboxOutput, SandboxPositionSnapshot, SandboxRunReport, SandboxRunStatus,
     SANDBOX_ABI_VERSION, SANDBOX_CANCEL, SANDBOX_CANDLE, SANDBOX_CANDLES, SANDBOX_CLOSE,
@@ -490,7 +490,12 @@ fn instantiate_with_snapshot(
         .func_wrap(
             SANDBOX_IMPORT_NAMESPACE,
             SANDBOX_EVENT_TEXT,
-            |mut caller: Caller<'_, HostState>, index: i32, field: i32, ptr: i32, cap: i32| -> i32 {
+            |mut caller: Caller<'_, HostState>,
+             index: i32,
+             field: i32,
+             ptr: i32,
+             cap: i32|
+             -> i32 {
                 if index < 0 || ptr < 0 || cap < 0 {
                     return 0;
                 }
@@ -927,7 +932,18 @@ pub async fn build_input(
     } else {
         symbols
     };
-    let opportunities = state.market.opportunities();
+    // 资金费率直接读取最新入库值，不依赖已被移除的现货-永续机会。
+    let mut funding_rates: HashMap<(String, String), Decimal> = HashMap::new();
+    for venue in &venues {
+        match state.store.funding_latest(venue, &symbols).await {
+            Ok(rows) => {
+                for row in rows {
+                    funding_rates.insert((row.venue, row.symbol), row.funding_rate);
+                }
+            }
+            Err(error) => tracing::warn!(%error, venue, "读取策略资金费率失败"),
+        }
+    }
     let mut markets = Vec::with_capacity(venues.len() * symbols.len());
     for venue in &venues {
         for market_symbol in &symbols {
@@ -967,18 +983,13 @@ pub async fn build_input(
                 }
             };
             let indicators = arb_core::indicators::compute(&candles, &data);
-            // 资金费率与可成交额度来自同一交易所的资金费率机会。
-            let opportunity = opportunities.iter().find(|opportunity| {
-                opportunity.kind == OpportunityKind::FundingRate
-                    && &opportunity.symbol == market_symbol
-                    && (&opportunity.long_venue == venue || &opportunity.short_venue == venue)
-            });
             let funding_rate = (instrument == Instrument::Perp)
-                .then(|| opportunity.and_then(|opportunity| opportunity.funding_rate))
+                .then(|| {
+                    funding_rates
+                        .get(&(venue.clone(), market_symbol.clone()))
+                        .copied()
+                })
                 .flatten();
-            let max_notional_usd = opportunity
-                .map(|opportunity| opportunity.max_notional_usd)
-                .unwrap_or(order_limits.max_notional_usd);
 
             markets.push(SandboxMarketSnapshot {
                 symbol: market_symbol.clone(),
@@ -989,7 +1000,7 @@ pub async fn build_input(
                 last: None,
                 funding_rate,
                 next_funding_at: None,
-                max_notional_usd,
+                max_notional_usd: order_limits.max_notional_usd,
                 observed_at: quote.observed_at,
                 candles,
                 indicators,

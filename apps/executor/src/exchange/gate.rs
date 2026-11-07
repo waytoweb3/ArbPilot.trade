@@ -2,9 +2,14 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context};
 use chrono::{DateTime, TimeZone, Utc};
+use rust_decimal::Decimal;
 use serde::Deserialize;
+use serde_json::Value;
 
-use super::{parse_decimal, FundingRate, FundingSnapshot, FundingVenueClient};
+use super::{
+    make_book, parse_decimal, parse_json_decimal, BookSnapshot, FundingRate, FundingSnapshot,
+    FundingVenueClient,
+};
 use crate::http_client::HttpClient;
 
 /// Gate.io 的交易所标识。
@@ -53,6 +58,9 @@ struct ContractRow {
     in_delisting: Option<bool>,
     #[serde(default)]
     is_pre_market: Option<bool>,
+    /// 一张合约对应的标的数量，用于把盘口张数折算成币。
+    #[serde(default)]
+    quanto_multiplier: Option<String>,
 }
 
 impl ContractRow {
@@ -93,6 +101,14 @@ struct HistoryRow {
     r: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct OrderBookRow {
+    #[serde(default)]
+    bids: Vec<Vec<Value>>,
+    #[serde(default)]
+    asks: Vec<Vec<Value>>,
+}
+
 /// Gate.io USDT 本位永续公开资金费率客户端。
 pub struct GateFundingClient {
     base_url: String,
@@ -131,14 +147,49 @@ impl GateFundingClient {
 
     pub fn premium_index(&self, symbol: &str) -> anyhow::Result<FundingSnapshot> {
         let contract = gate_contract(symbol)?;
-        let url = format!(
-            "{}/api/v4/futures/usdt/contracts/{contract}",
-            self.base_url
-        );
+        let url = format!("{}/api/v4/futures/usdt/contracts/{contract}", self.base_url);
         let row: ContractRow =
             serde_json::from_value(self.http.get_json(&url)?).context("解析 Gate contract 失败")?;
         row.snapshot()
             .ok_or_else(|| anyhow!("Gate contract 缺少合法的 funding_rate: {contract}"))
+    }
+
+    /// USDT 本位永续的买一/卖一档；盘口张数需乘以合约乘数折算成币。
+    pub fn book(&self, symbol: &str) -> anyhow::Result<BookSnapshot> {
+        let contract = gate_contract(symbol)?;
+        let multiplier = self.quanto_multiplier(&contract)?;
+        let url = format!(
+            "{}/api/v4/futures/usdt/order_book?contract={contract}&limit=1",
+            self.base_url
+        );
+        let row: OrderBookRow = serde_json::from_value(self.http.get_json(&url)?)
+            .context("解析 Gate order_book 失败")?;
+        let level = |rows: &[Vec<Value>], label: &str| -> anyhow::Result<(Decimal, Decimal)> {
+            let level = rows
+                .first()
+                .ok_or_else(|| anyhow!("Gate order_book 缺少{label}: {contract}"))?;
+            if level.len() < 2 {
+                bail!("Gate order_book {label}字段不足: {level:?}");
+            }
+            Ok((
+                parse_json_decimal(&level[0])?,
+                parse_json_decimal(&level[1])?,
+            ))
+        };
+        let (bid, bid_size) = level(&row.bids, "买一")?;
+        let (ask, ask_size) = level(&row.asks, "卖一")?;
+        make_book(bid, bid_size * multiplier, ask, ask_size * multiplier)
+    }
+
+    /// 合约乘数：一张合约对应的标的数量。
+    fn quanto_multiplier(&self, contract: &str) -> anyhow::Result<Decimal> {
+        let url = format!("{}/api/v4/futures/usdt/contracts/{contract}", self.base_url);
+        let row: ContractRow = serde_json::from_value(self.http.get_json(&url)?)
+            .with_context(|| format!("解析 Gate contract 失败: {contract}"))?;
+        row.quanto_multiplier
+            .as_deref()
+            .ok_or_else(|| anyhow!("Gate contract 缺少 quanto_multiplier: {contract}"))
+            .and_then(parse_decimal)
     }
 
     /// 当前正在交易的 USDT 本位永续合约清单。
@@ -169,8 +220,8 @@ impl GateFundingClient {
             url.push_str(&format!("&from={}", start.timestamp() + 1));
         }
 
-        let rows: Vec<HistoryRow> =
-            serde_json::from_value(self.http.get_json(&url)?).context("解析 Gate funding_rate 失败")?;
+        let rows: Vec<HistoryRow> = serde_json::from_value(self.http.get_json(&url)?)
+            .context("解析 Gate funding_rate 失败")?;
 
         let mut rates = Vec::with_capacity(rows.len());
         for row in rows {
@@ -237,6 +288,7 @@ mod tests {
             status: Some("trading".to_string()),
             in_delisting: Some(false),
             is_pre_market: Some(false),
+            quanto_multiplier: Some("0.0001".to_string()),
         };
         let snapshot = row.snapshot().expect("应能解析");
         assert_eq!(snapshot.funding_rate, dec!(0.000042));

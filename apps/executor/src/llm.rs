@@ -97,9 +97,7 @@ pub async fn generate(
         .as_deref()
         .map(str::trim)
         .filter(|key| !key.is_empty())
-        .ok_or_else(|| {
-            "未配置 ARBPILOT_LLM_API_KEY，无法调用 AI 生成策略代码".to_string()
-        })?
+        .ok_or_else(|| "未配置 ARBPILOT_LLM_API_KEY，无法调用 AI 生成策略代码".to_string())?
         .to_string();
 
     let url = format!(
@@ -139,7 +137,8 @@ pub async fn generate(
         "temperature": 0.2,
         "messages": messages,
     });
-    let body = serde_json::to_string(&body).map_err(|error| format!("构造 AI 请求失败: {error}"))?;
+    let body =
+        serde_json::to_string(&body).map_err(|error| format!("构造 AI 请求失败: {error}"))?;
     let timeout = Duration::from_secs(config.llm_timeout_secs.max(5));
     let proxy = config.market_proxy.clone();
 

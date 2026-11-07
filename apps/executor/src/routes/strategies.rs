@@ -1,7 +1,7 @@
 use arb_core::{
     BacktestReport, CostAssumptions, DataRules, EntryRules, ExecutionRules, ExitRules,
-    FundingSample, Instrument, StrategyDefinition, StrategyEventLevel, StrategyKind, StrategyRecord,
-    StrategyRisk, StrategySource, StrategyStatus, StrategyUniverse,
+    FundingSample, Instrument, StrategyDefinition, StrategyEventLevel, StrategyKind,
+    StrategyRecord, StrategyRisk, StrategySource, StrategyStatus, StrategyUniverse,
 };
 use axum::{
     extract::{Path, State},
@@ -51,6 +51,11 @@ pub async fn create(
         Some(definition) => definition,
         None => code_definition(&state, body.name.unwrap_or_default()).await,
     };
+    if definition.kind == StrategyKind::FundingRate {
+        return Err(ApiError::BadRequest(
+            "内置资金费率套利（现货-永续）已下线，请使用永续-永续资金费率策略".to_string(),
+        ));
+    }
     let mut record = StrategyRecord::new(
         definition,
         body.source.unwrap_or(StrategySource::Manual),
@@ -253,6 +258,11 @@ pub async fn update_definition(
     if record.status == StrategyStatus::Running {
         return Err(ApiError::Conflict("请先停止策略再修改定义".to_string()));
     }
+    if body.definition.kind == StrategyKind::FundingRate {
+        return Err(ApiError::BadRequest(
+            "内置资金费率套利（现货-永续）已下线，请使用永续-永续资金费率策略".to_string(),
+        ));
+    }
     record.apply_definition(body.definition);
     record.validation = record.definition.validate(&state.risk_limits());
 
@@ -287,9 +297,7 @@ pub async fn update_scope(
 ) -> Result<Json<StrategyRecord>, ApiError> {
     let mut record = find(&state, id)?;
     if record.status == StrategyStatus::Running {
-        return Err(ApiError::Conflict(
-            "请先停止策略再修改应用范围".to_string(),
-        ));
+        return Err(ApiError::Conflict("请先停止策略再修改应用范围".to_string()));
     }
 
     let spot_venue = body.spot_venue.trim();

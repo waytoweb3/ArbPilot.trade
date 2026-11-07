@@ -33,11 +33,26 @@ pub use okx::{OkxFundingClient, OkxMarketClient, VENUE as OKX_VENUE};
 /// Aster 的合约接口与 Binance 完全兼容，只换域名与交易所标识。
 pub const ASTER_VENUE: &str = "aster";
 
-/// 现货 / USDT 本位永续两类行情。
+/// 现货 / USDT 本位永续 / 交割合约三类行情。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Segment {
     Spot,
     Swap,
+    /// 有固定到期日的交割合约（季度合约）。
+    Delivery,
+}
+
+/// 一个在交易的交割合约，用于「现货多 + 交割空」的基差机会。
+#[derive(Debug, Clone)]
+pub struct DeliveryContract {
+    /// 交易所标识，与永续 venue 相同（`binance` / `okx` / `bybit`）。
+    pub venue: String,
+    /// 内部交易对，如 `BTCUSDT`。
+    pub symbol: String,
+    /// 交易所合约名，如 `BTCUSDT_251226` / `BTC-USDT-251226` / `BTCUSDT-26DEC25`。
+    pub contract: String,
+    /// 到期时间。
+    pub expiry: DateTime<Utc>,
 }
 
 /// 已结算的一期资金费率，`venue` 区分 Binance / OKX。

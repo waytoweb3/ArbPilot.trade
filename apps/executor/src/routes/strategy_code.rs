@@ -392,10 +392,7 @@ fn describe(record: &StrategyRecord) -> String {
     let mut lines = vec![
         format!("名称：{}", definition.name),
         format!("类型：{:?}", definition.kind),
-        format!(
-            "交易所：{}",
-            definition.universe.venues.join(" / ")
-        ),
+        format!("交易所：{}", definition.universe.venues.join(" / ")),
         format!(
             "交易对：{}",
             if definition.universe.symbols.is_empty() {
@@ -417,7 +414,11 @@ fn describe(record: &StrategyRecord) -> String {
             definition.risk.max_notional_usd, definition.risk.max_unhedged_seconds
         ),
     ];
-    if let Some(notes) = definition.notes.as_deref().filter(|notes| !notes.trim().is_empty()) {
+    if let Some(notes) = definition
+        .notes
+        .as_deref()
+        .filter(|notes| !notes.trim().is_empty())
+    {
         lines.push(format!("备注：{notes}"));
     }
     lines.join("\n")

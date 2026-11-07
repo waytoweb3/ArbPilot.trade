@@ -1,5 +1,6 @@
 mod accounts;
 mod candles;
+mod chain;
 mod config;
 mod control;
 mod funding;
@@ -32,6 +33,7 @@ use crate::state::AppState;
 pub fn build(state: AppState) -> Router {
     let protected = Router::new()
         .route("/opportunities", get(opportunities::list))
+        .route("/opportunities/basis", get(opportunities::basis))
         .route("/candles", get(candles::list))
         .route("/orders", get(orders::list).post(orders::create))
         .route("/positions", get(portfolio::positions))
@@ -144,6 +146,7 @@ pub fn build(state: AppState) -> Router {
             get(config::notifications).put(config::update_notifications),
         )
         .route("/news", get(news::list))
+        .route("/chain/prices", get(chain::prices))
         .route(
             "/license",
             get(license::status)

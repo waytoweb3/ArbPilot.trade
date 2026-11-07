@@ -1,9 +1,9 @@
 use std::time::Duration;
 
 use arb_core::{
-    Opportunity, OpportunityKind, OrderOrigin, OrderStatus, PositionSide, SandboxDecision,
-    SandboxInput, SandboxMarketSnapshot, SandboxRunStatus, StrategyEventLevel, StrategyKind,
-    StrategyOpenPosition, StrategyPendingOrder, StrategyRecord, StrategyRunScope, StrategyStatus,
+    OrderOrigin, OrderStatus, PositionSide, SandboxDecision, SandboxInput, SandboxMarketSnapshot,
+    SandboxRunStatus, StrategyEventLevel, StrategyKind, StrategyOpenPosition, StrategyPendingOrder,
+    StrategyRecord, StrategyRunScope, StrategyStatus,
 };
 use chrono::{Duration as ChronoDuration, Utc};
 use rust_decimal::Decimal;
@@ -74,8 +74,21 @@ async fn evaluate_one(state: &AppState, mut record: StrategyRecord) {
         return;
     }
 
-    // 自定义策略没有内置规则，缺少沙箱绑定时必须停下，避免误跑资金费率逻辑。
-    if record.sandbox.is_none() && record.definition.kind != StrategyKind::FundingRate {
+    // 内置「现货-永续」资金费率策略已下线，历史记录直接暂停。
+    if record.definition.kind == StrategyKind::FundingRate {
+        record.status = StrategyStatus::Paused;
+        record.runtime.record(
+            StrategyEventLevel::Error,
+            "内置资金费率套利（现货-永续）已下线，请改用永续-永续资金费率策略",
+            None,
+        );
+        sync_run(state, &mut record, events_before).await;
+        commit(state, record, true).await;
+        return;
+    }
+
+    // 自定义策略没有内置规则，缺少沙箱绑定时必须停下。
+    if record.sandbox.is_none() {
         record.status = StrategyStatus::Paused;
         record.runtime.record(
             StrategyEventLevel::Error,
@@ -93,14 +106,7 @@ async fn evaluate_one(state: &AppState, mut record: StrategyRecord) {
         return;
     }
 
-    // 绑定沙箱模块时由模块决定开仓/平仓；未绑定时使用内置资金费率规则。
-    let evaluated = if record.sandbox.is_some() {
-        evaluate_sandbox(state, &mut record).await
-    } else if record.runtime.open.is_some() {
-        evaluate_exit(state, &mut record).await
-    } else {
-        evaluate_entry(state, &mut record).await
-    };
+    let evaluated = evaluate_sandbox(state, &mut record).await;
 
     let persist = match evaluated {
         Ok(changed) => changed,
@@ -164,102 +170,7 @@ async fn sync_run(state: &AppState, record: &mut StrategyRecord, events_before: 
     }
 }
 
-/// 入场：匹配策略交易对与双腿交易所的资金费率机会，产出开仓意图。
-async fn evaluate_entry(state: &AppState, record: &mut StrategyRecord) -> Result<bool, String> {
-    let now = Utc::now();
-    let Some(opportunity) = select_opportunity(state, record) else {
-        return Ok(false);
-    };
-
-    let funding_rate = opportunity.funding_rate.unwrap_or_default();
-    if funding_rate < record.definition.entry.funding_spread_min {
-        return Ok(false);
-    }
-    let net_edge = opportunity.net_edge_bps / Decimal::from(10_000);
-    if net_edge < record.definition.entry.net_edge_min {
-        return Ok(false);
-    }
-    if let Some(last) = record.runtime.last_signal_at {
-        let cooldown = ChronoDuration::seconds(record.definition.execution.cooldown_secs as i64);
-        if now.signed_duration_since(last) < cooldown {
-            return Ok(false);
-        }
-    }
-
-    let notional = record
-        .definition
-        .risk
-        .max_notional_usd
-        .min(opportunity.max_notional_usd);
-    if notional <= Decimal::ZERO {
-        return Ok(false);
-    }
-
-    let reason = format!(
-        "已开仓 {} {} USD，费率 {} bps，净收益 {} bps",
-        opportunity.symbol,
-        notional,
-        opportunity.gross_spread_bps,
-        opportunity.net_edge_bps
-    );
-    submit_open(
-        state,
-        record,
-        &opportunity.symbol,
-        &opportunity.long_venue,
-        &opportunity.short_venue,
-        notional,
-        opportunity.net_edge_bps,
-        reason,
-        format!(
-            "{}-{}-{}",
-            record.id,
-            opportunity.symbol,
-            opportunity.observed_at.timestamp()
-        ),
-    )
-    .await
-}
-
-/// 出场：费率跌破退出阈值或超过最长持仓时间时，反向平掉双腿。
-async fn evaluate_exit(state: &AppState, record: &mut StrategyRecord) -> Result<bool, String> {
-    let Some(open) = record.runtime.open.clone() else {
-        return Ok(false);
-    };
-    let now = Utc::now();
-    let held_secs = Decimal::from(now.signed_duration_since(open.opened_at).num_seconds());
-    let timed_out = held_secs >= record.definition.exit.max_holding_hours * Decimal::from(3_600);
-    let rate_dropped = current_funding_rate(state, record, &open.symbol)
-        .map(|rate| rate < record.definition.exit.spread_below)
-        .unwrap_or(false);
-
-    if !timed_out && !rate_dropped {
-        return Ok(false);
-    }
-
-    let reason = if timed_out {
-        format!(
-            "持仓已超过 {} 小时",
-            record.definition.exit.max_holding_hours
-        )
-    } else {
-        format!(
-            "资金费率跌破退出阈值 {}",
-            record.definition.exit.spread_below
-        )
-    };
-
-    submit_close(
-        state,
-        record,
-        &open,
-        format!("已平仓 {}：{reason}", open.symbol),
-        format!("{}-exit-{}", record.id, now.timestamp()),
-    )
-    .await
-}
-
-/// 提交开仓意图。沙箱与内置规则共用此入口，确保都经过统一风控网关。
+/// 提交开仓意图。所有策略入口都经过统一风控网关。
 #[allow(clippy::too_many_arguments)]
 async fn submit_open(
     state: &AppState,
@@ -304,11 +215,9 @@ async fn submit_open(
                     opened_at: Utc::now(),
                     entry_net_edge_bps,
                 });
-                record.runtime.record(
-                    StrategyEventLevel::Info,
-                    message,
-                    Some(outcome.order.id),
-                );
+                record
+                    .runtime
+                    .record(StrategyEventLevel::Info, message, Some(outcome.order.id));
             } else {
                 let note = outcome
                     .order
@@ -356,11 +265,9 @@ async fn submit_close(
                 record.runtime.orders += 1;
                 record.runtime.last_signal_at = Some(Utc::now());
                 record.runtime.open = None;
-                record.runtime.record(
-                    StrategyEventLevel::Info,
-                    message,
-                    Some(outcome.order.id),
-                );
+                record
+                    .runtime
+                    .record(StrategyEventLevel::Info, message, Some(outcome.order.id));
             } else {
                 let note = outcome
                     .order
@@ -842,47 +749,6 @@ fn find_market<'a>(
     })
 }
 
-fn select_opportunity(state: &AppState, record: &StrategyRecord) -> Option<Opportunity> {
-    let spot = record.definition.spot_venue()?;
-    let perp = record.definition.perp_venue()?;
-    let now = Utc::now();
-    state
-        .market
-        .opportunities()
-        .into_iter()
-        .find(|opportunity| {
-            opportunity.kind == OpportunityKind::FundingRate
-                && record
-                    .definition
-                    .universe
-                    .symbols
-                    .contains(&opportunity.symbol)
-                && opportunity.long_venue == spot
-                && opportunity.short_venue == perp
-                && opportunity.is_fresh(now, ChronoDuration::seconds(30))
-        })
-}
-
-fn current_funding_rate(
-    state: &AppState,
-    record: &StrategyRecord,
-    symbol: &str,
-) -> Option<Decimal> {
-    let spot = record.definition.spot_venue()?;
-    let perp = record.definition.perp_venue()?;
-    state
-        .market
-        .opportunities()
-        .into_iter()
-        .find(|opportunity| {
-            opportunity.kind == OpportunityKind::FundingRate
-                && opportunity.symbol == symbol
-                && opportunity.long_venue == spot
-                && opportunity.short_venue == perp
-        })
-        .and_then(|opportunity| opportunity.funding_rate)
-}
-
 /// 把运行状态合并回共享状态；只有订单/状态变化时才落库。
 async fn commit(state: &AppState, record: StrategyRecord, persist: bool) {
     let merged = {
@@ -973,13 +839,8 @@ mod tests {
             notes: None,
             created_at: Utc::now(),
         };
-        let report = crate::sandbox::evaluate(
-            artifact,
-            wasm,
-            input,
-            SandboxLimits::default(),
-        )
-        .await;
+        let report =
+            crate::sandbox::evaluate(artifact, wasm, input, SandboxLimits::default()).await;
         assert_eq!(report.status, SandboxRunStatus::Ok, "{:?}", report.error);
 
         let mut runtime = StrategyRuntime::default();

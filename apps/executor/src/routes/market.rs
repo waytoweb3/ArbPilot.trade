@@ -11,7 +11,7 @@ use arb_core::{
     RiskLevel, SandboxArtifact, SandboxArtifactSource, SandboxBinding, SourceVisibility,
     StrategyAuthorCard, StrategyChangelogEntry, StrategyDefinition, StrategyEventLevel,
     StrategyPerformanceRecord, StrategyPricing, StrategyPublication, StrategyRunScope,
-    StrategySettlement, StrategySubscription, StrategyStatus, SubscriptionStatus,
+    StrategySettlement, StrategyStatus, StrategySubscription, SubscriptionStatus,
     ValidationSeverity,
 };
 use axum::{
@@ -188,9 +188,9 @@ pub async fn create_publication(
             .map(|binding| format!("WASM 沙箱 · {}", &binding.artifact_hash[..12]))
             .unwrap_or_else(|| "受限数据定义".to_string())
     });
-    let data_sources = body.data_sources.unwrap_or_else(|| {
-        vec!["已结算资金费率".to_string(), "实时盘口".to_string()]
-    });
+    let data_sources = body
+        .data_sources
+        .unwrap_or_else(|| vec!["已结算资金费率".to_string(), "实时盘口".to_string()]);
     let changelog = vec![StrategyChangelogEntry {
         version: record.version,
         at: now,
@@ -323,7 +323,9 @@ pub async fn update_publication(
             }
             // 冻结发布版本的代码与定义：订阅者在自己的执行器导入后运行。
             let Some(binding) = record.sandbox.as_ref() else {
-                return Err(ApiError::Conflict("策略未部署沙箱模块，无法发布".to_string()));
+                return Err(ApiError::Conflict(
+                    "策略未部署沙箱模块，无法发布".to_string(),
+                ));
             };
             publication.artifact_sha256 = Some(binding.artifact_hash.clone());
             publication.definition = Some(record.definition.clone());
@@ -410,7 +412,9 @@ pub async fn create_performance(
     // 作者自报记录一律不可标记为可复现，避免污染榜单。
     let reproducible = match body.source {
         PerformanceSource::AuthorBacktest => false,
-        _ => body.reproducible.unwrap_or_else(|| body.source.is_platform_verified()),
+        _ => body
+            .reproducible
+            .unwrap_or_else(|| body.source.is_platform_verified()),
     };
 
     let record = StrategyPerformanceRecord {
@@ -483,9 +487,7 @@ pub async fn subscribe(
 ) -> Result<(StatusCode, Json<StrategySubscription>), ApiError> {
     let publication = find_publication(&state, id).await?;
     if publication.status != PublicationStatus::Published {
-        return Err(ApiError::Conflict(
-            "该策略当前未发布，无法订阅".to_string(),
-        ));
+        return Err(ApiError::Conflict("该策略当前未发布，无法订阅".to_string()));
     }
 
     let snapshot = state.store.market_snapshot().await;
@@ -499,8 +501,12 @@ pub async fn subscribe(
         return Ok((StatusCode::OK, Json(existing.clone())));
     }
 
-    let subscription =
-        StrategySubscription::new(&publication, body.subscriber_id, body.payment_ref, Utc::now());
+    let subscription = StrategySubscription::new(
+        &publication,
+        body.subscriber_id,
+        body.payment_ref,
+        Utc::now(),
+    );
     state.store.save_subscription(&subscription).await;
     Ok((StatusCode::CREATED, Json(subscription)))
 }
@@ -893,10 +899,7 @@ fn find_strategy(state: &AppState, id: Uuid) -> Result<arb_core::StrategyRecord,
         .ok_or_else(|| ApiError::NotFound(format!("策略 {id} 不存在")))
 }
 
-async fn find_publication(
-    state: &AppState,
-    id: Uuid,
-) -> Result<StrategyPublication, ApiError> {
+async fn find_publication(state: &AppState, id: Uuid) -> Result<StrategyPublication, ApiError> {
     state
         .store
         .market_snapshot()

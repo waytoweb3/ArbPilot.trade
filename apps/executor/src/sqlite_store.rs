@@ -148,10 +148,7 @@ impl SqliteStore {
     }
 
     pub async fn save_order(&self, order: &Order) {
-        if let Err(error) = self
-            .put_doc("orders", &order.id.to_string(), order)
-            .await
-        {
+        if let Err(error) = self.put_doc("orders", &order.id.to_string(), order).await {
             tracing::error!(%error, order_id = %order.id, "写入订单失败");
         }
     }
@@ -167,7 +164,9 @@ impl SqliteStore {
             "event_type": event_type,
             "detail": detail,
         });
-        if let Err(error) = self.put_doc("order_events", &Uuid::new_v4().to_string(), &payload).await
+        if let Err(error) = self
+            .put_doc("order_events", &Uuid::new_v4().to_string(), &payload)
+            .await
         {
             tracing::error!(%error, %order_id, event_type, "写入订单事件失败");
         }
@@ -186,7 +185,9 @@ impl SqliteStore {
             "target": target,
             "detail": detail,
         });
-        if let Err(error) = self.put_doc("audit_log", &Uuid::new_v4().to_string(), &payload).await
+        if let Err(error) = self
+            .put_doc("audit_log", &Uuid::new_v4().to_string(), &payload)
+            .await
         {
             tracing::error!(%error, actor, action, "写入审计日志失败");
         }
@@ -317,11 +318,10 @@ impl SqliteStore {
     }
 
     pub async fn funding_count(&self, venue: &str) -> anyhow::Result<usize> {
-        let count: i64 =
-            sqlx::query_scalar("select count(*) from funding_rates where venue = ?")
-                .bind(venue)
-                .fetch_one(&self.pool)
-                .await?;
+        let count: i64 = sqlx::query_scalar("select count(*) from funding_rates where venue = ?")
+            .bind(venue)
+            .fetch_one(&self.pool)
+            .await?;
         Ok(count as usize)
     }
 
@@ -470,10 +470,7 @@ impl SqliteStore {
     }
 
     pub async fn save_notification_settings(&self, settings: &NotificationSettings) {
-        if let Err(error) = self
-            .put_doc("settings", "notifications", settings)
-            .await
-        {
+        if let Err(error) = self.put_doc("settings", "notifications", settings).await {
             tracing::error!(%error, "写入通知配置失败");
         }
     }
@@ -640,10 +637,7 @@ impl SqliteStore {
 
     pub async fn save_settlement(&self, settlement: &StrategySettlement) {
         let id = format!("{}:{}", settlement.author_id, settlement.period);
-        if let Err(error) = self
-            .put_doc("strategy_settlements", &id, settlement)
-            .await
-        {
+        if let Err(error) = self.put_doc("strategy_settlements", &id, settlement).await {
             tracing::error!(%error, "写入结算单失败");
         }
     }
@@ -657,12 +651,8 @@ impl SqliteStore {
         artifact: &SandboxArtifact,
         wasm: &[u8],
     ) -> anyhow::Result<()> {
-        self.put_doc(
-            "sandbox_artifacts",
-            &artifact.id.to_string(),
-            artifact,
-        )
-        .await?;
+        self.put_doc("sandbox_artifacts", &artifact.id.to_string(), artifact)
+            .await?;
         sqlx::query(
             r#"
             insert into sandbox_modules (id, wasm) values (?, ?)
@@ -769,18 +759,17 @@ impl SqliteStore {
 
     /// 删除 payload 中 `strategy_id` 匹配的文档；本地数据量很小，直接过滤即可。
     async fn delete_docs_for_strategy(&self, collection: &str, strategy_id: Uuid) {
-        let rows =
-            match sqlx::query("select id, payload from documents where collection = ?")
-                .bind(collection)
-                .fetch_all(&self.pool)
-                .await
-            {
-                Ok(rows) => rows,
-                Err(error) => {
-                    tracing::error!(%error, collection, "读取本地数据失败");
-                    return;
-                }
-            };
+        let rows = match sqlx::query("select id, payload from documents where collection = ?")
+            .bind(collection)
+            .fetch_all(&self.pool)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::error!(%error, collection, "读取本地数据失败");
+                return;
+            }
+        };
 
         for row in rows {
             let payload: String = match row.try_get("payload") {

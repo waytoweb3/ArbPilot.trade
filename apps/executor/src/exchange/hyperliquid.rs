@@ -2,10 +2,14 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context};
 use chrono::{DateTime, TimeZone, Utc};
+use rust_decimal::Decimal;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::{parse_decimal, FundingRate, FundingSnapshot, FundingVenueClient};
+use super::{
+    make_book, parse_decimal, parse_json_decimal, BookSnapshot, FundingRate, FundingSnapshot,
+    FundingVenueClient,
+};
 use crate::http_client::HttpClient;
 
 /// Hyperliquid 的交易所标识。
@@ -39,6 +43,31 @@ fn venue_coin(symbol: &str) -> anyhow::Result<&str> {
         }
     }
     Err(anyhow!("Hyperliquid 无法映射交易对: {symbol}"))
+}
+
+/// 从 `l2Book` 解析买一/卖一；`levels[0]` 为买盘、`levels[1]` 为卖盘。
+fn book_from_l2(value: &Value) -> anyhow::Result<BookSnapshot> {
+    let levels = value
+        .get("levels")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("Hyperliquid l2Book 响应缺少 levels"))?;
+    let level = |index: usize, label: &str| -> anyhow::Result<(Decimal, Decimal)> {
+        let row = levels
+            .get(index)
+            .and_then(Value::as_array)
+            .and_then(|rows| rows.first())
+            .ok_or_else(|| anyhow!("Hyperliquid l2Book 缺少{label}"))?;
+        let price = row
+            .get("px")
+            .ok_or_else(|| anyhow!("Hyperliquid l2Book {label}缺少 px"))?;
+        let size = row
+            .get("sz")
+            .ok_or_else(|| anyhow!("Hyperliquid l2Book {label}缺少 sz"))?;
+        Ok((parse_json_decimal(price)?, parse_json_decimal(size)?))
+    };
+    let (bid, bid_size) = level(0, "买一")?;
+    let (ask, ask_size) = level(1, "卖一")?;
+    make_book(bid, bid_size, ask, ask_size)
 }
 
 #[derive(Debug, Deserialize)]
@@ -87,7 +116,15 @@ impl HyperliquidFundingClient {
     }
 
     fn info(&self, payload: Value) -> anyhow::Result<Value> {
-        self.http.post_json(&format!("{}/info", self.base_url), &payload)
+        self.http
+            .post_json(&format!("{}/info", self.base_url), &payload)
+    }
+
+    /// 永续的买一/卖一档；`l2Book` 的数量单位是币。
+    pub fn book(&self, symbol: &str) -> anyhow::Result<BookSnapshot> {
+        let coin = venue_coin(symbol)?;
+        let value = self.info(json!({ "type": "l2Book", "coin": coin }))?;
+        book_from_l2(&value)
     }
 
     /// 全部永续的当期费率、标记价与下次结算时间，一次 `metaAndAssetCtxs` 请求即可。
@@ -256,7 +293,10 @@ mod tests {
         assert_eq!(meta.universe.len(), 2);
         assert_eq!(meta.universe[1].is_delisted, true);
         assert_eq!(
-            ctxs[0].funding.as_deref().and_then(|v| parse_decimal(v).ok()),
+            ctxs[0]
+                .funding
+                .as_deref()
+                .and_then(|v| parse_decimal(v).ok()),
             Some(dec!(0.0000125))
         );
     }
@@ -266,5 +306,21 @@ mod tests {
         let now = Utc.timestamp_opt(1_700_000_123, 0).unwrap();
         let next = next_hour(now).unwrap();
         assert_eq!(next.timestamp(), 1_700_002_800);
+    }
+
+    #[test]
+    fn builds_book_from_l2() {
+        let value = json!({
+            "coin": "BTC",
+            "levels": [
+                [{ "px": "75722.0", "sz": "1.76879" }],
+                [{ "px": "75723.0", "sz": "6.47643" }]
+            ]
+        });
+        let book = book_from_l2(&value).unwrap();
+        assert_eq!(book.bid, dec!(75722.0));
+        assert_eq!(book.ask, dec!(75723.0));
+        assert_eq!(book.bid_notional_usd, dec!(133_936.31638));
+        assert_eq!(book.ask_notional_usd, dec!(490_414.70889));
     }
 }

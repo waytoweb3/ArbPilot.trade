@@ -2,8 +2,78 @@ use std::{env, net::SocketAddr, path::PathBuf};
 
 use anyhow::Context;
 use arb_core::{RiskLimits, SandboxLimits};
+use serde::{Deserialize, Serialize};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// 单个链上价格源：一个 DEX 池子，可选配一个预言机做偏离比较。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChainFeedConfig {
+    /// 唯一标识，用于告警冷却与桌面端展示。
+    pub id: String,
+    /// 展示用交易对，如 `ETH/USDT`。
+    pub symbol: String,
+    /// Uniswap V2 风格的池子地址。
+    pub pool: String,
+    /// 池子里 token0 是否为计价基准币（如 ETH）；否则基准币在 token1。
+    #[serde(default = "default_true")]
+    pub base_is_token0: bool,
+    pub base_decimals: u32,
+    pub quote_decimals: u32,
+    /// Chainlink 风格聚合器地址；留空表示只记录池子价格，不算偏离。
+    #[serde(default)]
+    pub oracle: Option<String>,
+    #[serde(default = "default_oracle_decimals")]
+    pub oracle_decimals: u32,
+    #[serde(default)]
+    pub oracle_label: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_oracle_decimals() -> u32 {
+    8
+}
+
+/// 未配置 `ARBPILOT_CHAIN_FEEDS` 时的默认监控对象：
+/// Uniswap V2 的 ETH/USDT、ETH/USDC 池子，对 Chainlink ETH/USD。
+fn default_chain_feeds() -> Vec<ChainFeedConfig> {
+    vec![
+        ChainFeedConfig {
+            id: "eth-usdt-uniswap-v2".to_string(),
+            symbol: "ETH/USDT".to_string(),
+            pool: "0x0d4a11d5EEaaC28EC3F61d100daF4d40471f1852".to_string(),
+            base_is_token0: true,
+            base_decimals: 18,
+            quote_decimals: 6,
+            oracle: Some("0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419".to_string()),
+            oracle_decimals: 8,
+            oracle_label: Some("chainlink-eth-usd".to_string()),
+        },
+        ChainFeedConfig {
+            id: "eth-usdc-uniswap-v2".to_string(),
+            symbol: "ETH/USDC".to_string(),
+            pool: "0xB4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc".to_string(),
+            base_is_token0: false,
+            base_decimals: 18,
+            quote_decimals: 6,
+            oracle: Some("0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419".to_string()),
+            oracle_decimals: 8,
+            oracle_label: Some("chainlink-eth-usd".to_string()),
+        },
+    ]
+}
+
+/// 池子与预言机地址必须是标准的 20 字节十六进制，避免配置错了却只看到空价格。
+fn validate_address(value: &str, field: &str) -> anyhow::Result<()> {
+    let raw = value.strip_prefix("0x").unwrap_or(value);
+    if raw.len() != 40 || !raw.chars().all(|item| item.is_ascii_hexdigit()) {
+        anyhow::bail!("{field} 不是合法的 0x 地址: {value}");
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -82,6 +152,16 @@ pub struct Config {
     pub news_bybit_url: String,
     /// Bitget 上币公告接口。
     pub news_bitget_url: String,
+    /// 是否启用链上价格监听。
+    pub chain_enabled: bool,
+    /// 链上 JSON-RPC 地址；未配置时监听器保持空闲，不发起请求。
+    pub chain_rpc_url: Option<String>,
+    /// 链上价格轮询间隔（秒）。
+    pub chain_poll_secs: u64,
+    /// 池子价格与预言机价格偏离超过该值时告警（bps）。
+    pub chain_alert_bps: u32,
+    /// 监控的池子与预言机组合。
+    pub chain_feeds: Vec<ChainFeedConfig>,
     /// 是否启用 Telegram 机器人；未配置 Token 时即使开启也不会连接。
     pub telegram_enabled: bool,
     /// Telegram Bot Token，只保存在执行器所在机器，不通过 API 回传。
@@ -198,19 +278,19 @@ impl Config {
 
         let htx_enabled = env::var("ARBPILOT_HTX_ENABLED")
             .map(|value| !value.eq_ignore_ascii_case("false"))
-            .unwrap_or(true);
+            .unwrap_or(false);
         let htx_base_url = env::var("ARBPILOT_HTX_BASE_URL")
             .unwrap_or_else(|_| "https://api.hbdm.com".to_string());
 
         let mexc_enabled = env::var("ARBPILOT_MEXC_ENABLED")
             .map(|value| !value.eq_ignore_ascii_case("false"))
-            .unwrap_or(true);
+            .unwrap_or(false);
         let mexc_base_url = env::var("ARBPILOT_MEXC_BASE_URL")
             .unwrap_or_else(|_| "https://contract.mexc.com".to_string());
 
         let bingx_enabled = env::var("ARBPILOT_BINGX_ENABLED")
             .map(|value| !value.eq_ignore_ascii_case("false"))
-            .unwrap_or(true);
+            .unwrap_or(false);
         let bingx_base_url = env::var("ARBPILOT_BINGX_BASE_URL")
             .unwrap_or_else(|_| "https://open-api.bingx.com".to_string());
 
@@ -295,6 +375,36 @@ impl Config {
             "https://api.bitget.com/api/v2/public/annoucements?language=en_US&annType=coin_listings"
                 .to_string()
         });
+
+        // 链上价格监听默认开启，但没有 RPC 地址时不会发出任何请求。
+        let chain_enabled = env::var("ARBPILOT_CHAIN_ENABLED")
+            .map(|value| !value.eq_ignore_ascii_case("false"))
+            .unwrap_or(true);
+        let chain_rpc_url = env::var("ARBPILOT_CHAIN_RPC_URL")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let chain_poll_secs = env::var("ARBPILOT_CHAIN_POLL_SECS")
+            .unwrap_or_else(|_| "3".to_string())
+            .parse()
+            .context("解析 ARBPILOT_CHAIN_POLL_SECS 失败")?;
+        let chain_alert_bps = env::var("ARBPILOT_CHAIN_ALERT_BPS")
+            .unwrap_or_else(|_| "100".to_string())
+            .parse()
+            .context("解析 ARBPILOT_CHAIN_ALERT_BPS 失败")?;
+        let chain_feeds = match env::var("ARBPILOT_CHAIN_FEEDS") {
+            Ok(value) if !value.trim().is_empty() => {
+                serde_json::from_str::<Vec<ChainFeedConfig>>(&value)
+                    .context("解析 ARBPILOT_CHAIN_FEEDS 失败")?
+            }
+            _ => default_chain_feeds(),
+        };
+        for feed in &chain_feeds {
+            validate_address(&feed.pool, "chain feed pool")?;
+            if let Some(oracle) = feed.oracle.as_deref() {
+                validate_address(oracle, "chain feed oracle")?;
+            }
+        }
 
         let accounts_file = env::var("ARBPILOT_ACCOUNTS_FILE")
             .map(PathBuf::from)
@@ -447,6 +557,11 @@ impl Config {
             news_okx_url,
             news_bybit_url,
             news_bitget_url,
+            chain_enabled,
+            chain_rpc_url,
+            chain_poll_secs,
+            chain_alert_bps,
+            chain_feeds,
             telegram_enabled,
             telegram_bot_token,
             telegram_api_base,

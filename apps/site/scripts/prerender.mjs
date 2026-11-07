@@ -15,7 +15,7 @@ if (!template.includes(rootPlaceholder)) {
 }
 
 const { renderPages, SITE_URL } = await import(pathToFileURL(serverEntry).href);
-const pages = renderPages("zh");
+const pages = renderPages("en");
 
 for (const page of pages) {
   const targetDir = page.meta.path === "/" ? distDir : join(distDir, page.meta.path.slice(1));

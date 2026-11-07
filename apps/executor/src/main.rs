@@ -12,6 +12,7 @@ mod llm;
 mod market;
 mod news;
 mod notifier;
+mod onchain;
 mod public_mode;
 mod realtime;
 mod routes;

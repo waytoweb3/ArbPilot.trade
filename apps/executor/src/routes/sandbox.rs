@@ -174,9 +174,7 @@ pub async fn bind(
         let issue = limits
             .validate()
             .into_iter()
-            .find(|issue| {
-                issue.severity == arb_core::ValidationSeverity::Error
-            })
+            .find(|issue| issue.severity == arb_core::ValidationSeverity::Error)
             .expect("已有错误");
         return Err(ApiError::BadRequest(format!(
             "{}: {}",
@@ -229,9 +227,7 @@ pub async fn unbind(
             .ok_or_else(|| ApiError::NotFound(format!("策略 {strategy_id} 不存在")))?
     };
     if record.status == arb_core::StrategyStatus::Running {
-        return Err(ApiError::Conflict(
-            "请先停止策略再解绑沙箱模块".to_string(),
-        ));
+        return Err(ApiError::Conflict("请先停止策略再解绑沙箱模块".to_string()));
     }
 
     record.sandbox = None;

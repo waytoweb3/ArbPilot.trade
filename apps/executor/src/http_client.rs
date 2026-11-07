@@ -72,11 +72,7 @@ impl HttpClient {
     }
 
     /// 无请求体的 POST：签名参数放在 URL 上，交易所私有下单接口常用这种形式。
-    pub fn post_with_headers(
-        &self,
-        url: &str,
-        headers: &[(&str, &str)],
-    ) -> anyhow::Result<Value> {
+    pub fn post_with_headers(&self, url: &str, headers: &[(&str, &str)]) -> anyhow::Result<Value> {
         let raw = self.request("POST", url, headers, None)?;
         serde_json::from_slice(&raw).with_context(|| format!("解析 JSON 失败: {url}"))
     }

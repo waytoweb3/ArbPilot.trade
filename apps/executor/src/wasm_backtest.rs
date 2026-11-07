@@ -77,44 +77,33 @@ pub async fn run(
                 candles.len()
             ));
         }
-        series.push((
-            symbol.clone(),
-            {
-                let mut bars: Vec<SandboxCandle> = candles
-                    .into_iter()
-                    .map(|candle| SandboxCandle {
-                        open_time: candle.open_time,
-                        open: candle.open,
-                        high: candle.high,
-                        low: candle.low,
-                        close: candle.close,
-                        volume: candle.volume,
-                    })
-                    .collect();
-                // 各交易所返回顺序不同，回放前统一按时间正序。
-                bars.sort_by(|left, right| left.open_time.cmp(&right.open_time));
-                // 只保留回放窗口；窗口本身还要用到前面的 context 根 K 线。
-                let keep = wanted + window - 1;
-                if bars.len() > keep {
-                    bars.drain(..bars.len() - keep);
-                }
-                bars
-            },
-        ));
+        series.push((symbol.clone(), {
+            let mut bars: Vec<SandboxCandle> = candles
+                .into_iter()
+                .map(|candle| SandboxCandle {
+                    open_time: candle.open_time,
+                    open: candle.open,
+                    high: candle.high,
+                    low: candle.low,
+                    close: candle.close,
+                    volume: candle.volume,
+                })
+                .collect();
+            // 各交易所返回顺序不同，回放前统一按时间正序。
+            bars.sort_by(|left, right| left.open_time.cmp(&right.open_time));
+            // 只保留回放窗口；窗口本身还要用到前面的 context 根 K 线。
+            let keep = wanted + window - 1;
+            if bars.len() > keep {
+                bars.drain(..bars.len() - keep);
+            }
+            bars
+        }));
     }
     if series.is_empty() {
         return Err("策略没有声明交易对，无法回测".to_string());
     }
 
-    replay(
-        record,
-        &artifact,
-        &wasm,
-        binding.limits,
-        &venue,
-        &series,
-    )
-    .await
+    replay(record, &artifact, &wasm, binding.limits, &venue, &series).await
 }
 
 /// 回放一组交易对，产出与资金费率回测同构的报告。
@@ -397,13 +386,8 @@ async fn replay_symbol(
             events: Vec::new(),
         };
 
-        let report = crate::sandbox::evaluate(
-            artifact.clone(),
-            wasm.to_vec(),
-            input,
-            limits.clone(),
-        )
-        .await;
+        let report =
+            crate::sandbox::evaluate(artifact.clone(), wasm.to_vec(), input, limits.clone()).await;
         if report.status != SandboxRunStatus::Ok {
             return Err(format!(
                 "{symbol} 第 {} 根 K 线执行失败（{:?}）：{}",
@@ -734,11 +718,16 @@ mod tests {
         assert!(report.wins >= 2, "{:?}", report);
         assert!(report.sample_start.is_some());
         assert!(report.sample_end.is_some());
-        assert_eq!(report.net_pnl_usd, report.gross_funding_usd - report.fees_usd - report.slippage_usd);
+        assert_eq!(
+            report.net_pnl_usd,
+            report.gross_funding_usd - report.fees_usd - report.slippage_usd
+        );
         assert!(report
             .assumptions
             .contains(&BacktestAssumption::WasmBarReplay));
-        assert!(report.assumptions.contains(&BacktestAssumption::BarCloseFills));
+        assert!(report
+            .assumptions
+            .contains(&BacktestAssumption::BarCloseFills));
         // 每笔交易 2 腿手续费：100 * 4bps * 2 / 10000 = 0.08
         assert_eq!(report.fees_usd, dec!(0.24));
     }

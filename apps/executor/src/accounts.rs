@@ -253,7 +253,11 @@ impl Accounts {
             .signer_key
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
-        let api_key = if wallet { String::new() } else { request.api_key.trim().to_string() };
+        let api_key = if wallet {
+            String::new()
+        } else {
+            request.api_key.trim().to_string()
+        };
         let api_secret = if wallet {
             String::new()
         } else {
@@ -330,7 +334,10 @@ impl Accounts {
         self.commit_snapshot(&credentials, snapshot).await;
 
         let snapshots = self.snapshots.read().expect("快照锁不可用");
-        Ok(view_of(&credentials, snapshots.get(&credentials.id).cloned()))
+        Ok(view_of(
+            &credentials,
+            snapshots.get(&credentials.id).cloned(),
+        ))
     }
 
     /// 把 Lighter 的钱包地址或账户索引解析成数字账户索引。
@@ -357,9 +364,7 @@ impl Accounts {
             let account = value["accounts"]
                 .as_array()
                 .and_then(|rows| rows.first())
-                .ok_or_else(|| {
-                    anyhow!("Lighter 未找到该钱包的账户，请确认地址或改填账户索引")
-                })?;
+                .ok_or_else(|| anyhow!("Lighter 未找到该钱包的账户，请确认地址或改填账户索引"))?;
             account["account_index"]
                 .as_i64()
                 .or_else(|| account["index"].as_i64())
@@ -381,7 +386,10 @@ impl Accounts {
         }
         self.persist()?;
         self.snapshots.write().expect("快照锁不可用").remove(&id);
-        self.last_point.lock().expect("快照节流锁不可用").remove(&id);
+        self.last_point
+            .lock()
+            .expect("快照节流锁不可用")
+            .remove(&id);
         self.store.clear_equity_points(id).await?;
         Ok(())
     }
@@ -400,7 +408,10 @@ impl Accounts {
         self.commit_snapshot(&credentials, snapshot).await;
 
         let snapshots = self.snapshots.read().expect("快照锁不可用");
-        Ok(view_of(&credentials, snapshots.get(&credentials.id).cloned()))
+        Ok(view_of(
+            &credentials,
+            snapshots.get(&credentials.id).cloned(),
+        ))
     }
 
     pub async fn refresh_all(&self) {
@@ -418,7 +429,11 @@ impl Accounts {
         Ok(aggregate(points, bucket_secs))
     }
 
-    async fn commit_snapshot(&self, credentials: &AccountCredentials, snapshot: AccountSnapshotView) {
+    async fn commit_snapshot(
+        &self,
+        credentials: &AccountCredentials,
+        snapshot: AccountSnapshotView,
+    ) {
         let success = snapshot.error.is_none();
         self.snapshots
             .write()
@@ -506,7 +521,10 @@ impl Accounts {
             .http
             .clone()
             .ok_or_else(|| anyhow!("行情 HTTP 客户端不可用"))?;
-        let url = format!("{}/api/v3/ticker/price", self.endpoints.binance_spot.trim_end_matches('/'));
+        let url = format!(
+            "{}/api/v3/ticker/price",
+            self.endpoints.binance_spot.trim_end_matches('/')
+        );
         let value = tokio::task::spawn_blocking(move || http.get_json(&url))
             .await
             .context("获取美元价格任务失败")??;
@@ -649,7 +667,10 @@ fn aggregate(points: Vec<EquityPoint>, bucket_secs: i64) -> Vec<EquityPoint> {
             account_id: Uuid::nil(),
             venue,
             equity_usd,
-            observed_at: Utc.timestamp_opt(bucket, 0).single().unwrap_or_else(Utc::now),
+            observed_at: Utc
+                .timestamp_opt(bucket, 0)
+                .single()
+                .unwrap_or_else(Utc::now),
         });
     }
     out
@@ -689,7 +710,9 @@ fn value_balances(
 ) -> (Decimal, Vec<AssetBalance>) {
     let mut merged: HashMap<String, (Decimal, Decimal)> = HashMap::new();
     for (asset, free, locked) in raw {
-        let entry = merged.entry(asset).or_insert((Decimal::ZERO, Decimal::ZERO));
+        let entry = merged
+            .entry(asset)
+            .or_insert((Decimal::ZERO, Decimal::ZERO));
         entry.0 += free;
         entry.1 += locked;
     }
@@ -739,10 +762,14 @@ fn fetch_binance(
     credentials: &AccountCredentials,
 ) -> anyhow::Result<(RawBalances, Option<Decimal>)> {
     let base_url = base_url.trim_end_matches('/');
-    let query = format!("timestamp={}&recvWindow=5000", Utc::now().timestamp_millis());
+    let query = format!(
+        "timestamp={}&recvWindow=5000",
+        Utc::now().timestamp_millis()
+    );
     let signature = hmac_sha256_hex(&credentials.api_secret, &query)?;
     let url = format!("{base_url}/api/v3/account?{query}&signature={signature}");
-    let value = http.get_json_with_headers(&url, &[("X-MBX-APIKEY", credentials.api_key.as_str())])?;
+    let value =
+        http.get_json_with_headers(&url, &[("X-MBX-APIKEY", credentials.api_key.as_str())])?;
 
     let rows = value["balances"]
         .as_array()
@@ -757,14 +784,15 @@ fn fetch_binance(
 
     // 合约钱包与现货钱包相互独立，权益需要相加。
     let futures_url = format!("{base_url}/fapi/v2/account?{query}&signature={signature}");
-    if let Ok(futures) =
-        http.get_json_with_headers(&futures_url, &[("X-MBX-APIKEY", credentials.api_key.as_str())])
-    {
+    if let Ok(futures) = http.get_json_with_headers(
+        &futures_url,
+        &[("X-MBX-APIKEY", credentials.api_key.as_str())],
+    ) {
         if let Some(rows) = futures["assets"].as_array() {
             for row in rows {
                 let asset = row.get("asset").and_then(Value::as_str).unwrap_or_default();
-                let wallet = decimal(row.get("walletBalance").unwrap_or(&Value::Null))
-                    .unwrap_or_default();
+                let wallet =
+                    decimal(row.get("walletBalance").unwrap_or(&Value::Null)).unwrap_or_default();
                 let available = decimal(row.get("availableBalance").unwrap_or(&Value::Null))
                     .unwrap_or_default();
                 if wallet > Decimal::ZERO {
@@ -785,10 +813,7 @@ fn fetch_okx(
     let base_url = base_url.trim_end_matches('/');
     let path = "/api/v5/account/balance";
     let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
-    let signature = hmac_sha256_base64(
-        &credentials.api_secret,
-        &format!("{timestamp}GET{path}"),
-    )?;
+    let signature = hmac_sha256_base64(&credentials.api_secret, &format!("{timestamp}GET{path}"))?;
     let passphrase = credentials
         .passphrase
         .as_deref()
@@ -818,13 +843,20 @@ fn fetch_okx(
     let mut balances = Vec::new();
     if let Some(details) = account["details"].as_array() {
         for detail in details {
-            let asset = detail.get("ccy").and_then(Value::as_str).unwrap_or_default();
+            let asset = detail
+                .get("ccy")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             let total = decimal(detail.get("eq").unwrap_or(&Value::Null))
                 .or_else(|| decimal(detail.get("cashBal").unwrap_or(&Value::Null)))
                 .unwrap_or_default();
-            let available = decimal(detail.get("availBal").unwrap_or(&Value::Null))
-                .unwrap_or_default();
-            balances.push((asset.to_string(), available, (total - available).max(Decimal::ZERO)));
+            let available =
+                decimal(detail.get("availBal").unwrap_or(&Value::Null)).unwrap_or_default();
+            balances.push((
+                asset.to_string(),
+                available,
+                (total - available).max(Decimal::ZERO),
+            ));
         }
     }
     Ok((balances, equity))
@@ -870,11 +902,14 @@ fn fetch_bybit(
     if let Some(coins) = account["coin"].as_array() {
         for coin in coins {
             let asset = coin.get("coin").and_then(Value::as_str).unwrap_or_default();
-            let wallet = decimal(coin.get("walletBalance").unwrap_or(&Value::Null))
-                .unwrap_or_default();
-            let locked = decimal(coin.get("locked").unwrap_or(&Value::Null))
-                .unwrap_or_default();
-            balances.push((asset.to_string(), (wallet - locked).max(Decimal::ZERO), locked));
+            let wallet =
+                decimal(coin.get("walletBalance").unwrap_or(&Value::Null)).unwrap_or_default();
+            let locked = decimal(coin.get("locked").unwrap_or(&Value::Null)).unwrap_or_default();
+            balances.push((
+                asset.to_string(),
+                (wallet - locked).max(Decimal::ZERO),
+                locked,
+            ));
         }
     }
     Ok((balances, equity))
@@ -917,8 +952,8 @@ fn fetch_bitget(
     if let Some(rows) = spot["data"].as_array() {
         for row in rows {
             let asset = row.get("coin").and_then(Value::as_str).unwrap_or_default();
-            let available = decimal(row.get("available").unwrap_or(&Value::Null))
-                .unwrap_or_default();
+            let available =
+                decimal(row.get("available").unwrap_or(&Value::Null)).unwrap_or_default();
             let frozen = decimal(row.get("frozen").unwrap_or(&Value::Null)).unwrap_or_default();
             balances.push((asset.to_string(), available, frozen));
         }
@@ -943,8 +978,8 @@ fn fetch_bitget(
     {
         if let Some(rows) = futures["data"].as_array() {
             for row in rows {
-                let equity = decimal(row.get("accountEquity").unwrap_or(&Value::Null))
-                    .unwrap_or_default();
+                let equity =
+                    decimal(row.get("accountEquity").unwrap_or(&Value::Null)).unwrap_or_default();
                 if equity > futures_equity {
                     futures_equity = equity;
                 }
@@ -977,9 +1012,12 @@ fn fetch_gate(
     let mut balances = Vec::new();
     if let Some(rows) = spot.as_array() {
         for row in rows {
-            let asset = row.get("currency").and_then(Value::as_str).unwrap_or_default();
-            let available = decimal(row.get("available").unwrap_or(&Value::Null))
+            let asset = row
+                .get("currency")
+                .and_then(Value::as_str)
                 .unwrap_or_default();
+            let available =
+                decimal(row.get("available").unwrap_or(&Value::Null)).unwrap_or_default();
             let locked = decimal(row.get("locked").unwrap_or(&Value::Null)).unwrap_or_default();
             balances.push((asset.to_string(), available, locked));
         }
@@ -1008,7 +1046,10 @@ fn fetch_aster(
     credentials: &AccountCredentials,
 ) -> anyhow::Result<(RawBalances, Option<Decimal>)> {
     let base_url = base_url.trim_end_matches('/');
-    let query = format!("timestamp={}&recvWindow=5000", Utc::now().timestamp_millis());
+    let query = format!(
+        "timestamp={}&recvWindow=5000",
+        Utc::now().timestamp_millis()
+    );
     let signature = hmac_sha256_hex(&credentials.api_secret, &query)?;
     let url = format!("{base_url}/fapi/v2/account?{query}&signature={signature}");
     let value =
@@ -1020,8 +1061,7 @@ fn fetch_aster(
     let mut balances = Vec::with_capacity(rows.len());
     for row in rows {
         let asset = row.get("asset").and_then(Value::as_str).unwrap_or_default();
-        let wallet =
-            decimal(row.get("walletBalance").unwrap_or(&Value::Null)).unwrap_or_default();
+        let wallet = decimal(row.get("walletBalance").unwrap_or(&Value::Null)).unwrap_or_default();
         let available =
             decimal(row.get("availableBalance").unwrap_or(&Value::Null)).unwrap_or_default();
         if wallet > Decimal::ZERO {
@@ -1072,11 +1112,7 @@ fn fetch_hyperliquid(
                 let total = decimal(row.get("total").unwrap_or(&Value::Null)).unwrap_or_default();
                 let hold = decimal(row.get("hold").unwrap_or(&Value::Null)).unwrap_or_default();
                 if total > Decimal::ZERO {
-                    balances.push((
-                        coin.to_string(),
-                        (total - hold).max(Decimal::ZERO),
-                        hold,
-                    ));
+                    balances.push((coin.to_string(), (total - hold).max(Decimal::ZERO), hold));
                 }
             }
         }
@@ -1101,9 +1137,7 @@ fn fetch_lighter(
     } else {
         "l1_address"
     };
-    let value = http.get_json(&format!(
-        "{base_url}/api/v1/account?by={by}&value={target}"
-    ))?;
+    let value = http.get_json(&format!("{base_url}/api/v1/account?by={by}&value={target}"))?;
 
     if value["code"].as_i64().unwrap_or(0) != 200 {
         bail!("Lighter 返回错误: {}", value["code"]);
@@ -1125,10 +1159,9 @@ fn fetch_lighter(
                 .get("symbol")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            let balance =
-                decimal(asset.get("balance").unwrap_or(&Value::Null)).unwrap_or_default();
-            let locked = decimal(asset.get("locked_balance").unwrap_or(&Value::Null))
-                .unwrap_or_default();
+            let balance = decimal(asset.get("balance").unwrap_or(&Value::Null)).unwrap_or_default();
+            let locked =
+                decimal(asset.get("locked_balance").unwrap_or(&Value::Null)).unwrap_or_default();
             if balance > Decimal::ZERO {
                 balances.push((
                     symbol.to_string(),
@@ -1176,9 +1209,18 @@ fn fetch_mexc(
     credentials: &AccountCredentials,
 ) -> anyhow::Result<(RawBalances, Option<Decimal>)> {
     let base_url = base_url.trim_end_matches('/');
-    let value = mexc_get(http, base_url, "/api/v1/private/account/assets", "", credentials)?;
+    let value = mexc_get(
+        http,
+        base_url,
+        "/api/v1/private/account/assets",
+        "",
+        credentials,
+    )?;
     if value["success"].as_bool() != Some(true) {
-        bail!("MEXC 返回错误: {}", value["message"].as_str().unwrap_or("未知错误"));
+        bail!(
+            "MEXC 返回错误: {}",
+            value["message"].as_str().unwrap_or("未知错误")
+        );
     }
 
     let rows = value["data"]
@@ -1186,7 +1228,10 @@ fn fetch_mexc(
         .ok_or_else(|| anyhow!("MEXC 响应缺少 data"))?;
     let mut balances = Vec::with_capacity(rows.len());
     for row in rows {
-        let currency = row.get("currency").and_then(Value::as_str).unwrap_or_default();
+        let currency = row
+            .get("currency")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         let equity = decimal(&row["equity"]).unwrap_or_default();
         let available = decimal(&row["availableBalance"]).unwrap_or_default();
         if equity > Decimal::ZERO {
@@ -1217,7 +1262,10 @@ fn fetch_bingx(
         &[("X-BX-APIKEY", credentials.api_key.as_str())],
     )?;
     if value["code"].as_i64().unwrap_or(-1) != 0 {
-        bail!("BingX 返回错误: {}", value["msg"].as_str().unwrap_or("未知错误"));
+        bail!(
+            "BingX 返回错误: {}",
+            value["msg"].as_str().unwrap_or("未知错误")
+        );
     }
 
     let balance = &value["data"]["balance"];
@@ -1226,11 +1274,7 @@ fn fetch_bingx(
     let available = decimal(&balance["availableMargin"]).unwrap_or_default();
     let mut balances = Vec::new();
     if total > Decimal::ZERO {
-        balances.push((
-            asset,
-            available,
-            (total - available).max(Decimal::ZERO),
-        ));
+        balances.push((asset, available, (total - available).max(Decimal::ZERO)));
     }
 
     Ok((balances, None))
@@ -1284,7 +1328,10 @@ fn htx_get(
         &credentials.api_secret,
         &format!("GET\n{host}\n{path}\n{query}"),
     )?;
-    let url = format!("{base_url}{path}?{query}&Signature={}", htx_encode(&signature));
+    let url = format!(
+        "{base_url}{path}?{query}&Signature={}",
+        htx_encode(&signature)
+    );
     http.get_json(&url)
 }
 

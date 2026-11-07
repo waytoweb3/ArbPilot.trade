@@ -287,6 +287,9 @@ export const api = {
 
   opportunities: () => dataRequest<Opportunity[]>("/api/v1/opportunities"),
 
+  /** 交割合约基差排行：现货多 + 交割空。 */
+  basisOpportunities: () => dataRequest<Opportunity[]>("/api/v1/opportunities/basis"),
+
   candles: (symbol: string, interval: string, limit: number, venue?: string) => {
     const params = new URLSearchParams({
       symbol,

@@ -14,7 +14,7 @@ export const PRERENDER_ROUTES = ["/", "/privacy", "/terms"] as const;
 export type PrerenderPage = { meta: PageMeta; html: string };
 
 /** 由 scripts/prerender.mjs 调用，把整站渲染成静态 HTML 后写进 dist。 */
-export function renderPages(locale: Locale = "zh"): PrerenderPage[] {
+export function renderPages(locale: Locale = "en"): PrerenderPage[] {
   return PRERENDER_ROUTES.map((path) => ({
     meta: metaForPath(path, locale),
     html: renderToString(

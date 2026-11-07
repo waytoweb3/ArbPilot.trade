@@ -1,16 +1,18 @@
 use std::{
+    collections::HashMap,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
 use anyhow::{anyhow, bail, Context};
 use chrono::{DateTime, Utc};
+use rust_decimal::Decimal;
 use serde::Deserialize;
 use serde_json::Value;
 
 use super::{
-    millis_to_time, parse_json_decimal, value_to_millis, FundingRate, FundingSnapshot,
-    FundingVenueClient,
+    make_book, millis_to_time, parse_json_decimal, value_to_millis, BookSnapshot, FundingRate,
+    FundingSnapshot, FundingVenueClient,
 };
 use crate::http_client::HttpClient;
 
@@ -46,6 +48,25 @@ fn mexc_contract(symbol: &str) -> anyhow::Result<String> {
         bail!("交易对名称不合法: {symbol}");
     }
     Ok(format!("{base}_USDT"))
+}
+
+/// 从 `contract/depth` 解析买一/卖一；数量单位是张，乘以合约面值折算成币。
+fn book_from_depth(data: &Value, contract_size: Decimal) -> anyhow::Result<BookSnapshot> {
+    let level = |key: &str, label: &str| -> anyhow::Result<(Decimal, Decimal)> {
+        let row = data
+            .get(key)
+            .and_then(Value::as_array)
+            .and_then(|rows| rows.first())
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow!("MEXC 盘口缺少{label}"))?;
+        if row.len() < 2 {
+            bail!("MEXC 盘口{label}字段不足: {row:?}");
+        }
+        Ok((parse_json_decimal(&row[0])?, parse_json_decimal(&row[1])?))
+    };
+    let (bid, bid_size) = level("bids", "买一")?;
+    let (ask, ask_size) = level("asks", "卖一")?;
+    make_book(bid, bid_size * contract_size, ask, ask_size * contract_size)
 }
 
 #[derive(Debug, Deserialize)]
@@ -108,6 +129,8 @@ pub struct MexcFundingClient {
     http: Arc<HttpClient>,
     /// 上次请求时间，用于进程内节流。
     gate: Mutex<Option<Instant>>,
+    /// 合约面值（一张合约对应的币数）缓存，静态数据不必每次盘口都查。
+    sizes: Mutex<HashMap<String, Decimal>>,
 }
 
 impl MexcFundingClient {
@@ -116,7 +139,48 @@ impl MexcFundingClient {
             base_url: base_url.trim_end_matches('/').to_string(),
             http,
             gate: Mutex::new(None),
+            sizes: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// USDT 本位永续的买一/卖一档；盘口数量单位是张，需乘以合约面值折算成币。
+    pub fn book(&self, symbol: &str) -> anyhow::Result<BookSnapshot> {
+        let contract = mexc_contract(symbol)?;
+        let contract_size = self.contract_size(&contract)?;
+        let url = format!("{}/api/v1/contract/depth/{contract}", self.base_url);
+        let envelope: Envelope =
+            serde_json::from_value(self.fetch(&url)?).context("解析 MEXC depth 失败")?;
+        let data = into_data(envelope, "contract/depth")?;
+        book_from_depth(&data, contract_size)
+    }
+
+    /// 合约面值：一张合约对应的标的数量。
+    fn contract_size(&self, contract: &str) -> anyhow::Result<Decimal> {
+        if let Some(size) = self
+            .sizes
+            .lock()
+            .expect("MEXC 合约面值锁不可用")
+            .get(contract)
+            .copied()
+        {
+            return Ok(size);
+        }
+        let url = format!("{}/api/v1/contract/detail?symbol={contract}", self.base_url);
+        let envelope: Envelope =
+            serde_json::from_value(self.fetch(&url)?).context("解析 MEXC 合约信息失败")?;
+        let data = into_data(envelope, "contract/detail")?;
+        let raw = data
+            .get("contractSize")
+            .ok_or_else(|| anyhow!("MEXC 合约信息缺少 contractSize: {contract}"))?;
+        let size = parse_json_decimal(raw)?;
+        if size <= Decimal::ZERO {
+            bail!("MEXC 合约面值不合法: {contract} {size}");
+        }
+        self.sizes
+            .lock()
+            .expect("MEXC 合约面值锁不可用")
+            .insert(contract.to_string(), size);
+        Ok(size)
     }
 
     /// 按最小间隔串行化请求，避免触发 MEXC 的频率限制。
@@ -150,7 +214,10 @@ impl MexcFundingClient {
             let Some(symbol) = internal_symbol(&row.symbol) else {
                 continue;
             };
-            let Some(rate) = row.funding_rate.as_ref().and_then(|item| parse_json_decimal(item).ok())
+            let Some(rate) = row
+                .funding_rate
+                .as_ref()
+                .and_then(|item| parse_json_decimal(item).ok())
             else {
                 continue;
             };
@@ -158,7 +225,10 @@ impl MexcFundingClient {
                 symbol,
                 FundingSnapshot {
                     funding_rate: rate,
-                    mark_price: row.fair_price.as_ref().and_then(|item| parse_json_decimal(item).ok()),
+                    mark_price: row
+                        .fair_price
+                        .as_ref()
+                        .and_then(|item| parse_json_decimal(item).ok()),
                     next_funding_at: row
                         .next_settle_time
                         .as_ref()
@@ -197,8 +267,8 @@ impl MexcFundingClient {
                 "{}/api/v1/contract/funding_rate/history?symbol={contract}&page_num={page}&page_size={HISTORY_PAGE_SIZE}",
                 self.base_url
             );
-            let envelope: Envelope = serde_json::from_value(self.fetch(&url)?)
-                .context("解析 MEXC 历史费率失败")?;
+            let envelope: Envelope =
+                serde_json::from_value(self.fetch(&url)?).context("解析 MEXC 历史费率失败")?;
             let data = into_data(envelope, "contract/funding_rate/history")?;
             let parsed: HistoryPage =
                 serde_json::from_value(data).context("解析 MEXC 历史费率列表失败")?;
@@ -297,5 +367,17 @@ mod tests {
             value_to_millis(&Value::from(1_793_808_000_000i64)),
             Some(1_793_808_000_000)
         );
+    }
+
+    #[test]
+    fn builds_book_from_depth() {
+        let data = serde_json::json!({
+            "bids": [[75722.5, 120000]],
+            "asks": [[75723.0, 80000]],
+        });
+        let book = book_from_depth(&data, rust_decimal_macros::dec!(0.0001)).unwrap();
+        assert_eq!(book.bid, rust_decimal_macros::dec!(75722.5));
+        assert_eq!(book.bid_notional_usd, rust_decimal_macros::dec!(908670));
+        assert_eq!(book.ask_notional_usd, rust_decimal_macros::dec!(605784));
     }
 }

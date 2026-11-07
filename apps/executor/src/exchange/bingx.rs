@@ -2,11 +2,12 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, bail};
 use chrono::{DateTime, Utc};
+use rust_decimal::Decimal;
 use serde_json::Value;
 
 use super::{
-    millis_to_time, parse_json_decimal, value_to_millis, FundingRate, FundingSnapshot,
-    FundingVenueClient,
+    make_book, millis_to_time, parse_json_decimal, value_to_millis, BookSnapshot, FundingRate,
+    FundingSnapshot, FundingVenueClient,
 };
 use crate::http_client::HttpClient;
 
@@ -38,6 +39,25 @@ fn bingx_contract(symbol: &str) -> anyhow::Result<String> {
         bail!("交易对名称不合法: {symbol}");
     }
     Ok(format!("{base}-USDT"))
+}
+
+/// 从 `quote/depth` 解析买一/卖一；数量单位是币，无需换算合约面值。
+fn book_from_depth(data: &Value) -> anyhow::Result<BookSnapshot> {
+    let level = |key: &str, label: &str| -> anyhow::Result<(Decimal, Decimal)> {
+        let row = data
+            .get(key)
+            .and_then(Value::as_array)
+            .and_then(|rows| rows.first())
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow!("BingX 盘口缺少{label}"))?;
+        if row.len() < 2 {
+            bail!("BingX 盘口{label}字段不足: {row:?}");
+        }
+        Ok((parse_json_decimal(&row[0])?, parse_json_decimal(&row[1])?))
+    };
+    let (bid, bid_size) = level("bids", "买一")?;
+    let (ask, ask_size) = level("asks", "卖一")?;
+    make_book(bid, bid_size, ask, ask_size)
 }
 
 /// BingX 的响应既可能是裸数组，也可能是 `{code, msg, data}` 信封，统一取出数组。
@@ -84,6 +104,27 @@ impl BingxFundingClient {
         rows(self.http.get_json(&url)?, "premiumIndex")
     }
 
+    /// USDT 本位永续的买一/卖一档；盘口数量单位是币，可直接折算名义价值。
+    pub fn book(&self, symbol: &str) -> anyhow::Result<BookSnapshot> {
+        let contract = bingx_contract(symbol)?;
+        let url = format!(
+            "{}/openApi/swap/v2/quote/depth?symbol={contract}&limit=1",
+            self.base_url
+        );
+        let value = self.http.get_json(&url)?;
+        if let Some(code) = value.get("code").and_then(Value::as_i64) {
+            if code != 0 {
+                let message = value
+                    .get("msg")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                bail!("BingX depth 返回错误 {code}: {message}");
+            }
+        }
+        let data = value.get("data").unwrap_or(&value);
+        book_from_depth(data)
+    }
+
     /// 一次请求返回全部 USDT 本位永续的当期费率、标记价与下次结算时间。
     pub fn premium_index_all(&self) -> anyhow::Result<Vec<(String, FundingSnapshot)>> {
         let now = Utc::now();
@@ -95,8 +136,8 @@ impl BingxFundingClient {
             let Some(symbol) = internal_symbol(contract) else {
                 continue;
             };
-            let Some(rate) = field(&row, "lastFundingRate")
-                .and_then(|value| parse_json_decimal(value).ok())
+            let Some(rate) =
+                field(&row, "lastFundingRate").and_then(|value| parse_json_decimal(value).ok())
             else {
                 continue;
             };
@@ -157,8 +198,8 @@ impl BingxFundingClient {
             if start.map(|start| funding_time <= start).unwrap_or(false) {
                 continue;
             }
-            let Some(rate) = field(&row, "fundingRate")
-                .and_then(|value| parse_json_decimal(value).ok())
+            let Some(rate) =
+                field(&row, "fundingRate").and_then(|value| parse_json_decimal(value).ok())
             else {
                 continue;
             };
@@ -226,5 +267,17 @@ mod tests {
 
         let error = serde_json::json!({ "code": 100400, "msg": "bad" });
         assert!(rows(error, "premiumIndex").is_err());
+    }
+
+    #[test]
+    fn builds_book_from_depth() {
+        let data = serde_json::json!({
+            "bids": [["75722.5", "1.2"]],
+            "asks": [["75723.0", "0.8"]],
+        });
+        let book = book_from_depth(&data).unwrap();
+        assert_eq!(book.bid, rust_decimal_macros::dec!(75722.5));
+        assert_eq!(book.bid_notional_usd, rust_decimal_macros::dec!(90867));
+        assert_eq!(book.ask_notional_usd, rust_decimal_macros::dec!(60578.4));
     }
 }

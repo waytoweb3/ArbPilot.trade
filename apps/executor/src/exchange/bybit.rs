@@ -1,10 +1,14 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use anyhow::{anyhow, bail, Context};
 use chrono::{DateTime, Utc};
+use rust_decimal::Decimal;
 use serde::Deserialize;
 
-use super::{millis_to_time, parse_decimal, FundingRate, FundingSnapshot, FundingVenueClient};
+use super::{
+    make_book, millis_to_time, parse_decimal, BookSnapshot, DeliveryContract, FundingRate,
+    FundingSnapshot, FundingVenueClient,
+};
 use crate::http_client::HttpClient;
 
 /// Bybit 的交易所标识。
@@ -51,6 +55,14 @@ struct TickerRow {
     mark_price: Option<String>,
     #[serde(rename = "nextFundingTime", default)]
     next_funding_time: Option<String>,
+    #[serde(rename = "bid1Price", default)]
+    bid_price: Option<String>,
+    #[serde(rename = "bid1Size", default)]
+    bid_size: Option<String>,
+    #[serde(rename = "ask1Price", default)]
+    ask_price: Option<String>,
+    #[serde(rename = "ask1Size", default)]
+    ask_size: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -82,7 +94,12 @@ struct InstrumentRow {
     #[serde(default)]
     status: String,
     #[serde(default)]
+    base_coin: String,
+    #[serde(default)]
     quote_coin: String,
+    /// 交割合约到期时间（毫秒）。
+    #[serde(default)]
+    delivery_time: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -163,9 +180,111 @@ impl BybitFundingClient {
         snapshot_from(&row).ok_or_else(|| anyhow!("Bybit tickers 缺少合法的 fundingRate: {symbol}"))
     }
 
-    /// 当前正在交易的 USDT 本位永续合约清单，按游标翻页取全。
+    /// 线性永续买一/卖一档；数量单位是币，可直接折算名义价值。
+    pub fn book(&self, symbol: &str) -> anyhow::Result<BookSnapshot> {
+        self.category_book("linear", symbol)
+    }
+
+    /// 现货买一/卖一档；作为「现货多 + 交割空」基差机会的现货腿。
+    pub fn spot_book(&self, symbol: &str) -> anyhow::Result<BookSnapshot> {
+        self.category_book("spot", symbol)
+    }
+
+    fn category_book(&self, category: &str, symbol: &str) -> anyhow::Result<BookSnapshot> {
+        let url = format!(
+            "{}/v5/market/tickers?category={category}&symbol={symbol}",
+            self.base_url
+        );
+        let envelope: Envelope<TickerResult> =
+            serde_json::from_value(self.http.get_json(&url)?).context("解析 Bybit tickers 失败")?;
+        let row = into_result(envelope, "market/tickers")?
+            .list
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("Bybit tickers 返回空数据: {symbol}"))?;
+        let field = |value: Option<&str>, name: &str| -> anyhow::Result<Decimal> {
+            value
+                .ok_or_else(|| anyhow!("Bybit ticker 缺少 {name}: {symbol}"))
+                .and_then(parse_decimal)
+        };
+        make_book(
+            field(row.bid_price.as_deref(), "bid1Price")?,
+            field(row.bid_size.as_deref(), "bid1Size")?,
+            field(row.ask_price.as_deref(), "ask1Price")?,
+            field(row.ask_size.as_deref(), "ask1Size")?,
+        )
+    }
+
+    /// 当前正在交易的 USDT 本位永续合约清单。
     pub fn perpetual_symbols(&self) -> anyhow::Result<Vec<String>> {
-        let mut symbols = Vec::new();
+        let mut symbols: Vec<String> = self
+            .linear_instruments()?
+            .into_iter()
+            .filter(|item| item.status.eq_ignore_ascii_case("Trading"))
+            .filter(|item| item.contract_type.eq_ignore_ascii_case("LinearPerpetual"))
+            .filter(|item| item.quote_coin.eq_ignore_ascii_case("USDT"))
+            .map(|item| item.symbol.to_ascii_uppercase())
+            .collect();
+        symbols.sort();
+        symbols.dedup();
+        Ok(symbols)
+    }
+
+    /// 当前在交易的 USDT 本位交割合约；每个交易对只保留最近到期的一张。
+    pub fn delivery_contracts(&self, symbols: &[String]) -> anyhow::Result<Vec<DeliveryContract>> {
+        let now = Utc::now();
+        let mut nearest: HashMap<String, DeliveryContract> = HashMap::new();
+        for item in self.linear_instruments()? {
+            if !item.status.eq_ignore_ascii_case("Trading") {
+                continue;
+            }
+            if !item.contract_type.eq_ignore_ascii_case("LinearFutures") {
+                continue;
+            }
+            if !item.quote_coin.eq_ignore_ascii_case("USDT") {
+                continue;
+            }
+            let underlying = format!("{}{}", item.base_coin, item.quote_coin).to_ascii_uppercase();
+            if !symbols.is_empty()
+                && !symbols
+                    .iter()
+                    .any(|symbol| symbol.eq_ignore_ascii_case(&underlying))
+            {
+                continue;
+            }
+            let Some(expiry) = item
+                .delivery_time
+                .as_deref()
+                .and_then(|value| value.trim().parse::<i64>().ok())
+                .and_then(millis_to_time)
+            else {
+                continue;
+            };
+            if expiry <= now {
+                continue;
+            }
+            let contract = DeliveryContract {
+                venue: VENUE.to_string(),
+                symbol: underlying.clone(),
+                contract: item.symbol.to_ascii_uppercase(),
+                expiry,
+            };
+            match nearest.get(&underlying) {
+                Some(existing) if existing.expiry <= expiry => {}
+                _ => {
+                    nearest.insert(underlying, contract);
+                }
+            }
+        }
+
+        let mut contracts: Vec<DeliveryContract> = nearest.into_values().collect();
+        contracts.sort_by_key(|contract| contract.expiry);
+        Ok(contracts)
+    }
+
+    /// 线性合约清单（永续 + 交割），按游标翻页取全。
+    fn linear_instruments(&self) -> anyhow::Result<Vec<InstrumentRow>> {
+        let mut rows = Vec::new();
         let mut cursor: Option<String> = None;
         for _ in 0..MAX_PAGES {
             let mut url = format!(
@@ -175,31 +294,18 @@ impl BybitFundingClient {
             if let Some(cursor) = cursor.as_deref().filter(|value| !value.is_empty()) {
                 url.push_str(&format!("&cursor={cursor}"));
             }
-            let envelope: Envelope<InstrumentResult> = serde_json::from_value(
-                self.http.get_json(&url)?,
-            )
-            .context("解析 Bybit instruments-info 失败")?;
+            let envelope: Envelope<InstrumentResult> =
+                serde_json::from_value(self.http.get_json(&url)?)
+                    .context("解析 Bybit instruments-info 失败")?;
             let result = into_result(envelope, "market/instruments-info")?;
-
-            symbols.extend(
-                result
-                    .list
-                    .into_iter()
-                    .filter(|item| item.status.eq_ignore_ascii_case("Trading"))
-                    .filter(|item| item.contract_type.eq_ignore_ascii_case("LinearPerpetual"))
-                    .filter(|item| item.quote_coin.eq_ignore_ascii_case("USDT"))
-                    .map(|item| item.symbol.to_ascii_uppercase()),
-            );
+            rows.extend(result.list);
 
             match result.next_page_cursor.filter(|value| !value.is_empty()) {
                 Some(next) => cursor = Some(next),
                 None => break,
             }
         }
-
-        symbols.sort();
-        symbols.dedup();
-        Ok(symbols)
+        Ok(rows)
     }
 
     /// 历史已结算费率，按结算时间升序返回；`start` 为已入库的最后一条。
@@ -231,9 +337,14 @@ impl BybitFundingClient {
                 .funding_rate_timestamp
                 .trim()
                 .parse::<i64>()
-                .map_err(|_| anyhow!("fundingRateTimestamp 不合法: {}", row.funding_rate_timestamp))?;
-            let funding_time =
-                millis_to_time(millis).ok_or_else(|| anyhow!("fundingRateTimestamp 越界: {millis}"))?;
+                .map_err(|_| {
+                    anyhow!(
+                        "fundingRateTimestamp 不合法: {}",
+                        row.funding_rate_timestamp
+                    )
+                })?;
+            let funding_time = millis_to_time(millis)
+                .ok_or_else(|| anyhow!("fundingRateTimestamp 越界: {millis}"))?;
             if start.map(|start| funding_time <= start).unwrap_or(false) {
                 continue;
             }
@@ -283,6 +394,10 @@ mod tests {
             funding_rate: Some("0.0001".to_string()),
             mark_price: Some("78358.16".to_string()),
             next_funding_time: Some("1793808000000".to_string()),
+            bid_price: None,
+            bid_size: None,
+            ask_price: None,
+            ask_size: None,
         };
         let snapshot = snapshot_from(&row).expect("应能解析");
         assert_eq!(snapshot.funding_rate.to_string(), "0.0001");
@@ -297,6 +412,10 @@ mod tests {
             funding_rate: Some(String::new()),
             mark_price: None,
             next_funding_time: None,
+            bid_price: None,
+            bid_size: None,
+            ask_price: None,
+            ask_size: None,
         };
         assert!(snapshot_from(&row).is_none());
     }

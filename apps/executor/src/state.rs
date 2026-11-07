@@ -24,6 +24,7 @@ use crate::{
     market::MarketFeed,
     news::NewsFeed,
     notifier::Notifier,
+    onchain::ChainFeed,
     realtime::RealtimeFeed,
     store::Store,
     telegram::TelegramBot,
@@ -40,6 +41,8 @@ pub struct AppState {
     pub market: Arc<MarketFeed>,
     pub funding: Arc<FundingFeed>,
     pub news: Arc<NewsFeed>,
+    /// 链上池子价格与预言机价格的最近一次快照。
+    pub chain: Arc<ChainFeed>,
     pub telegram: Arc<TelegramBot>,
     pub accounts: Arc<Accounts>,
     pub exchange: Arc<LiveExchange>,
@@ -87,6 +90,8 @@ impl AppState {
             events.clone(),
         );
         let news = NewsFeed::start(config.as_ref(), http.clone());
+        // 链上价格监听复用同一套 HTTP 客户端与事件总线；未配置 RPC 时不发请求。
+        let chain = ChainFeed::start(config.as_ref(), http.clone(), events.clone());
         let telegram = TelegramBot::start(config.as_ref(), http.clone());
         // 账户余额采集与行情共用同一套 TLS / 代理配置。
         let account_endpoints = AccountEndpoints {
@@ -150,6 +155,7 @@ impl AppState {
             market,
             funding,
             news,
+            chain,
             telegram,
             accounts,
             exchange,
@@ -167,6 +173,8 @@ impl AppState {
         state.telegram.clone().attach(state.clone());
         // 行情与新闻采集在产生新数据后按通知设置推送。
         state.market.attach_notifier(notifier.clone());
+        // 行情侧需要结算间隔来归一跨所资金费率。
+        state.market.attach_funding(state.funding.clone());
         state.news.attach_notifier(notifier);
         state
     }

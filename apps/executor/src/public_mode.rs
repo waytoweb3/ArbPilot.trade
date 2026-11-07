@@ -14,9 +14,11 @@ fn is_public_read(path: &str) -> bool {
         || path == "/license"
         || path == "/news"
         || path.starts_with("/news/")
+        || path == "/chain/prices"
         || path == "/funding"
         || path.starts_with("/funding/")
         || path == "/opportunities"
+        || path.starts_with("/opportunities/")
         || path == "/candles"
         || path == "/templates"
         || path.starts_with("/templates/")
@@ -54,7 +56,7 @@ mod tests {
 
     #[test]
     fn allows_market_data_and_blocks_trading_paths() {
-        for path in ["/funding/status", "/news", "/market/leaderboard", "/events", "/templates"] {
+        for path in ["/funding/status", "/news", "/chain/prices", "/market/leaderboard", "/events", "/templates"] {
             assert!(is_public_read(path), "{path} 应允许只读访问");
         }
         for path in [

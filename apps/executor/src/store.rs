@@ -68,7 +68,10 @@ impl Default for NotificationSettings {
     fn default() -> Self {
         Self {
             news_enabled: true,
-            news_sources: crate::news::SOURCES.iter().map(|item| item.to_string()).collect(),
+            news_sources: crate::news::SOURCES
+                .iter()
+                .map(|item| item.to_string())
+                .collect(),
             funding_enabled: true,
             funding_min_annualized_pct: Decimal::from(10),
             funding_cooldown_secs: 6 * 3600,
@@ -1379,7 +1382,10 @@ impl Store {
         sqlite_branch!(self, db => db.save_author_card(card).await);
         let Some(pool) = &self.pool else {
             let mut rows = self.authors.write().expect("作者锁不可用");
-            match rows.iter_mut().find(|existing| existing.author_id == card.author_id) {
+            match rows
+                .iter_mut()
+                .find(|existing| existing.author_id == card.author_id)
+            {
                 Some(existing) => *existing = card.clone(),
                 None => rows.push(card.clone()),
             }
@@ -1415,7 +1421,10 @@ impl Store {
         sqlite_branch!(self, db => db.save_publication(publication).await);
         let Some(pool) = &self.pool else {
             let mut rows = self.publications.write().expect("发布锁不可用");
-            match rows.iter_mut().find(|existing| existing.id == publication.id) {
+            match rows
+                .iter_mut()
+                .find(|existing| existing.id == publication.id)
+            {
                 Some(existing) => *existing = publication.clone(),
                 None => rows.push(publication.clone()),
             }
@@ -1499,7 +1508,10 @@ impl Store {
         sqlite_branch!(self, db => db.save_subscription(subscription).await);
         let Some(pool) = &self.pool else {
             let mut rows = self.subscriptions.write().expect("订阅锁不可用");
-            match rows.iter_mut().find(|existing| existing.id == subscription.id) {
+            match rows
+                .iter_mut()
+                .find(|existing| existing.id == subscription.id)
+            {
                 Some(existing) => *existing = subscription.clone(),
                 None => rows.push(subscription.clone()),
             }
@@ -1602,11 +1614,11 @@ impl Store {
         sqlite_branch!(self, db => db.save_sandbox_artifact(artifact, wasm).await);
         let Some(pool) = &self.pool else {
             {
-                let mut rows = self
-                    .sandbox_artifacts
-                    .write()
-                    .expect("沙箱模块锁不可用");
-                match rows.iter_mut().find(|existing| existing.sha256 == artifact.sha256) {
+                let mut rows = self.sandbox_artifacts.write().expect("沙箱模块锁不可用");
+                match rows
+                    .iter_mut()
+                    .find(|existing| existing.sha256 == artifact.sha256)
+                {
                     Some(existing) => *existing = artifact.clone(),
                     None => rows.push(artifact.clone()),
                 }
@@ -1682,7 +1694,10 @@ impl Store {
         sqlite_branch!(self, db => db.save_strategy_template(template).await);
         let Some(pool) = &self.pool else {
             let mut rows = self.strategy_templates.write().expect("模板锁不可用");
-            match rows.iter_mut().find(|existing| existing.key == template.key) {
+            match rows
+                .iter_mut()
+                .find(|existing| existing.key == template.key)
+            {
                 Some(existing) => *existing = template.clone(),
                 None => rows.push(template.clone()),
             }
@@ -1768,7 +1783,10 @@ impl Store {
 /// 读取只含 `payload` 列的表。表名来自内部常量，不接受外部输入。
 async fn load_payloads<T: DeserializeOwned>(pool: &PgPool, table: &str) -> Vec<T> {
     let rows: Vec<sqlx::postgres::PgRow> =
-        match sqlx::query(&format!("select payload from {table}")).fetch_all(pool).await {
+        match sqlx::query(&format!("select payload from {table}"))
+            .fetch_all(pool)
+            .await
+        {
             Ok(rows) => rows,
             Err(error) => {
                 tracing::error!(%error, table, "读取市场数据失败");

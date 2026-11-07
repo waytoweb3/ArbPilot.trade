@@ -1,4 +1,4 @@
-use std::{str::FromStr, sync::Arc};
+use std::{collections::HashMap, str::FromStr, sync::Arc};
 
 use anyhow::{anyhow, Context};
 use chrono::{DateTime, TimeZone, Utc};
@@ -7,8 +7,8 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::{
-    candles_from_rows, make_book, BookSnapshot, Candle, FundingRate, FundingSnapshot,
-    FundingVenueClient, Segment,
+    candles_from_rows, make_book, BookSnapshot, Candle, DeliveryContract, FundingRate,
+    FundingSnapshot, FundingVenueClient, Segment,
 };
 use crate::http_client::HttpClient;
 
@@ -171,7 +171,7 @@ impl BinanceMarketClient {
                 "{}/api/v3/ticker/bookTicker?symbol={symbol}",
                 self.spot_base_url
             ),
-            Segment::Swap => format!(
+            Segment::Swap | Segment::Delivery => format!(
                 "{}/fapi/v1/ticker/bookTicker?symbol={symbol}",
                 self.futures_base_url
             ),
@@ -195,7 +195,7 @@ impl BinanceMarketClient {
     ) -> anyhow::Result<Vec<Candle>> {
         let (base, path) = match segment {
             Segment::Spot => (&self.spot_base_url, "/api/v3/klines"),
-            Segment::Swap => (&self.futures_base_url, "/fapi/v1/klines"),
+            Segment::Swap | Segment::Delivery => (&self.futures_base_url, "/fapi/v1/klines"),
         };
         let url = format!(
             "{base}{path}?symbol={symbol}&interval={interval}&limit={}",
@@ -204,6 +204,60 @@ impl BinanceMarketClient {
         let rows: Vec<Vec<Value>> =
             serde_json::from_value(self.http.get_json(&url)?).context("解析 Binance K 线失败")?;
         candles_from_rows(rows, false)
+    }
+
+    /// 当前在交易的 USDT 本位季度交割合约；每个交易对只保留最近到期的一张。
+    pub fn delivery_contracts(&self, symbols: &[String]) -> anyhow::Result<Vec<DeliveryContract>> {
+        let url = format!("{}/fapi/v1/exchangeInfo", self.futures_base_url);
+        let payload: ExchangeInfo =
+            serde_json::from_value(self.http.get_json(&url)?).context("解析 exchangeInfo 失败")?;
+        let now = Utc::now();
+
+        let mut nearest: HashMap<String, DeliveryContract> = HashMap::new();
+        for item in payload.symbols {
+            if !item.status.eq_ignore_ascii_case("TRADING") {
+                continue;
+            }
+            // 季度交割合约的 contractType 为 CURRENT_QUARTER / NEXT_QUARTER。
+            if !item.contract_type.to_ascii_uppercase().contains("QUARTER") {
+                continue;
+            }
+            let Some(expiry) = item
+                .delivery_date
+                .filter(|millis| *millis > 0)
+                .and_then(millis_to_time)
+            else {
+                continue;
+            };
+            if expiry <= now {
+                continue;
+            }
+            let underlying =
+                format!("{}{}", item.base_asset, item.quote_asset).to_ascii_uppercase();
+            if !symbols.is_empty()
+                && !symbols
+                    .iter()
+                    .any(|symbol| symbol.eq_ignore_ascii_case(&underlying))
+            {
+                continue;
+            }
+            let contract = DeliveryContract {
+                venue: VENUE.to_string(),
+                symbol: underlying.clone(),
+                contract: item.symbol.to_ascii_uppercase(),
+                expiry,
+            };
+            match nearest.get(&underlying) {
+                Some(existing) if existing.expiry <= expiry => {}
+                _ => {
+                    nearest.insert(underlying, contract);
+                }
+            }
+        }
+
+        let mut contracts: Vec<DeliveryContract> = nearest.into_values().collect();
+        contracts.sort_by_key(|contract| contract.expiry);
+        Ok(contracts)
     }
 }
 
@@ -252,7 +306,12 @@ struct ExchangeSymbol {
     #[serde(default)]
     contract_type: String,
     #[serde(default)]
+    base_asset: String,
+    #[serde(default)]
     quote_asset: String,
+    /// 交割合约的到期时间（毫秒）；永续为 0。
+    #[serde(default)]
+    delivery_date: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]

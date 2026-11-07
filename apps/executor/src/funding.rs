@@ -46,7 +46,10 @@ fn retention_cutoff(now: DateTime<Utc>) -> DateTime<Utc> {
 }
 
 /// 按实际结算间隔折算年化百分比（百分比数值，例如 10.95 表示 10.95%）。
-fn annualize(rate: Decimal, interval_secs: i64) -> Decimal {
+///
+/// 各交易所结算周期不同（Hyperliquid 1 小时、多数 CEX 8 小时），
+/// 跨交易所比较费率前必须先用本函数折算到同一口径。
+pub(crate) fn annualize(rate: Decimal, interval_secs: i64) -> Decimal {
     let periods = Decimal::from(365 * 24 * 3600) / Decimal::from(interval_secs.max(1));
     rate * periods * Decimal::from(100)
 }
@@ -425,6 +428,29 @@ impl FundingFeed {
         statuses
     }
 
+    /// 各交易所各交易对的结算间隔（秒），供行情侧把费率归一到同一口径。
+    pub fn intervals(&self) -> HashMap<(String, String), i64> {
+        let mut intervals = HashMap::new();
+        for venue in &self.venues {
+            let symbols = venue
+                .symbols
+                .read()
+                .expect("资金费率交易对锁不可用")
+                .clone();
+            let state = venue.state.read().expect("资金费率状态锁不可用");
+            let fallback = venue
+                .client
+                .as_ref()
+                .and_then(|client| client.funding_interval_secs())
+                .unwrap_or(DEFAULT_INTERVAL_SECS);
+            for symbol in &symbols {
+                let secs = state.intervals.get(symbol).copied().unwrap_or(fallback);
+                intervals.insert((venue.venue.to_string(), symbol.clone()), secs);
+            }
+        }
+        intervals
+    }
+
     async fn sync_once(self: &Arc<Self>) {
         let now = Utc::now();
         self.prune_history().await;
@@ -517,10 +543,7 @@ impl FundingFeed {
             return;
         }
         // 先记录时间：清理失败时也等下一轮，避免每轮轮询都打库。
-        *self
-            .last_prune
-            .write()
-            .expect("资金费率清理时间锁不可用") = Some(Instant::now());
+        *self.last_prune.write().expect("资金费率清理时间锁不可用") = Some(Instant::now());
 
         let cutoff = retention_cutoff(Utc::now());
         match self.store.prune_funding_rates(cutoff).await {
@@ -577,10 +600,8 @@ impl FundingFeed {
                         realtime.funding_symbols().set(snapshot);
                     }
                 }
-                *venue
-                    .discovered_at
-                    .write()
-                    .expect("交易对发现时间锁不可用") = Some(Instant::now());
+                *venue.discovered_at.write().expect("交易对发现时间锁不可用") =
+                    Some(Instant::now());
                 tracing::info!(
                     venue = venue.venue,
                     count,

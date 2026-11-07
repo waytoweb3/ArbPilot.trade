@@ -85,20 +85,64 @@ fn place(
     request: &PlaceOrderRequest,
 ) -> Result<VenueOrderAck, ExchangeError> {
     if request.quantity <= Decimal::ZERO || request.limit_price <= Decimal::ZERO {
-        return Err(ExchangeError::Rejected("下单数量与限价必须大于 0".to_string()));
+        return Err(ExchangeError::Rejected(
+            "下单数量与限价必须大于 0".to_string(),
+        ));
     }
     let client_order_id = client_id(&request.client_order_id);
     match venue {
         // Aster 的合约下单接口与 Binance 完全兼容。
-        "binance" => binance_place(http, &endpoints.binance, credentials, request, &client_order_id),
-        "aster" => binance_place(http, &endpoints.aster, credentials, request, &client_order_id),
+        "binance" => binance_place(
+            http,
+            &endpoints.binance,
+            credentials,
+            request,
+            &client_order_id,
+        ),
+        "aster" => binance_place(
+            http,
+            &endpoints.aster,
+            credentials,
+            request,
+            &client_order_id,
+        ),
         "okx" => okx_place(http, &endpoints.okx, credentials, request, &client_order_id),
-        "bybit" => bybit_place(http, &endpoints.bybit, credentials, request, &client_order_id),
-        "bitget" => bitget_place(http, &endpoints.bitget, credentials, request, &client_order_id),
-        "gate" => gate_place(http, &endpoints.gate, credentials, request, &client_order_id),
+        "bybit" => bybit_place(
+            http,
+            &endpoints.bybit,
+            credentials,
+            request,
+            &client_order_id,
+        ),
+        "bitget" => bitget_place(
+            http,
+            &endpoints.bitget,
+            credentials,
+            request,
+            &client_order_id,
+        ),
+        "gate" => gate_place(
+            http,
+            &endpoints.gate,
+            credentials,
+            request,
+            &client_order_id,
+        ),
         "htx" => htx_place(http, &endpoints.htx, credentials, request, &client_order_id),
-        "mexc" => mexc_place(http, &endpoints.mexc, credentials, request, &client_order_id),
-        "bingx" => bingx_place(http, &endpoints.bingx, credentials, request, &client_order_id),
+        "mexc" => mexc_place(
+            http,
+            &endpoints.mexc,
+            credentials,
+            request,
+            &client_order_id,
+        ),
+        "bingx" => bingx_place(
+            http,
+            &endpoints.bingx,
+            credentials,
+            request,
+            &client_order_id,
+        ),
         "hyperliquid" => hyperliquid_place(
             http,
             &endpoints.hyperliquid,
@@ -180,9 +224,8 @@ fn okx_place(
             "{base_url}/api/v5/public/instruments?instType=SWAP&instId={inst_id}"
         ))
         .map_err(transport)?;
-    let contract_value = decimal(&instrument["data"][0]["ctVal"]).ok_or_else(|| {
-        ExchangeError::Rejected(format!("OKX 未返回 {inst_id} 的合约面值"))
-    })?;
+    let contract_value = decimal(&instrument["data"][0]["ctVal"])
+        .ok_or_else(|| ExchangeError::Rejected(format!("OKX 未返回 {inst_id} 的合约面值")))?;
     if contract_value <= Decimal::ZERO {
         return Err(ExchangeError::Rejected(format!(
             "OKX {inst_id} 合约面值异常: {contract_value}"
@@ -254,10 +297,7 @@ fn bybit_place(
     .to_string();
     let timestamp = now_millis().to_string();
     let recv_window = "5000";
-    let signature = hmac_hex(
-        secret,
-        &format!("{timestamp}{key}{recv_window}{body}"),
-    )?;
+    let signature = hmac_hex(secret, &format!("{timestamp}{key}{recv_window}{body}"))?;
     let headers = [
         ("X-BAPI-API-KEY", key),
         ("X-BAPI-TIMESTAMP", timestamp.as_str()),
@@ -471,7 +511,14 @@ fn htx_place(
             ("contract_code", contract.as_str()),
             ("volume", volume.as_str()),
             ("price", price.as_str()),
-            ("direction", if request.side == Side::Buy { "buy" } else { "sell" }),
+            (
+                "direction",
+                if request.side == Side::Buy {
+                    "buy"
+                } else {
+                    "sell"
+                },
+            ),
             ("offset", if request.reduce_only { "close" } else { "open" }),
             ("order_price_type", "limit"),
             ("lever_rate", "20"),
@@ -550,7 +597,9 @@ fn mexc_place(
     let base_url = base_url.trim_end_matches('/');
     let symbol = format!("{}_USDT", base_asset(request)?);
     let detail = http
-        .get_json(&format!("{base_url}/api/v1/contract/detail?symbol={symbol}"))
+        .get_json(&format!(
+            "{base_url}/api/v1/contract/detail?symbol={symbol}"
+        ))
         .map_err(transport)?;
     let contract_size = decimal(&detail["data"]["contractSize"])
         .filter(|value| *value > Decimal::ZERO)
@@ -643,7 +692,14 @@ fn bingx_place(
         ("quantity", quantity.as_str()),
         ("recvWindow", "5000"),
         ("reduceOnly", reduce_only),
-        ("side", if request.side == Side::Buy { "BUY" } else { "SELL" }),
+        (
+            "side",
+            if request.side == Side::Buy {
+                "BUY"
+            } else {
+                "SELL"
+            },
+        ),
         ("symbol", symbol.as_str()),
         ("timeInForce", "GTC"),
         ("timestamp", timestamp.as_str()),
@@ -672,7 +728,11 @@ fn bingx_place(
     let order_id = value["data"]["order"]["orderId"]
         .as_i64()
         .map(|id| id.to_string())
-        .or_else(|| value["data"]["order"]["orderId"].as_str().map(str::to_string))
+        .or_else(|| {
+            value["data"]["order"]["orderId"]
+                .as_str()
+                .map(str::to_string)
+        })
         .ok_or_else(|| ExchangeError::Rejected(format!("BingX 响应缺少订单号: {value}")))?;
     Ok(ack(order_id, client_order_id))
 }
@@ -704,9 +764,7 @@ fn hyperliquid_place(
         .iter()
         .enumerate()
         .find(|(_, entry)| entry["name"].as_str() == Some(coin.as_str()))
-        .ok_or_else(|| {
-            ExchangeError::Rejected(format!("Hyperliquid 未上架该合约: {coin}"))
-        })?;
+        .ok_or_else(|| ExchangeError::Rejected(format!("Hyperliquid 未上架该合约: {coin}")))?;
     let asset = entry.0 as u32;
     let size_decimals = entry.1["szDecimals"].as_u64().unwrap_or(0) as u32;
 
@@ -777,18 +835,18 @@ fn lighter_place(
             "Lighter 下单需要 API Key 私钥，仅填写钱包地址只能查询余额".to_string(),
         )
     })?;
-    let account_index = credentials.account_index.ok_or_else(|| {
-        ExchangeError::Credentials("Lighter 账户缺少数字账户索引".to_string())
-    })?;
+    let account_index = credentials
+        .account_index
+        .ok_or_else(|| ExchangeError::Credentials("Lighter 账户缺少数字账户索引".to_string()))?;
     let base_url = base_url.trim_end_matches('/');
     let coin = base_asset(request)?;
 
     let details = http
         .get_json(&format!("{base_url}/api/v1/orderBookDetails"))
         .map_err(transport)?;
-    let rows = details["order_book_details"].as_array().ok_or_else(|| {
-        ExchangeError::Rejected(format!("Lighter 合约列表响应异常: {details}"))
-    })?;
+    let rows = details["order_book_details"]
+        .as_array()
+        .ok_or_else(|| ExchangeError::Rejected(format!("Lighter 合约列表响应异常: {details}")))?;
     let row = rows
         .iter()
         .find(|row| {
@@ -827,7 +885,11 @@ fn lighter_place(
     let signed = sign_lighter_order(&order, private_key, chain_id)
         .map_err(|error| ExchangeError::Credentials(error.to_string()))?;
 
-    let form = format!("tx_type={}&tx_info={}", signed.tx_type, pct(&signed.tx_info));
+    let form = format!(
+        "tx_type={}&tx_info={}",
+        signed.tx_type,
+        pct(&signed.tx_info)
+    );
     let value = http
         .post_body_with_headers(
             &format!("{base_url}/api/v1/sendTx"),
@@ -866,10 +928,7 @@ fn base_asset(request: &PlaceOrderRequest) -> Result<String, ExchangeError> {
         .map(str::to_string)
         .filter(|base| !base.is_empty())
         .ok_or_else(|| {
-            ExchangeError::Unsupported(format!(
-                "仅支持 USDT 本位永续: {}",
-                request.symbol
-            ))
+            ExchangeError::Unsupported(format!("仅支持 USDT 本位永续: {}", request.symbol))
         })
 }
 
@@ -879,7 +938,10 @@ fn internal_symbol(request: &PlaceOrderRequest) -> String {
 
 /// 交易所客户端订单号只允许字母数字，统一裁剪到 32 位。
 fn client_id(raw: &str) -> String {
-    let cleaned: String = raw.chars().filter(|ch| ch.is_ascii_alphanumeric()).collect();
+    let cleaned: String = raw
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect();
     if cleaned.is_empty() {
         format!("arb{}", now_millis())
     } else {

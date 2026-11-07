@@ -29,6 +29,15 @@ export function useOpportunities() {
   });
 }
 
+/** 交割合约基差排行，与资金费率机会同频刷新。 */
+export function useBasisOpportunities() {
+  return useQuery({
+    queryKey: ["opportunities", "basis"],
+    queryFn: api.basisOpportunities,
+    refetchInterval: 3_000,
+  });
+}
+
 /** 现货 K 线：执行器按需拉取，桌面端定时刷新。 */
 export function useCandles(symbol: string, interval: string, limit: number, venue = "binance-spot") {
   return useQuery({

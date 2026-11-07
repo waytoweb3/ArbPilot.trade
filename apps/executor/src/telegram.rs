@@ -130,7 +130,8 @@ impl TelegramBot {
                 match bot.poll_once(&poll_state).await {
                     Ok(()) => tokio::time::sleep(bot.poll).await,
                     Err(error) => {
-                        *bot.last_error.write().expect("电报错误锁不可用") = Some(error.to_string());
+                        *bot.last_error.write().expect("电报错误锁不可用") =
+                            Some(error.to_string());
                         tracing::warn!(%error, "Telegram 轮询失败");
                         tokio::time::sleep(Duration::from_secs(5)).await;
                     }
@@ -155,16 +156,8 @@ impl TelegramBot {
         TelegramStatus {
             enabled: self.enabled(),
             polling: self.enabled() && self.last_error.read().expect("电报错误锁不可用").is_none(),
-            bot_username: self
-                .bot_username
-                .read()
-                .expect("电报身份锁不可用")
-                .clone(),
-            last_error: self
-                .last_error
-                .read()
-                .expect("电报错误锁不可用")
-                .clone(),
+            bot_username: self.bot_username.read().expect("电报身份锁不可用").clone(),
+            last_error: self.last_error.read().expect("电报错误锁不可用").clone(),
             bindings: self.bindings.read().expect("电报绑定锁不可用").clone(),
         }
     }
@@ -246,7 +239,11 @@ impl TelegramBot {
             .pointer("/from/username")
             .and_then(Value::as_str)
             .map(str::to_string);
-        let text = message.get("text").and_then(Value::as_str).unwrap_or("").trim();
+        let text = message
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
         if text.is_empty() {
             return;
         }
@@ -266,7 +263,8 @@ impl TelegramBot {
             "/bind" => self.bind(chat_id, user_id, username, &args),
             _ => {
                 if self.binding(user_id).is_none() {
-                    "尚未绑定。请在桌面端「设置 → Telegram」生成配对码，然后发送 /bind <配对码>。".to_string()
+                    "尚未绑定。请在桌面端「设置 → Telegram」生成配对码，然后发送 /bind <配对码>。"
+                        .to_string()
                 } else {
                     match command.as_str() {
                         "/status" => status_text(state),
@@ -293,13 +291,7 @@ impl TelegramBot {
         self.send(chat_id, &reply).await;
     }
 
-    fn bind(
-        &self,
-        chat_id: i64,
-        user_id: i64,
-        username: Option<String>,
-        args: &[&str],
-    ) -> String {
+    fn bind(&self, chat_id: i64, user_id: i64, username: Option<String>, args: &[&str]) -> String {
         if self.binding(user_id).is_some() {
             return "该账号已绑定，如需换绑请先发送 /unbind。".to_string();
         }
@@ -388,7 +380,12 @@ impl TelegramBot {
         {
             let mut pending = self.pending.lock().expect("待确认订单锁不可用");
             pending.retain(|_, trade| trade.expires_at > Utc::now() && trade.owner != user_id);
-            if pending.values().filter(|trade| trade.owner == user_id).count() >= MAX_PENDING {
+            if pending
+                .values()
+                .filter(|trade| trade.owner == user_id)
+                .count()
+                >= MAX_PENDING
+            {
                 return "待确认订单过多，请先 /cancel 旧订单。".to_string();
             }
             pending.insert(
@@ -546,7 +543,10 @@ impl TelegramBot {
             .collect::<Vec<_>>()
             .join("&");
         let url = if query.is_empty() {
-            format!("{}/bot{token}/{method}", self.api_base.trim_end_matches('/'))
+            format!(
+                "{}/bot{token}/{method}",
+                self.api_base.trim_end_matches('/')
+            )
         } else {
             format!(
                 "{}/bot{token}/{method}?{query}",
@@ -603,7 +603,11 @@ fn status_text(state: &AppState) -> String {
     let minutes = (uptime % 3600) / 60;
     format!(
         "执行器在线\n开仓：{}\n运行：{hours}h{minutes}m\n账户权益：{} USD",
-        if state.is_paused() { "已暂停" } else { "正常" },
+        if state.is_paused() {
+            "已暂停"
+        } else {
+            "正常"
+        },
         state.accounts.total_equity_usd()
     )
 }

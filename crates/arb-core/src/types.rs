@@ -14,7 +14,12 @@ pub enum VenueKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OpportunityKind {
+    /// 同交易所「现货多 + 永续空」吃资金费。
     FundingRate,
+    /// 跨交易所「永续多 + 永续空」吃资金费率差。
+    PerpPerpFunding,
+    /// 同交易所「现货多 + 交割合约空」吃基差到期收敛。
+    DeliveryBasis,
     CexCexSpread,
     CexDexSpread,
 }
@@ -34,6 +39,20 @@ pub struct Opportunity {
     pub max_notional_usd: Decimal,
     /// 仅资金费率机会有值，正数表示多头收资金费。
     pub funding_rate: Option<Decimal>,
+    /// 资金费率年化收益率（百分比，`10.95` 表示 10.95%/年）。
+    ///
+    /// 各交易所结算间隔不同（Hyperliquid 1 小时、多数 CEX 8 小时），
+    /// 机会之间的比较与排序一律以该字段为准，避免直接比较单期费率。
+    pub funding_annualized_pct: Option<Decimal>,
+    /// 仅交割基差机会有值：交割合约代码，如 `BTCUSDT_251226`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_contract: Option<String>,
+    /// 仅交割基差机会有值：交割合约到期时间。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expiry: Option<DateTime<Utc>>,
+    /// 基差年化收益率（百分比，`10.95` 表示 10.95%/年），仅交割基差机会有值。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annualized_basis_pct: Option<Decimal>,
     pub observed_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
 }

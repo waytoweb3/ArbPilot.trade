@@ -5,9 +5,9 @@
 //! 经过统一风控网关，模板本身没有任何下单或密钥能力。
 
 use arb_core::{
-    CostAssumptions, DataRules, EntryRules, ExecutionRules, ExitRules, Instrument,
-    SandboxArtifact, SandboxArtifactSource, StrategyDefinition, StrategyKind, StrategyRisk,
-    StrategyUniverse, ValidationSeverity,
+    CostAssumptions, DataRules, EntryRules, ExecutionRules, ExitRules, Instrument, SandboxArtifact,
+    SandboxArtifactSource, StrategyDefinition, StrategyKind, StrategyRisk, StrategyUniverse,
+    ValidationSeverity,
 };
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
@@ -746,10 +746,7 @@ pub async fn compile(
         anyhow::bail!("{}: {}", issue.path, issue.message);
     }
 
-    state
-        .store
-        .save_sandbox_artifact(&artifact, &wasm)
-        .await?;
+    state.store.save_sandbox_artifact(&artifact, &wasm).await?;
     Ok(artifact)
 }
 
@@ -912,7 +909,9 @@ mod tests {
         .await;
         assert_eq!(report.status, SandboxRunStatus::Ok, "{:?}", report.error);
         match only_decision(&report) {
-            SandboxDecision::Open { side, notional_usd, .. } => {
+            SandboxDecision::Open {
+                side, notional_usd, ..
+            } => {
                 assert_eq!(*side, PositionSide::Long);
                 assert_eq!(*notional_usd, dec!(500));
             }

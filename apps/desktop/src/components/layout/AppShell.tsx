@@ -1,5 +1,6 @@
 import {
   Bot,
+  CalendarClock,
   Languages,
   LayoutDashboard,
   Moon,
@@ -76,6 +77,7 @@ export function AppShell() {
     { to: "/", label: t.nav.overview, icon: LayoutDashboard, end: true },
     { to: "/positions", label: t.nav.positions, icon: Wallet },
     { to: "/funding", label: t.nav.funding, icon: Percent },
+    { to: "/basis", label: t.nav.basis, icon: CalendarClock },
     { to: "/news", label: t.nav.news, icon: Newspaper, badge: unread },
     { to: "/strategies", label: t.nav.strategies, icon: Bot },
     { to: "/market", label: t.nav.market, icon: Store },

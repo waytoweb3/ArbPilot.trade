@@ -10,8 +10,8 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::{
-    candles_from_rows, make_book, millis_to_time, parse_decimal, BookSnapshot, Candle, FundingRate,
-    FundingSnapshot, FundingVenueClient, Segment,
+    candles_from_rows, make_book, millis_to_time, parse_decimal, BookSnapshot, Candle,
+    DeliveryContract, FundingRate, FundingSnapshot, FundingVenueClient, Segment,
 };
 use crate::http_client::HttpClient;
 
@@ -129,10 +129,40 @@ struct OkxSwapInstrument {
     ct_type: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OkxFuturesInstrument {
+    inst_id: String,
+    #[serde(default)]
+    settle_ccy: Option<String>,
+    #[serde(default)]
+    state: Option<String>,
+    /// 到期时间（毫秒）。
+    #[serde(default)]
+    exp_time: Option<String>,
+}
+
 /// `BTC-USDT-SWAP` → `BTCUSDT`；非 USDT 本位线性合约返回 `None`。
 fn swap_symbol(inst_id: &str) -> Option<String> {
     let base = inst_id.trim().strip_suffix("-USDT-SWAP")?;
     if base.is_empty() {
+        return None;
+    }
+    Some(format!("{}USDT", base.to_ascii_uppercase()))
+}
+
+/// `BTC-USDT-251226` → `BTCUSDT`；非 USDT 本位交割合约返回 `None`。
+fn futures_symbol(inst_id: &str) -> Option<String> {
+    let mut parts = inst_id.trim().split('-');
+    let base = parts.next()?;
+    let quote = parts.next()?;
+    let expiry = parts.next()?;
+    if parts.next().is_some()
+        || base.is_empty()
+        || !quote.eq_ignore_ascii_case("USDT")
+        || expiry.len() != 6
+        || !expiry.chars().all(|char| char.is_ascii_digit())
+    {
         return None;
     }
     Some(format!("{}USDT", base.to_ascii_uppercase()))
@@ -318,6 +348,8 @@ impl OkxMarketClient {
         let inst_id = match segment {
             Segment::Spot => spot_inst_id(symbol)?,
             Segment::Swap => swap_inst_id(symbol)?,
+            // 交割合约直接传交易所 instId（如 `BTC-USDT-251226`）。
+            Segment::Delivery => symbol.trim().to_ascii_uppercase(),
         };
         let url = format!("{}/api/v5/market/ticker?instId={inst_id}", self.base_url);
         let envelope: Envelope<OkxTicker> =
@@ -334,7 +366,7 @@ impl OkxMarketClient {
                 parse_decimal(&ticker.bid_sz)?,
                 parse_decimal(&ticker.ask_sz)?,
             ),
-            Segment::Swap => {
+            Segment::Swap | Segment::Delivery => {
                 let ct_val = self.contract_value(&inst_id)?;
                 (
                     parse_decimal(&ticker.bid_sz)? * ct_val,
@@ -356,6 +388,7 @@ impl OkxMarketClient {
         let inst_id = match segment {
             Segment::Spot => spot_inst_id(symbol)?,
             Segment::Swap => swap_inst_id(symbol)?,
+            Segment::Delivery => symbol.trim().to_ascii_uppercase(),
         };
         let bar = okx_bar(interval)?;
         let url = format!(
@@ -374,6 +407,65 @@ impl OkxMarketClient {
         self.contract_value(&inst_id)
     }
 
+    /// 当前在交易的 USDT 本位交割合约；每个交易对只保留最近到期的一张。
+    pub fn delivery_contracts(&self, symbols: &[String]) -> anyhow::Result<Vec<DeliveryContract>> {
+        let url = format!(
+            "{}/api/v5/public/instruments?instType=FUTURES",
+            self.base_url
+        );
+        let envelope: Envelope<OkxFuturesInstrument> =
+            serde_json::from_value(self.http.get_json(&url)?)
+                .context("解析 OKX instruments 失败")?;
+        let now = Utc::now();
+
+        let mut nearest: HashMap<String, DeliveryContract> = HashMap::new();
+        for item in into_data(envelope, "public/instruments")? {
+            if item.state.as_deref() != Some("live") {
+                continue;
+            }
+            if item.settle_ccy.as_deref() != Some("USDT") {
+                continue;
+            }
+            let Some(underlying) = futures_symbol(&item.inst_id) else {
+                continue;
+            };
+            if !symbols.is_empty()
+                && !symbols
+                    .iter()
+                    .any(|symbol| symbol.eq_ignore_ascii_case(&underlying))
+            {
+                continue;
+            }
+            let Some(expiry) = item
+                .exp_time
+                .as_deref()
+                .and_then(|value| parse_millis(value).ok())
+                .and_then(millis_to_time)
+            else {
+                continue;
+            };
+            if expiry <= now {
+                continue;
+            }
+            let contract = DeliveryContract {
+                venue: VENUE.to_string(),
+                symbol: underlying.clone(),
+                contract: item.inst_id.to_ascii_uppercase(),
+                expiry,
+            };
+            match nearest.get(&underlying) {
+                Some(existing) if existing.expiry <= expiry => {}
+                _ => {
+                    nearest.insert(underlying, contract);
+                }
+            }
+        }
+
+        let mut contracts: Vec<DeliveryContract> = nearest.into_values().collect();
+        contracts.sort_by_key(|contract| contract.expiry);
+        Ok(contracts)
+    }
+
     /// 永续合约面值（1 张 = ctVal 个基础币），按合约缓存，进程内只查一次。
     fn contract_value(&self, inst_id: &str) -> anyhow::Result<Decimal> {
         if let Some(value) = self
@@ -386,8 +478,14 @@ impl OkxMarketClient {
             return Ok(value);
         }
 
+        // 交割合约在 FUTURES 下查询，永续在 SWAP 下查询。
+        let inst_type = if inst_id.ends_with("-SWAP") {
+            "SWAP"
+        } else {
+            "FUTURES"
+        };
         let url = format!(
-            "{}/api/v5/public/instruments?instType=SWAP&instId={inst_id}",
+            "{}/api/v5/public/instruments?instType={inst_type}&instId={inst_id}",
             self.base_url
         );
         let envelope: Envelope<OkxInstrument> = serde_json::from_value(self.http.get_json(&url)?)

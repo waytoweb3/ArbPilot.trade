@@ -1,6 +1,8 @@
 //! 内置策略模板：列出数据库中的模板，并按模板定义创建策略实例。
 
-use arb_core::{SandboxBinding, StrategyDefinition, StrategyRecord, StrategySource, StrategyStatus};
+use arb_core::{
+    SandboxBinding, StrategyDefinition, StrategyRecord, StrategySource, StrategyStatus,
+};
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -86,11 +88,15 @@ pub async fn instantiate(
     let mut definition = template.definition.clone();
     definition.name = name;
 
-    let mut record = StrategyRecord::new(definition, StrategySource::BuiltIn, StrategyStatus::Draft);
+    let mut record =
+        StrategyRecord::new(definition, StrategySource::BuiltIn, StrategyStatus::Draft);
     record.sandbox = Some(SandboxBinding::new(&artifact, state.config.sandbox));
     record.runtime.record(
         arb_core::StrategyEventLevel::Info,
-        format!("由模板「{}」创建，已绑定模块 {}", template.name, artifact.name),
+        format!(
+            "由模板「{}」创建，已绑定模块 {}",
+            template.name, artifact.name
+        ),
         None,
     );
     record.validation = record.definition.validate(&state.risk_limits());

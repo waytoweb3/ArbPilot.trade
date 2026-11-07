@@ -1,6 +1,7 @@
 import { Route, Routes } from "react-router-dom";
 
 import { AppShell } from "./components/layout/AppShell";
+import BasisPage from "./pages/Basis";
 import FundingPage from "./pages/Funding";
 import FundingHistoryPage from "./pages/FundingHistory";
 import MarketPage from "./pages/Market";
@@ -17,6 +18,7 @@ export default function App() {
       <Route element={<AppShell />}>
         <Route index element={<OverviewPage />} />
         <Route path="funding" element={<FundingPage />} />
+        <Route path="basis" element={<BasisPage />} />
         <Route path="funding-history" element={<FundingHistoryPage />} />
         <Route path="trade" element={<TradePage />} />
         <Route path="news" element={<NewsPage />} />

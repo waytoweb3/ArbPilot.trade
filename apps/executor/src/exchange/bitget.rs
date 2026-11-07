@@ -2,9 +2,13 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context};
 use chrono::{DateTime, Utc};
+use rust_decimal::Decimal;
 use serde::Deserialize;
 
-use super::{millis_to_time, parse_decimal, FundingRate, FundingSnapshot, FundingVenueClient};
+use super::{
+    make_book, millis_to_time, parse_decimal, BookSnapshot, FundingRate, FundingSnapshot,
+    FundingVenueClient,
+};
 use crate::http_client::HttpClient;
 
 /// Bitget 的交易所标识。
@@ -46,6 +50,16 @@ struct TickerRow {
     mark_price: Option<String>,
     #[serde(default)]
     ts: Option<String>,
+    /// 买一价 / 买一量，数量单位是币。
+    #[serde(default)]
+    bid_pr: Option<String>,
+    #[serde(default)]
+    bid_sz: Option<String>,
+    /// 卖一价 / 卖一量，数量单位是币。
+    #[serde(default)]
+    ask_pr: Option<String>,
+    #[serde(default)]
+    ask_sz: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -108,8 +122,8 @@ impl BitgetFundingClient {
             "{}/api/v2/mix/market/tickers?productType=usdt-futures",
             self.base_url
         );
-        let envelope: Envelope<TickerRow> =
-            serde_json::from_value(self.http.get_json(&url)?).context("解析 Bitget tickers 失败")?;
+        let envelope: Envelope<TickerRow> = serde_json::from_value(self.http.get_json(&url)?)
+            .context("解析 Bitget tickers 失败")?;
         let rows = into_data(envelope, "market/tickers")?;
 
         let mut snapshots = Vec::with_capacity(rows.len());
@@ -136,6 +150,32 @@ impl BitgetFundingClient {
             .next()
             .ok_or_else(|| anyhow!("Bitget ticker 返回空数据: {symbol}"))?;
         snapshot_from(&row).ok_or_else(|| anyhow!("Bitget ticker 缺少合法的 fundingRate: {symbol}"))
+    }
+
+    /// USDT 本位永续的买一/卖一档；数量单位是币，可直接折算名义价值。
+    pub fn book(&self, symbol: &str) -> anyhow::Result<BookSnapshot> {
+        let wanted = symbol.trim().to_ascii_uppercase();
+        let url = format!(
+            "{}/api/v2/mix/market/tickers?productType=usdt-futures&symbol={wanted}",
+            self.base_url
+        );
+        let envelope: Envelope<TickerRow> = serde_json::from_value(self.http.get_json(&url)?)
+            .context("解析 Bitget tickers 失败")?;
+        let row = into_data(envelope, "market/tickers")?
+            .into_iter()
+            .find(|row| row.symbol.eq_ignore_ascii_case(&wanted))
+            .ok_or_else(|| anyhow!("Bitget tickers 未返回 {wanted}"))?;
+        let field = |value: Option<&str>, name: &str| -> anyhow::Result<Decimal> {
+            value
+                .ok_or_else(|| anyhow!("Bitget ticker 缺少 {name}: {wanted}"))
+                .and_then(parse_decimal)
+        };
+        make_book(
+            field(row.bid_pr.as_deref(), "bidPr")?,
+            field(row.bid_sz.as_deref(), "bidSz")?,
+            field(row.ask_pr.as_deref(), "askPr")?,
+            field(row.ask_sz.as_deref(), "askSz")?,
+        )
     }
 
     /// 当前正在交易的 USDT 本位永续合约清单。
@@ -243,10 +283,37 @@ mod tests {
             funding_rate: Some("-0.000028".to_string()),
             mark_price: Some("78347.2".to_string()),
             ts: Some("1793799862316".to_string()),
+            bid_pr: Some("78347.1".to_string()),
+            bid_sz: Some("1.5".to_string()),
+            ask_pr: Some("78347.3".to_string()),
+            ask_sz: Some("2.5".to_string()),
         };
         let snapshot = snapshot_from(&row).expect("应能解析");
         assert_eq!(snapshot.funding_rate, dec!(-0.000028));
         assert!(snapshot.mark_price.is_some());
         assert!(snapshot.next_funding_at.is_none());
+    }
+
+    #[test]
+    fn builds_book_from_ticker() {
+        let row = TickerRow {
+            symbol: "BTCUSDT".to_string(),
+            funding_rate: None,
+            mark_price: None,
+            ts: None,
+            bid_pr: Some("78347.1".to_string()),
+            bid_sz: Some("1.5".to_string()),
+            ask_pr: Some("78347.3".to_string()),
+            ask_sz: Some("2".to_string()),
+        };
+        let book = make_book(
+            parse_decimal(row.bid_pr.as_deref().unwrap()).unwrap(),
+            parse_decimal(row.bid_sz.as_deref().unwrap()).unwrap(),
+            parse_decimal(row.ask_pr.as_deref().unwrap()).unwrap(),
+            parse_decimal(row.ask_sz.as_deref().unwrap()).unwrap(),
+        )
+        .expect("盘口应合法");
+        assert_eq!(book.bid, dec!(78347.1));
+        assert_eq!(book.ask_notional_usd, dec!(156694.6));
     }
 }

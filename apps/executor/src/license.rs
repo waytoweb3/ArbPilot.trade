@@ -184,7 +184,8 @@ impl LicenseManager {
 
     /// 授权是否仍然有效；过期后在宽限期内仍允许离线运行。
     pub fn is_valid(&self) -> bool {
-        self.claims().is_some_and(|claims| self.claims_valid(&claims))
+        self.claims()
+            .is_some_and(|claims| self.claims_valid(&claims))
     }
 
     fn claims_valid(&self, claims: &LicenseClaims) -> bool {
@@ -226,7 +227,10 @@ impl LicenseManager {
 
     pub fn status(&self) -> LicenseStatus {
         let claims = self.claims();
-        self.status_of(claims.as_ref(), self.error.read().expect("授权令牌锁不可用").clone())
+        self.status_of(
+            claims.as_ref(),
+            self.error.read().expect("授权令牌锁不可用").clone(),
+        )
     }
 
     /// 请求携带用户令牌时的授权状态；不暴露整机安装的那份授权。
@@ -486,10 +490,19 @@ mod tests {
 
     #[test]
     fn plan_mapping_covers_paid_modules() {
-        assert_eq!(required_plan("GET", "/api/v1/funding/status"), Some("arbitrage"));
+        assert_eq!(
+            required_plan("GET", "/api/v1/funding/status"),
+            Some("arbitrage")
+        );
         assert_eq!(required_plan("GET", "/api/v1/news"), Some("arbitrage"));
-        assert_eq!(required_plan("POST", "/api/v1/strategies"), Some("strategy"));
-        assert_eq!(required_plan("GET", "/api/v1/strategies/abc"), Some("arbitrage"));
+        assert_eq!(
+            required_plan("POST", "/api/v1/strategies"),
+            Some("strategy")
+        );
+        assert_eq!(
+            required_plan("GET", "/api/v1/strategies/abc"),
+            Some("arbitrage")
+        );
         assert_eq!(
             required_plan("PATCH", "/api/v1/strategies/abc/scope"),
             Some("arbitrage")

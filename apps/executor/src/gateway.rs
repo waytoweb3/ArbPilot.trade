@@ -387,7 +387,8 @@ pub async fn submit_legs(
                 if remaining <= 0 {
                     Err(format!("第 {} 腿超过双腿间隔上限 {limit} 秒", index + 1))
                 } else {
-                    match tokio::time::timeout(Duration::from_secs(remaining as u64), executed).await
+                    match tokio::time::timeout(Duration::from_secs(remaining as u64), executed)
+                        .await
                     {
                         Ok(result) => result.map_err(|error| error.to_string()),
                         Err(_) => Err(format!("第 {} 腿等待成交超时", index + 1)),
