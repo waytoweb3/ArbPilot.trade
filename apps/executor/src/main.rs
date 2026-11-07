@@ -12,9 +12,11 @@ mod llm;
 mod market;
 mod news;
 mod notifier;
+mod public_mode;
 mod realtime;
 mod routes;
 mod sandbox;
+mod sqlite_store;
 mod state;
 mod store;
 mod strategy_runner;
@@ -42,7 +44,11 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!("正在使用默认访问令牌，正式部署前请设置 ARBPILOT_API_TOKEN");
     }
 
-    let store = store::Store::connect_if_configured(config.database_url.as_deref()).await;
+    let store = store::Store::connect_if_configured(
+        config.database_url.as_deref(),
+        config.local_db.as_deref(),
+    )
+    .await;
     let state = state::AppState::new(config.clone(), store).await;
     // 内置模板存数据库：补齐缺失模板并把源码编译成沙箱模块。
     templates::seed(&state).await;

@@ -1,11 +1,13 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import { Users, Wallet } from "lucide-react";
 
 import { Badge } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "../components/ui/card";
 import { BillingCard } from "../components/BillingCard";
+import { HostedLocked } from "../components/HostedLocked";
 import DocsPage from "./Docs";
 import { checkAppUpdate, currentAppVersion, relaunchApp } from "../lib/appUpdate";
 import type { DownloadProgress, PendingUpdate } from "../lib/appUpdate";
@@ -25,7 +27,17 @@ import {
   useUpdateRiskLimits,
   useUpdateSettlement,
 } from "../hooks/useApi";
-import { DEFAULT_TOKEN, getApiToken, getExecutorUrl, isLocalExecutor, setApiToken, setExecutorUrl } from "../lib/api";
+import {
+  getApiToken,
+  getExecutorMode,
+  getExecutorUrl,
+  hasLocalExecutor,
+  localExecutorDatabase,
+  setApiToken,
+  setExecutorMode,
+  setExecutorUrl,
+  type ExecutorMode,
+} from "../lib/api";
 import { formatDateTime, formatUsd } from "../lib/format";
 import { fmt, useI18n } from "../lib/i18n";
 import type { NotificationSettings, RiskLimits, SettlementStatus } from "../lib/types";
@@ -39,20 +51,55 @@ const smallInputClass =
 
 type SettingsTab = "connection" | "risk" | "account" | "author" | "notify" | "client" | "deploy";
 
+const SETTINGS_TABS: SettingsTab[] = [
+  "connection",
+  "risk",
+  "account",
+  "author",
+  "notify",
+  "client",
+  "deploy",
+];
+
+const isSettingsTab = (value: string | null): value is SettingsTab =>
+  SETTINGS_TABS.includes(value as SettingsTab);
+
 export default function SettingsPage() {
   const queryClient = useQueryClient();
+  const [mode, setMode] = useState<ExecutorMode>(getExecutorMode());
   const [token, setToken] = useState(getApiToken());
   const [address, setAddress] = useState(getExecutorUrl());
   const [saved, setSaved] = useState(false);
-  const local = isLocalExecutor();
+  const loopback =
+    mode === "self" && /^https?:\/\/(127\.0\.0\.1|localhost)(:|\/|$)/.test(address.trim());
   const { t } = useI18n();
-  const [tab, setTab] = useState<SettingsTab>("connection");
+  // 支持从升级提示直接跳到对应标签页：/settings?tab=client|deploy
+  const [searchParams, setSearchParams] = useSearchParams();
+  const requested = searchParams.get("tab");
+  const tab: SettingsTab = isSettingsTab(requested) ? requested : "connection";
+  const setTab = (next: SettingsTab) => {
+    const params = new URLSearchParams(searchParams);
+    params.set("tab", next);
+    setSearchParams(params, { replace: true });
+  };
+
+  /** 切换模式时载入该模式自己的地址与令牌，两者互不覆盖。 */
+  const switchMode = (next: ExecutorMode) => {
+    setMode(next);
+    setAddress(getExecutorUrl(next));
+    setToken(getApiToken(next));
+  };
 
   const save = () => {
-    const changed = address.trim().replace(/\/$/, "") !== getExecutorUrl();
-    setExecutorUrl(address);
-    setApiToken(token.trim() || DEFAULT_TOKEN);
-    if (changed) {
+    const prevMode = getExecutorMode();
+    const prevUrl = getExecutorUrl();
+    setExecutorMode(mode);
+    // 托管实例的令牌由客户端内置，只保存自托管实例自己的地址和令牌。
+    if (mode === "self") {
+      setExecutorUrl(address);
+      setApiToken(token.trim());
+    }
+    if (mode !== prevMode || (mode === "self" && getExecutorUrl() !== prevUrl)) {
       window.location.reload();
       return;
     }
@@ -60,6 +107,14 @@ export default function SettingsPage() {
     queryClient.invalidateQueries();
     window.setTimeout(() => setSaved(false), 2_000);
   };
+
+  const modeOptions: { id: ExecutorMode; label: string }[] = [
+    ...(hasLocalExecutor()
+      ? [{ id: "local" as ExecutorMode, label: t.settings.localExecutor }]
+      : []),
+    { id: "hosted", label: t.settings.hosted },
+    { id: "self", label: t.settings.self },
+  ];
 
   const tabs: { id: SettingsTab; label: string }[] = [
     { id: "connection", label: t.settings.tabConnection },
@@ -103,54 +158,118 @@ export default function SettingsPage() {
               <CardTitle>{t.settings.connection}</CardTitle>
               <CardDescription>{t.settings.connectionDesc}</CardDescription>
             </div>
-            <Badge tone="info">{local ? t.settings.local : t.settings.remote}</Badge>
+            <Badge tone="info">
+              {mode === "local"
+                ? t.settings.localExecutor
+                : mode === "hosted"
+                  ? t.settings.hosted
+                  : loopback
+                    ? t.settings.local
+                    : t.settings.remote}
+            </Badge>
           </CardHeader>
           <CardContent className="space-y-4">
-            <label className="block space-y-1.5">
-              <span className="text-xs text-muted">{t.settings.address}</span>
-              <input
-                className={`${inputClass} font-mono`}
-                value={address}
-                onChange={(event) => setAddress(event.target.value)}
-                placeholder="http://127.0.0.1:8787"
-              />
+            <div className="space-y-1.5">
+              <span className="text-xs text-muted">{t.settings.mode}</span>
+              <div className="flex gap-1.5">
+                {modeOptions.map((item) => (
+                  <button
+                    key={item.id}
+                    type="button"
+                    onClick={() => switchMode(item.id)}
+                    className={cn(
+                      "rounded-lg border px-3 py-1.5 text-xs transition-colors",
+                      mode === item.id
+                        ? "border-accent/40 bg-accent/10 font-medium text-fg"
+                        : "border-line text-muted hover:bg-hover hover:text-body",
+                    )}
+                  >
+                    {item.label}
+                  </button>
+                ))}
+              </div>
               <span className="block text-[11px] leading-relaxed text-muted">
-                {t.settings.addressHint}
+                {t.settings.modeHint}
               </span>
-            </label>
-            <label className="block space-y-1.5">
-              <span className="text-xs text-muted">{t.settings.token}</span>
-              <input
-                className={`${inputClass} font-mono`}
-                type="password"
-                value={token}
-                onChange={(event) => setToken(event.target.value)}
-                placeholder="ARBPILOT_API_TOKEN"
-              />
-            </label>
+            </div>
+
+            {mode === "hosted" ? (
+              <div className="space-y-1.5">
+                <span className="text-xs text-muted">{t.settings.address}</span>
+                <div className={`${inputClass} font-mono text-muted`}>{address}</div>
+                <span className="block text-[11px] leading-relaxed text-muted">
+                  {t.settings.hostedNote}
+                </span>
+              </div>
+            ) : mode === "local" ? (
+              <div className="space-y-1.5">
+                <span className="text-xs text-muted">{t.settings.address}</span>
+                <div className={`${inputClass} font-mono text-muted`}>
+                  {getExecutorUrl("local")}
+                </div>
+                <span className="text-xs text-muted">{t.settings.database}</span>
+                <div className={`${inputClass} font-mono text-muted`}>
+                  {localExecutorDatabase()}
+                </div>
+                <span className="block text-[11px] leading-relaxed text-muted">
+                  {t.settings.localExecutorNote}
+                </span>
+              </div>
+            ) : (
+              <>
+                <label className="block space-y-1.5">
+                  <span className="text-xs text-muted">{t.settings.address}</span>
+                  <input
+                    className={`${inputClass} font-mono`}
+                    value={address}
+                    onChange={(event) => setAddress(event.target.value)}
+                    placeholder="http://127.0.0.1:8787"
+                  />
+                  <span className="block text-[11px] leading-relaxed text-muted">
+                    {t.settings.addressHint}
+                  </span>
+                </label>
+                <label className="block space-y-1.5">
+                  <span className="text-xs text-muted">{t.settings.token}</span>
+                  <input
+                    className={`${inputClass} font-mono`}
+                    type="password"
+                    value={token}
+                    onChange={(event) => setToken(event.target.value)}
+                    placeholder="ARBPILOT_API_TOKEN"
+                  />
+                  <span className="block text-[11px] leading-relaxed text-muted">
+                    {t.settings.tokenNote}
+                  </span>
+                </label>
+              </>
+            )}
+
             <div className="flex items-center gap-3">
               <Button size="sm" onClick={save}>
                 {t.settings.save}
               </Button>
               {saved && <span className="text-xs text-accent">{t.settings.saved}</span>}
             </div>
-            <p className="text-[11px] leading-relaxed text-muted">{t.settings.tokenNote}</p>
           </CardContent>
         </Card>
       )}
 
-      {tab === "risk" && <RiskLimitsCard />}
+      {tab === "risk" && (mode === "hosted" ? <HostedLocked /> : <RiskLimitsCard />)}
 
       {tab === "account" && <BillingCard />}
 
-      {tab === "author" && <AuthorSettings />}
+      {tab === "author" && (mode === "hosted" ? <HostedLocked /> : <AuthorSettings />)}
 
-      {tab === "notify" && (
-        <div className="space-y-4">
-          <NotificationCard />
-          <TelegramCard />
-        </div>
-      )}
+      {tab === "notify" &&
+        (mode === "hosted" ? (
+          <HostedLocked />
+        ) : (
+          <div className="space-y-4">
+            <NotificationCard />
+            <TelegramCard />
+          </div>
+        ))}
 
       {tab === "deploy" && <DocsPage embedded />}
 

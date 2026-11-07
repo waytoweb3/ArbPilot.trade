@@ -12,7 +12,7 @@ import {
   logout,
   revokeDevice,
 } from "../lib/accounts";
-import { api } from "../lib/api";
+import { api, getExecutorMode, setLicenseToken } from "../lib/api";
 import { useSessionStore } from "../lib/session";
 import type { ExecutorLicense } from "../lib/types";
 
@@ -96,12 +96,17 @@ export function useLogout() {
  * 执行器只用内置公钥离线验签，账号服务不可达时已安装的授权继续生效。
  */
 async function applyLicense(token: string | null): Promise<ExecutorLicense> {
+  const hosted = getExecutorMode() === "hosted";
   if (!token) {
-    return api.clearLicense();
+    setLicenseToken(null);
+    // 托管实例不保存整机授权，退出登录只需刷新本机状态。
+    return hosted ? api.licenseStatus() : api.clearLicense();
   }
   await activateDevice(token);
   const grant = await fetchLicenseToken(token, deviceFingerprint());
-  return api.installLicense(grant.token);
+  // 自托管把令牌装进自己的执行器；托管实例改为每个请求携带，按用户校验。
+  setLicenseToken(grant.token);
+  return hosted ? api.licenseStatus() : api.installLicense(grant.token);
 }
 
 /** 执行器当前的授权状态；ARBPILOT_LICENSE_REQUIRED 关闭时 required 为 false。 */
@@ -139,4 +144,14 @@ export function useLicenseSync() {
   useEffect(() => {
     mutate(token);
   }, [token, signature, mutate]);
+
+  // 托管与本地模式都靠每个请求携带用户令牌（后者访问官方数据接口），
+  // 令牌有效期 24 小时，定时换新避免中途失效。
+  useEffect(() => {
+    if (!token || getExecutorMode() === "self") {
+      return;
+    }
+    const timer = window.setInterval(() => mutate(token), 6 * 60 * 60 * 1_000);
+    return () => window.clearInterval(timer);
+  }, [token, mutate]);
 }

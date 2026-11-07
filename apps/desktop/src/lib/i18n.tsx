@@ -113,9 +113,24 @@ const zh = {
     pauseReason: "桌面端手动暂停",
     noticeClose: "关闭通知",
   },
+  updates: {
+    clientTitle: "客户端有新版本 {version}",
+    clientBody: "更新只替换客户端本体，本机配置、执行器与服务器数据都会保留。",
+    executorTitle: "执行器有新版本 {version}",
+    executorBody: "当前运行 v{current}，升级会保留部署配置与数据库。",
+    action: "去升级",
+    dismiss: "稍后提醒",
+  },
   overview: {
     title: "总览",
     subtitle: "已导入交易账户的总权益、权益走势与资产明细。",
+  },
+  hosted: {
+    lockedTitle: "需要自托管实例",
+    lockedBody:
+      "官方托管实例只提供行情、资金费率与资讯等公共数据，不保存交易所 API Key，也不代你下单。账户、下单、策略与风控请部署到自己的服务器后连接。",
+    goSettings: "切换连接设置",
+    accountsBody: "交易所账户与 API Key 只能保存在你自己的执行器上。切换到自托管实例后即可导入。",
   },
   accounts: {
     title: "交易账户",
@@ -725,7 +740,17 @@ const zh = {
     tabClient: "客户端",
     tabDeploy: "自托管部署文档",
     connection: "执行器连接",
-    connectionDesc: "本机或用户自有服务器上的执行器",
+    connectionDesc: "内置执行器、官方托管与远程实例是三类独立配置",
+    mode: "实例类型",
+    modeHint:
+      "内置执行器随桌面端启动，零配置即可交易，密钥不出本机；官方托管只提供行情与资讯；自托管连接你自己服务器上的执行器。",
+    hosted: "官方托管",
+    self: "自托管",
+    hostedNote: "官方实例只提供行情与资讯等公共数据，不会保存你的交易所 API Key。",
+    localExecutor: "内置执行器",
+    localExecutorNote:
+      "随桌面端启动，数据保存在本机 SQLite 文件，交易所 API Key 与订单都不会离开本机。",
+    database: "本地数据库",
     local: "本地",
     remote: "服务器",
     address: "执行器地址",
@@ -757,7 +782,7 @@ const zh = {
     seconds: "{value} 秒",
     unavailable: "无法读取风控配置，请确认执行器在线。",
     security: "安全提示",
-    securityDesc: "自托管模式下的默认约定",
+    securityDesc: "本地与自托管模式下的默认约定",
     security1: "交易所 API Key 只保存在执行器所在服务器，不进入桌面前端或数据库。",
     security2: "API Key 应关闭提现与资金划转权限，并在交易所侧配置 IP 白名单。",
     security3: "所有开仓指令都必须通过执行器风控，Telegram 与策略插件无法绕过。",
@@ -1045,9 +1070,25 @@ const en: typeof zh = {
     pauseReason: "Paused manually from desktop",
     noticeClose: "Dismiss notification",
   },
+  updates: {
+    clientTitle: "Client version {version} is available",
+    clientBody: "Updating only replaces the desktop app; local settings, the executor and server data are kept.",
+    executorTitle: "Executor version {version} is available",
+    executorBody: "Currently running v{current}; upgrading keeps the deployment config and database.",
+    action: "Update",
+    dismiss: "Remind me later",
+  },
   overview: {
     title: "Overview",
     subtitle: "Total equity, equity curve and balances across your imported trading accounts.",
+  },
+  hosted: {
+    lockedTitle: "Self-hosted instance required",
+    lockedBody:
+      "The hosted instance only serves public market, funding and news data. It never stores exchange API keys or places orders for you. Deploy the executor on your own server to manage accounts, orders, strategies and risk.",
+    goSettings: "Change connection",
+    accountsBody:
+      "Exchange accounts and API keys can only live on your own executor. Switch to a self-hosted instance to import them.",
   },
   accounts: {
     title: "Trading accounts",
@@ -1680,7 +1721,18 @@ const en: typeof zh = {
     tabClient: "Client",
     tabDeploy: "Self-hosted deployment",
     connection: "Executor connection",
-    connectionDesc: "Executor on this machine or your own server",
+    connectionDesc: "Built-in, hosted and remote instances keep separate settings",
+    mode: "Instance type",
+    modeHint:
+      "The built-in executor starts with the desktop app and needs no configuration; the hosted instance only serves market and news data; self-hosted connects to an executor on your own server.",
+    hosted: "Hosted",
+    self: "Self-hosted",
+    hostedNote:
+      "The hosted instance only serves public market and news data; it never stores your exchange API keys.",
+    localExecutor: "Built-in executor",
+    localExecutorNote:
+      "Starts with the desktop app, keeps data in a local SQLite file, and never sends exchange API keys or orders off this machine.",
+    database: "Local database",
     local: "Local",
     remote: "Server",
     address: "Executor URL",
@@ -1712,7 +1764,7 @@ const en: typeof zh = {
     seconds: "{value}s",
     unavailable: "Unable to read risk limits. Check that the executor is online.",
     security: "Security notes",
-    securityDesc: "Defaults for self-hosted mode",
+    securityDesc: "Defaults for local and self-hosted mode",
     security1:
       "Exchange API keys are stored only on the executor host and never reach the desktop UI or the database.",
     security2:

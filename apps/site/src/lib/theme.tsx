@@ -15,11 +15,18 @@ const STORAGE_KEY = "arbpilot.theme";
 const QUERY = "(prefers-color-scheme: dark)";
 
 function readStored(): ThemeMode {
+  // 构建期预渲染在 Node 中执行，没有 localStorage。
+  if (typeof window === "undefined") {
+    return "system";
+  }
   const stored = localStorage.getItem(STORAGE_KEY);
   return stored === "light" || stored === "dark" || stored === "system" ? stored : "system";
 }
 
 function systemTheme(): ResolvedTheme {
+  if (typeof window === "undefined") {
+    return "dark";
+  }
   return window.matchMedia(QUERY).matches ? "dark" : "light";
 }
 
@@ -31,6 +38,9 @@ let currentMode: ThemeMode = readStored();
 let currentResolved: ResolvedTheme = resolve(currentMode);
 
 function apply(resolved: ResolvedTheme) {
+  if (typeof document === "undefined") {
+    return;
+  }
   document.documentElement.classList.toggle("dark", resolved === "dark");
 }
 

@@ -3,6 +3,27 @@ import { isDesktopRuntime } from "./deploy";
 /** 客户端更新清单地址，与 tauri.conf.json 里 plugins.updater.endpoints 保持一致。 */
 export const APP_UPDATE_ENDPOINT = "https://download.arbpilot.trade/desktop/latest.json";
 
+/** 比较版本号：latest 比 current 新时返回 true。忽略前导 v 与预发布后缀。 */
+export function isNewerVersion(latest: string, current: string): boolean {
+  const parse = (value: string) =>
+    value
+      .trim()
+      .replace(/^v/i, "")
+      .split(/[+-]/)[0]
+      .split(".")
+      .map((part) => Number.parseInt(part, 10) || 0);
+  const next = parse(latest);
+  const now = parse(current);
+  for (let index = 0; index < Math.max(next.length, now.length); index += 1) {
+    const left = next[index] ?? 0;
+    const right = now[index] ?? 0;
+    if (left !== right) {
+      return left > right;
+    }
+  }
+  return false;
+}
+
 export interface AppUpdateInfo {
   version: string;
   notes?: string;

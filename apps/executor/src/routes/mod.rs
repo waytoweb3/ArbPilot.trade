@@ -167,6 +167,14 @@ pub fn build(state: AppState) -> Router {
         ))
         .layer(middleware::from_fn_with_state(
             state.clone(),
+            crate::license::attach_identity,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::public_mode::require_public_reads,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
             crate::auth::require_token,
         ));
 

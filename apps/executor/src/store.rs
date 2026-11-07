@@ -12,7 +12,16 @@ use serde::{de::DeserializeOwned, Serialize};
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 use uuid::Uuid;
 
-use crate::{exchange::FundingRate, templates::StrategyTemplate};
+use crate::{exchange::FundingRate, sqlite_store::SqliteStore, templates::StrategyTemplate};
+
+/// 有本地 SQLite 时优先走本地库，其余分支保持 PostgreSQL / 内存逻辑不变。
+macro_rules! sqlite_branch {
+    ($self:expr, $store:ident => $call:expr) => {
+        if let Some($store) = &$self.sqlite {
+            return $call;
+        }
+    };
+}
 
 /// 某个时间窗口内某交易所某交易对的资金费率累计值。
 #[derive(Debug, Clone, Serialize)]
@@ -92,7 +101,7 @@ pub struct StrategyVersion {
 }
 
 impl StrategyVersion {
-    fn from_record(record: &StrategyRecord) -> Self {
+    pub(crate) fn from_record(record: &StrategyRecord) -> Self {
         Self {
             strategy_id: record.id,
             version: record.version,
@@ -176,6 +185,8 @@ pub struct MarketSnapshot {
 /// - 只会写入订单、风控告警、资金费率等业务数据，不保存任何交易所密钥或签名材料。
 pub struct Store {
     pool: Option<PgPool>,
+    /// 桌面端随包启动时使用的本地 SQLite；配置后所有业务数据都落在这里。
+    sqlite: Option<SqliteStore>,
     /// 内存降级时的资金费率缓存，重启即丢。
     funding: RwLock<Vec<FundingRate>>,
     /// 内存降级时的账户权益快照，重启即丢。
@@ -205,27 +216,60 @@ pub struct Store {
 }
 
 impl Store {
-    pub async fn connect_if_configured(database_url: Option<&str>) -> Self {
-        let Some(url) = database_url else {
-            tracing::info!("未配置 DATABASE_URL，执行器以内存模式运行");
-            return Self::memory();
-        };
-
-        let pool = match PgPoolOptions::new().max_connections(8).connect(url).await {
-            Ok(pool) => pool,
-            Err(error) => {
-                tracing::warn!(%error, "连接 PostgreSQL 失败，执行器以内存模式运行");
-                return Self::memory();
+    /// 连接业务库：优先 `DATABASE_URL`，其次桌面端注入的本地 SQLite 文件。
+    ///
+    /// 两者都没有时降级为内存模式，便于在浏览器里调试界面。
+    pub async fn connect_if_configured(
+        database_url: Option<&str>,
+        local_db: Option<&std::path::Path>,
+    ) -> Self {
+        if let Some(url) = database_url {
+            if url.starts_with("sqlite:") {
+                let path = url
+                    .strip_prefix("sqlite://")
+                    .or_else(|| url.strip_prefix("sqlite:"))
+                    .unwrap_or(url);
+                return Self::connect_sqlite(std::path::Path::new(path)).await;
             }
-        };
+        }
 
-        match sqlx::migrate!("./migrations").run(&pool).await {
-            Ok(_) => {
-                tracing::info!("PostgreSQL 已连接并完成迁移");
-                Self::with_pool(Some(pool))
+        if let Some(url) = database_url {
+            let pool = match PgPoolOptions::new().max_connections(8).connect(url).await {
+                Ok(pool) => pool,
+                Err(error) => {
+                    tracing::warn!(%error, "连接 PostgreSQL 失败，执行器以内存模式运行");
+                    return Self::memory();
+                }
+            };
+
+            match sqlx::migrate!("./migrations").run(&pool).await {
+                Ok(_) => {
+                    tracing::info!("PostgreSQL 已连接并完成迁移");
+                    return Self::with_pool(Some(pool));
+                }
+                Err(error) => {
+                    tracing::error!(%error, "数据库迁移失败，执行器以内存模式运行");
+                    return Self::memory();
+                }
+            }
+        }
+
+        if let Some(path) = local_db {
+            return Self::connect_sqlite(path).await;
+        }
+
+        tracing::info!("未配置数据库，执行器以内存模式运行");
+        Self::memory()
+    }
+
+    async fn connect_sqlite(path: &std::path::Path) -> Self {
+        match SqliteStore::connect(path).await {
+            Ok(store) => {
+                tracing::info!(path = %path.display(), "本地 SQLite 已就绪");
+                Self::with_sqlite(store)
             }
             Err(error) => {
-                tracing::error!(%error, "数据库迁移失败，执行器以内存模式运行");
+                tracing::error!(%error, path = %path.display(), "打开本地 SQLite 失败，执行器以内存模式运行");
                 Self::memory()
             }
         }
@@ -238,6 +282,7 @@ impl Store {
     fn with_pool(pool: Option<PgPool>) -> Self {
         Self {
             pool,
+            sqlite: None,
             funding: RwLock::new(Vec::new()),
             equity: RwLock::new(Vec::new()),
             strategies: RwLock::new(Vec::new()),
@@ -256,11 +301,18 @@ impl Store {
         }
     }
 
+    fn with_sqlite(sqlite: SqliteStore) -> Self {
+        let mut store = Self::with_pool(None);
+        store.sqlite = Some(sqlite);
+        store
+    }
+
     pub fn is_connected(&self) -> bool {
-        self.pool.is_some()
+        self.pool.is_some() || self.sqlite.is_some()
     }
 
     pub async fn save_order(&self, order: &Order) {
+        sqlite_branch!(self, db => db.save_order(order).await);
         let Some(pool) = &self.pool else {
             return;
         };
@@ -312,6 +364,7 @@ impl Store {
         event_type: &str,
         detail: serde_json::Value,
     ) {
+        sqlite_branch!(self, db => db.append_order_event(order_id, event_type, detail.clone()).await);
         let Some(pool) = &self.pool else {
             tracing::info!(%order_id, event_type, detail = %detail, "订单事件（内存模式，未落库）");
             return;
@@ -342,6 +395,7 @@ impl Store {
         target: Option<&str>,
         detail: serde_json::Value,
     ) {
+        sqlite_branch!(self, db => db.append_audit_log(actor, action, target, detail.clone()).await);
         let Some(pool) = &self.pool else {
             tracing::info!(
                 actor,
@@ -379,6 +433,7 @@ impl Store {
             return Ok(0);
         }
 
+        sqlite_branch!(self, db => db.upsert_funding_rates(rates).await);
         let Some(pool) = &self.pool else {
             return Ok(self.upsert_funding_memory(rates));
         };
@@ -427,6 +482,7 @@ impl Store {
         symbol: Option<&str>,
         limit: i64,
     ) -> anyhow::Result<Vec<FundingRate>> {
+        sqlite_branch!(self, db => db.funding_rates(venue, symbol, limit).await);
         let Some(pool) = &self.pool else {
             return Ok(self.funding_rates_memory(venue, symbol, limit));
         };
@@ -464,6 +520,7 @@ impl Store {
             return Ok(Vec::new());
         }
 
+        sqlite_branch!(self, db => db.funding_latest(venue, symbols).await);
         let Some(pool) = &self.pool else {
             let rows = self.funding.read().expect("资金费率锁不可用");
             return Ok(symbols
@@ -505,6 +562,7 @@ impl Store {
         &self,
         since: DateTime<Utc>,
     ) -> anyhow::Result<Vec<FundingSummary>> {
+        sqlite_branch!(self, db => db.funding_summary(since).await);
         let Some(pool) = &self.pool else {
             let rows = self.funding.read().expect("资金费率锁不可用");
             let mut grouped: std::collections::HashMap<(String, String), (Decimal, i64)> =
@@ -556,6 +614,7 @@ impl Store {
 
     /// 已入库的资金费率条数。
     pub async fn funding_count(&self, venue: &str) -> anyhow::Result<usize> {
+        sqlite_branch!(self, db => db.funding_count(venue).await);
         let Some(pool) = &self.pool else {
             let rows = self.funding.read().expect("资金费率锁不可用");
             return Ok(rows.iter().filter(|rate| rate.venue == venue).count());
@@ -570,6 +629,7 @@ impl Store {
 
     /// 删除结算时间早于 `before` 的资金费率，返回删除条数。
     pub async fn prune_funding_rates(&self, before: DateTime<Utc>) -> anyhow::Result<usize> {
+        sqlite_branch!(self, db => db.prune_funding_rates(before).await);
         let Some(pool) = &self.pool else {
             let mut rows = self.funding.write().expect("资金费率锁不可用");
             let total = rows.len();
@@ -586,6 +646,7 @@ impl Store {
 
     /// 记录一条账户权益快照。
     pub async fn save_equity_point(&self, point: &EquityPoint) -> anyhow::Result<()> {
+        sqlite_branch!(self, db => db.save_equity_point(point).await);
         let Some(pool) = &self.pool else {
             let mut rows = self.equity.write().expect("权益锁不可用");
             rows.push(point.clone());
@@ -618,6 +679,7 @@ impl Store {
         since: DateTime<Utc>,
         account_id: Option<Uuid>,
     ) -> anyhow::Result<Vec<EquityPoint>> {
+        sqlite_branch!(self, db => db.equity_history(since, account_id).await);
         let Some(pool) = &self.pool else {
             let rows = self.equity.read().expect("权益锁不可用");
             let mut points: Vec<EquityPoint> = rows
@@ -658,6 +720,7 @@ impl Store {
 
     /// 删除账户时一并清空其历史快照。
     pub async fn clear_equity_points(&self, account_id: Uuid) -> anyhow::Result<()> {
+        sqlite_branch!(self, db => db.clear_equity_points(account_id).await);
         let Some(pool) = &self.pool else {
             self.equity
                 .write()
@@ -675,6 +738,7 @@ impl Store {
 
     /// 读取全部策略定义。未连接数据库时返回内存快照。
     pub async fn load_strategies(&self) -> Vec<StrategyRecord> {
+        sqlite_branch!(self, db => db.load_strategies().await);
         let Some(pool) = &self.pool else {
             return self.strategies.read().expect("策略锁不可用").clone();
         };
@@ -697,6 +761,7 @@ impl Store {
 
     /// 读取已启用的现货 / 永续交易所配置。未连接数据库时返回空列表。
     pub async fn exchange_venues(&self) -> Vec<ExchangeVenueConfig> {
+        sqlite_branch!(self, db => db.exchange_venues().await);
         let Some(pool) = &self.pool else {
             return Vec::new();
         };
@@ -727,6 +792,7 @@ impl Store {
 
     /// 读取已启用的交易对配置；同一交易所的现货与永续共享这份清单。
     pub async fn tradable_symbols(&self) -> Vec<TradableSymbolConfig> {
+        sqlite_branch!(self, db => db.tradable_symbols().await);
         let Some(pool) = &self.pool else {
             return Vec::new();
         };
@@ -756,6 +822,7 @@ impl Store {
 
     /// 资金费率采集器发现新合约后写入配置，已有交易对保持原有启用状态与排序。
     pub async fn upsert_tradable_symbols(&self, venue: &str, symbols: &[String]) {
+        sqlite_branch!(self, db => db.upsert_tradable_symbols(venue, symbols).await);
         let Some(pool) = &self.pool else {
             return;
         };
@@ -782,6 +849,7 @@ impl Store {
 
     /// 读取通知配置；未连接数据库时返回默认值。
     pub async fn notification_settings(&self) -> NotificationSettings {
+        sqlite_branch!(self, db => db.notification_settings().await);
         let Some(pool) = &self.pool else {
             return NotificationSettings::default();
         };
@@ -825,6 +893,7 @@ impl Store {
 
     /// 保存通知配置；内存模式下由调用方自行保存，这里不报错。
     pub async fn save_notification_settings(&self, settings: &NotificationSettings) {
+        sqlite_branch!(self, db => db.save_notification_settings(settings).await);
         let Some(pool) = &self.pool else {
             return;
         };
@@ -864,6 +933,7 @@ impl Store {
 
     /// 写入策略定义与运行状态快照。
     pub async fn save_strategy(&self, record: &StrategyRecord) {
+        sqlite_branch!(self, db => db.save_strategy(record).await);
         let Some(pool) = &self.pool else {
             let mut rows = self.strategies.write().expect("策略锁不可用");
             match rows.iter_mut().find(|existing| existing.id == record.id) {
@@ -916,6 +986,7 @@ impl Store {
 
     /// 追加一条版本快照；同一 (strategy_id, version) 只保留首次写入。
     pub async fn save_strategy_version(&self, record: &StrategyRecord) {
+        sqlite_branch!(self, db => db.save_strategy_version(record).await);
         let snapshot = StrategyVersion::from_record(record);
         let Some(pool) = &self.pool else {
             let mut rows = self.strategy_versions.write().expect("策略版本锁不可用");
@@ -956,6 +1027,7 @@ impl Store {
 
     /// 写入运行实例；重复写入只更新状态、停止时间与心跳。
     pub async fn save_strategy_run(&self, run: &StrategyRun) {
+        sqlite_branch!(self, db => db.save_strategy_run(run).await);
         let Some(pool) = &self.pool else {
             let mut rows = self.strategy_runs.write().expect("运行实例锁不可用");
             match rows.iter_mut().find(|existing| existing.id == run.id) {
@@ -1007,6 +1079,7 @@ impl Store {
 
     /// 按开始时间倒序返回策略的运行实例。
     pub async fn strategy_runs(&self, strategy_id: Uuid, limit: i64) -> Vec<StrategyRun> {
+        sqlite_branch!(self, db => db.strategy_runs(strategy_id, limit).await);
         let Some(pool) = &self.pool else {
             let rows = self.strategy_runs.read().expect("运行实例锁不可用");
             let mut runs: Vec<StrategyRun> = rows
@@ -1038,6 +1111,7 @@ impl Store {
 
     /// 按 id 读取单个运行实例。
     pub async fn strategy_run(&self, run_id: Uuid) -> Option<StrategyRun> {
+        sqlite_branch!(self, db => db.strategy_run(run_id).await);
         let Some(pool) = &self.pool else {
             return self
                 .strategy_runs
@@ -1067,6 +1141,7 @@ impl Store {
 
     /// 追加一条运行事件。
     pub async fn append_strategy_run_event(&self, event: &StrategyRunEvent) {
+        sqlite_branch!(self, db => db.append_strategy_run_event(event).await);
         let Some(pool) = &self.pool else {
             let mut rows = self.strategy_run_events.write().expect("运行事件锁不可用");
             rows.push(event.clone());
@@ -1104,6 +1179,7 @@ impl Store {
 
     /// 按时间正序返回运行实例的事件。
     pub async fn strategy_run_events(&self, run_id: Uuid, limit: i64) -> Vec<StrategyRunEvent> {
+        sqlite_branch!(self, db => db.strategy_run_events(run_id, limit).await);
         let Some(pool) = &self.pool else {
             let rows = self.strategy_run_events.read().expect("运行事件锁不可用");
             let mut events: Vec<StrategyRunEvent> = rows
@@ -1138,6 +1214,7 @@ impl Store {
 
     /// 按版本号倒序返回历史快照。
     pub async fn strategy_versions(&self, strategy_id: Uuid) -> Vec<StrategyVersion> {
+        sqlite_branch!(self, db => db.strategy_versions(strategy_id).await);
         let Some(pool) = &self.pool else {
             let rows = self.strategy_versions.read().expect("策略版本锁不可用");
             let mut versions: Vec<StrategyVersion> = rows
@@ -1173,6 +1250,7 @@ impl Store {
 
     /// 读取策略当前沙箱源码。
     pub async fn strategy_code(&self, strategy_id: Uuid) -> Option<StrategyCode> {
+        sqlite_branch!(self, db => db.strategy_code(strategy_id).await);
         let Some(pool) = &self.pool else {
             return self
                 .strategy_codes
@@ -1199,6 +1277,7 @@ impl Store {
 
     /// 保存策略源码；每个策略只保留最新一份，代码历史由策略版本承担。
     pub async fn save_strategy_code(&self, code: &StrategyCode) {
+        sqlite_branch!(self, db => db.save_strategy_code(code).await);
         let Some(pool) = &self.pool else {
             self.strategy_codes
                 .write()
@@ -1234,6 +1313,7 @@ impl Store {
 
     /// 删除策略及其版本历史。已有仓位与订单不受影响。
     pub async fn delete_strategy(&self, strategy_id: Uuid) {
+        sqlite_branch!(self, db => db.delete_strategy(strategy_id).await);
         let Some(pool) = &self.pool else {
             self.strategies
                 .write()
@@ -1275,6 +1355,7 @@ impl Store {
 
     /// 读取策略市场全部数据。数据量小（单一执行器用户），一次拉取便于计算榜单。
     pub async fn market_snapshot(&self) -> MarketSnapshot {
+        sqlite_branch!(self, db => db.market_snapshot().await);
         let Some(pool) = &self.pool else {
             return MarketSnapshot {
                 authors: self.authors.read().expect("作者锁不可用").clone(),
@@ -1295,6 +1376,7 @@ impl Store {
     }
 
     pub async fn save_author_card(&self, card: &StrategyAuthorCard) {
+        sqlite_branch!(self, db => db.save_author_card(card).await);
         let Some(pool) = &self.pool else {
             let mut rows = self.authors.write().expect("作者锁不可用");
             match rows.iter_mut().find(|existing| existing.author_id == card.author_id) {
@@ -1330,6 +1412,7 @@ impl Store {
     }
 
     pub async fn save_publication(&self, publication: &StrategyPublication) {
+        sqlite_branch!(self, db => db.save_publication(publication).await);
         let Some(pool) = &self.pool else {
             let mut rows = self.publications.write().expect("发布锁不可用");
             match rows.iter_mut().find(|existing| existing.id == publication.id) {
@@ -1374,6 +1457,7 @@ impl Store {
     }
 
     pub async fn save_performance(&self, record: &StrategyPerformanceRecord) {
+        sqlite_branch!(self, db => db.save_performance(record).await);
         let Some(pool) = &self.pool else {
             let mut rows = self.performance.write().expect("表现记录锁不可用");
             match rows.iter_mut().find(|existing| existing.id == record.id) {
@@ -1412,6 +1496,7 @@ impl Store {
     }
 
     pub async fn save_subscription(&self, subscription: &StrategySubscription) {
+        sqlite_branch!(self, db => db.save_subscription(subscription).await);
         let Some(pool) = &self.pool else {
             let mut rows = self.subscriptions.write().expect("订阅锁不可用");
             match rows.iter_mut().find(|existing| existing.id == subscription.id) {
@@ -1453,6 +1538,7 @@ impl Store {
     }
 
     pub async fn save_settlement(&self, settlement: &StrategySettlement) {
+        sqlite_branch!(self, db => db.save_settlement(settlement).await);
         let Some(pool) = &self.pool else {
             let mut rows = self.settlements.write().expect("结算锁不可用");
             match rows.iter_mut().find(|existing| {
@@ -1496,6 +1582,7 @@ impl Store {
 
     /// 读取全部沙箱模块元数据。
     pub async fn sandbox_artifacts(&self) -> Vec<SandboxArtifact> {
+        sqlite_branch!(self, db => db.sandbox_artifacts().await);
         let Some(pool) = &self.pool else {
             return self
                 .sandbox_artifacts
@@ -1512,6 +1599,7 @@ impl Store {
         artifact: &SandboxArtifact,
         wasm: &[u8],
     ) -> anyhow::Result<()> {
+        sqlite_branch!(self, db => db.save_sandbox_artifact(artifact, wasm).await);
         let Some(pool) = &self.pool else {
             {
                 let mut rows = self
@@ -1558,6 +1646,7 @@ impl Store {
 
     /// 按 id 读取模块字节；运行器据此执行沙箱。
     pub async fn sandbox_module(&self, id: Uuid) -> Option<Vec<u8>> {
+        sqlite_branch!(self, db => db.sandbox_module(id).await);
         let Some(pool) = &self.pool else {
             return self
                 .sandbox_modules
@@ -1577,6 +1666,7 @@ impl Store {
 
     /// 读取全部策略模板。未连接数据库时返回内存快照。
     pub async fn strategy_templates(&self) -> Vec<StrategyTemplate> {
+        sqlite_branch!(self, db => db.strategy_templates().await);
         let Some(pool) = &self.pool else {
             return self
                 .strategy_templates
@@ -1589,6 +1679,7 @@ impl Store {
 
     /// 写入策略模板，按 `key` 幂等。
     pub async fn save_strategy_template(&self, template: &StrategyTemplate) {
+        sqlite_branch!(self, db => db.save_strategy_template(template).await);
         let Some(pool) = &self.pool else {
             let mut rows = self.strategy_templates.write().expect("模板锁不可用");
             match rows.iter_mut().find(|existing| existing.key == template.key) {

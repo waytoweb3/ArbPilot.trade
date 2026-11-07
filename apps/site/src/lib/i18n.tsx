@@ -468,7 +468,16 @@ export type Copy = typeof zh;
 
 const dictionaries: Record<Locale, Copy> = { zh, en };
 
+/** 取整套文案；seo.ts 在构建期据此生成页面标题与描述。 */
+export function copyFor(locale: Locale): Copy {
+  return dictionaries[locale];
+}
+
 function detectLocale(): Locale {
+  // 构建期预渲染在 Node 中执行，没有 localStorage / navigator。
+  if (typeof window === "undefined") {
+    return "zh";
+  }
   const stored = localStorage.getItem(STORAGE_KEY);
   if (stored === "zh" || stored === "en") {
     return stored;
@@ -500,15 +509,18 @@ type I18nValue = {
 
 const I18nContext = createContext<I18nValue | null>(null);
 
-export function I18nProvider({ children }: { children: ReactNode }) {
-  const [locale, setLocaleState] = useState<Locale>(detectLocale);
+export function I18nProvider({
+  children,
+  initialLocale,
+}: {
+  children: ReactNode;
+  /** 预渲染时固定语言，浏览器端缺省按本地存储与浏览器语言判断。 */
+  initialLocale?: Locale;
+}) {
+  const [locale, setLocaleState] = useState<Locale>(() => initialLocale ?? detectLocale());
 
   useEffect(() => {
     document.documentElement.lang = locale === "zh" ? "zh-CN" : "en";
-    document.title = dictionaries[locale].meta.title;
-    document
-      .querySelector('meta[name="description"]')
-      ?.setAttribute("content", dictionaries[locale].meta.description);
   }, [locale]);
 
   const setLocale = useCallback((next: Locale) => {

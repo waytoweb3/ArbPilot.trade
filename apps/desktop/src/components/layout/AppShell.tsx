@@ -31,6 +31,7 @@ import { cn } from "../../lib/utils";
 import { useExecutorStore } from "../../state/executor";
 import { Button } from "../ui/button";
 import { AccountButton } from "./AccountButton";
+import { UpdateBanner } from "./UpdateBanner";
 
 const SIDEBAR_KEY = "arbpilot.sidebar.collapsed";
 
@@ -243,6 +244,8 @@ export function AppShell() {
             </Button>
           </div>
         </header>
+
+        <UpdateBanner />
 
         <main className="min-h-0 flex-1 overflow-y-auto px-6 py-6">
           <Outlet />

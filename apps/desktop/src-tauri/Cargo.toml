@@ -20,3 +20,4 @@ serde_json = { workspace = true }
 ssh2 = { version = "0.9", features = ["vendored-openssl"] }
 tauri = { version = "2", features = [] }
 tauri-plugin-updater = "2"
+uuid = { workspace = true }

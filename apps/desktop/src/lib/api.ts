@@ -50,41 +50,158 @@ import type {
 } from "./types";
 import { fmt, getCopy } from "./i18n";
 
-const DEFAULT_EXECUTOR_URL = (
+const HOSTED_URL = (
   (import.meta.env.VITE_EXECUTOR_URL as string | undefined) ?? "http://127.0.0.1:8787"
 ).replace(/\/$/, "");
 
-const URL_STORAGE_KEY = "arbpilot.executor.url";
+const SELF_URL_DEFAULT = "http://127.0.0.1:8787";
 
-/** 当前连接的执行器地址；用户可在设置页改成自有服务器上的执行器。 */
-export function getExecutorUrl(): string {
-  return (localStorage.getItem(URL_STORAGE_KEY) || DEFAULT_EXECUTOR_URL).replace(/\/$/, "");
+/**
+ * 官方只读数据接口：资金费率、新闻与行情。
+ * 本地模式下读取类请求优先走这里，账户密钥与订单始终留在本机执行器。
+ */
+const DATA_URL = (
+  (import.meta.env.VITE_ARBPILOT_DATA_URL as string | undefined) ?? HOSTED_URL
+).replace(/\/$/, "");
+
+/** 官方托管、用户远程实例与桌面内置执行器是三套独立配置。 */
+export type ExecutorMode = "hosted" | "self" | "local";
+
+const MODE_KEY = "arbpilot.executor.mode";
+const URL_STORAGE_KEY = "arbpilot.executor.url";
+const TOKEN_STORAGE_KEY = "arbpilot.executor.token";
+
+/** 内置执行器的连接参数，由桌面端启动时注入。 */
+let localRuntime: { baseUrl: string; token: string; database: string } | null = null;
+
+function hasTauriRuntime(): boolean {
+  return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+}
+
+/**
+ * 桌面端启动时调用：连接随包启动的本地执行器，用户无需任何配置。
+ * 浏览器里（vite dev）没有 Tauri 运行时，直接跳过。
+ */
+export async function bootstrapDesktopExecutor(): Promise<void> {
+  if (!hasTauriRuntime()) {
+    return;
+  }
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    const config = await invoke<{
+      base_url: string;
+      token: string;
+      database: string;
+    } | null>("executor_local_config");
+    if (!config?.base_url || !config.token) {
+      return;
+    }
+    localRuntime = {
+      baseUrl: config.base_url.replace(/\/$/, ""),
+      token: config.token,
+      database: config.database,
+    };
+    // 首次启动默认连内置执行器；用户已在设置里选择其他模式时保持不动。
+    if (!localStorage.getItem(MODE_KEY)) {
+      setExecutorMode("local");
+    }
+  } catch {
+    // 内置执行器不可用时保持现有配置，由设置页提示用户手动填写地址。
+  }
+}
+
+/** 内置执行器是否已就绪，设置页据此展示本地模式。 */
+export function hasLocalExecutor(): boolean {
+  return localRuntime !== null;
+}
+
+/** 内置执行器的数据库文件，仅桌面端可用。 */
+export function localExecutorDatabase(): string {
+  return localRuntime?.database ?? "";
+}
+
+export function getExecutorMode(): ExecutorMode {
+  const stored = localStorage.getItem(MODE_KEY);
+  if (stored === "local" || stored === "self" || stored === "hosted") {
+    // 内置执行器不可用时不要停留在本地模式，回退到远程 / 托管。
+    if (stored === "local" && !localRuntime) {
+      return hasTauriRuntime() ? "self" : "hosted";
+    }
+    return stored;
+  }
+  if (localRuntime) {
+    return "local";
+  }
+  // 旧版本只保存过一个地址：与托管地址不同就视为用户自己填写的自托管配置。
+  const legacy = localStorage.getItem(URL_STORAGE_KEY)?.replace(/\/$/, "");
+  return legacy && legacy !== HOSTED_URL ? "self" : "hosted";
+}
+
+export function setExecutorMode(mode: ExecutorMode): void {
+  localStorage.setItem(MODE_KEY, mode);
+}
+
+/** 当前模式的执行器地址；托管模式固定使用构建时注入的地址，本地模式由 Tauri 注入。 */
+export function getExecutorUrl(mode: ExecutorMode = getExecutorMode()): string {
+  if (mode === "hosted") {
+    return HOSTED_URL;
+  }
+  if (mode === "local" && localRuntime) {
+    return localRuntime.baseUrl;
+  }
+  return (localStorage.getItem(URL_STORAGE_KEY) || SELF_URL_DEFAULT).replace(/\/$/, "");
 }
 
 export function setExecutorUrl(url: string): void {
   const next = url.trim().replace(/\/$/, "");
-  if (next && next !== DEFAULT_EXECUTOR_URL) {
+  if (next) {
     localStorage.setItem(URL_STORAGE_KEY, next);
   } else {
     localStorage.removeItem(URL_STORAGE_KEY);
   }
 }
 
-export function isLocalExecutor(): boolean {
-  return /^https?:\/\/(127\.0\.0\.1|localhost)(:|\/|$)/.test(getExecutorUrl());
-}
-
-const TOKEN_STORAGE_KEY = "arbpilot.executor.token";
-/** 官方托管模式在构建时注入默认令牌；源码本地运行回退到开发令牌。 */
+/** 官方托管实例在构建时注入的令牌；源码本地运行回退到开发令牌。 */
 export const DEFAULT_TOKEN =
   (import.meta.env.VITE_EXECUTOR_TOKEN as string | undefined) ?? "dev-local-token";
 
-export function getApiToken(): string {
-  return localStorage.getItem(TOKEN_STORAGE_KEY) || DEFAULT_TOKEN;
+export function getApiToken(mode: ExecutorMode = getExecutorMode()): string {
+  if (mode === "hosted") {
+    return DEFAULT_TOKEN;
+  }
+  if (mode === "local" && localRuntime) {
+    return localRuntime.token;
+  }
+  return localStorage.getItem(TOKEN_STORAGE_KEY) ?? "";
 }
 
+/** 只保存自托管实例的令牌，避免与托管实例的令牌互相覆盖。 */
 export function setApiToken(token: string): void {
   localStorage.setItem(TOKEN_STORAGE_KEY, token);
+}
+
+const LICENSE_TOKEN_KEY = "arbpilot.license.token";
+
+/** 账号服务签发的用户令牌；托管实例据此按用户校验套餐。 */
+export function getLicenseToken(): string {
+  return localStorage.getItem(LICENSE_TOKEN_KEY) ?? "";
+}
+
+export function setLicenseToken(token: string | null): void {
+  if (token) {
+    localStorage.setItem(LICENSE_TOKEN_KEY, token);
+  } else {
+    localStorage.removeItem(LICENSE_TOKEN_KEY);
+  }
+}
+
+/** 托管实例的身份头：每个请求带上当前用户的授权令牌。 */
+function identityHeaders(): Record<string, string> {
+  if (getExecutorMode() !== "hosted") {
+    return {};
+  }
+  const license = getLicenseToken();
+  return license ? { "X-ArbPilot-License": license } : {};
 }
 
 export class ApiError extends Error {
@@ -97,18 +214,19 @@ export class ApiError extends Error {
   }
 }
 
-async function request<T>(
-  path: string,
-  init: RequestInit = {},
-  acceptedStatuses: number[] = [],
+async function send<T>(
+  url: string,
+  headers: Record<string, string>,
+  init: RequestInit,
+  acceptedStatuses: number[],
 ): Promise<T> {
   let response: Response;
   try {
-    response = await fetch(`${getExecutorUrl()}${path}`, {
+    response = await fetch(url, {
       ...init,
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${getApiToken()}`,
+        ...headers,
         ...(init.headers ?? {}),
       },
     });
@@ -127,10 +245,58 @@ async function request<T>(
   return payload as T;
 }
 
+async function request<T>(
+  path: string,
+  init: RequestInit = {},
+  acceptedStatuses: number[] = [],
+): Promise<T> {
+  return send<T>(
+    `${getExecutorUrl()}${path}`,
+    {
+      Authorization: `Bearer ${getApiToken()}`,
+      ...identityHeaders(),
+    },
+    init,
+    acceptedStatuses,
+  );
+}
+
+/**
+ * 只读数据请求：本地模式下走官方数据接口，官方不可达时回退到本机采集结果。
+ * 交易类请求（下单、账户、策略、风控）始终使用 `request`。
+ */
+async function dataRequest<T>(
+  path: string,
+  init: RequestInit = {},
+  acceptedStatuses: number[] = [],
+): Promise<T> {
+  if (getExecutorMode() !== "local" || DATA_URL === getExecutorUrl("local")) {
+    return request<T>(path, init, acceptedStatuses);
+  }
+  const license = getLicenseToken();
+  try {
+    return await send<T>(
+      `${DATA_URL}${path}`,
+      {
+        Authorization: `Bearer ${DEFAULT_TOKEN}`,
+        ...(license ? { "X-ArbPilot-License": license } : {}),
+      },
+      init,
+      acceptedStatuses,
+    );
+  } catch (error) {
+    // 官方数据接口不可达或当前账号无权访问时，用内置执行器的本地采集兜底。
+    if (error instanceof ApiError && [0, 401, 402, 403].includes(error.status)) {
+      return request<T>(path, init, acceptedStatuses);
+    }
+    throw error;
+  }
+}
+
 export const api = {
   health: () => request<HealthResponse>("/api/v1/health"),
 
-  opportunities: () => request<Opportunity[]>("/api/v1/opportunities"),
+  opportunities: () => dataRequest<Opportunity[]>("/api/v1/opportunities"),
 
   candles: (symbol: string, interval: string, limit: number, venue?: string) => {
     const params = new URLSearchParams({
@@ -141,7 +307,7 @@ export const api = {
     if (venue) {
       params.set("venue", venue);
     }
-    return request<Candle[]>(`/api/v1/candles?${params.toString()}`);
+    return dataRequest<Candle[]>(`/api/v1/candles?${params.toString()}`);
   },
 
   positions: () => request<Position[]>("/api/v1/positions"),
@@ -403,22 +569,22 @@ export const api = {
       body: JSON.stringify(limits),
     }),
 
-  fundingStatus: () => request<FundingStatus[]>("/api/v1/funding/status"),
+  fundingStatus: () => dataRequest<FundingStatus[]>("/api/v1/funding/status"),
 
   fundingHistory: (symbol: string | undefined, limit: number, venue: string) => {
     const params = new URLSearchParams({ limit: String(limit), venue });
     if (symbol) {
       params.set("symbol", symbol);
     }
-    return request<FundingRate[]>(`/api/v1/funding/history?${params.toString()}`);
+    return dataRequest<FundingRate[]>(`/api/v1/funding/history?${params.toString()}`);
   },
 
   /** 时间窗口内各交易对的累计资金费率，一次请求覆盖全部币种。 */
   fundingSummary: (secs: number) =>
-    request<FundingSummary[]>(`/api/v1/funding/summary?secs=${secs}`),
+    dataRequest<FundingSummary[]>(`/api/v1/funding/summary?secs=${secs}`),
 
   /** 上币公告：Binance / Upbit / OKX / Bybit / Bitget 的采集结果与来源状态。 */
-  news: (limit = 200) => request<NewsResponse>(`/api/v1/news?limit=${limit}`),
+  news: (limit = 200) => dataRequest<NewsResponse>(`/api/v1/news?limit=${limit}`),
 
   telegramStatus: () => request<TelegramStatus>("/api/v1/telegram"),
 
@@ -462,8 +628,14 @@ export const api = {
       [422],
     ),
 
-  eventsUrl: () =>
-    `${getExecutorUrl().replace(/^http/, "ws")}/api/v1/events?token=${encodeURIComponent(getApiToken())}`,
+  eventsUrl: () => {
+    const params = new URLSearchParams({ token: getApiToken() });
+    const license = getExecutorMode() === "hosted" ? getLicenseToken() : "";
+    if (license) {
+      params.set("license", license);
+    }
+    return `${getExecutorUrl().replace(/^http/, "ws")}/api/v1/events?${params.toString()}`;
+  },
 };
 
 /** 用于展示，不做精度敏感计算。 */

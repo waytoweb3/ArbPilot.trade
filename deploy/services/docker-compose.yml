@@ -51,9 +51,28 @@ services:
       - internal
       - edge
 
+  # 执行器：行情采集、资金费率、新闻与策略托管。桌面端远程连接这台实例。
+  executor:
+    # 镜像由 GitHub Actions 构建并推送到 GHCR（.github/workflows/executor-image.yml），
+    # 服务器只 pull，不再需要同步源码；可用 ARBPILOT_EXECUTOR_IMAGE 固定到某个 sha-<commit>。
+    image: ${ARBPILOT_EXECUTOR_IMAGE:-ghcr.io/waytoweb3/arbpilot-executor:latest}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - ./executor.env
+    volumes:
+      # 账户凭证、风控限额与授权令牌都在这里，必须持久化且不对外暴露。
+      - arbpilot-execdata:/data
+    networks:
+      - internal
+      - edge
+
 volumes:
   arbpilot-pgdata:
   arbpilot-paydata:
+  arbpilot-execdata:
 
 networks:
   internal:

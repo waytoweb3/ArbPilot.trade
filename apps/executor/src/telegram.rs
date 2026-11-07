@@ -662,10 +662,12 @@ fn news_text(state: &AppState) -> String {
 fn describe_error(error: &ApiError) -> String {
     match error {
         ApiError::Unauthorized => "未授权".to_string(),
-        ApiError::BadRequest(message)
+        ApiError::UnauthorizedWith(message)
+        | ApiError::BadRequest(message)
         | ApiError::NotFound(message)
         | ApiError::Conflict(message)
         | ApiError::PaymentRequired(message)
+        | ApiError::Forbidden(message)
         | ApiError::Internal(message) => message.clone(),
     }
 }

@@ -1,4 +1,3 @@
-import { useEffect } from "react";
 import { Link } from "react-router-dom";
 
 import { legalDocs, type LegalDoc } from "../lib/legal";
@@ -7,18 +6,6 @@ import { useI18n } from "../lib/i18n";
 export default function LegalPage({ slug }: { slug: LegalDoc["slug"] }) {
   const { t, locale } = useI18n();
   const doc = legalDocs[locale][slug];
-
-  useEffect(() => {
-    const previous = document.title;
-    // I18nProvider 会在同一轮 effect 中写入站点默认标题，这里放到下一帧覆盖。
-    const timer = window.setTimeout(() => {
-      document.title = `${doc.title} · ArbPilot`;
-    }, 0);
-    return () => {
-      window.clearTimeout(timer);
-      document.title = previous;
-    };
-  }, [doc.title]);
 
   return (
     <div className="page pb-24 pt-28">

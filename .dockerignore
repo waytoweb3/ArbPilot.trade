@@ -1,0 +1,9 @@
+.git
+**/node_modules
+**/dist
+**/target
+target
+apps/payments/.data
+*.pem
+.env
+**/.env

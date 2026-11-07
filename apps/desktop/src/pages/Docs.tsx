@@ -5,7 +5,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Badge } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "../components/ui/card";
-import { setApiToken, setExecutorUrl } from "../lib/api";
+import { setApiToken, setExecutorMode, setExecutorUrl } from "../lib/api";
+import { isNewerVersion } from "../lib/appUpdate";
 import {
   deployServer,
   fetchManifest,
@@ -221,6 +222,8 @@ export default function DocsPage({ embedded = false }: { embedded?: boolean }) {
         // install.sh 会把生成的访问令牌打印到日志里，部署完成后直接写入客户端连接配置。
         const match = logsRef.current.match(/访问令牌[：:]\s*([0-9a-fA-F]{16,})/);
         if (match) {
+          // 刚部署的是用户自己的实例，切到自托管连接，避免把令牌写进托管配置。
+          setExecutorMode("self");
           setApiToken(match[1]);
           setExecutorUrl("http://127.0.0.1:8787");
           setTokenFilled(true);
@@ -238,7 +241,9 @@ export default function DocsPage({ embedded = false }: { embedded?: boolean }) {
 
   const serverVersion = probe?.version ?? null;
   const latestVersion = manifest?.version ?? null;
-  const upToDate = Boolean(serverVersion && latestVersion && serverVersion === latestVersion);
+  const upToDate = Boolean(
+    serverVersion && latestVersion && !isNewerVersion(latestVersion, serverVersion),
+  );
   const deployLabel =
     busy === "deploy"
       ? t.docs.deploying

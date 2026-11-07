@@ -5,6 +5,7 @@ import {
   type ServerResponse,
 } from "node:http";
 
+import { adminOverview } from "./admin";
 import { config, isAllowedRedirect } from "./config";
 import { closePool, migrate, pool } from "./db";
 import {
@@ -69,6 +70,23 @@ function requireInternal(req: IncomingMessage): void {
   const actual = Buffer.from(value ?? "");
   if (expected.length !== actual.length || !timingSafeEqual(expected, actual)) {
     throw new HttpError(401, "内部接口需要有效令牌", "forbidden");
+  }
+}
+
+/** 运营后台：用 ADMIN_TOKEN 作为 Bearer 令牌，未配置时直接禁用接口。 */
+function requireAdmin(req: IncomingMessage): void {
+  if (!config.adminToken) {
+    throw new HttpError(
+      503,
+      "运营后台未启用：请在账号服务配置 ADMIN_TOKEN 后重启",
+      "admin_disabled",
+    );
+  }
+  const token = bearer(req);
+  const expected = Buffer.from(config.adminToken);
+  const actual = Buffer.from(token ?? "");
+  if (expected.length !== actual.length || !timingSafeEqual(expected, actual)) {
+    throw new HttpError(401, "管理令牌无效", "unauthorized");
   }
 }
 
@@ -489,6 +507,15 @@ async function handleInternalSession(
   sendJson(res, 200, userPayload(user));
 }
 
+/** 运营后台：返回全部注册用户及其订阅/设备明细。 */
+async function handleAdminUsers(
+  req: IncomingMessage,
+  res: ServerResponse,
+): Promise<void> {
+  requireAdmin(req);
+  sendJson(res, 200, await adminOverview());
+}
+
 // ---------------------------------------------------------------------------
 // 入口
 // ---------------------------------------------------------------------------
@@ -677,6 +704,11 @@ const server = createServer((req, res) => {
 
       if (req.method === "POST" && pathname === "/api/internal/session") {
         await handleInternalSession(req, res);
+        return;
+      }
+
+      if (req.method === "GET" && pathname === "/api/admin/users") {
+        await handleAdminUsers(req, res);
         return;
       }
 

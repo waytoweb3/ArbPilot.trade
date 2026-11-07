@@ -10,6 +10,8 @@ pub struct Config {
     pub bind_addr: SocketAddr,
     pub api_token: String,
     pub database_url: Option<String>,
+    /// 桌面端随包启动时使用的本地 SQLite 文件；未配置 `DATABASE_URL` 时优先使用它。
+    pub local_db: Option<PathBuf>,
     pub risk: RiskLimits,
     pub funding_enabled: bool,
     /// Binance USDT 本位合约公开行情地址，可指向代理或测试桩。
@@ -119,6 +121,8 @@ pub struct Config {
     pub license_grace_hours: u64,
     /// 授权令牌本地保存路径，文件权限固定为 600。
     pub license_file: PathBuf,
+    /// 官方托管只读模式：只放行公共行情与资讯，拒绝账户、下单与策略写入。
+    pub public_mode: bool,
 }
 
 impl Config {
@@ -391,11 +395,19 @@ impl Config {
         let license_file = env::var("ARBPILOT_LICENSE_FILE")
             .map(PathBuf::from)
             .unwrap_or_else(|_| accounts_file.with_file_name("license.json"));
+        let public_mode = env::var("ARBPILOT_PUBLIC_MODE")
+            .map(|value| value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
 
         Ok(Self {
             bind_addr,
             api_token,
             database_url: env::var("DATABASE_URL").ok().filter(|url| !url.is_empty()),
+            local_db: env::var("ARBPILOT_LOCAL_DB")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from),
             risk,
             funding_enabled,
             binance_fapi_url,
@@ -455,6 +467,7 @@ impl Config {
             license_public_key,
             license_grace_hours,
             license_file,
+            public_mode,
         })
     }
 }

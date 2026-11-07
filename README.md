@@ -19,7 +19,8 @@
 │       │   ├── exchange/     # 交易所公开行情、账户查询与实盘下单适配器
 │       │   ├── funding.rs    # 资金费率采集（历史回填 + 增量轮询）
 │       │   ├── market.rs     # 盘口行情与机会扫描
-│       │   ├── store.rs      # PostgreSQL（未配置时降级内存模式）
+│       │   ├── store.rs      # PostgreSQL / 本地 SQLite / 内存三态存储
+│       │   ├── sqlite_store.rs # 桌面端随包使用的本地库（零配置，WAL）
 │       │   └── state.rs      # 共享状态与暂停开关
 │       └── migrations/       # SQLx 迁移
 ├── crates/arb-core/          # 领域模型、风控引擎、双腿状态机、交易所 trait
@@ -27,18 +28,50 @@
 └── Cargo.toml                # Rust workspace
 ```
 
+## 内置执行器（桌面端）
+
+桌面端安装包内置了执行器二进制（Tauri sidecar），启动时自动拉起：
+
+- 只监听 `127.0.0.1` 的随机端口，访问令牌每次启动随机生成，仅通过 Tauri 命令交给前端；
+- 业务数据写入本机 SQLite（macOS `~/Library/Application Support/trade.arbpilot.desktop/executor.db`），用户无需安装 PostgreSQL；
+- 交易所 API Key 由执行器保存在本机文件（权限 600），不经过官方服务器，也不进入前端。
+
+官方托管实例只提供行情、资金费率与资讯等只读数据接口（`ARBPILOT_PUBLIC_MODE=true`），不承接账户、下单或策略写入。
+
+内置执行器模式下，桌面端的只读请求（`/opportunities`、`/candles`、`/funding/*`、`/news`）优先发往官方数据接口（`VITE_ARBPILOT_DATA_URL`，默认复用 `VITE_EXECUTOR_URL`），官方不可达或当前账号无权访问时回退到本机采集；下单、账户、策略、风控与事件流始终在本机执行器。
+
+托管实例对外放行的只读路径（`GET`，其余一律 403，见 `apps/executor/src/public_mode.rs`）：
+
+- 行情：`/api/v1/opportunities`、`/api/v1/candles`、`/api/v1/config/market`
+- 资金费率：`/api/v1/funding/status`、`/api/v1/funding/history`、`/api/v1/funding/summary`
+- 资讯：`/api/v1/news`
+- 策略市场：`/api/v1/market/*`、`/api/v1/templates*`（只读列表与详情）
+- 其他：`/api/v1/license`、`/api/v1/events`
+
+## 官方托管实例镜像
+
+执行器镜像由 GitHub Actions 在 amd64 runner 上构建并推送到 GHCR，服务器只拉取、不保存源码：
+
+- 工作流：`.github/workflows/executor-image.yml`，`main` 上执行器相关路径变更时自动构建，也可手动触发；
+- 标签：`latest` 与 `sha-<完整 commit>`，回滚时把 `ARBPILOT_EXECUTOR_IMAGE` 指到旧 sha 即可；
+- 部署：`docker compose pull executor && docker compose up -d executor`；
+- 仓库是私有的，镜像包默认也私有，服务器需 `docker login ghcr.io`（`read:packages` 令牌），或把该包设为 public。
+
 ## 本地启动
 
 ```bash
 # 1. 安装前端依赖
 pnpm install
 
-# 2. 启动执行器（默认 127.0.0.1:8787，内存模式）
+# 2. 启动桌面端开发模式（会先构建并放入 sidecar 执行器，随窗口自动启动）
+pnpm dev:desktop
+```
+
+也可以手动启动执行器调试接口（默认 127.0.0.1:8787，未配置数据库时为内存模式）：
+
+```bash
 cp .env.example .env
 cargo run -p arbpilot-executor
-
-# 3. 另开终端启动桌面端开发模式
-pnpm dev:desktop
 ```
 
 只调试界面可运行 `pnpm dev`（浏览器打开 http://localhost:1420）。
@@ -52,13 +85,15 @@ pnpm dev:desktop
 | `ARBPILOT_BIND_ADDR` | `127.0.0.1:8787` | 执行器监听地址 |
 | `ARBPILOT_API_TOKEN` | `dev-local-token` | 执行器访问令牌，正式部署必须修改 |
 | `ARBPILOT_RISK_FILE` | `data/risk_limits.json` | 设置页修改的风控限额，存在时优先于环境变量 |
-| `DATABASE_URL` | 空 | 未配置时执行器以内存模式运行 |
+| `DATABASE_URL` | 空 | PostgreSQL 连接串，或 `sqlite:///path/to.db`；与 `ARBPILOT_LOCAL_DB` 都未配置时以内存模式运行 |
+| `ARBPILOT_LOCAL_DB` | 空 | 本地 SQLite 文件路径；桌面端随包启动时自动注入，用户无需配置 |
 | `ARBPILOT_FUNDING_ENABLED` | `true` | 资金费率采集开关，设为 `false` 关闭 |
 | `ARBPILOT_FUNDING_SYMBOLS` | `BTCUSDT,ETHUSDT` | 采集的 USDT 本位永续合约，逗号分隔 |
 | `ARBPILOT_FUNDING_POLL_SECS` | `60` | 增量采集间隔（秒），最小 15 |
 | `ARBPILOT_BINANCE_FAPI_URL` | `https://fapi.binance.com` | Binance 合约公开行情地址，可指向镜像或本地桩 |
 | `VITE_EXECUTOR_URL` | `http://127.0.0.1:8787` | 桌面端连接的执行器地址 |
 | `VITE_EXECUTOR_TOKEN` | `dev-local-token` | 桌面端默认访问令牌，官方托管版本构建时注入 |
+| `VITE_ARBPILOT_DATA_URL` | 复用 `VITE_EXECUTOR_URL` | 官方只读数据接口地址，内置执行器模式下行情/资金费率/新闻从这里读取 |
 
 ## 常用命令
 

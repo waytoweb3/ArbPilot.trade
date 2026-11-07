@@ -1,0 +1,8 @@
+User-agent: *
+Allow: /
+
+# 工具页与会话相关页面不参与收录。
+Disallow: /device
+Disallow: /checkout/
+
+Sitemap: https://arbpilot.trade/sitemap.xml

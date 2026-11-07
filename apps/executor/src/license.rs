@@ -163,6 +163,11 @@ impl LicenseManager {
         verify(token, key)
     }
 
+    /// 校验请求携带的用户令牌，不落盘、不影响整机授权。
+    pub fn verify_claims(&self, token: &str) -> Result<LicenseClaims, String> {
+        self.verify_token(token)
+    }
+
     pub fn clear(&self) {
         *self.claims.write().expect("授权令牌锁不可用") = None;
         *self.error.write().expect("授权令牌锁不可用") = None;
@@ -179,55 +184,80 @@ impl LicenseManager {
 
     /// 授权是否仍然有效；过期后在宽限期内仍允许离线运行。
     pub fn is_valid(&self) -> bool {
-        let Some(claims) = self.claims() else {
-            return false;
-        };
+        self.claims().is_some_and(|claims| self.claims_valid(&claims))
+    }
+
+    fn claims_valid(&self, claims: &LicenseClaims) -> bool {
         if !matches!(claims.status.as_str(), "active" | "canceling") {
             return false;
         }
-        claims.exp + self.grace_secs > Utc::now().timestamp()
+        !self.expired(claims)
+    }
+
+    /// 是否已过有效期（宽限期结束）；过期令牌仍可用于提示用户重新登录。
+    pub fn expired(&self, claims: &LicenseClaims) -> bool {
+        claims.exp + self.grace_secs <= Utc::now().timestamp()
     }
 
     /// 判断某个套餐是否被授权；`strategy` 包含 `arbitrage` 的权益。
     pub fn allows(&self, plan: &str) -> bool {
+        match self.claims() {
+            Some(claims) => self.allows_claims(&claims, plan),
+            None => !self.required,
+        }
+    }
+
+    /// 按某份令牌判断套餐；用于托管实例的按用户校验。
+    pub fn allows_claims(&self, claims: &LicenseClaims, plan: &str) -> bool {
         if !self.required {
             return true;
         }
-        if !self.is_valid() {
+        if !self.claims_valid(claims) {
             return false;
         }
-        let Some(claims) = self.claims() else {
-            return false;
-        };
         claims.plans.iter().any(|item| item == plan)
             || (plan == "arbitrage" && claims.plans.iter().any(|item| item == "strategy"))
     }
 
     pub fn status(&self) -> LicenseStatus {
         let claims = self.claims();
+        self.status_of(claims.as_ref(), self.error.read().expect("授权令牌锁不可用").clone())
+    }
+
+    /// 请求携带用户令牌时的授权状态；不暴露整机安装的那份授权。
+    pub fn status_for(&self, claims: &LicenseClaims) -> LicenseStatus {
+        self.status_of(Some(claims), None)
+    }
+
+    /// 未携带用户令牌时的空授权；托管实例不暴露整机授权。
+    pub fn anonymous_status(&self) -> LicenseStatus {
+        self.status_of(None, None)
+    }
+
+    fn status_of(&self, claims: Option<&LicenseClaims>, error: Option<String>) -> LicenseStatus {
         let now = Utc::now().timestamp();
-        let expired = claims.as_ref().is_some_and(|item| item.exp + self.grace_secs <= now);
-        let beyond_expiry = claims.as_ref().is_some_and(|item| item.exp <= now);
+        let expired = claims.is_some_and(|item| self.expired(item));
+        let beyond_expiry = claims.is_some_and(|item| item.exp <= now);
+        let valid = claims.is_some_and(|item| self.claims_valid(item));
         LicenseStatus {
             required: self.required,
             installed: claims.is_some(),
-            valid: self.is_valid(),
-            in_grace: beyond_expiry && !expired && self.is_valid(),
-            plans: claims.as_ref().map(|item| item.plans.clone()).unwrap_or_default(),
+            valid,
+            in_grace: beyond_expiry && !expired && valid,
+            plans: claims.map(|item| item.plans.clone()).unwrap_or_default(),
             status: if expired {
                 "expired".to_string()
             } else {
                 claims
-                    .as_ref()
                     .map(|item| item.status.clone())
                     .unwrap_or_else(|| "none".to_string())
             },
-            email: claims.as_ref().and_then(|item| item.email.clone()),
-            subject: claims.as_ref().map(|item| item.sub.clone()),
-            device: claims.as_ref().and_then(|item| item.device.clone()),
-            expires_at: claims.as_ref().map(|item| item.exp),
-            grace_until: claims.as_ref().map(|item| item.exp + self.grace_secs),
-            error: self.error.read().expect("授权令牌锁不可用").clone(),
+            email: claims.and_then(|item| item.email.clone()),
+            subject: claims.map(|item| item.sub.clone()),
+            device: claims.and_then(|item| item.device.clone()),
+            expires_at: claims.map(|item| item.exp),
+            grace_until: claims.map(|item| item.exp + self.grace_secs),
+            error,
         }
     }
 }
@@ -323,6 +353,42 @@ pub fn required_plan(path: &str) -> Option<&'static str> {
     None
 }
 
+/// 请求头/查询参数里携带用户授权令牌的字段名；WebSocket 只能用查询参数。
+pub const LICENSE_HEADER: &str = "x-arbpilot-license";
+
+/// 中间件：校验请求携带的用户令牌并写入请求上下文。
+///
+/// 托管实例据此按用户判定套餐；自托管未携带时继续使用整机授权。
+pub async fn attach_identity(
+    State(state): State<AppState>,
+    mut request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    let token = request
+        .headers()
+        .get(LICENSE_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .or_else(|| query_param(request.uri().query(), "license"));
+    if let Some(token) = token {
+        let claims = state
+            .license
+            .verify_claims(&token)
+            .map_err(|error| ApiError::UnauthorizedWith(format!("授权令牌无效: {error}")))?;
+        request.extensions_mut().insert(claims);
+    }
+    Ok(next.run(request).await)
+}
+
+fn query_param(query: Option<&str>, key: &str) -> Option<String> {
+    query?.split('&').find_map(|pair| {
+        let (name, value) = pair.split_once('=')?;
+        (name == key && !value.is_empty()).then(|| value.to_string())
+    })
+}
+
 /// 中间件：按套餐限制付费模块。未开启校验时直接放行。
 pub async fn require_plan(
     State(state): State<AppState>,
@@ -335,17 +401,42 @@ pub async fn require_plan(
     let Some(plan) = required_plan(request.uri().path()) else {
         return Ok(next.run(request).await);
     };
-    if state.license.allows(plan) {
+    let identity = request.extensions().get::<LicenseClaims>().cloned();
+    let allowed = match identity.as_ref() {
+        Some(claims) => state.license.allows_claims(claims, plan),
+        // 托管实例按请求里的用户身份计费，不回退到整机授权。
+        None if state.config.public_mode => false,
+        None => state.license.allows(plan),
+    };
+    if allowed {
         return Ok(next.run(request).await);
     }
 
-    let status = state.license.status();
-    let message = if !status.installed {
-        "付费模块需要先登录 ArbPilot 账号，授权令牌尚未同步到执行器"
-    } else if !status.valid {
-        "授权令牌已过期，请在桌面端重新登录"
-    } else {
-        "当前套餐不包含该模块"
+    let message = match identity.as_ref() {
+        None if state.config.public_mode => {
+            return Err(ApiError::UnauthorizedWith(
+                "官方托管实例需要先登录 ArbPilot 账号并同步授权".to_string(),
+            ));
+        }
+        None => {
+            let status = state.license.status();
+            if !status.installed {
+                "付费模块需要先登录 ArbPilot 账号，授权令牌尚未同步到执行器"
+            } else if !status.valid {
+                "授权令牌已过期，请在桌面端重新登录"
+            } else {
+                "当前套餐不包含该模块"
+            }
+        }
+        Some(claims) => {
+            if state.license.expired(claims) {
+                "授权令牌已过期，请在桌面端重新登录"
+            } else if !matches!(claims.status.as_str(), "active" | "canceling") {
+                "账号订阅未生效，请检查订阅状态"
+            } else {
+                "当前套餐不包含该模块"
+            }
+        }
     };
     Err(ApiError::PaymentRequired(message.to_string()))
 }

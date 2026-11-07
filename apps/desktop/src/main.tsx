@@ -4,6 +4,7 @@ import ReactDOM from "react-dom/client";
 import { HashRouter } from "react-router-dom";
 
 import App from "./App";
+import { bootstrapDesktopExecutor } from "./lib/api";
 import { I18nProvider } from "./lib/i18n";
 import { ThemeProvider } from "./lib/theme";
 import "./index.css";
@@ -18,16 +19,19 @@ const queryClient = new QueryClient({
   },
 });
 
-ReactDOM.createRoot(document.getElementById("root")!).render(
-  <React.StrictMode>
-    <I18nProvider>
-      <ThemeProvider>
-        <QueryClientProvider client={queryClient}>
-          <HashRouter>
-            <App />
-          </HashRouter>
-        </QueryClientProvider>
-      </ThemeProvider>
-    </I18nProvider>
-  </React.StrictMode>,
-);
+// 桌面端先拿到内置执行器的地址与令牌，再渲染界面，保证首屏请求可用。
+void bootstrapDesktopExecutor().finally(() => {
+  ReactDOM.createRoot(document.getElementById("root")!).render(
+    <React.StrictMode>
+      <I18nProvider>
+        <ThemeProvider>
+          <QueryClientProvider client={queryClient}>
+            <HashRouter>
+              <App />
+            </HashRouter>
+          </QueryClientProvider>
+        </ThemeProvider>
+      </I18nProvider>
+    </React.StrictMode>,
+  );
+});

@@ -39,7 +39,9 @@ case "$(uname -s)" in
     ;;
 esac
 
-echo "构建 ArbPilot $VERSION（$PLATFORM）…"
+echo "构建 ArbPilot ${VERSION}（${PLATFORM}）…"
+# 先把执行器编译成 sidecar，安装包内随桌面端一起分发并在启动时拉起。
+bash "$ROOT_DIR/deploy/prepare-sidecar.sh" release
 (
   cd "$DESKTOP_DIR"
   TAURI_SIGNING_PRIVATE_KEY="$KEY" \
@@ -48,6 +50,8 @@ echo "构建 ArbPilot $VERSION（$PLATFORM）…"
 )
 
 BUNDLE_DIR="$DESKTOP_DIR/src-tauri/target/release/bundle"
+# Cargo workspace 统一把产物放在仓库根目录的 target 下。
+[ -d "$BUNDLE_DIR" ] || BUNDLE_DIR="$ROOT_DIR/target/release/bundle"
 SIG="$(find "$BUNDLE_DIR" -name '*.sig' -type f -exec ls -t {} + | head -n 1)"
 [ -n "$SIG" ] || {
   echo "没有找到更新包签名，请确认 tauri.conf.json 的 bundle.createUpdaterArtifacts 为 true" >&2

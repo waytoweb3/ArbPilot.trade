@@ -8,11 +8,15 @@ use serde_json::json;
 #[derive(Debug)]
 pub enum ApiError {
     Unauthorized,
+    /// 身份令牌（账号服务签发的授权令牌）无效或已过期。
+    UnauthorizedWith(String),
     BadRequest(String),
     NotFound(String),
     Conflict(String),
     /// 套餐未授权：需要登录账号或升级订阅。
     PaymentRequired(String),
+    /// 官方托管实例只提供只读公共数据。
+    Forbidden(String),
     Internal(String),
 }
 
@@ -24,6 +28,9 @@ impl ApiError {
                 "unauthorized",
                 "缺少或无效的执行器访问令牌".to_string(),
             ),
+            Self::UnauthorizedWith(message) => {
+                (StatusCode::UNAUTHORIZED, "unauthorized", message.clone())
+            }
             Self::BadRequest(message) => (StatusCode::BAD_REQUEST, "bad_request", message.clone()),
             Self::NotFound(message) => (StatusCode::NOT_FOUND, "not_found", message.clone()),
             Self::Conflict(message) => (StatusCode::CONFLICT, "conflict", message.clone()),
@@ -32,6 +39,7 @@ impl ApiError {
                 "license_required",
                 message.clone(),
             ),
+            Self::Forbidden(message) => (StatusCode::FORBIDDEN, "forbidden", message.clone()),
             Self::Internal(message) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal_error",

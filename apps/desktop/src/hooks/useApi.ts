@@ -170,20 +170,22 @@ export function useFundingSummary(secs: number | null) {
 }
 
 /** 已导入的交易所账户与当前权益，15 秒轮询一次。 */
-export function useAccounts() {
+export function useAccounts(enabled = true) {
   return useQuery({
     queryKey: ["accounts"],
     queryFn: api.accounts,
     refetchInterval: 15_000,
+    enabled,
   });
 }
 
 /** 账户权益历史曲线，按所选时间范围聚合。 */
-export function useAccountHistory(hours: number) {
+export function useAccountHistory(hours: number, enabled = true) {
   return useQuery({
     queryKey: ["account-history", hours],
     queryFn: () => api.accountHistory(hours),
     refetchInterval: 60_000,
+    enabled,
   });
 }
 

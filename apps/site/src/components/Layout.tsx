@@ -1,11 +1,16 @@
 import { useEffect } from "react";
 import { Outlet, useLocation } from "react-router-dom";
 
+import { useI18n } from "../lib/i18n";
+import { metaForPath, usePageMeta } from "../lib/seo";
 import Nav from "./Nav";
 import { Footer } from "./Sections";
 
 export default function Layout() {
   const { pathname, hash } = useLocation();
+  const { locale } = useI18n();
+
+  usePageMeta(metaForPath(pathname, locale));
 
   useEffect(() => {
     if (hash) {

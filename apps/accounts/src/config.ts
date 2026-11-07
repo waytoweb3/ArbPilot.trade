@@ -132,6 +132,8 @@ export const config = {
   origins: csv(process.env.ALLOWED_ORIGINS, defaultOrigins),
   /** 支付服务回写订阅状态时使用的共享密钥，避免内部接口裸露。 */
   internalToken: process.env.INTERNAL_TOKEN ?? "dev-internal-token",
+  /** 运营后台（/admin）的访问令牌；留空则后台接口禁用。 */
+  adminToken: process.env.ADMIN_TOKEN ?? "",
   paymentsUrl: (process.env.PAYMENTS_URL ?? "http://127.0.0.1:8788").replace(/\/$/, ""),
   executorUrl: (process.env.EXECUTOR_URL ?? "http://127.0.0.1:8787").replace(/\/$/, ""),
   executorToken: process.env.EXECUTOR_TOKEN ?? "dev-local-token",
