@@ -22,8 +22,7 @@ export interface LegalDoc {
   footnote: string;
 }
 
-/** 法务页面的方括号占位符需要替换为真实主体信息后再对外发布。 */
-const UPDATED = "2026-11-04";
+const UPDATED = "2026-11-07";
 
 const privacyZh: LegalDoc = {
   slug: "privacy",
@@ -31,7 +30,7 @@ const privacyZh: LegalDoc = {
   updated: UPDATED,
   version: "1.0",
   intro: [
-    "[公司全称]（以下简称“我们”）尊重并保护您的隐私权。本隐私政策（“本政策”）说明我们在您购买订阅、访问介绍站或使用 ArbPilot 桌面端与执行器（合称“本服务”）时，如何收集、使用、存储和共享您的个人信息，以及您依法享有的权利。",
+    "arbpilot.trade（由个人经营者运营，以下简称“我们”）尊重并保护您的隐私权。本隐私政策（“本政策”）说明我们在您购买订阅、访问介绍站或使用 ArbPilot 桌面端与执行器（合称“本服务”）时，如何收集、使用、存储和共享您的个人信息，以及您依法享有的权利。",
     "请在使用本服务前仔细阅读本政策。完成购买或继续使用本服务，即表示您已阅读并同意本政策。我们可能不时更新本政策，如发生重大变更将通过邮件或站内公告提前告知。",
   ],
   sections: [
@@ -39,9 +38,9 @@ const privacyZh: LegalDoc = {
       heading: "1. 数据控制者",
       paragraphs: ["本服务的数据控制者为："],
       bullets: [
-        "公司名称：[公司全称]",
-        "注册地址：[营业执照地址]",
-        "隐私联系邮箱：[privacy@your-domain.com]",
+        "运营主体：arbpilot.trade（个人经营者）",
+        "注册地址：中华人民共和国浙江省杭州市",
+        "隐私联系邮箱：support@arbpilot.trade",
         "数据保护负责人（DPO）：暂未设立",
       ],
     },
@@ -85,7 +84,6 @@ const privacyZh: LegalDoc = {
         rows: [
           ["严格必要型", "维持收银台会话、完成支付与防欺诈", "否"],
           ["功能型", "记住语言与浅色/深色偏好", "是"],
-          ["分析型", "匿名访问统计与产品优化", "是"],
         ],
       },
     },
@@ -129,7 +127,7 @@ const privacyZh: LegalDoc = {
     {
       heading: "8. 您的数据权利",
       paragraphs: [
-        "如需行使以下权利，请发送邮件至 [privacy@your-domain.com]，我们将在 30 个日历日内处理。",
+        "如需行使以下权利，请发送邮件至 support@arbpilot.trade，我们将在 30 个日历日内处理。",
       ],
       table: {
         columns: ["权利", "说明"],
@@ -178,16 +176,14 @@ const privacyZh: LegalDoc = {
     {
       heading: "14. 联系我们",
       bullets: [
-        "隐私与法务：[legal@your-domain.com]",
-        "客户支持：[support@your-domain.com]",
-        "退款申请：[refunds@your-domain.com]",
-        "公司名称：[公司全称]",
-        "通讯地址：[邮寄地址]",
+        "客户支持、隐私与法务、退款申请：support@arbpilot.trade",
+        "运营主体：arbpilot.trade（个人经营者）",
+        "通讯地址：中华人民共和国浙江省杭州市",
       ],
     },
   ],
   footnote:
-    "本政策为基于 Waffo Pancake 隐私政策模板整理的示例文本，不构成法律意见。正式发布前请替换全部方括号占位符，并由目标市场具备资质的法律专业人士审阅。",
+    "本政策最后更新于 2026-11-07。如对本政策有任何疑问，请联系 support@arbpilot.trade。",
 };
 
 const privacyEn: LegalDoc = {
@@ -196,7 +192,7 @@ const privacyEn: LegalDoc = {
   updated: UPDATED,
   version: "1.0",
   intro: [
-    '[Legal company name] ("we", "us", "our") respects your privacy. This Privacy Policy explains how we collect, use, store and share personal information when you purchase a subscription, visit this website, or use the ArbPilot desktop app and executor (together, the "Service"), and the rights you have under applicable law.',
+    'arbpilot.trade, operated by an individual sole proprietor ("we", "us", "our"), respects your privacy. This Privacy Policy explains how we collect, use, store and share personal information when you purchase a subscription, visit this website, or use the ArbPilot desktop app and executor (together, the "Service"), and the rights you have under applicable law.',
     "Please read this Policy before using the Service. Completing a purchase or continuing to use the Service means you have read and agree to this Policy. We may update it from time to time and will notify you in advance of material changes by email or in-product notice.",
   ],
   sections: [
@@ -204,9 +200,9 @@ const privacyEn: LegalDoc = {
       heading: "1. Data controller",
       paragraphs: ["The data controller for the Service is:"],
       bullets: [
-        "Legal name: [Legal company name]",
-        "Registered address: [Registered address]",
-        "Privacy contact: [privacy@your-domain.com]",
+        "Legal name: arbpilot.trade (sole proprietor)",
+        "Registered address: Hangzhou, Zhejiang, People's Republic of China",
+        "Privacy contact: support@arbpilot.trade",
         "Data Protection Officer: not appointed",
       ],
     },
@@ -252,7 +248,6 @@ const privacyEn: LegalDoc = {
         rows: [
           ["Strictly necessary", "Checkout session, payment completion, fraud prevention", "No"],
           ["Functional", "Remember language and light/dark preference", "Yes"],
-          ["Analytics", "Anonymous traffic statistics and product improvement", "Yes"],
         ],
       },
     },
@@ -296,7 +291,7 @@ const privacyEn: LegalDoc = {
     {
       heading: "8. Your rights",
       paragraphs: [
-        "To exercise any of the rights below, email [privacy@your-domain.com]. We respond within 30 calendar days.",
+        "To exercise any of the rights below, email support@arbpilot.trade. We respond within 30 calendar days.",
       ],
       table: {
         columns: ["Right", "What it means"],
@@ -345,16 +340,14 @@ const privacyEn: LegalDoc = {
     {
       heading: "14. Contact us",
       bullets: [
-        "Legal and privacy: [legal@your-domain.com]",
-        "Customer support: [support@your-domain.com]",
-        "Refund requests: [refunds@your-domain.com]",
-        "Legal name: [Legal company name]",
-        "Postal address: [Postal address]",
+        "Customer support, privacy, legal and refunds: support@arbpilot.trade",
+        "Legal name: arbpilot.trade (sole proprietor)",
+        "Postal address: Hangzhou, Zhejiang, People's Republic of China",
       ],
     },
   ],
   footnote:
-    "This Policy is an example adapted from the Waffo Pancake privacy policy template and is not legal advice. Replace every bracketed placeholder and have it reviewed by qualified counsel in your target markets before publishing.",
+    "This Policy was last updated on 2026-11-07. If you have any questions, contact support@arbpilot.trade.",
 };
 
 const termsZh: LegalDoc = {
@@ -363,7 +356,7 @@ const termsZh: LegalDoc = {
   updated: UPDATED,
   version: "1.0",
   intro: [
-    "欢迎使用 ArbPilot（以下简称“我们”或“本公司”）。本服务条款（“条款”）规范您对 ArbPilot 桌面端、执行器、介绍站及相关服务（合称“本服务”）的访问与使用。[如为公司：本公司依据 [国家/地区] 法律注册成立，注册地址为 [公司注册地址]；如为个人/个体经营者：本公司为依据 [国家/地区] 法律经营的个人/个体经营者。]",
+    "欢迎使用 ArbPilot（以下简称“我们”）。本服务由个人经营者以 arbpilot.trade 名义运营，经营地为中华人民共和国浙江省杭州市，依据中华人民共和国法律经营。本服务条款（“条款”）规范您对 ArbPilot 桌面端、执行器、介绍站及相关服务（合称“本服务”）的访问与使用。",
     "订阅方案、建立授权或以其他方式使用本服务，即表示您：（a）已年满 18 周岁；（b）已阅读、理解并同意受本条款约束；（c）同意我们的隐私政策；以及（d）有权代表自身或所属机构签署本协议。如不同意本条款，请停止使用本服务。",
   ],
   sections: [
@@ -378,7 +371,7 @@ const termsZh: LegalDoc = {
       heading: "第 2 条 授权与账号",
       paragraphs: [
         "2.1 授权创建。购买订阅时需提供准确、完整的邮箱地址。授权与订阅绑定至该邮箱，您有责任保证邮箱持续有效。",
-        "2.2 账号安全。请勿与他人共享授权或安装包；如发现未经授权的使用，请立即联系 [security@your-domain.com]。",
+        "2.2 账号安全。请勿与他人共享授权或安装包；如发现未经授权的使用，请立即联系 support@arbpilot.trade。",
         "2.3 授权范围。每份订阅授权供单一自然人或其所属机构在合理数量的自有设备上使用。不得转售、出租或分包本服务。",
       ],
     },
@@ -403,7 +396,7 @@ const termsZh: LegalDoc = {
       ],
       bullets: [
         "在线（推荐）：通过您购买时收到的订阅管理链接或收银台中的订阅入口取消",
-        "邮件：从授权邮箱发送取消申请至 [cancel@your-domain.com]",
+        "邮件：从授权邮箱发送取消申请至 support@arbpilot.trade",
       ],
     },
     {
@@ -431,14 +424,14 @@ const termsZh: LegalDoc = {
     {
       heading: "7.3 如何申请退款与不予退款项",
       paragraphs: [
-        "退款申请请发送至 [refunds@your-domain.com]，并提供授权邮箱、订单号与退款原因。我们将在 2 个工作日内确认，并在 5–10 个工作日内原路退款。",
+        "退款申请请发送至 support@arbpilot.trade，并提供授权邮箱、订单号与退款原因。我们将在 2 个工作日内确认，并在 5–10 个工作日内原路退款。",
         "以下情形不予退款：已使用的订阅周期费用（第 7.2 条除外）；年付订阅首次购买 30 天后的退款申请；因违反本条款或可接受使用政策而被关闭的授权；因交易亏损、行情波动或第三方交易所故障造成的损失。",
       ],
     },
     {
       heading: "第 8 条 账单争议",
       paragraphs: [
-        "如您认为扣款存在错误，请先发送邮件至 [billing@your-domain.com]，在向银行或卡组织提起争议前与我们联系。我们承诺在 2 个工作日内回复，并在 5 个工作日内解决确认的计费错误。",
+        "如您认为扣款存在错误，请先发送邮件至 support@arbpilot.trade，在向银行或卡组织提起争议前与我们联系。我们承诺在 2 个工作日内回复，并在 5 个工作日内解决确认的计费错误。",
       ],
     },
     {
@@ -478,13 +471,13 @@ const termsZh: LegalDoc = {
     {
       heading: "第 13 条 期限与终止",
       paragraphs: [
-        "本条款在您使用本服务期间持续有效。如您严重违反本条款、涉嫌欺诈或法律要求，我们可暂停或终止您的授权。如我方因非您违约的原因终止服务，将按比例退还未使用部分。您可随时通过 [support@your-domain.com] 申请注销授权。",
+        "本条款在您使用本服务期间持续有效。如您严重违反本条款、涉嫌欺诈或法律要求，我们可暂停或终止您的授权。如我方因非您违约的原因终止服务，将按比例退还未使用部分。您可随时通过 support@arbpilot.trade 申请注销授权。",
       ],
     },
     {
       heading: "第 14 条 适用法律与争议解决",
       paragraphs: [
-        "本条款受 [国家/地区] 法律管辖，不适用其冲突法规则。提起正式程序前，请先发送邮件至 [legal@your-domain.com] 尝试友好解决；协商不成的，提交 [仲裁机构/管辖法院] 处理。",
+        "本条款受中华人民共和国法律管辖，不适用其冲突法规则。提起正式程序前，请先发送邮件至 support@arbpilot.trade 尝试友好解决；协商不成的，提交杭州市有管辖权的人民法院处理。",
       ],
     },
     {
@@ -496,17 +489,14 @@ const termsZh: LegalDoc = {
     {
       heading: "第 16 条 联系方式",
       bullets: [
-        "客户支持：[support@your-domain.com]",
-        "账单查询：[billing@your-domain.com]",
-        "退款申请：[refunds@your-domain.com]",
-        "取消订阅：[cancel@your-domain.com]",
-        "法务与隐私：[legal@your-domain.com]",
-        "安全问题：[security@your-domain.com]",
+        "客户支持、账单查询、退款申请、取消订阅、法务与隐私、安全问题：support@arbpilot.trade",
+        "运营主体：arbpilot.trade（个人经营者）",
+        "通讯地址：中华人民共和国浙江省杭州市",
       ],
     },
   ],
   footnote:
-    "本条款为基于 Waffo Pancake 服务条款模板（V1 订阅版）整理的示例文本，不构成法律意见。正式发布前请替换全部方括号占位符，并由目标市场具备资质的法律专业人士审阅。",
+    "本条款最后更新于 2026-11-07。如对本条款有任何疑问，请联系 support@arbpilot.trade。",
 };
 
 const termsEn: LegalDoc = {
@@ -515,7 +505,7 @@ const termsEn: LegalDoc = {
   updated: UPDATED,
   version: "1.0",
   intro: [
-    'Welcome to ArbPilot ("ArbPilot", "we", "us", "our"). These Terms of Service ("Terms") govern your access to and use of the ArbPilot desktop app, executor, website and related services (together, the "Service"). [If a company: we are a company incorporated under the laws of [Country/Region] with our registered address at [Registered Address]. If an individual or sole trader: we are an individual/sole trader operating under the laws of [Country/Region].]',
+    'Welcome to ArbPilot ("ArbPilot", "we", "us", "our"). These Terms of Service ("Terms") govern your access to and use of the ArbPilot desktop app, executor, website and related services (together, the "Service"). The Service is operated by an individual sole proprietor under the name arbpilot.trade, based in Hangzhou, Zhejiang, People\'s Republic of China.',
     "By subscribing to a plan, activating a license or otherwise using the Service, you confirm that you: (a) are at least 18 years of age; (b) have read, understood and agree to be bound by these Terms; (c) agree to our Privacy Policy; and (d) are authorised to enter into this agreement on behalf of yourself or any organisation you represent. If you do not agree, do not use the Service.",
   ],
   sections: [
@@ -530,7 +520,7 @@ const termsEn: LegalDoc = {
       heading: "2. License and account",
       paragraphs: [
         "2.1 Creating a license. A valid and accurate email address is required at purchase. The license is bound to that address and you are responsible for keeping it active.",
-        "2.2 Account security. Do not share your license or installers with third parties. Report unauthorised use immediately to [security@your-domain.com].",
+        "2.2 Account security. Do not share your license or installers with third parties. Report unauthorised use immediately to support@arbpilot.trade.",
         "2.3 Scope. Each subscription licenses a single individual, or the organisation they represent, across a reasonable number of devices they own. Resale, rental or sublicensing is not permitted.",
       ],
     },
@@ -553,7 +543,7 @@ const termsEn: LegalDoc = {
       paragraphs: ["5.1 How to cancel. You may cancel at any time; auto-renewal then stops:"],
       bullets: [
         "Online (recommended): use the subscription management link in your purchase receipt or the subscription entry in the checkout portal",
-        "Email: send a cancellation request from your license email to [cancel@your-domain.com]",
+        "Email: send a cancellation request from your license email to support@arbpilot.trade",
       ],
     },
     {
@@ -581,14 +571,14 @@ const termsEn: LegalDoc = {
     {
       heading: "7.3 How to request a refund, and exclusions",
       paragraphs: [
-        "Email [refunds@your-domain.com] with your license email, order ID and reason. We confirm within 2 business days and refund to the original payment method within 5–10 business days.",
+        "Email support@arbpilot.trade with your license email, order ID and reason. We confirm within 2 business days and refund to the original payment method within 5–10 business days.",
         "We do not refund: fees for subscription periods already used (other than under Section 7.2); yearly plans after 30 days from the initial purchase; licenses terminated for breach of these Terms or the acceptable use policy; losses caused by trading, market movement or third-party exchange failures.",
       ],
     },
     {
       heading: "8. Billing disputes",
       paragraphs: [
-        "If you believe a charge is incorrect, email [billing@your-domain.com] before raising a dispute with your bank or card network. We respond within 2 business days and resolve confirmed billing errors within 5 business days.",
+        "If you believe a charge is incorrect, email support@arbpilot.trade before raising a dispute with your bank or card network. We respond within 2 business days and resolve confirmed billing errors within 5 business days.",
       ],
     },
     {
@@ -628,13 +618,13 @@ const termsEn: LegalDoc = {
     {
       heading: "13. Term and termination",
       paragraphs: [
-        "These Terms remain in effect while you use the Service. We may suspend or terminate your license for material breach, suspected fraud or where required by law. If we terminate for reasons other than your breach, we refund the unused pro-rata portion. You may close your license at any time by contacting [support@your-domain.com].",
+        "These Terms remain in effect while you use the Service. We may suspend or terminate your license for material breach, suspected fraud or where required by law. If we terminate for reasons other than your breach, we refund the unused pro-rata portion. You may close your license at any time by contacting support@arbpilot.trade.",
       ],
     },
     {
       heading: "14. Governing law and disputes",
       paragraphs: [
-        "These Terms are governed by the laws of [Country/Region], excluding conflict-of-law rules. Before starting formal proceedings, email [legal@your-domain.com] to seek an amicable resolution; unresolved disputes are submitted to [arbitration institution / competent courts].",
+        "These Terms are governed by the laws of the People's Republic of China, excluding conflict-of-law rules. Before starting formal proceedings, email support@arbpilot.trade to seek an amicable resolution; unresolved disputes are submitted to the competent People's Court in Hangzhou, Zhejiang.",
       ],
     },
     {
@@ -646,17 +636,14 @@ const termsEn: LegalDoc = {
     {
       heading: "16. Contact",
       bullets: [
-        "Customer support: [support@your-domain.com]",
-        "Billing: [billing@your-domain.com]",
-        "Refunds: [refunds@your-domain.com]",
-        "Cancellations: [cancel@your-domain.com]",
-        "Legal and privacy: [legal@your-domain.com]",
-        "Security: [security@your-domain.com]",
+        "Customer support, billing, refunds, cancellations, legal, privacy and security: support@arbpilot.trade",
+        "Legal name: arbpilot.trade (sole proprietor)",
+        "Postal address: Hangzhou, Zhejiang, People's Republic of China",
       ],
     },
   ],
   footnote:
-    "These Terms are an example adapted from the Waffo Pancake Terms of Service template (V1 subscription) and are not legal advice. Replace every bracketed placeholder and have them reviewed by qualified counsel in your target markets before publishing.",
+    "These Terms were last updated on 2026-11-07. If you have any questions, contact support@arbpilot.trade.",
 };
 
 export const legalDocs: Record<Locale, Record<LegalDoc["slug"], LegalDoc>> = {

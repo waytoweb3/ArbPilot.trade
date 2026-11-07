@@ -192,7 +192,6 @@ const zh = {
     perMonth: "/ 月",
     payment: "支付由 Waffo Pancake 作为记录商户处理，卡数据不经过我们的服务器。",
     policies: "订阅即表示同意服务条款与隐私政策；退款政策见服务条款第 7 条。",
-    loadFailed: "套餐加载失败，显示的是默认价格。",
     note: "价格以美元计价，不含适用税费。订阅需在桌面端登录账号后完成，账号仅用于授权校验与跨设备同步；API Key、订单与交易数据不会上传。",
   },
   checkout: {
@@ -231,7 +230,6 @@ const zh = {
     legal: "法律",
     links: ["首页介绍", "资金费用", "新闻采集", "自定义策略"],
     discord: "Discord 社区",
-    telegram: "Telegram 频道",
     privacy: "隐私政策",
     terms: "服务条款",
     disclaimer:
@@ -420,7 +418,6 @@ const en: typeof zh = {
     perMonth: "/ mo",
     payment: "Payments are processed by Waffo Pancake as Merchant of Record. Card data never touches our servers.",
     policies: "Subscribing means you accept the Terms of Service and Privacy Policy; refunds are covered by Section 7 of the Terms.",
-    loadFailed: "Could not load plans; showing default prices.",
     note: "Prices are in USD and exclude applicable taxes. Subscriptions are completed in the desktop app after signing in; the account is only used for licensing and cross-device sync, and API keys, orders and trading data are never uploaded.",
   },
   checkout: {
@@ -459,7 +456,6 @@ const en: typeof zh = {
     legal: "Legal",
     links: ["Overview", "Funding rates", "News feed", "Strategies"],
     discord: "Discord community",
-    telegram: "Telegram channel",
     privacy: "Privacy Policy",
     terms: "Terms of Service",
     disclaimer:

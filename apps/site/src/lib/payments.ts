@@ -30,14 +30,6 @@ export interface LicenseInfo {
   updatedAt: string;
 }
 
-export async function fetchPlans(): Promise<{ currency: string; plans: PlanInfo[] }> {
-  const response = await fetch(`${PAYMENTS_URL}/api/plans`);
-  if (!response.ok) {
-    throw new Error(`plans: ${response.status}`);
-  }
-  return (await response.json()) as { currency: string; plans: PlanInfo[] };
-}
-
 export async function fetchLicense(ref: string): Promise<LicenseInfo> {
   const response = await fetch(`${PAYMENTS_URL}/api/licenses/${encodeURIComponent(ref)}`);
   if (response.status === 404) {

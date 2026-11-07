@@ -2,7 +2,7 @@ import type { ReactNode } from "react";
 import { Link } from "react-router-dom";
 
 import { useI18n } from "../lib/i18n";
-import { APP_VERSION, DISCORD_URL, DOWNLOAD_BASE, TELEGRAM_URL } from "../lib/links";
+import { APP_VERSION, DISCORD_URL, DOWNLOAD_BASE } from "../lib/links";
 
 function SectionHeading({
   eyebrow,
@@ -453,16 +453,6 @@ export function Footer() {
                   className="transition-colors hover:text-fg"
                 >
                   {t.footer.discord}
-                </a>
-              </li>
-              <li>
-                <a
-                  href={TELEGRAM_URL}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="transition-colors hover:text-fg"
-                >
-                  {t.footer.telegram}
                 </a>
               </li>
             </ul>

@@ -1,7 +1,7 @@
-import { useEffect, useState, type ReactNode } from "react";
+import type { ReactNode } from "react";
 
 import { useI18n } from "../lib/i18n";
-import { fetchPlans, type PlanId, type PlanInfo } from "../lib/payments";
+import type { PlanId, PlanInfo } from "../lib/payments";
 
 const FALLBACK_PLANS: PlanInfo[] = [
   {
@@ -91,31 +91,9 @@ const secondaryCta =
 /** 官网只展示价格，订阅与支付都在桌面端完成。 */
 export default function Pricing() {
   const { t } = useI18n();
-  const [plans, setPlans] = useState<PlanInfo[]>(FALLBACK_PLANS);
-  const [loadFailed, setLoadFailed] = useState(false);
-
-  useEffect(() => {
-    let alive = true;
-    fetchPlans()
-      .then((payload) => {
-        if (alive && payload.plans.length > 0) {
-          setPlans(payload.plans);
-        }
-      })
-      .catch(() => {
-        if (alive) {
-          setLoadFailed(true);
-        }
-      });
-    return () => {
-      alive = false;
-    };
-  }, []);
 
   const amountFor = (id: PlanId) =>
-    plans.find((plan) => plan.id === id)?.amount ??
-    FALLBACK_PLANS.find((plan) => plan.id === id)?.amount ??
-    "0.00";
+    FALLBACK_PLANS.find((plan) => plan.id === id)?.amount ?? "0.00";
 
   const copy: Record<PlanId, { name: string; desc: string; features: string[]; cta: string }> = {
     arbitrage: {
@@ -181,8 +159,6 @@ export default function Pricing() {
           <p>{t.pricing.payment}</p>
           <p>{t.pricing.policies}</p>
         </div>
-
-        {loadFailed && <p className="mt-3 text-[11px] text-warning">{t.pricing.loadFailed}</p>}
       </div>
     </section>
   );

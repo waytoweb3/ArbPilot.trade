@@ -1,0 +1,63 @@
+name: arbpilot-svc
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: arbpilot
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?请先设置 POSTGRES_PASSWORD}
+      POSTGRES_DB: arbpilot
+    volumes:
+      - arbpilot-pgdata:/var/lib/postgresql/data
+    # 数据库只绑定回环地址，不对外暴露。
+    ports:
+      - "127.0.0.1:5432:5432"
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U arbpilot -d arbpilot"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  accounts:
+    build:
+      context: ./accounts
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - ./accounts.env
+    # Ed25519 权益签名密钥只读挂载，重启后已签发的权益令牌仍然有效。
+    volumes:
+      - ./keys:/run/secrets:ro
+    networks:
+      - internal
+      - edge
+
+  payments:
+    build:
+      context: ./payments
+    restart: unless-stopped
+    env_file:
+      - ./payments.env
+    volumes:
+      # 许可证、商品缓存与策略订单都落在这里，必须持久化。
+      - arbpilot-paydata:/app/.data
+      - ./keys:/run/secrets:ro
+    networks:
+      - internal
+      - edge
+
+volumes:
+  arbpilot-pgdata:
+  arbpilot-paydata:
+
+networks:
+  internal:
+  # 与 deploy/site/docker-compose.yml 里的 nginx 共用，便于反代 pay/auth。
+  edge:
+    external: true
+    name: arbpilot-edge

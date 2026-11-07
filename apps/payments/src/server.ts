@@ -153,9 +153,11 @@ async function handleCheckout(req: IncomingMessage, res: ServerResponse): Promis
   const ref = randomUUID();
   const products = await ensureProducts(client);
 
-  const session = await client.checkout.createSession({
+  const session = await client.checkout.authenticated.create({
     productId: products[plan.id],
     currency: config.currency,
+    // 用账号 ID 作为 buyerIdentity，订单始终绑定到同一用户，换邮箱也无法重置试用。
+    buyerIdentity: user.id,
     buyerEmail: email,
     successUrl: `${config.siteUrl}/checkout/success?ref=${ref}`,
     metadata: {
@@ -257,9 +259,10 @@ async function handleStrategyCheckout(
   const email =
     user.email ??
     (typeof body.email === "string" && body.email.includes("@") ? body.email.trim() : undefined);
-  const session = await client.checkout.createSession({
+  const session = await client.checkout.authenticated.create({
     productId,
     currency: config.currency,
+    buyerIdentity: user.id,
     buyerEmail: email,
     successUrl: `${config.siteUrl}/checkout/success?ref=${ref}`,
     metadata: {

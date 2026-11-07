@@ -10,8 +10,8 @@ cp apps/payments/.env.example apps/payments/.env   # 填入真实值
 pnpm --filter @arbpilot/payments dev               # http://127.0.0.1:8788
 ```
 
-当前默认 `WAFFO_ENVIRONMENT=test`：收银台会带 `env=test`，显示「测试模式 - 不会产生真实扣款」，
-用的也是测试环境商品。正式收款前再改成 `prod`，并换成 prod 私钥。
+默认 `WAFFO_ENVIRONMENT=prod`（未显式设为 `test` 时即正式收款）。联调阶段改成 `test`
+即可显示「测试模式 - 不会产生真实扣款」，用的也是测试环境商品。
 
 若本机走企业代理或自签根证书，Node 的 `fetch` 可能报 `fetch failed`（`UNABLE_TO_GET_ISSUER_CERT_LOCALLY`），
 启动时补一份根证书即可：`NODE_EXTRA_CA_CERTS=/etc/ssl/cert.pem pnpm --filter @arbpilot/payments dev`。
