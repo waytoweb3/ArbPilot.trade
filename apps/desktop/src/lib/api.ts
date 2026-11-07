@@ -50,22 +50,20 @@ import type {
 } from "./types";
 import { fmt, getCopy } from "./i18n";
 
-const HOSTED_URL = (
-  (import.meta.env.VITE_EXECUTOR_URL as string | undefined) ?? "http://127.0.0.1:8787"
-).replace(/\/$/, "");
-
+const OFFICIAL_DATA_URL = "https://exec.arbpilot.trade";
 const SELF_URL_DEFAULT = "http://127.0.0.1:8787";
 
 /**
  * 官方只读数据接口：资金费率、新闻与行情。
- * 本地模式下读取类请求优先走这里，账户密钥与订单始终留在本机执行器。
+ * 非托管模式（内置执行器）默认使用官方地址，可用 VITE_ARBPILOT_DATA_URL 覆盖；
+ * 托管模式（自建执行器）的请求全部走用户自己的服务器。
  */
 const DATA_URL = (
-  (import.meta.env.VITE_ARBPILOT_DATA_URL as string | undefined) ?? HOSTED_URL
+  (import.meta.env.VITE_ARBPILOT_DATA_URL as string | undefined) ?? OFFICIAL_DATA_URL
 ).replace(/\/$/, "");
 
-/** 官方托管、用户远程实例与桌面内置执行器是三套独立配置。 */
-export type ExecutorMode = "hosted" | "self" | "local";
+/** 桌面内置执行器与用户自己服务器上的远程执行器是两套独立配置。 */
+export type ExecutorMode = "local" | "self";
 
 const MODE_KEY = "arbpilot.executor.mode";
 const URL_STORAGE_KEY = "arbpilot.executor.url";
@@ -122,34 +120,40 @@ export function localExecutorDatabase(): string {
 
 export function getExecutorMode(): ExecutorMode {
   const stored = localStorage.getItem(MODE_KEY);
-  if (stored === "local" || stored === "self" || stored === "hosted") {
-    // 内置执行器不可用时不要停留在本地模式，回退到远程 / 托管。
-    if (stored === "local" && !localRuntime) {
-      return hasTauriRuntime() ? "self" : "hosted";
-    }
-    return stored;
+  if (stored === "self") {
+    return "self";
   }
-  if (localRuntime) {
-    return "local";
+  // 内置执行器不可用时不要停留在本地模式，回退到远程执行器。
+  if (stored === "local") {
+    return localRuntime ? "local" : "self";
   }
-  // 旧版本只保存过一个地址：与托管地址不同就视为用户自己填写的自托管配置。
-  const legacy = localStorage.getItem(URL_STORAGE_KEY)?.replace(/\/$/, "");
-  return legacy && legacy !== HOSTED_URL ? "self" : "hosted";
+  // 旧版本可能存过 "hosted"（官方只读实例）：官方地址不再作为连接目标，
+  // 统一按自托管处理，地址取用户自己配置的服务器。
+  return localRuntime ? "local" : "self";
 }
 
 export function setExecutorMode(mode: ExecutorMode): void {
   localStorage.setItem(MODE_KEY, mode);
 }
 
-/** 当前模式的执行器地址；托管模式固定使用构建时注入的地址，本地模式由 Tauri 注入。 */
-export function getExecutorUrl(mode: ExecutorMode = getExecutorMode()): string {
-  if (mode === "hosted") {
-    return HOSTED_URL;
+/**
+ * 规范化执行器地址：允许只填 IP 或域名（可带端口），缺省协议补 http://，去掉末尾斜杠。
+ * 例：`45.76.177.242:8787` → `http://45.76.177.242:8787`
+ */
+export function normalizeExecutorUrl(input: string): string {
+  const value = input.trim().replace(/\/+$/, "");
+  if (!value) {
+    return "";
   }
+  return /^https?:\/\//i.test(value) ? value : `http://${value}`;
+}
+
+/** 当前模式的执行器地址；托管模式使用用户填写的服务器地址（域名或 IP）。 */
+export function getExecutorUrl(mode: ExecutorMode = getExecutorMode()): string {
   if (mode === "local" && localRuntime) {
     return localRuntime.baseUrl;
   }
-  return (localStorage.getItem(URL_STORAGE_KEY) || SELF_URL_DEFAULT).replace(/\/$/, "");
+  return normalizeExecutorUrl(localStorage.getItem(URL_STORAGE_KEY) || SELF_URL_DEFAULT);
 }
 
 export function setExecutorUrl(url: string): void {
@@ -161,28 +165,25 @@ export function setExecutorUrl(url: string): void {
   }
 }
 
-/** 官方托管实例在构建时注入的令牌；源码本地运行回退到开发令牌。 */
-export const DEFAULT_TOKEN =
+/** 官方只读数据接口在构建时注入的令牌；源码本地运行回退到开发令牌。 */
+const DEFAULT_TOKEN =
   (import.meta.env.VITE_EXECUTOR_TOKEN as string | undefined) ?? "dev-local-token";
 
 export function getApiToken(mode: ExecutorMode = getExecutorMode()): string {
-  if (mode === "hosted") {
-    return DEFAULT_TOKEN;
-  }
   if (mode === "local" && localRuntime) {
     return localRuntime.token;
   }
   return localStorage.getItem(TOKEN_STORAGE_KEY) ?? "";
 }
 
-/** 只保存自托管实例的令牌，避免与托管实例的令牌互相覆盖。 */
+/** 只保存自托管实例的令牌。 */
 export function setApiToken(token: string): void {
   localStorage.setItem(TOKEN_STORAGE_KEY, token);
 }
 
 const LICENSE_TOKEN_KEY = "arbpilot.license.token";
 
-/** 账号服务签发的用户令牌；托管实例据此按用户校验套餐。 */
+/** 账号服务签发的用户令牌；访问官方只读数据接口时按用户校验套餐。 */
 export function getLicenseToken(): string {
   return localStorage.getItem(LICENSE_TOKEN_KEY) ?? "";
 }
@@ -193,15 +194,6 @@ export function setLicenseToken(token: string | null): void {
   } else {
     localStorage.removeItem(LICENSE_TOKEN_KEY);
   }
-}
-
-/** 托管实例的身份头：每个请求带上当前用户的授权令牌。 */
-function identityHeaders(): Record<string, string> {
-  if (getExecutorMode() !== "hosted") {
-    return {};
-  }
-  const license = getLicenseToken();
-  return license ? { "X-ArbPilot-License": license } : {};
 }
 
 export class ApiError extends Error {
@@ -252,17 +244,14 @@ async function request<T>(
 ): Promise<T> {
   return send<T>(
     `${getExecutorUrl()}${path}`,
-    {
-      Authorization: `Bearer ${getApiToken()}`,
-      ...identityHeaders(),
-    },
+    { Authorization: `Bearer ${getApiToken()}` },
     init,
     acceptedStatuses,
   );
 }
 
 /**
- * 只读数据请求：本地模式下走官方数据接口，官方不可达时回退到本机采集结果。
+ * 只读数据请求：内置执行器模式下优先走官方数据接口，不可用时回退到本机采集结果。
  * 交易类请求（下单、账户、策略、风控）始终使用 `request`。
  */
 async function dataRequest<T>(
@@ -270,7 +259,7 @@ async function dataRequest<T>(
   init: RequestInit = {},
   acceptedStatuses: number[] = [],
 ): Promise<T> {
-  if (getExecutorMode() !== "local" || DATA_URL === getExecutorUrl("local")) {
+  if (getExecutorMode() !== "local" || !DATA_URL || DATA_URL === getExecutorUrl("local")) {
     return request<T>(path, init, acceptedStatuses);
   }
   const license = getLicenseToken();
@@ -630,10 +619,6 @@ export const api = {
 
   eventsUrl: () => {
     const params = new URLSearchParams({ token: getApiToken() });
-    const license = getExecutorMode() === "hosted" ? getLicenseToken() : "";
-    if (license) {
-      params.set("license", license);
-    }
     return `${getExecutorUrl().replace(/^http/, "ws")}/api/v1/events?${params.toString()}`;
   },
 };

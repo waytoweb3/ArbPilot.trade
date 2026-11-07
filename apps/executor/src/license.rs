@@ -199,7 +199,7 @@ impl LicenseManager {
         claims.exp + self.grace_secs <= Utc::now().timestamp()
     }
 
-    /// 判断某个套餐是否被授权；`strategy` 包含 `arbitrage` 的权益。
+    /// 判断某个套餐是否被授权；`strategy` 是附加包，必须同时拥有 `arbitrage` 基础版。
     pub fn allows(&self, plan: &str) -> bool {
         match self.claims() {
             Some(claims) => self.allows_claims(&claims, plan),
@@ -215,8 +215,13 @@ impl LicenseManager {
         if !self.claims_valid(claims) {
             return false;
         }
-        claims.plans.iter().any(|item| item == plan)
-            || (plan == "arbitrage" && claims.plans.iter().any(|item| item == "strategy"))
+        let has_base = claims.plans.iter().any(|item| item == "arbitrage");
+        let has_creator = claims.plans.iter().any(|item| item == "strategy");
+        match plan {
+            "arbitrage" => has_base,
+            "strategy" => has_base && has_creator,
+            other => claims.plans.iter().any(|item| item == other),
+        }
     }
 
     pub fn status(&self) -> LicenseStatus {
@@ -336,7 +341,10 @@ fn persist_token(path: &Path, token: &str) -> anyhow::Result<()> {
 }
 
 /// 各路由所属套餐；返回 None 表示免费模块，不校验授权。
-pub fn required_plan(path: &str) -> Option<&'static str> {
+///
+/// `arbitrage`（$49 自托管部署）覆盖套利/新闻、浏览与使用市场策略、运行已导入策略；
+/// `strategy`（+$50 策略创建附加包）覆盖创建/编辑/回测/发布策略与沙盒。
+pub fn required_plan(method: &str, path: &str) -> Option<&'static str> {
     let path = path.strip_prefix("/api/v1").unwrap_or(path);
     if path.starts_with("/opportunities")
         || path.starts_with("/funding")
@@ -344,12 +352,43 @@ pub fn required_plan(path: &str) -> Option<&'static str> {
     {
         return Some("arbitrage");
     }
-    if path.starts_with("/strategies")
-        || path.starts_with("/sandbox")
-        || path.starts_with("/market")
-    {
+
+    let write = !matches!(method, "GET" | "HEAD" | "OPTIONS");
+
+    if path.starts_with("/templates") {
+        return if write && path.ends_with("/instantiate") {
+            Some("strategy")
+        } else {
+            Some("arbitrage")
+        };
+    }
+
+    if path.starts_with("/sandbox") {
         return Some("strategy");
     }
+
+    if path.starts_with("/market") {
+        if !write {
+            return Some("arbitrage");
+        }
+        // 订阅/导入他人的策略属于“使用策略”，只需基础版；其余写入是作者行为。
+        if path.ends_with("/subscribe") || path.ends_with("/import") {
+            return Some("arbitrage");
+        }
+        return Some("strategy");
+    }
+
+    if path.starts_with("/strategies") {
+        if !write {
+            return Some("arbitrage");
+        }
+        // 启停/删除已导入的策略不需要创建权限。
+        if path.ends_with("/scope") || method == "DELETE" {
+            return Some("arbitrage");
+        }
+        return Some("strategy");
+    }
+
     None
 }
 
@@ -398,7 +437,7 @@ pub async fn require_plan(
     if !state.license.required() {
         return Ok(next.run(request).await);
     }
-    let Some(plan) = required_plan(request.uri().path()) else {
+    let Some(plan) = required_plan(request.method().as_str(), request.uri().path()) else {
         return Ok(next.run(request).await);
     };
     let identity = request.extensions().get::<LicenseClaims>().cloned();
@@ -447,11 +486,64 @@ mod tests {
 
     #[test]
     fn plan_mapping_covers_paid_modules() {
-        assert_eq!(required_plan("/api/v1/funding/status"), Some("arbitrage"));
-        assert_eq!(required_plan("/api/v1/news"), Some("arbitrage"));
-        assert_eq!(required_plan("/api/v1/strategies/abc"), Some("strategy"));
-        assert_eq!(required_plan("/api/v1/market/leaderboard"), Some("strategy"));
-        assert_eq!(required_plan("/api/v1/orders"), None);
-        assert_eq!(required_plan("/api/v1/license"), None);
+        assert_eq!(required_plan("GET", "/api/v1/funding/status"), Some("arbitrage"));
+        assert_eq!(required_plan("GET", "/api/v1/news"), Some("arbitrage"));
+        assert_eq!(required_plan("POST", "/api/v1/strategies"), Some("strategy"));
+        assert_eq!(required_plan("GET", "/api/v1/strategies/abc"), Some("arbitrage"));
+        assert_eq!(
+            required_plan("PATCH", "/api/v1/strategies/abc/scope"),
+            Some("arbitrage")
+        );
+        assert_eq!(
+            required_plan("POST", "/api/v1/strategies/abc/backtest"),
+            Some("strategy")
+        );
+        assert_eq!(
+            required_plan("GET", "/api/v1/market/leaderboard"),
+            Some("arbitrage")
+        );
+        assert_eq!(
+            required_plan("POST", "/api/v1/market/publications/abc/subscribe"),
+            Some("arbitrage")
+        );
+        assert_eq!(
+            required_plan("POST", "/api/v1/market/publications/abc/import"),
+            Some("arbitrage")
+        );
+        assert_eq!(
+            required_plan("POST", "/api/v1/market/publications"),
+            Some("strategy")
+        );
+        assert_eq!(required_plan("GET", "/api/v1/orders"), None);
+        assert_eq!(required_plan("GET", "/api/v1/license"), None);
+    }
+
+    #[test]
+    fn creator_addon_requires_base_plan() {
+        let manager = LicenseManager {
+            required: true,
+            public_key: None,
+            grace_secs: 0,
+            file: PathBuf::new(),
+            claims: RwLock::new(None),
+            error: RwLock::new(None),
+        };
+        let claims = |plans: &[&str]| LicenseClaims {
+            sub: "u1".to_string(),
+            email: None,
+            plans: plans.iter().map(|plan| (*plan).to_string()).collect(),
+            status: "active".to_string(),
+            devices: Vec::new(),
+            device: None,
+            iat: 0,
+            exp: Utc::now().timestamp() + 3_600,
+            v: 1,
+        };
+
+        assert!(manager.allows_claims(&claims(&["arbitrage"]), "arbitrage"));
+        assert!(!manager.allows_claims(&claims(&["arbitrage"]), "strategy"));
+        assert!(!manager.allows_claims(&claims(&["strategy"]), "arbitrage"));
+        assert!(!manager.allows_claims(&claims(&["strategy"]), "strategy"));
+        assert!(manager.allows_claims(&claims(&["arbitrage", "strategy"]), "strategy"));
     }
 }

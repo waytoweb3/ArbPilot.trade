@@ -16,7 +16,6 @@ const copy = {
     desc: "账号只用于订阅授权、设备数量与策略购买同步。API Key、签名私钥、订单与数据库始终留在你的机器上。",
     code: "配对码",
     google: "使用 Google 登录",
-    github: "使用 GitHub 登录",
     redirecting: "正在跳转到授权页面…",
     approve: "允许这台设备登录",
     deny: "拒绝",
@@ -33,7 +32,6 @@ const copy = {
     desc: "The account is only used for licensing, device limits and purchased strategies. API keys, signing keys, orders and your database stay on your machine.",
     code: "Pairing code",
     google: "Continue with Google",
-    github: "Continue with GitHub",
     redirecting: "Redirecting to the provider…",
     approve: "Allow this device",
     deny: "Deny",
@@ -236,8 +234,8 @@ export default function DevicePage() {
                     onClick={() => void startProvider(provider.id)}
                     className="inline-flex items-center gap-2 rounded-full border border-line-strong px-5 py-2.5 text-[13px] text-body transition-colors hover:border-accent/50 hover:text-fg disabled:opacity-60"
                   >
-                    {provider.id === "google" ? <GoogleMark /> : null}
-                    {provider.id === "google" ? text.google : text.github}
+                    <GoogleMark />
+                    {text.google}
                   </button>
                 ))}
               </div>

@@ -136,6 +136,18 @@ async function handleCheckout(req: IncomingMessage, res: ServerResponse): Promis
     sendJson(res, 400, { error: "unknown_plan", message: "plan 必须是 arbitrage 或 strategy" });
     return;
   }
+  // 策略创建是附加包，必须先有 $49/月 的自托管部署基础订阅。
+  if (
+    plan.addon &&
+    plan.requires &&
+    !(user.entitlement?.plans ?? []).includes(plan.requires)
+  ) {
+    sendJson(res, 409, {
+      error: "base_plan_required",
+      message: "请先订阅自托管部署，再购买策略创建附加包",
+    });
+    return;
+  }
   if (!client) {
     sendJson(res, 503, {
       error: "payments_not_configured",
@@ -584,6 +596,8 @@ const server = createServer((req, res) => {
             amount: plan.amount,
             billingPeriod: plan.billingPeriod,
             name: plan.name,
+            requires: plan.requires,
+            addon: plan.addon,
           })),
         });
         return;

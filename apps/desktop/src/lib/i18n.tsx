@@ -69,6 +69,7 @@ const zh = {
     check: "检查更新",
     checking: "检查中…",
     deploy: "一键部署",
+    deployRequiresPlan: "自托管部署需要 $49/月的订阅，请先在设置中完成订阅。",
     update: "更新到 {version}",
     redeploy: "重新部署",
     upToDate: "已是最新",
@@ -124,13 +125,6 @@ const zh = {
   overview: {
     title: "总览",
     subtitle: "已导入交易账户的总权益、权益走势与资产明细。",
-  },
-  hosted: {
-    lockedTitle: "需要自托管实例",
-    lockedBody:
-      "官方托管实例只提供行情、资金费率与资讯等公共数据，不保存交易所 API Key，也不代你下单。账户、下单、策略与风控请部署到自己的服务器后连接。",
-    goSettings: "切换连接设置",
-    accountsBody: "交易所账户与 API Key 只能保存在你自己的执行器上。切换到自托管实例后即可导入。",
   },
   accounts: {
     title: "交易账户",
@@ -306,6 +300,10 @@ const zh = {
     start: "启动策略",
     stop: "停止策略",
     create: "新建策略",
+    createRequiresPlan:
+      "创建策略需要先订阅「自托管部署」基础版（$49/月），再叠加「策略创建」附加包（+$50/月）。",
+    createTrialEnded:
+      "本期 7 天策略创建试用已结束，订阅「策略创建」附加包（+$50/月）后可继续创建。",
     createTitle: "新建资金费率策略",
     templatesTitle: "内置模板",
     templatesDesc: "模板存在数据库里，启动时编译成沙箱模块；实例化后仍走统一风控。",
@@ -740,21 +738,20 @@ const zh = {
     tabClient: "客户端",
     tabDeploy: "自托管部署文档",
     connection: "执行器连接",
-    connectionDesc: "内置执行器、官方托管与远程实例是三类独立配置",
+    connectionDesc: "内置执行器与自托管实例是两类独立配置",
     mode: "实例类型",
     modeHint:
-      "内置执行器随桌面端启动，零配置即可交易，密钥不出本机；官方托管只提供行情与资讯；自托管连接你自己服务器上的执行器。",
-    hosted: "官方托管",
+      "内置执行器随桌面端启动，零配置即可交易，密钥不出本机；自托管连接你自己服务器上的执行器，地址与令牌由你填写。",
     self: "自托管",
-    hostedNote: "官方实例只提供行情与资讯等公共数据，不会保存你的交易所 API Key。",
     localExecutor: "内置执行器",
     localExecutorNote:
-      "随桌面端启动，数据保存在本机 SQLite 文件，交易所 API Key 与订单都不会离开本机。",
+      "非托管模式：随桌面端启动，数据保存在本机 SQLite 文件，交易所 API Key 与订单都不会离开本机；行情、资金费率与资讯等只读数据默认使用官方接口 exec.arbpilot.trade。",
     database: "本地数据库",
     local: "本地",
     remote: "服务器",
     address: "执行器地址",
-    addressHint: "可填写用户自有服务器上的执行器地址，交易所 API Key 保存在该服务器。",
+    addressHint:
+      "托管模式：填写你自己服务器上的执行器地址，支持域名或 IP（如 http://45.76.177.242:8787）；交易所 API Key 保存在该服务器。",
     token: "访问令牌",
     save: "保存并连接",
     saved: "已保存并重新连接",
@@ -844,8 +841,14 @@ const zh = {
     ],
     billingStatus: "当前授权",
     billingNone: "尚未绑定授权。选择方案后会打开支付页面完成订阅。",
-    billingArbitrage: "Arbitrage & News",
-    billingStrategy: "Strategy",
+    billingArbitrage: "自托管部署",
+    billingStrategy: "策略创建",
+    billingStrategyTrial: "策略创建试用（至 {value}）",
+    billingAddonMissingBase: "需先订阅自托管部署",
+    billingAddonHint: "在自托管部署基础上升级",
+    billingAddonTrialHint: "本期试用至 {value}，之后需订阅附加包",
+    billingMarketNote:
+      "策略市场中的策略由作者定价，可免费或按月收费；购买和使用已订阅策略不需要再额外付费。",
     billingSubscribe: "订阅{plan}",
     billingOpening: "正在创建收银台…",
     billingRefresh: "刷新状态",
@@ -1025,6 +1028,8 @@ const en: typeof zh = {
     check: "Check for updates",
     checking: "Checking…",
     deploy: "One-click deploy",
+    deployRequiresPlan:
+      "Self-hosted deployment requires the $49/month subscription. Subscribe in Settings first.",
     update: "Update to {version}",
     redeploy: "Redeploy",
     upToDate: "Up to date",
@@ -1081,14 +1086,6 @@ const en: typeof zh = {
   overview: {
     title: "Overview",
     subtitle: "Total equity, equity curve and balances across your imported trading accounts.",
-  },
-  hosted: {
-    lockedTitle: "Self-hosted instance required",
-    lockedBody:
-      "The hosted instance only serves public market, funding and news data. It never stores exchange API keys or places orders for you. Deploy the executor on your own server to manage accounts, orders, strategies and risk.",
-    goSettings: "Change connection",
-    accountsBody:
-      "Exchange accounts and API keys can only live on your own executor. Switch to a self-hosted instance to import them.",
   },
   accounts: {
     title: "Trading accounts",
@@ -1272,6 +1269,10 @@ const en: typeof zh = {
     start: "Start strategy",
     stop: "Stop strategy",
     create: "New strategy",
+    createRequiresPlan:
+      "Creating strategies requires the self-hosted deployment base plan ($49/mo) plus the Strategy Creation add-on (+$50/mo).",
+    createTrialEnded:
+      "The 7-day strategy creation trial for this billing period has ended. Subscribe to the Strategy Creation add-on (+$50/mo) to keep creating.",
     createTitle: "New funding-rate strategy",
     templatesTitle: "Built-in templates",
     templatesDesc:
@@ -1721,22 +1722,20 @@ const en: typeof zh = {
     tabClient: "Client",
     tabDeploy: "Self-hosted deployment",
     connection: "Executor connection",
-    connectionDesc: "Built-in, hosted and remote instances keep separate settings",
+    connectionDesc: "Built-in and self-hosted instances keep separate settings",
     mode: "Instance type",
     modeHint:
-      "The built-in executor starts with the desktop app and needs no configuration; the hosted instance only serves market and news data; self-hosted connects to an executor on your own server.",
-    hosted: "Hosted",
+      "The built-in executor starts with the desktop app and needs no configuration; self-hosted connects to an executor on your own server with the address and token you provide.",
     self: "Self-hosted",
-    hostedNote:
-      "The hosted instance only serves public market and news data; it never stores your exchange API keys.",
     localExecutor: "Built-in executor",
     localExecutorNote:
-      "Starts with the desktop app, keeps data in a local SQLite file, and never sends exchange API keys or orders off this machine.",
+      "Unmanaged mode: starts with the desktop app, keeps data in a local SQLite file, and never sends exchange API keys or orders off this machine; market, funding and news data come from the official exec.arbpilot.trade endpoint.",
     database: "Local database",
     local: "Local",
     remote: "Server",
     address: "Executor URL",
-    addressHint: "Point this at an executor on your own server; exchange API keys stay on that server.",
+    addressHint:
+      "Managed mode: point this at the executor on your own server. Domains and IP addresses are both accepted (e.g. http://45.76.177.242:8787); exchange API keys stay on that server.",
     token: "Access token",
     save: "Save & connect",
     saved: "Saved and reconnecting",
@@ -1832,8 +1831,14 @@ const en: typeof zh = {
     ],
     billingStatus: "Current license",
     billingNone: "No license linked yet. Choosing a plan opens a payment page to complete the subscription.",
-    billingArbitrage: "Arbitrage & News",
-    billingStrategy: "Strategy",
+    billingArbitrage: "Self-hosted Deployment",
+    billingStrategy: "Strategy Creation",
+    billingStrategyTrial: "Strategy Creation trial (until {value})",
+    billingAddonMissingBase: "Subscribe to self-hosted deployment first",
+    billingAddonHint: "Add-on on top of self-hosted deployment",
+    billingAddonTrialHint: "Trial until {value}; subscribe to the add-on afterwards",
+    billingMarketNote:
+      "Strategies in the market are priced by their authors, free or monthly; using a subscribed strategy needs no extra add-on.",
     billingSubscribe: "Subscribe · {plan}",
     billingOpening: "Opening checkout…",
     billingRefresh: "Refresh",

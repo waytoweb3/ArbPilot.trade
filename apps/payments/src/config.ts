@@ -67,6 +67,9 @@ export interface PlanDefinition {
   amount: string;
   name: { zh: string; en: string };
   productId: string;
+  /** 附加包必须先拥有该基础套餐；基础版为 null。 */
+  requires: PlanId | null;
+  addon: boolean;
 }
 
 export const config = {
@@ -95,20 +98,29 @@ export const config = {
   accountsInternalToken: process.env.ACCOUNTS_INTERNAL_TOKEN ?? "dev-internal-token",
 } as const;
 
+/**
+ * `arbitrage` 是 $49/月的基础版「自托管部署」，包含套利/新闻与策略市场使用；
+ * `strategy` 是 +$50/月的「策略创建」附加包，必须先有基础版才能生效。
+ * 策略市场里的单个策略由作者自行定价，可免费或按月收费。
+ */
 export const plans: PlanDefinition[] = [
   {
     id: "arbitrage",
     billingPeriod: "monthly",
     amount: process.env.WAFFO_PRICE_ARBITRAGE ?? "49.00",
-    name: { zh: "ArbPilot · Arbitrage & News", en: "ArbPilot · Arbitrage & News" },
+    name: { zh: "ArbPilot · 自托管部署", en: "ArbPilot · Self-hosted Deployment" },
     productId: process.env.WAFFO_PRODUCT_ARBITRAGE ?? "",
+    requires: null,
+    addon: false,
   },
   {
     id: "strategy",
     billingPeriod: "monthly",
-    amount: process.env.WAFFO_PRICE_STRATEGY ?? "99.00",
-    name: { zh: "ArbPilot · Strategy", en: "ArbPilot · Strategy" },
+    amount: process.env.WAFFO_PRICE_STRATEGY ?? "50.00",
+    name: { zh: "ArbPilot · 策略创建", en: "ArbPilot · Strategy Creation" },
     productId: process.env.WAFFO_PRODUCT_STRATEGY ?? "",
+    requires: "arbitrage",
+    addon: true,
   },
 ];
 

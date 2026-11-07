@@ -9,6 +9,9 @@ export interface PlanInfo {
   amount: string;
   billingPeriod: "monthly";
   name: { zh: string; en: string };
+  /** 附加包必须先拥有该基础套餐；基础版为 null。 */
+  requires?: PlanId | null;
+  addon?: boolean;
 }
 
 export type LicenseStatus =

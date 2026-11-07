@@ -7,8 +7,10 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_FILE="$ROOT_DIR/deploy/.env"
 COMPOSE_FILE="$ROOT_DIR/deploy/docker-compose.yml"
 EXECUTOR_PORT="${ARBPILOT_EXECUTOR_PORT:-8787}"
-# compose 的端口映射也读这个变量，需导出到子进程。
+# compose 的端口映射也读这些变量，需导出到子进程。
 export ARBPILOT_EXECUTOR_PORT="$EXECUTOR_PORT"
+# 默认只绑定回环地址；设为 0.0.0.0 时桌面端可直接用服务器 IP 连接（需自行放行防火墙）。
+export ARBPILOT_EXECUTOR_HOST="${ARBPILOT_EXECUTOR_HOST:-127.0.0.1}"
 
 log() { printf '\033[1;36m[arbpilot]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[arbpilot]\033[0m %s\n' "$*"; }

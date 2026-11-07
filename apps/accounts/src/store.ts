@@ -21,6 +21,7 @@ export interface SubscriptionView {
   providerOrderId: string | null;
   currentPeriodEnd: string | null;
   cancelAtPeriodEnd: boolean;
+  createdAt: string;
 }
 
 export interface DeviceView {
@@ -38,6 +39,8 @@ export interface Entitlement {
   expiresAt: string | null;
   deviceLimit: number;
   subscriptions: SubscriptionView[];
+  /** 基础版当前计费周期内赠送的策略创建试用截止时间；不在试用期为 null。 */
+  trialEndsAt: string | null;
 }
 
 export interface AuthorProfileView {
@@ -213,9 +216,10 @@ export async function listSubscriptions(userId: string): Promise<SubscriptionVie
     provider_order_id: string | null;
     current_period_end: Date | null;
     cancel_at_period_end: boolean;
+    created_at: Date;
   }>(
     `SELECT id, plan, status, provider, payment_ref, provider_order_id,
-            current_period_end, cancel_at_period_end
+            current_period_end, cancel_at_period_end, created_at
        FROM subscriptions
       WHERE user_id = $1
       ORDER BY updated_at DESC`,
@@ -233,6 +237,7 @@ export async function listSubscriptions(userId: string): Promise<SubscriptionVie
       providerOrderId: row.provider_order_id,
       currentPeriodEnd,
       cancelAtPeriodEnd: row.cancel_at_period_end,
+      createdAt: iso(row.created_at) ?? "",
     };
   });
 }
@@ -246,6 +251,27 @@ export function deviceLimitFor(plans: string[]): number {
   );
 }
 
+/** 基础版每个计费周期附带的策略创建试用天数。 */
+const STRATEGY_TRIAL_DAYS = 7;
+
+/** 当前周期起点：按月计费，用周期末往前推一个自然月；缺周期末时退回订阅创建时间。 */
+function periodStart(subscription: SubscriptionView): number | null {
+  if (subscription.currentPeriodEnd) {
+    const date = new Date(subscription.currentPeriodEnd);
+    date.setMonth(date.getMonth() - 1);
+    return date.getTime();
+  }
+  return subscription.createdAt ? Date.parse(subscription.createdAt) : null;
+}
+
+function trialEndsAtFor(subscription: SubscriptionView): string | null {
+  const start = periodStart(subscription);
+  if (start === null) {
+    return null;
+  }
+  return new Date(start + STRATEGY_TRIAL_DAYS * 86_400_000).toISOString();
+}
+
 export async function entitlements(userId: string): Promise<Entitlement> {
   const subscriptions = await listSubscriptions(userId);
   const plans = [
@@ -255,6 +281,21 @@ export async function entitlements(userId: string): Promise<Entitlement> {
         .map((item) => item.plan),
     ),
   ];
+
+  // 基础版每个周期前 7 天免费开放策略创建；购买附加包后不再标记试用。
+  let trialEndsAt: string | null = null;
+  if (!plans.includes("strategy")) {
+    const base = subscriptions.find(
+      (item) =>
+        item.plan === "arbitrage" &&
+        (item.status === "active" || item.status === "canceling"),
+    );
+    const endsAt = base ? trialEndsAtFor(base) : null;
+    if (endsAt && Date.parse(endsAt) > Date.now()) {
+      plans.push("strategy");
+      trialEndsAt = endsAt;
+    }
+  }
 
   let status: Entitlement["status"] = "none";
   if (subscriptions.some((item) => item.status === "active")) {
@@ -278,6 +319,7 @@ export async function entitlements(userId: string): Promise<Entitlement> {
     expiresAt,
     deviceLimit: deviceLimitFor(plans),
     subscriptions,
+    trialEndsAt,
   };
 }
 

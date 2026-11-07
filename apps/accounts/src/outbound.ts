@@ -14,7 +14,7 @@ export interface OutboundResponse {
 
 const TIMEOUT_MS = 15_000;
 
-/** 代理只用于 OAuth 服务（Google/GitHub），本机服务仍走直连。 */
+/** 代理只用于 OAuth 服务（Google），本机服务仍走直连。 */
 const proxyUrl = [
   process.env.ARBPILOT_OAUTH_PROXY,
   process.env.HTTPS_PROXY,
@@ -99,7 +99,7 @@ const agent = proxyUrl ? new ProxyAgent(new URL(proxyUrl.trim())) : undefined;
  * 访问第三方 OAuth 接口的统一出口。
  *
  * 直连时沿用全局 fetch；配置了 http 代理时改走 CONNECT 隧道，
- * 保证 Google/GitHub 在需要代理的网络下也能完成登录。
+ * 保证 Google 在需要代理的网络下也能完成登录。
  */
 export function outboundFetch(
   url: string,

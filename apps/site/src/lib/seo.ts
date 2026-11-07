@@ -19,7 +19,7 @@ export type PageMeta = {
 const DESCRIPTIONS: Record<Locale, Record<"pricing" | "privacy" | "terms", string>> = {
   zh: {
     pricing:
-      "ArbPilot 价格：自托管永久免费，Arbitrage & News 与 Strategy 模块按月订阅，所有方案都在你自己的设备上运行，订阅在桌面端完成。",
+      "ArbPilot 价格：Google 登录后可免费查看行情；自托管部署 $49/月，每个计费周期含 7 天策略创建试用，之后 +$50/月，策略市场由作者定价，可免费或按月收费。",
     privacy:
       "ArbPilot 隐私政策：说明订阅与访问官网时我们收集哪些信息、如何使用与共享，以及自托管架构下 API 密钥、订单与交易数据为何始终留在你的设备。",
     terms:
@@ -27,7 +27,7 @@ const DESCRIPTIONS: Record<Locale, Record<"pricing" | "privacy" | "terms", strin
   },
   en: {
     pricing:
-      "ArbPilot pricing: self-hosted forever free, with monthly subscriptions for the Arbitrage & News and Strategy modules. Every plan runs on your own machine.",
+      "ArbPilot pricing: free read-only access with Google sign-in; self-hosted deployment is $49/mo with a 7-day strategy-creation trial each billing period, then +$50/mo, and market strategies are author-priced, free or monthly.",
     privacy:
       "ArbPilot privacy policy: what we collect when you subscribe or browse the site, how it is used, and why API keys, orders and trading data stay on your device.",
     terms:

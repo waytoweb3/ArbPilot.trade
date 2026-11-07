@@ -8,7 +8,7 @@ import {
   useRefreshAccount,
   useRemoveAccount,
 } from "../hooks/useApi";
-import { getExecutorMode, toNumber } from "../lib/api";
+import { toNumber } from "../lib/api";
 import { formatDateTime, formatNumber, formatUsd } from "../lib/format";
 import { fmt, useI18n } from "../lib/i18n";
 import type { AccountKind, AccountVenue, EquityPoint, TradingAccount } from "../lib/types";
@@ -40,11 +40,9 @@ const inputClass =
 /** 总览页的交易账户面板：导入 Key、余额汇总、权益走势。 */
 export function AccountsPanel() {
   const { t } = useI18n();
-  // 托管实例不保存交易所密钥，也不提供账户接口，直接跳过轮询。
-  const hosted = getExecutorMode() === "hosted";
-  const accounts = useAccounts(!hosted);
+  const accounts = useAccounts();
   const [hours, setHours] = useState<number>(168);
-  const history = useAccountHistory(hours, !hosted);
+  const history = useAccountHistory(hours);
   const removeAccount = useRemoveAccount();
   const refreshAccount = useRefreshAccount();
   const [dialogOpen, setDialogOpen] = useState(false);
@@ -60,19 +58,6 @@ export function AccountsPanel() {
   const points = history.data?.points ?? [];
   const change = useMemo(() => computeChange(points), [points]);
   const list = accounts.data?.accounts ?? [];
-
-  if (hosted) {
-    return (
-      <Card>
-        <CardHeader>
-          <div>
-            <CardTitle>{t.accounts.title}</CardTitle>
-            <CardDescription>{t.hosted.accountsBody}</CardDescription>
-          </div>
-        </CardHeader>
-      </Card>
-    );
-  }
 
   return (
     <Card>

@@ -129,48 +129,6 @@ async function exchangeCode(
   return payload.access_token;
 }
 
-async function fetchGithubProfile(token: string): Promise<OAuthProfile> {
-  const headers = {
-    Authorization: `Bearer ${token}`,
-    Accept: "application/vnd.github+json",
-    "User-Agent": "arbpilot-accounts",
-  };
-
-  const response = await outboundFetch("https://api.github.com/user", { headers });
-  if (!response.ok) {
-    throw new HttpError(502, `读取 GitHub 账号失败：${response.status}`, "oauth_profile_failed");
-  }
-  const user = await response.json<{
-    id: number;
-    login: string;
-    name: string | null;
-    email: string | null;
-    avatar_url: string | null;
-  }>();
-  if (!user) {
-    throw new HttpError(502, "读取 GitHub 账号失败：响应不是 JSON", "oauth_profile_failed");
-  }
-
-  let email = user.email;
-  if (!email) {
-    // 公开资料不带邮箱时，读取已验证的主邮箱用于账号合并。
-    const emailsResponse = await outboundFetch("https://api.github.com/user/emails", { headers });
-    if (emailsResponse.ok) {
-      const emails = (await emailsResponse.json<
-        Array<{ email: string; primary: boolean; verified: boolean }>
-      >()) ?? [];
-      email = emails.find((item) => item.primary && item.verified)?.email ?? null;
-    }
-  }
-
-  return {
-    subject: String(user.id),
-    email,
-    name: user.name ?? user.login,
-    avatarUrl: user.avatar_url,
-  };
-}
-
 async function fetchGoogleProfile(token: string): Promise<OAuthProfile> {
   const response = await outboundFetch("https://openidconnect.googleapis.com/v1/userinfo", {
     headers: { Authorization: `Bearer ${token}` },
@@ -206,5 +164,5 @@ export async function finishFlow(
     throw new HttpError(404, `未启用登录方式 ${providerId}`, "unknown_provider");
   }
   const token = await exchangeCode(provider, code, provider.redirectUri, flow.codeVerifier);
-  return provider.id === "github" ? fetchGithubProfile(token) : fetchGoogleProfile(token);
+  return fetchGoogleProfile(token);
 }

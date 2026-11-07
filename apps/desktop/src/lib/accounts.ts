@@ -26,6 +26,8 @@ export interface AccountEntitlement {
   status: "active" | "canceling" | "past_due" | "none";
   expiresAt: string | null;
   deviceLimit: number;
+  /** 基础版当前周期内赠送的策略创建试用截止时间；不在试用期为 null。 */
+  trialEndsAt?: string | null;
 }
 
 export interface AccountMe {
@@ -43,6 +45,7 @@ export interface AccountSubscription {
   providerOrderId: string | null;
   currentPeriodEnd: string | null;
   cancelAtPeriodEnd: boolean;
+  createdAt?: string;
 }
 
 export interface DeviceCodeStart {

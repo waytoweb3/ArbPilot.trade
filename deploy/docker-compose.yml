@@ -47,9 +47,10 @@ services:
     # 账户凭证、风控限额与 Telegram 绑定都在 data/ 下，必须持久化。
     volumes:
       - arbpilot-data:/home/arbpilot/data
-    # 管理端口仅绑定回环地址，桌面端通过 SSH 隧道连接。
+    # 默认只绑定回环地址，桌面端通过 SSH 隧道连接；
+    # 需要让桌面端直接用服务器 IP 访问时，设置 ARBPILOT_EXECUTOR_HOST=0.0.0.0 并放行端口。
     ports:
-      - "127.0.0.1:${ARBPILOT_EXECUTOR_PORT:-8787}:8787"
+      - "${ARBPILOT_EXECUTOR_HOST:-127.0.0.1}:${ARBPILOT_EXECUTOR_PORT:-8787}:8787"
 
 volumes:
   arbpilot-pgdata:

@@ -23,13 +23,20 @@ const FALLBACK_PLANS: BillingPlan[] = [
     id: "arbitrage",
     amount: "49.00",
     billingPeriod: "monthly",
-    name: { zh: "ArbPilot · Arbitrage & News", en: "ArbPilot · Arbitrage & News" },
+    name: {
+      zh: "ArbPilot · 自托管部署",
+      en: "ArbPilot · Self-hosted Deployment",
+    },
+    requires: null,
+    addon: false,
   },
   {
     id: "strategy",
-    amount: "99.00",
+    amount: "50.00",
     billingPeriod: "monthly",
-    name: { zh: "ArbPilot · Strategy", en: "ArbPilot · Strategy" },
+    name: { zh: "ArbPilot · 策略创建", en: "ArbPilot · Strategy Creation" },
+    requires: "arbitrage",
+    addon: true,
   },
 ];
 
@@ -76,7 +83,10 @@ export function BillingCard() {
   const me = account.data;
   const entitlement = me?.entitlement;
   const license = licenseQuery.data;
-  const plan = entitlement?.plans[0];
+  const activePlans = entitlement?.plans ?? [];
+  const hasBasePlan = activePlans.includes("arbitrage");
+  /** 基础版每周期赠送 7 天策略创建试用，试用期内 plans 里会带上 strategy。 */
+  const trialEndsAt = entitlement?.trialEndsAt ?? null;
   const dateText = (value: string | null | undefined) =>
     value ? new Date(value).toLocaleDateString(locale === "zh" ? "zh-CN" : "en-US") : "—";
   const secondsText = (value: number | null | undefined) =>
@@ -88,6 +98,15 @@ export function BillingCard() {
       : id === "strategy"
         ? t.settings.billingStrategy
         : t.settings.accountPlanNone;
+  const activePlanText = activePlans.length
+    ? activePlans
+        .map((id) =>
+          id === "strategy" && trialEndsAt
+            ? fmt(t.settings.billingStrategyTrial, { value: dateText(trialEndsAt) })
+            : planLabel(id),
+        )
+        .join(" · ")
+    : t.settings.accountPlanNone;
 
   const entitlementStatus =
     entitlement && entitlement.status !== "none"
@@ -163,7 +182,7 @@ export function BillingCard() {
           <CardDescription>{t.settings.billingDesc}</CardDescription>
         </div>
         {token && (
-          <Badge tone={plan ? "success" : "neutral"}>{planLabel(plan)}</Badge>
+          <Badge tone={activePlans.length ? "success" : "neutral"}>{activePlanText}</Badge>
         )}
       </CardHeader>
       <CardContent className="space-y-5">
@@ -236,7 +255,7 @@ export function BillingCard() {
             <dl className="mt-3 grid grid-cols-3 gap-x-6 gap-y-3 text-xs">
               <div>
                 <dt className="text-[11px] text-muted">{t.settings.billingPlan}</dt>
-                <dd className="mt-0.5 text-body">{planLabel(plan)}</dd>
+                <dd className="mt-0.5 text-body">{activePlanText}</dd>
               </div>
               <div>
                 <dt className="text-[11px] text-muted">{t.settings.billingStatus}</dt>
@@ -349,8 +368,10 @@ export function BillingCard() {
 
         <div className="grid gap-3 sm:grid-cols-2">
           {plans.map((item) => {
-            const featured = item.id === "strategy";
+            const featured = item.id === "arbitrage";
             const label = planLabel(item.id);
+            const missingBase =
+              item.id === "strategy" && Boolean(token) && !hasBasePlan;
             return (
               <div
                 key={item.id}
@@ -358,25 +379,38 @@ export function BillingCard() {
                   featured ? "border-accent/30 bg-accent/[0.04]" : "border-line bg-panel-soft"
                 }`}
               >
-                <div className="flex items-baseline justify-between">
-                  <span className="text-[11px] text-muted">{label}</span>
-                  <span className="font-mono text-sm text-fg">${item.amount}</span>
+                <div>
+                  <div className="flex items-baseline justify-between">
+                    <span className="text-[11px] text-muted">{label}</span>
+                    <span className="font-mono text-sm text-fg">${item.amount}</span>
+                  </div>
+                  {item.addon && (
+                    <p className="mt-1 text-[10.5px] leading-relaxed text-subtle">
+                      {trialEndsAt
+                        ? fmt(t.settings.billingAddonTrialHint, { value: dateText(trialEndsAt) })
+                        : t.settings.billingAddonHint}
+                    </p>
+                  )}
                 </div>
                 <Button
                   size="sm"
                   variant={featured ? "primary" : "secondary"}
                   className="mt-3"
                   onClick={() => subscribe(item.id)}
-                  disabled={checkout.isPending}
+                  disabled={checkout.isPending || missingBase}
                 >
-                  {checkout.isPending && checkout.variables?.plan === item.id
-                    ? t.settings.billingOpening
-                    : fmt(t.settings.billingSubscribe, { plan: label })}
+                  {missingBase
+                    ? t.settings.billingAddonMissingBase
+                    : checkout.isPending && checkout.variables?.plan === item.id
+                      ? t.settings.billingOpening
+                      : fmt(t.settings.billingSubscribe, { plan: label })}
                 </Button>
               </div>
             );
           })}
         </div>
+
+        <p className="text-[11px] leading-relaxed text-muted">{t.settings.billingMarketNote}</p>
 
         {checkoutUrl && (
           <div className="rounded-xl border border-line bg-panel-soft px-4 py-3">

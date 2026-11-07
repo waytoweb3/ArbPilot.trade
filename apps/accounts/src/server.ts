@@ -504,7 +504,11 @@ async function handleInternalSession(
   if (!user) {
     throw new HttpError(401, "会话无效", "unauthorized");
   }
-  sendJson(res, 200, userPayload(user));
+  const entitlement = await entitlements(user.id);
+  sendJson(res, 200, {
+    ...userPayload(user),
+    entitlement: { plans: entitlement.plans, status: entitlement.status },
+  });
 }
 
 /** 运营后台：返回全部注册用户及其订阅/设备明细。 */
@@ -624,6 +628,7 @@ const server = createServer((req, res) => {
             status: entitlement.status,
             expiresAt: entitlement.expiresAt,
             deviceLimit: entitlement.deviceLimit,
+            trialEndsAt: entitlement.trialEndsAt,
           },
           devices,
         });
@@ -744,7 +749,7 @@ async function main(): Promise<void> {
     );
     if (config.providers.length === 0) {
       console.log(
-        "[accounts] 提示：配置 OAUTH_GITHUB_CLIENT_ID/SECRET 或 OAUTH_GOOGLE_CLIENT_ID/SECRET 后才能登录。",
+        "[accounts] 提示：配置 OAUTH_GOOGLE_CLIENT_ID/SECRET 后才能登录。",
       );
     }
   });

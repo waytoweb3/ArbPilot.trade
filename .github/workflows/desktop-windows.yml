@@ -1,0 +1,139 @@
+name: desktop-windows
+
+# Tauri 不支持从 macOS 交叉编译 Windows 安装包（缺 MSVC 与 NSIS 工具链），
+# 因此 Windows 客户端统一在 GitHub 的 windows-latest runner 上打包。
+# 产物：NSIS 安装包、更新签名与 latest.json，下载后上传到 download.arbpilot.trade/desktop/。
+on:
+  workflow_dispatch:
+    inputs:
+      notes:
+        description: 更新说明（写入 latest.json，客户端更新卡片会显示）
+        required: false
+        default: ""
+  push:
+    tags:
+      - "desktop-v*"
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      # 仓库里的 .sh 都是 LF，Windows runner 默认的换行转换会让 bash 执行失败。
+      - run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.16.1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Cargo workspace 的 target 目录在仓库根目录。
+          workspaces: "."
+
+      - name: 安装依赖
+        run: pnpm install --frozen-lockfile
+
+      # 桌面端启动时拉起执行器 sidecar，安装包必须把它一起打进去。
+      - name: 构建执行器 sidecar
+        shell: bash
+        run: bash deploy/prepare-sidecar.sh release
+
+      - name: 检查更新签名密钥
+        shell: bash
+        env:
+          KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          [ -n "$KEY" ] || {
+            echo "缺少仓库 Secret：TAURI_SIGNING_PRIVATE_KEY" >&2
+            exit 1
+          }
+
+      # 只打 NSIS：Tauri 的 Windows 增量更新只认 NSIS 安装包，MSI 无法用于自动升级。
+      - name: 打包 Windows 安装包
+        working-directory: apps/desktop
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: pnpm tauri build --bundles nsis
+
+      - name: 生成 latest.json
+        shell: bash
+        env:
+          ARBPILOT_DESKTOP_NOTES: ${{ inputs.notes }}
+        run: |
+          node - <<'NODE'
+          const fs = require("fs");
+          const path = require("path");
+
+          (async () => {
+            const version = JSON.parse(
+              fs.readFileSync("apps/desktop/src-tauri/tauri.conf.json", "utf8"),
+            ).version;
+            const outDir = "dist/desktop";
+            const bundleDir = "target/release/bundle/nsis";
+
+            const installer = fs
+              .readdirSync(bundleDir)
+              .find((name) => name.endsWith("-setup.exe"));
+            if (!installer) {
+              throw new Error(`未找到 NSIS 安装包：${bundleDir}`);
+            }
+            const sigPath = path.join(bundleDir, `${installer}.sig`);
+            const signature = fs.readFileSync(sigPath, "utf8").trim();
+
+            fs.mkdirSync(outDir, { recursive: true });
+            fs.copyFileSync(path.join(bundleDir, installer), path.join(outDir, installer));
+            fs.copyFileSync(sigPath, path.join(outDir, `${installer}.sig`));
+
+            const baseUrl = "https://download.arbpilot.trade/desktop";
+            let platforms = {};
+            let response;
+            try {
+              response = await fetch(`${baseUrl}/latest.json`, { cache: "no-store" });
+            } catch (error) {
+              // 读不到线上清单就无法合并其它平台，直接失败，避免用不完整的清单覆盖线上。
+              throw new Error(`读取线上 latest.json 失败：${error.message}`);
+            }
+            if (response.ok) {
+              const published = await response.json();
+              // 只有同一个版本才合并，避免把旧包地址带到新版本里。
+              if (published.version === version && published.platforms) {
+                platforms = published.platforms;
+              }
+            } else if (response.status !== 404) {
+              throw new Error(`读取线上 latest.json 失败：HTTP ${response.status}`);
+            }
+            platforms["windows-x86_64"] = {
+              signature,
+              url: `${baseUrl}/${installer}`,
+            };
+
+            const manifest = {
+              version,
+              notes: process.env.ARBPILOT_DESKTOP_NOTES || "",
+              pub_date: new Date().toISOString().replace(/\.\d+Z$/, "Z"),
+              platforms,
+            };
+            fs.writeFileSync(
+              path.join(outDir, "latest.json"),
+              `${JSON.stringify(manifest, null, 2)}\n`,
+            );
+          })();
+          NODE
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arbpilot-desktop-windows
+          path: dist/desktop/
+          if-no-files-found: error

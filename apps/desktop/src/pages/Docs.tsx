@@ -5,6 +5,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Badge } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "../components/ui/card";
+import { useAccount } from "../hooks/useAccount";
 import { setApiToken, setExecutorMode, setExecutorUrl } from "../lib/api";
 import { isNewerVersion } from "../lib/appUpdate";
 import {
@@ -83,6 +84,9 @@ export default function DocsPage({ embedded = false }: { embedded?: boolean }) {
   const { t } = useI18n();
   const queryClient = useQueryClient();
   const desktop = isDesktopRuntime();
+  const account = useAccount();
+  /** 自托管部署属于 $49/月基础版权益。 */
+  const hasDeployPlan = account.data?.entitlement?.plans.includes("arbitrage") ?? false;
 
   const [form, setForm] = useState<ServerForm>(() => ({
     host: "",
@@ -197,6 +201,10 @@ export default function DocsPage({ embedded = false }: { embedded?: boolean }) {
 
   const handleDeploy = async () => {
     setError(null);
+    if (!hasDeployPlan) {
+      setError(t.docs.deployRequiresPlan);
+      return;
+    }
     setBusy("deploy");
     setLogs("");
     logsRef.current = "";
@@ -433,12 +441,21 @@ export default function DocsPage({ embedded = false }: { embedded?: boolean }) {
                 <RefreshCw size={13} />
                 {busy === "check" ? t.docs.checking : t.docs.check}
               </Button>
-              <Button size="sm" onClick={handleDeploy} disabled={!desktop || busy !== null}>
+              <Button
+                size="sm"
+                onClick={handleDeploy}
+                disabled={!desktop || busy !== null || !hasDeployPlan}
+              >
                 <Terminal size={13} />
                 {deployLabel}
               </Button>
             </div>
 
+            {!hasDeployPlan && (
+              <p className="text-[11px] leading-relaxed text-warning">
+                {t.docs.deployRequiresPlan}
+              </p>
+            )}
             {tokenFilled && <p className="text-[11px] text-accent">{t.docs.tokenFilled}</p>}
             {error && <p className="text-[11px] leading-relaxed text-danger">{error}</p>}
 

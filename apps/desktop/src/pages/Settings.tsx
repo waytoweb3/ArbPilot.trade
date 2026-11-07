@@ -7,7 +7,6 @@ import { Badge } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "../components/ui/card";
 import { BillingCard } from "../components/BillingCard";
-import { HostedLocked } from "../components/HostedLocked";
 import DocsPage from "./Docs";
 import { checkAppUpdate, currentAppVersion, relaunchApp } from "../lib/appUpdate";
 import type { DownloadProgress, PendingUpdate } from "../lib/appUpdate";
@@ -33,6 +32,7 @@ import {
   getExecutorUrl,
   hasLocalExecutor,
   localExecutorDatabase,
+  normalizeExecutorUrl,
   setApiToken,
   setExecutorMode,
   setExecutorUrl,
@@ -94,9 +94,11 @@ export default function SettingsPage() {
     const prevMode = getExecutorMode();
     const prevUrl = getExecutorUrl();
     setExecutorMode(mode);
-    // 托管实例的令牌由客户端内置，只保存自托管实例自己的地址和令牌。
+    // 托管模式的令牌与地址由用户自己填写；非托管模式使用内置执行器与官方数据接口。
     if (mode === "self") {
-      setExecutorUrl(address);
+      const nextUrl = normalizeExecutorUrl(address);
+      setExecutorUrl(nextUrl);
+      setAddress(nextUrl);
       setApiToken(token.trim());
     }
     if (mode !== prevMode || (mode === "self" && getExecutorUrl() !== prevUrl)) {
@@ -112,7 +114,6 @@ export default function SettingsPage() {
     ...(hasLocalExecutor()
       ? [{ id: "local" as ExecutorMode, label: t.settings.localExecutor }]
       : []),
-    { id: "hosted", label: t.settings.hosted },
     { id: "self", label: t.settings.self },
   ];
 
@@ -161,11 +162,9 @@ export default function SettingsPage() {
             <Badge tone="info">
               {mode === "local"
                 ? t.settings.localExecutor
-                : mode === "hosted"
-                  ? t.settings.hosted
-                  : loopback
-                    ? t.settings.local
-                    : t.settings.remote}
+                : loopback
+                  ? t.settings.local
+                  : t.settings.remote}
             </Badge>
           </CardHeader>
           <CardContent className="space-y-4">
@@ -193,15 +192,7 @@ export default function SettingsPage() {
               </span>
             </div>
 
-            {mode === "hosted" ? (
-              <div className="space-y-1.5">
-                <span className="text-xs text-muted">{t.settings.address}</span>
-                <div className={`${inputClass} font-mono text-muted`}>{address}</div>
-                <span className="block text-[11px] leading-relaxed text-muted">
-                  {t.settings.hostedNote}
-                </span>
-              </div>
-            ) : mode === "local" ? (
+            {mode === "local" ? (
               <div className="space-y-1.5">
                 <span className="text-xs text-muted">{t.settings.address}</span>
                 <div className={`${inputClass} font-mono text-muted`}>
@@ -223,7 +214,7 @@ export default function SettingsPage() {
                     className={`${inputClass} font-mono`}
                     value={address}
                     onChange={(event) => setAddress(event.target.value)}
-                    placeholder="http://127.0.0.1:8787"
+                    placeholder="http://45.76.177.242:8787 或 https://exec.example.com"
                   />
                   <span className="block text-[11px] leading-relaxed text-muted">
                     {t.settings.addressHint}
@@ -255,21 +246,18 @@ export default function SettingsPage() {
         </Card>
       )}
 
-      {tab === "risk" && (mode === "hosted" ? <HostedLocked /> : <RiskLimitsCard />)}
+      {tab === "risk" && <RiskLimitsCard />}
 
       {tab === "account" && <BillingCard />}
 
-      {tab === "author" && (mode === "hosted" ? <HostedLocked /> : <AuthorSettings />)}
+      {tab === "author" && <AuthorSettings />}
 
-      {tab === "notify" &&
-        (mode === "hosted" ? (
-          <HostedLocked />
-        ) : (
-          <div className="space-y-4">
-            <NotificationCard />
-            <TelegramCard />
-          </div>
-        ))}
+      {tab === "notify" && (
+        <div className="space-y-4">
+          <NotificationCard />
+          <TelegramCard />
+        </div>
+      )}
 
       {tab === "deploy" && <DocsPage embedded />}
 

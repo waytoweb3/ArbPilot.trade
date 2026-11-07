@@ -143,18 +143,8 @@ export const config = {
   deviceLimits,
   /** 权益令牌有效期；执行器可额外放宽离线宽限期。 */
   licenseTtlHours: Number(process.env.LICENSE_TTL_HOURS ?? 24),
+  /** 托管与非托管用户统一使用 Google 第三方登录。 */
   providers: [
-    buildProvider(
-      "github",
-      "GitHub",
-      {
-        authorizeUrl: "https://github.com/login/oauth/authorize",
-        tokenUrl: "https://github.com/login/oauth/access_token",
-        userInfoUrl: "https://api.github.com/user",
-        scope: "read:user user:email",
-      },
-      publicBaseUrl,
-    ),
     buildProvider(
       "google",
       "Google",

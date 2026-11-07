@@ -158,9 +158,9 @@ function Details({ license }: { license: LicenseInfo | null }) {
   }
   const planLabel =
     license.plan === "arbitrage"
-      ? "Arbitrage & News"
+      ? "自托管部署"
       : license.plan === "strategy"
-        ? "Strategy"
+        ? "策略创建附加包"
         : "—";
 
   return (

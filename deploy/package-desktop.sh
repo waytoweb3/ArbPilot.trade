@@ -99,5 +99,6 @@ cat <<EOF
 平台：$PLATFORM
 
 上传这两个文件到 $BASE_URL/ ，客户端「设置 → 检查更新」即可发现新版本。
-macOS 与 Windows 需要分别在对应系统上各跑一次，latest.json 会自动合并两个平台的条目。
+本脚本只负责当前系统；Windows 安装包由 GitHub Actions 的 desktop-windows 工作流构建，
+其 latest.json 会合并线上同一版本的其它平台条目。
 EOF

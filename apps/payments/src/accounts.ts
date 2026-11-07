@@ -10,6 +10,7 @@ export interface AccountUser {
   email: string | null;
   name: string;
   avatarUrl: string | null;
+  entitlement?: { plans: string[]; status: string };
 }
 
 let warned = false;

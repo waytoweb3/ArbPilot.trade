@@ -18,6 +18,7 @@ import {
 import { Badge } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "../components/ui/card";
+import { useAccount } from "../hooks/useAccount";
 import {
   useBacktestStrategy,
   useCompileStrategyCode,
@@ -1352,6 +1353,11 @@ function StrategyRuntimeCard({ record }: { record: StrategyRecord }) {
 
 export default function StrategiesPage() {
   const { t } = useI18n();
+  const account = useAccount();
+  const plans = account.data?.entitlement?.plans ?? [];
+  const hasBasePlan = plans.includes("arbitrage");
+  /** 策略创建是 +$50/月 附加包；基础版每个计费周期含 7 天免费试用。 */
+  const canCreateStrategy = hasBasePlan && plans.includes("strategy");
   const strategies = useStrategies();
   const updateStrategy = useUpdateStrategy();
   const createStrategy = useCreateStrategy();
@@ -1382,6 +1388,9 @@ export default function StrategiesPage() {
   ].find(Boolean);
 
   const startCreate = () => {
+    if (!canCreateStrategy) {
+      return;
+    }
     setCreating(true);
     setSelectedId(null);
   };
@@ -1393,11 +1402,19 @@ export default function StrategiesPage() {
           <h1 className="text-xl font-semibold text-fg">{t.strategies.title}</h1>
           <p className="mt-1 text-sm text-muted">{t.strategies.subtitle}</p>
         </div>
-        <Button size="sm" onClick={startCreate}>
+        <Button size="sm" onClick={startCreate} disabled={!canCreateStrategy}>
           <Plus size={13} />
           {t.strategies.create}
         </Button>
       </header>
+
+      {!canCreateStrategy && (
+        <p className="rounded-lg border border-warning/30 bg-warning/10 px-3 py-2 text-xs leading-relaxed text-warning">
+          {hasBasePlan
+            ? t.strategies.createTrialEnded
+            : t.strategies.createRequiresPlan}
+        </p>
+      )}
 
       {actionError && (
         <p className="rounded-lg border border-danger/30 bg-danger/10 px-3 py-2 text-xs text-danger">

@@ -8,13 +8,13 @@ const FALLBACK_PLANS: PlanInfo[] = [
     id: "arbitrage",
     amount: "49.00",
     billingPeriod: "monthly",
-    name: { zh: "Arbitrage & News", en: "Arbitrage & News" },
+    name: { zh: "自托管部署", en: "Self-hosted Deployment" },
   },
   {
     id: "strategy",
-    amount: "99.00",
+    amount: "50.00",
     billingPeriod: "monthly",
-    name: { zh: "Strategy", en: "Strategy" },
+    name: { zh: "策略创建", en: "Strategy Creation" },
   },
 ];
 
@@ -29,6 +29,7 @@ function PlanCard({
   features,
   amount,
   free,
+  addon,
   recommended,
   action,
 }: {
@@ -37,6 +38,7 @@ function PlanCard({
   features: string[];
   amount: string;
   free?: boolean;
+  addon?: boolean;
   recommended?: boolean;
   action: ReactNode;
 }) {
@@ -59,7 +61,7 @@ function PlanCard({
       </div>
 
       <p className="mt-6 flex items-baseline gap-1 text-fg">
-        <span className="text-[15px] text-muted">$</span>
+        <span className="text-[15px] text-muted">{addon ? "+$" : "$"}</span>
         <span className="font-mono text-[34px] leading-none tracking-tight">{price.major}</span>
         {!free && <span className="font-mono text-[15px] text-muted">.{price.minor}</span>}
         <span className="ml-2 text-[11px] text-subtle">
@@ -144,9 +146,10 @@ export default function Pricing() {
               desc={copy[id].desc}
               features={copy[id].features}
               amount={amountFor(id)}
-              recommended={id === "strategy"}
+              addon={id === "strategy"}
+              recommended={id === "arbitrage"}
               action={
-                <a href="#download" className={id === "strategy" ? primaryCta : secondaryCta}>
+                <a href="#download" className={id === "arbitrage" ? primaryCta : secondaryCta}>
                   {copy[id].cta}
                 </a>
               }

@@ -67,6 +67,10 @@ services:
     volumes:
       # 账户凭证、风控限额与授权令牌都在这里，必须持久化且不对外暴露。
       - arbpilot-execdata:/data
+    # 默认只绑定回环地址，桌面端通过 SSH 隧道或反代连接；
+    # 需要让桌面端直接用服务器 IP 访问时，在 .env 里设置 ARBPILOT_EXECUTOR_HOST=0.0.0.0 并放行端口。
+    ports:
+      - "${ARBPILOT_EXECUTOR_HOST:-127.0.0.1}:${ARBPILOT_EXECUTOR_PORT:-8787}:8787"
     networks:
       - internal
       - edge

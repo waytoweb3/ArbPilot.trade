@@ -38,7 +38,7 @@
 
 官方托管实例只提供行情、资金费率与资讯等只读数据接口（`ARBPILOT_PUBLIC_MODE=true`），不承接账户、下单或策略写入。
 
-内置执行器模式下，桌面端的只读请求（`/opportunities`、`/candles`、`/funding/*`、`/news`）优先发往官方数据接口（`VITE_ARBPILOT_DATA_URL`，默认复用 `VITE_EXECUTOR_URL`），官方不可达或当前账号无权访问时回退到本机采集；下单、账户、策略、风控与事件流始终在本机执行器。
+内置执行器模式下，桌面端的只读请求（`/opportunities`、`/candles`、`/funding/*`、`/news`）默认发往官方数据接口 `https://exec.arbpilot.trade`（可用 `VITE_ARBPILOT_DATA_URL` 覆盖），官方不可达或当前账号无权访问时回退到本机采集；下单、账户、策略、风控与事件流始终在本机执行器。托管模式（自建执行器）的地址由用户在设置页填写，支持域名或 `http://<IP>:8787`。
 
 托管实例对外放行的只读路径（`GET`，其余一律 403，见 `apps/executor/src/public_mode.rs`）：
 
@@ -92,9 +92,8 @@ cargo run -p arbpilot-executor
 | `ARBPILOT_FUNDING_SYMBOLS` | `BTCUSDT,ETHUSDT` | 采集的 USDT 本位永续合约，逗号分隔 |
 | `ARBPILOT_FUNDING_POLL_SECS` | `60` | 增量采集间隔（秒），最小 15 |
 | `ARBPILOT_BINANCE_FAPI_URL` | `https://fapi.binance.com` | Binance 合约公开行情地址，可指向镜像或本地桩 |
-| `VITE_EXECUTOR_URL` | `http://127.0.0.1:8787` | 桌面端连接的执行器地址 |
-| `VITE_EXECUTOR_TOKEN` | `dev-local-token` | 桌面端默认访问令牌，官方托管版本构建时注入 |
-| `VITE_ARBPILOT_DATA_URL` | 复用 `VITE_EXECUTOR_URL` | 官方只读数据接口地址，内置执行器模式下行情/资金费率/新闻从这里读取 |
+| `VITE_EXECUTOR_TOKEN` | `dev-local-token` | 访问官方只读数据接口的令牌，官方发行版构建时注入 |
+| `VITE_ARBPILOT_DATA_URL` | `https://exec.arbpilot.trade` | 非托管模式的官方只读数据接口；托管模式在设置页填自己的服务器地址（域名或 IP） |
 
 ## 常用命令
 
@@ -116,7 +115,7 @@ sudo arbpilot update    # 后续升级，保留令牌与数据
 
 发布新版本：`bash deploy/package.sh`，把 `dist/release/` 下的 tar.gz、`manifest.json` 与 `install.sh` 上传到 `https://download.arbpilot.trade/executor/`，客户端即可检查到更新。
 
-客户端自身的更新走独立发布源：`bash deploy/package-desktop.sh` 生成带签名的安装包与 `latest.json`，上传到 `https://download.arbpilot.trade/desktop/` 后，用户在「设置 → 客户端更新 → 检查更新」即可一键升级并重启。
+客户端自身的更新走独立发布源：`bash deploy/package-desktop.sh` 生成带签名的安装包与 `latest.json`，上传到 `https://download.arbpilot.trade/desktop/` 后，用户在「设置 → 客户端更新 → 检查更新」即可一键升级并重启。Windows 安装包由 GitHub Actions 的 `desktop-windows` 工作流在 `windows-latest` 上构建（Tauri 不支持从 macOS 交叉编译），产物同样上传到该目录。
 
 也可以手动执行：
 
