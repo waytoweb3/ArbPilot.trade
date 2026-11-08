@@ -172,3 +172,30 @@
     text-wrap: balance;
   }
 }
+
+/* 费率变化时的高亮，参数与客户端保持一致（1.4s、24% 透明度） */
+@keyframes funding-flash-up {
+  from {
+    background-color: color-mix(in srgb, var(--accent) 24%, transparent);
+  }
+  to {
+    background-color: transparent;
+  }
+}
+
+@keyframes funding-flash-down {
+  from {
+    background-color: color-mix(in srgb, var(--danger) 24%, transparent);
+  }
+  to {
+    background-color: transparent;
+  }
+}
+
+.funding-flash-up {
+  animation: funding-flash-up 1.4s ease-out;
+}
+
+.funding-flash-down {
+  animation: funding-flash-down 1.4s ease-out;
+}

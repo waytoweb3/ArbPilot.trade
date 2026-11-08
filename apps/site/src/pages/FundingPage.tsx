@@ -1,11 +1,13 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import { useI18n } from "../lib/i18n";
 import { fetchFundingStatus, type FundingVenueStatus } from "../lib/funding";
 
 const REFRESH_MS = 30_000;
-/** 表格一次最多渲染的行数，避免整市场几千个合约拖慢首屏。 */
-const MAX_ROWS = 100;
+/** 每页行数；与客户端一样用分页代替一次性渲染整市场。 */
+const PAGE_SIZE = 50;
+/** 费率变化高亮时长，与客户端 1.4s 保持一致。 */
+const FLASH_MS = 1_400;
 
 function toNumber(value: number | string | null | undefined): number | null {
   if (value === null || value === undefined) return null;
@@ -31,6 +33,8 @@ function formatCountdown(target: number, now: number): string {
   return hours > 0 ? `${hours}h ${String(rest).padStart(2, "0")}m` : `${rest}m`;
 }
 
+type Flash = "up" | "down";
+
 type Cell = { rate: number | null; annualized: number | null; next: number | null };
 
 type Row = {
@@ -39,6 +43,30 @@ type Row = {
   maxAnnualized: number | null;
   next: number | null;
 };
+
+type SortKey = "symbol" | "max" | "next" | { venue: string };
+
+type Sort = { key: SortKey; dir: "asc" | "desc" };
+
+function sameKey(left: SortKey, right: SortKey): boolean {
+  if (typeof left === "string" || typeof right === "string") return left === right;
+  return left.venue === right.venue;
+}
+
+/** 表头点击：首次按该列降序（交易对按升序），再次点击切换方向。 */
+function nextSort(current: Sort, key: SortKey): Sort {
+  if (sameKey(current.key, key)) {
+    return { key, dir: current.dir === "asc" ? "desc" : "asc" };
+  }
+  return { key, dir: key === "symbol" ? "asc" : "desc" };
+}
+
+function sortValue(row: Row, key: SortKey): number | string | null {
+  if (key === "symbol") return row.symbol;
+  if (key === "max") return row.maxAnnualized;
+  if (key === "next") return row.next;
+  return row.cells[key.venue]?.rate ?? null;
+}
 
 export default function FundingPage() {
   const { t, locale } = useI18n();
@@ -49,7 +77,10 @@ export default function FundingPage() {
   const [updatedAt, setUpdatedAt] = useState<number | null>(null);
   const [reloadKey, setReloadKey] = useState(0);
   const [query, setQuery] = useState("");
-  const [sort, setSort] = useState<"annualized" | "symbol">("annualized");
+  const [sort, setSort] = useState<Sort>({ key: "max", dir: "desc" });
+  const [page, setPage] = useState(0);
+  const [flashes, setFlashes] = useState<Map<string, Flash>>(() => new Map());
+  const previousRates = useRef<Map<string, number>>(new Map());
 
   useEffect(() => {
     const controller = new AbortController();
@@ -76,6 +107,36 @@ export default function FundingPage() {
       window.clearInterval(timer);
     };
   }, [reloadKey]);
+
+  // 对比相邻两次刷新，费率上涨闪绿、下跌闪红，与客户端行为一致。
+  useEffect(() => {
+    if (!venues) return;
+
+    const next = new Map<string, number>();
+    const changed = new Map<string, Flash>();
+    for (const venue of venues) {
+      if (!venue.enabled) continue;
+      for (const item of venue.symbols) {
+        const rate = toNumber(item.predicted_rate) ?? toNumber(item.last_funding_rate);
+        if (rate === null) continue;
+        const key = `${venue.venue}:${item.symbol}`;
+        next.set(key, rate);
+        const before = previousRates.current.get(key);
+        if (before !== undefined && before !== rate) {
+          changed.set(key, rate > before ? "up" : "down");
+        }
+      }
+    }
+    previousRates.current = next;
+
+    if (changed.size === 0) {
+      setFlashes(new Map());
+      return;
+    }
+    setFlashes(changed);
+    const timer = window.setTimeout(() => setFlashes(new Map()), FLASH_MS);
+    return () => window.clearTimeout(timer);
+  }, [venues]);
 
   const { activeVenues, rows, totalPairs, pollSecs } = useMemo(() => {
     const active = (venues ?? []).filter(
@@ -115,11 +176,18 @@ export default function FundingPage() {
     if (keyword) {
       list = list.filter((row) => row.symbol.includes(keyword));
     }
+    const factor = sort.dir === "asc" ? 1 : -1;
     list.sort((left, right) => {
-      if (sort === "symbol") return left.symbol.localeCompare(right.symbol);
-      const leftValue = left.maxAnnualized ?? Number.NEGATIVE_INFINITY;
-      const rightValue = right.maxAnnualized ?? Number.NEGATIVE_INFINITY;
-      return rightValue - leftValue;
+      const leftValue = sortValue(left, sort.key);
+      const rightValue = sortValue(right, sort.key);
+      if (typeof leftValue === "string" || typeof rightValue === "string") {
+        return String(leftValue).localeCompare(String(rightValue)) * factor;
+      }
+      // 空值始终排在最后，避免翻页时跳到末尾。
+      if (leftValue === null && rightValue === null) return 0;
+      if (leftValue === null) return 1;
+      if (rightValue === null) return -1;
+      return (leftValue - rightValue) * factor;
     });
 
     const polls = active.map((venue) => venue.poll_secs).filter((secs) => secs > 0);
@@ -131,7 +199,16 @@ export default function FundingPage() {
     };
   }, [venues, query, sort]);
 
-  const visibleRows = rows.slice(0, MAX_ROWS);
+  const pages = Math.max(1, Math.ceil(rows.length / PAGE_SIZE));
+  const currentPage = Math.min(page, pages - 1);
+
+  useEffect(() => {
+    setPage(0);
+  }, [query, sort]);
+
+  const visibleRows = rows.slice(currentPage * PAGE_SIZE, currentPage * PAGE_SIZE + PAGE_SIZE);
+
+  const sortState = (key: SortKey) => (sameKey(sort.key, key) ? sort.dir : null);
 
   return (
     <section className="page pb-24 pt-32">
@@ -157,32 +234,13 @@ export default function FundingPage() {
         />
       </div>
 
-      <div className="mt-8 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+      <div className="mt-8">
         <input
           value={query}
           onChange={(event) => setQuery(event.target.value)}
           placeholder={text.search}
           className="w-full rounded-xl border border-line bg-panel px-3.5 py-2.5 text-[12.5px] text-fg outline-none transition-colors placeholder:text-subtle focus:border-line-strong sm:max-w-xs"
         />
-        <div className="flex items-center gap-2">
-          <button
-            type="button"
-            onClick={() => setSort("annualized")}
-            className={toggleClass(sort === "annualized")}
-          >
-            {text.sortAnnualized}
-          </button>
-          <button
-            type="button"
-            onClick={() => setSort("symbol")}
-            className={toggleClass(sort === "symbol")}
-          >
-            {text.sortSymbol}
-          </button>
-          <button type="button" onClick={() => setReloadKey((key) => key + 1)} className={toggleClass(false)}>
-            {text.refresh}
-          </button>
-        </div>
       </div>
 
       {error && !venues ? (
@@ -211,23 +269,33 @@ export default function FundingPage() {
             <table className="w-full min-w-[820px] border-collapse text-[11.5px]">
               <thead>
                 <tr className="border-b border-line">
-                  <th className="px-4 py-3 text-left font-mono text-[10px] font-normal uppercase tracking-[0.12em] text-subtle">
-                    {text.pair}
-                  </th>
+                  <HeaderCell
+                    label={text.pair}
+                    align="left"
+                    state={sortState("symbol")}
+                    onClick={() => setSort((current) => nextSort(current, "symbol"))}
+                  />
                   {activeVenues.map((venue) => (
-                    <th
+                    <HeaderCell
                       key={venue.venue}
-                      className="px-3 py-3 text-right font-mono text-[10px] font-normal uppercase tracking-[0.12em] text-subtle"
-                    >
-                      {venue.venue}
-                    </th>
+                      label={venue.venue}
+                      state={sortState({ venue: venue.venue })}
+                      onClick={() =>
+                        setSort((current) => nextSort(current, { venue: venue.venue }))
+                      }
+                    />
                   ))}
-                  <th className="px-3 py-3 text-right font-mono text-[10px] font-normal uppercase tracking-[0.12em] text-subtle">
-                    {text.maxAnnualized}
-                  </th>
-                  <th className="px-4 py-3 text-right font-mono text-[10px] font-normal uppercase tracking-[0.12em] text-subtle">
-                    {text.nextSettlement}
-                  </th>
+                  <HeaderCell
+                    label={text.maxAnnualized}
+                    state={sortState("max")}
+                    onClick={() => setSort((current) => nextSort(current, "max"))}
+                  />
+                  <HeaderCell
+                    label={text.nextSettlement}
+                    align="right"
+                    state={sortState("next")}
+                    onClick={() => setSort((current) => nextSort(current, "next"))}
+                  />
                 </tr>
               </thead>
               <tbody>
@@ -237,15 +305,24 @@ export default function FundingPage() {
                     {activeVenues.map((venue) => {
                       const cell = row.cells[venue.venue];
                       const rate = cell?.rate ?? null;
+                      const flash = flashes.get(`${venue.venue}:${row.symbol}`);
                       return (
                         <td
                           key={venue.venue}
-                          title={cell?.annualized !== null && cell?.annualized !== undefined
-                            ? formatAnnualized(cell.annualized)
-                            : undefined}
+                          title={
+                            cell?.annualized !== null && cell?.annualized !== undefined
+                              ? formatAnnualized(cell.annualized)
+                              : undefined
+                          }
                           className={`px-3 py-2.5 text-right font-mono text-[11.5px] ${
-                            rate === null ? "text-subtle" : rate > 0 ? "text-accent" : rate < 0 ? "text-danger" : "text-body"
-                          }`}
+                            rate === null
+                              ? "text-subtle"
+                              : rate > 0
+                                ? "text-accent"
+                                : rate < 0
+                                  ? "text-danger"
+                                  : "text-body"
+                          } ${flash === "up" ? "funding-flash-up" : flash === "down" ? "funding-flash-down" : ""}`}
                         >
                           {rate === null ? "—" : formatRate(rate)}
                         </td>
@@ -263,7 +340,10 @@ export default function FundingPage() {
                 ))}
                 {visibleRows.length === 0 && (
                   <tr>
-                    <td colSpan={activeVenues.length + 3} className="px-4 py-10 text-center text-[12.5px] text-muted">
+                    <td
+                      colSpan={activeVenues.length + 3}
+                      className="px-4 py-10 text-center text-[12.5px] text-muted"
+                    >
                       {text.empty}
                     </td>
                   </tr>
@@ -271,16 +351,75 @@ export default function FundingPage() {
               </tbody>
             </table>
           </div>
+
+          <div className="flex flex-wrap items-center justify-between gap-3 border-t border-line px-4 py-3 text-[11.5px] text-muted">
+            <span>
+              {totalPairs.toLocaleString()} {text.pairsUnit} · {text.page} {currentPage + 1} /{" "}
+              {pages}
+            </span>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                disabled={currentPage === 0}
+                onClick={() => setPage(currentPage - 1)}
+                className={pagerClass}
+              >
+                ← {text.prev}
+              </button>
+              <button
+                type="button"
+                disabled={currentPage >= pages - 1}
+                onClick={() => setPage(currentPage + 1)}
+                className={pagerClass}
+              >
+                {text.next} →
+              </button>
+            </div>
+          </div>
         </div>
       )}
 
       <p className="mt-4 text-[11px] leading-[1.8] text-subtle">
-        {totalPairs > MAX_ROWS ? `${text.limited} ` : ""}
-        {text.source}
+        {text.sortHint} · {text.source}
       </p>
     </section>
   );
 }
+
+function HeaderCell({
+  label,
+  align = "right",
+  state,
+  onClick,
+}: {
+  label: string;
+  align?: "left" | "right";
+  state: "asc" | "desc" | null;
+  onClick: () => void;
+}) {
+  return (
+    <th
+      aria-sort={state === null ? "none" : state === "asc" ? "ascending" : "descending"}
+      className={`px-3 py-3 ${align === "left" ? "text-left" : "text-right"} font-mono text-[10px] font-normal uppercase tracking-[0.12em] text-subtle first:pl-4 last:pr-4`}
+    >
+      <button
+        type="button"
+        onClick={onClick}
+        className={`inline-flex items-center gap-1 uppercase transition-colors hover:text-fg ${
+          state === null ? "" : "text-fg"
+        }`}
+      >
+        {label}
+        <span aria-hidden className={state === null ? "text-subtle/40" : "text-accent"}>
+          {state === "asc" ? "↑" : state === "desc" ? "↓" : "↕"}
+        </span>
+      </button>
+    </th>
+  );
+}
+
+const pagerClass =
+  "rounded-full border border-line px-3 py-1.5 text-[11.5px] text-body transition-colors hover:border-line-strong hover:text-fg disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:border-line disabled:hover:text-body";
 
 function Stat({ label, value }: { label: string; value: string }) {
   return (
@@ -289,12 +428,4 @@ function Stat({ label, value }: { label: string; value: string }) {
       <p className="mt-1 font-mono text-[13px] text-body">{value}</p>
     </div>
   );
-}
-
-function toggleClass(active: boolean): string {
-  return `rounded-full border px-3.5 py-1.5 text-[12px] transition-colors ${
-    active
-      ? "border-line-strong bg-hover text-fg"
-      : "border-line text-muted hover:border-line-strong hover:text-fg"
-  }`;
 }
