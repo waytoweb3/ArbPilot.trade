@@ -24,20 +24,10 @@ export interface SubscriptionView {
   createdAt: string;
 }
 
-export interface DeviceView {
-  id: string;
-  name: string;
-  platform: string;
-  fingerprint: string;
-  createdAt: string;
-  lastSeenAt: string;
-}
-
 export interface Entitlement {
   plans: string[];
   status: "active" | "canceling" | "past_due" | "none";
   expiresAt: string | null;
-  deviceLimit: number;
   subscriptions: SubscriptionView[];
   /** 基础版当前计费周期内赠送的策略创建试用截止时间；不在试用期为 null。 */
   trialEndsAt: string | null;
@@ -242,15 +232,6 @@ export async function listSubscriptions(userId: string): Promise<SubscriptionVie
   });
 }
 
-export function deviceLimitFor(plans: string[]): number {
-  if (plans.length === 0) {
-    return config.deviceLimits.free;
-  }
-  return Math.max(
-    ...plans.map((plan) => config.deviceLimits[plan] ?? config.deviceLimits.free),
-  );
-}
-
 /** 基础版每个计费周期附带的策略创建试用天数。 */
 const STRATEGY_TRIAL_DAYS = 3;
 
@@ -317,113 +298,9 @@ export async function entitlements(userId: string): Promise<Entitlement> {
     plans,
     status,
     expiresAt,
-    deviceLimit: deviceLimitFor(plans),
     subscriptions,
     trialEndsAt,
   };
-}
-
-// ---------------------------------------------------------------------------
-// 设备
-// ---------------------------------------------------------------------------
-
-interface DeviceRow {
-  id: string;
-  name: string;
-  platform: string;
-  fingerprint: string;
-  created_at: Date;
-  last_seen_at: Date;
-}
-
-function toDevice(row: DeviceRow): DeviceView {
-  return {
-    id: row.id,
-    name: row.name,
-    platform: row.platform,
-    fingerprint: row.fingerprint,
-    createdAt: iso(row.created_at) ?? "",
-    lastSeenAt: iso(row.last_seen_at) ?? "",
-  };
-}
-
-export async function listDevices(userId: string): Promise<DeviceView[]> {
-  const { rows } = await pool.query<DeviceRow>(
-    `SELECT id, name, platform, fingerprint, created_at, last_seen_at
-       FROM devices
-      WHERE user_id = $1 AND revoked_at IS NULL
-      ORDER BY last_seen_at DESC`,
-    [userId],
-  );
-  return rows.map(toDevice);
-}
-
-export async function activateDevice(
-  userId: string,
-  input: { fingerprint: string; name: string; platform: string },
-): Promise<DeviceView> {
-  const existing = await pool.query<DeviceRow & { revoked_at: Date | null }>(
-    `SELECT id, name, platform, fingerprint, created_at, last_seen_at, revoked_at
-       FROM devices
-      WHERE user_id = $1 AND fingerprint = $2`,
-    [userId, input.fingerprint],
-  );
-
-  const current = existing.rows[0];
-  if (current) {
-    if (current.revoked_at) {
-      throw new HttpError(403, "该设备已被撤销，请重新授权或联系支持", "device_revoked");
-    }
-    const updated = await pool.query<DeviceRow>(
-      `UPDATE devices
-          SET name = $3, platform = $4, last_seen_at = now()
-        WHERE id = $1 AND user_id = $2
-        RETURNING id, name, platform, fingerprint, created_at, last_seen_at`,
-      [current.id, userId, input.name, input.platform],
-    );
-    return toDevice(updated.rows[0]!);
-  }
-
-  const entitlement = await entitlements(userId);
-  const active = await pool.query<{ count: string }>(
-    "SELECT count(*)::text AS count FROM devices WHERE user_id = $1 AND revoked_at IS NULL",
-    [userId],
-  );
-  const used = Number(active.rows[0]?.count ?? "0");
-  if (used >= entitlement.deviceLimit) {
-    throw new HttpError(
-      409,
-      `设备数已达上限（${entitlement.deviceLimit} 台），请先在账号页移除旧设备`,
-      "device_limit",
-    );
-  }
-
-  const inserted = await pool.query<DeviceRow>(
-    `INSERT INTO devices (user_id, fingerprint, name, platform)
-     VALUES ($1, $2, $3, $4)
-     RETURNING id, name, platform, fingerprint, created_at, last_seen_at`,
-    [userId, input.fingerprint, input.name, input.platform],
-  );
-  return toDevice(inserted.rows[0]!);
-}
-
-export async function revokeDevice(userId: string, deviceId: string): Promise<void> {
-  const result = await pool.query(
-    `UPDATE devices SET revoked_at = now()
-      WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL`,
-    [deviceId, userId],
-  );
-  if (!result.rowCount) {
-    throw new HttpError(404, "设备不存在或已移除");
-  }
-}
-
-export async function deviceIds(userId: string): Promise<string[]> {
-  const { rows } = await pool.query<{ id: string }>(
-    "SELECT id FROM devices WHERE user_id = $1 AND revoked_at IS NULL",
-    [userId],
-  );
-  return rows.map((row) => row.id);
 }
 
 // ---------------------------------------------------------------------------
@@ -433,7 +310,6 @@ export async function deviceIds(userId: string): Promise<string[]> {
 export interface DeviceCodeRow {
   id: string;
   user_id: string | null;
-  device_id: string | null;
   status: string;
   expires_at: Date;
   fingerprint: string;
@@ -467,7 +343,7 @@ export async function createDeviceCode(input: {
 
 export async function pollDeviceCode(deviceCode: string): Promise<DeviceCodeRow | null> {
   const { rows } = await pool.query<DeviceCodeRow>(
-    `SELECT id, user_id, device_id, status, expires_at, fingerprint, client_name, platform
+    `SELECT id, user_id, status, expires_at, fingerprint, client_name, platform
        FROM device_codes
       WHERE device_code_hash = $1`,
     [hashToken(deviceCode)],
@@ -478,13 +354,12 @@ export async function pollDeviceCode(deviceCode: string): Promise<DeviceCodeRow 
 export async function approveDeviceCode(
   userCode: string,
   userId: string,
-  device: DeviceView,
 ): Promise<void> {
   const result = await pool.query(
     `UPDATE device_codes
-        SET status = 'approved', user_id = $2, device_id = $3, approved_at = now()
+        SET status = 'approved', user_id = $2, approved_at = now()
       WHERE user_code = $1 AND status = 'pending' AND expires_at > now()`,
-    [userCode, userId, device.id],
+    [userCode, userId],
   );
   if (!result.rowCount) {
     throw new HttpError(404, "配对码不存在或已过期", "invalid_user_code");
@@ -507,15 +382,6 @@ export async function claimDeviceCode(id: string): Promise<boolean> {
     [id],
   );
   return Boolean(result.rowCount);
-}
-
-export async function deviceOf(deviceId: string): Promise<DeviceView | null> {
-  const { rows } = await pool.query<DeviceRow>(
-    `SELECT id, name, platform, fingerprint, created_at, last_seen_at
-       FROM devices WHERE id = $1 AND revoked_at IS NULL`,
-    [deviceId],
-  );
-  return rows[0] ? toDevice(rows[0]) : null;
 }
 
 // ---------------------------------------------------------------------------

@@ -26,7 +26,6 @@ import {
   startFlow,
 } from "./oauth";
 import {
-  activateDevice,
   applyLicenseEvent,
   approveDeviceCode,
   authorProfile,
@@ -35,15 +34,11 @@ import {
   createPendingCheckout,
   createSession,
   denyDeviceCode,
-  deviceIds,
-  deviceOf,
   entitlements,
   findOrCreateUser,
-  listDevices,
   listSubscriptions,
   markCanceling,
   pollDeviceCode,
-  revokeDevice,
   revokeSession,
   saveAuthorProfile,
   userFromToken,
@@ -252,15 +247,10 @@ async function handleDeviceStart(
   res: ServerResponse,
 ): Promise<void> {
   const body = await readJson(req);
-  const fingerprint = text(body.fingerprint);
-  if (!fingerprint) {
-    throw new HttpError(400, "缺少设备指纹", "invalid_request");
-  }
-
   const code = await createDeviceCode({
     clientName: text(body.client_name) ?? "ArbPilot Desktop",
     platform: text(body.platform) ?? "",
-    fingerprint,
+    fingerprint: text(body.fingerprint) ?? "",
   });
 
   sendJson(res, 201, {
@@ -305,17 +295,14 @@ async function handleDevicePoll(
     throw new HttpError(409, "该配对码已被使用", "already_claimed");
   }
 
-  const device = row.device_id ? await deviceOf(row.device_id) : null;
   const session = await createSession(row.user_id, "device");
   const userRow = await userFromToken(session.token);
-  const devices = await listDevices(row.user_id);
 
   sendJson(res, 200, {
     status: "approved",
     token: session.token,
     expires_at: session.expiresAt,
     user: userRow ? userPayload(userRow) : null,
-    device: device ?? devices[0] ?? null,
   });
 }
 
@@ -331,26 +318,16 @@ async function handleDeviceApprove(
   }
 
   const userCode = `${normalizeCode(code).slice(0, 4)}-${normalizeCode(code).slice(4)}`;
-  const { rows } = await pool.query<{
-    fingerprint: string;
-    client_name: string;
-    platform: string;
-  }>(
-    "SELECT fingerprint, client_name, platform FROM device_codes WHERE user_code = $1 AND status = 'pending' AND expires_at > now()",
+  const { rows } = await pool.query<{ user_code: string }>(
+    "SELECT user_code FROM device_codes WHERE user_code = $1 AND status = 'pending' AND expires_at > now()",
     [userCode],
   );
-  const pending = rows[0];
-  if (!pending) {
+  if (!rows[0]) {
     throw new HttpError(404, "配对码不存在或已过期", "invalid_user_code");
   }
 
-  const device = await activateDevice(user.id, {
-    fingerprint: pending.fingerprint,
-    name: pending.client_name || "ArbPilot Desktop",
-    platform: pending.platform,
-  });
-  await approveDeviceCode(userCode, user.id, device);
-  sendJson(res, 200, { status: "approved", device });
+  await approveDeviceCode(userCode, user.id);
+  sendJson(res, 200, { status: "approved" });
 }
 
 async function handleDeviceDeny(
@@ -373,21 +350,12 @@ async function handleLicenseToken(
   res: ServerResponse,
 ): Promise<void> {
   const user = await requireUser(req);
-  const body = await readJson(req);
-  const fingerprint = text(body.device_fingerprint);
-
-  const devices = await listDevices(user.id);
-  if (fingerprint && !devices.some((device) => device.fingerprint === fingerprint)) {
-    throw new HttpError(403, "该设备尚未激活", "device_not_activated");
-  }
 
   const entitlement = await entitlements(user.id);
   const issued = issueLicenseToken({
     userId: user.id,
     email: user.email,
     entitlement,
-    devices: await deviceIds(user.id),
-    deviceFingerprint: fingerprint,
   });
 
   sendJson(res, 200, {
@@ -617,20 +585,15 @@ const server = createServer((req, res) => {
 
       if (req.method === "GET" && pathname === "/api/me") {
         const user = await requireUser(req);
-        const [entitlement, devices] = await Promise.all([
-          entitlements(user.id),
-          listDevices(user.id),
-        ]);
+        const entitlement = await entitlements(user.id);
         sendJson(res, 200, {
           user: userPayload(user),
           entitlement: {
             plans: entitlement.plans,
             status: entitlement.status,
             expiresAt: entitlement.expiresAt,
-            deviceLimit: entitlement.deviceLimit,
             trialEndsAt: entitlement.trialEndsAt,
           },
-          devices,
         });
         return;
       }
@@ -648,41 +611,6 @@ const server = createServer((req, res) => {
 
       if (req.method === "POST" && pathname === "/api/me/billing/cancel") {
         await handleBillingCancel(req, res);
-        return;
-      }
-
-      if (pathname === "/api/me/devices" && req.method === "GET") {
-        const user = await requireUser(req);
-        sendJson(res, 200, { devices: await listDevices(user.id) });
-        return;
-      }
-
-      if (pathname === "/api/me/devices" && req.method === "POST") {
-        const user = await requireUser(req);
-        const body = await readJson(req);
-        const fingerprint = text(body.fingerprint);
-        if (!fingerprint) {
-          throw new HttpError(400, "缺少设备指纹", "invalid_request");
-        }
-        const device = await activateDevice(user.id, {
-          fingerprint,
-          name: text(body.name) ?? "ArbPilot Desktop",
-          platform: text(body.platform) ?? "",
-        });
-        sendJson(res, 200, { device });
-        return;
-      }
-
-      if (
-        req.method === "DELETE" &&
-        segments.length === 4 &&
-        segments[0] === "api" &&
-        segments[1] === "me" &&
-        segments[2] === "devices"
-      ) {
-        const user = await requireUser(req);
-        await revokeDevice(user.id, segments[3]!);
-        sendJson(res, 200, { ok: true });
         return;
       }
 

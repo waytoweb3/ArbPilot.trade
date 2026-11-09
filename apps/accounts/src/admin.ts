@@ -1,7 +1,7 @@
 import { pool } from "./db";
 
 /**
- * 运营后台数据：按用户聚合注册信息、订阅、授权与设备。
+ * 运营后台数据：按用户聚合注册信息、订阅与授权。
  * 只读取账号库，不接触执行器的交易数据与交易所密钥。
  */
 
@@ -28,13 +28,6 @@ export interface AdminLicense {
   updatedAt: string | null;
 }
 
-export interface AdminDevice {
-  name: string;
-  platform: string;
-  createdAt: string | null;
-  lastSeenAt: string | null;
-}
-
 export interface AdminUser {
   id: string;
   email: string | null;
@@ -43,7 +36,6 @@ export interface AdminUser {
   createdAt: string;
   lastSeenAt: string | null;
   providers: string[];
-  deviceCount: number;
   isAuthor: boolean;
   /** 是否产生过订阅（含已取消/已过期），用于区分免费与付费用户。 */
   paid: boolean;
@@ -53,7 +45,6 @@ export interface AdminUser {
   currentPeriodEnd: string | null;
   subscriptions: AdminSubscription[];
   licenses: AdminLicense[];
-  devices: AdminDevice[];
 }
 
 export interface AdminSummary {
@@ -62,7 +53,6 @@ export interface AdminSummary {
   paidUsers: number;
   activeSubscriptions: number;
   pastDueSubscriptions: number;
-  activeDevices: number;
   newUsers7d: number;
   newUsers30d: number;
 }
@@ -81,12 +71,10 @@ interface AdminRow {
   avatar_url: string | null;
   created_at: Date;
   last_seen_at: Date | null;
-  device_count: number;
   providers: string[];
   is_author: boolean;
   subscriptions: AdminSubscription[];
   licenses: AdminLicense[];
-  devices: AdminDevice[];
 }
 
 const LIMIT = 5000;
@@ -139,10 +127,7 @@ export async function adminOverview(): Promise<AdminOverview> {
        (SELECT max(s.last_seen_at)
           FROM sessions s
          WHERE s.user_id = u.id AND s.revoked_at IS NULL) AS last_seen_at,
-       (SELECT count(*)::int
-          FROM devices d
-         WHERE d.user_id = u.id AND d.revoked_at IS NULL) AS device_count,
-       COALESCE((SELECT array_agg(DISTINCT i.provider)
+      COALESCE((SELECT array_agg(DISTINCT i.provider)
                    FROM identities i WHERE i.user_id = u.id), '{}') AS providers,
        EXISTS (SELECT 1 FROM author_profiles ap WHERE ap.user_id = u.id) AS is_author,
        COALESCE((SELECT json_agg(json_build_object(
@@ -167,15 +152,7 @@ export async function adminOverview(): Promise<AdminOverview> {
                    'createdAt', l.created_at,
                    'updatedAt', l.updated_at
                  ) ORDER BY l.updated_at DESC)
-                   FROM licenses l WHERE l.user_id = u.id), '[]'::json) AS licenses,
-       COALESCE((SELECT json_agg(json_build_object(
-                   'name', d.name,
-                   'platform', d.platform,
-                   'createdAt', d.created_at,
-                   'lastSeenAt', d.last_seen_at
-                 ) ORDER BY d.last_seen_at DESC)
-                   FROM devices d
-                  WHERE d.user_id = u.id AND d.revoked_at IS NULL), '[]'::json) AS devices
+                   FROM licenses l WHERE l.user_id = u.id), '[]'::json) AS licenses
      FROM users u
      ORDER BY u.created_at DESC
      LIMIT ${LIMIT + 1}`,
@@ -210,7 +187,6 @@ export async function adminOverview(): Promise<AdminOverview> {
       createdAt: iso(row.created_at) ?? "",
       lastSeenAt: iso(row.last_seen_at),
       providers: row.providers,
-      deviceCount: row.device_count,
       isAuthor: row.is_author,
       paid,
       plans,
@@ -218,7 +194,6 @@ export async function adminOverview(): Promise<AdminOverview> {
       currentPeriodEnd,
       subscriptions: row.subscriptions,
       licenses: row.licenses,
-      devices: row.devices,
     };
   });
 
@@ -244,7 +219,6 @@ export async function adminOverview(): Promise<AdminOverview> {
         ).length,
       0,
     ),
-    activeDevices: users.reduce((total, user) => total + user.deviceCount, 0),
     newUsers7d: users.filter((user) => now - Date.parse(user.createdAt) <= 7 * day).length,
     newUsers30d: users.filter((user) => now - Date.parse(user.createdAt) <= 30 * day).length,
   };

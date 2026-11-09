@@ -665,7 +665,6 @@ export interface ExecutorLicense {
   status: "active" | "canceling" | "past_due" | "expired" | "none";
   email: string | null;
   subject: string | null;
-  device: string | null;
   expires_at: number | null;
   grace_until: number | null;
   error: string | null;

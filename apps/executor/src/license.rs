@@ -35,10 +35,6 @@ pub struct LicenseClaims {
     #[serde(default = "default_status")]
     pub status: String,
     #[serde(default)]
-    pub devices: Vec<String>,
-    #[serde(default)]
-    pub device: Option<String>,
-    #[serde(default)]
     pub iat: i64,
     #[serde(default)]
     pub exp: i64,
@@ -70,7 +66,6 @@ pub struct LicenseStatus {
     pub status: String,
     pub email: Option<String>,
     pub subject: Option<String>,
-    pub device: Option<String>,
     pub expires_at: Option<i64>,
     pub grace_until: Option<i64>,
     /// 读取或校验令牌时的错误，便于桌面端提示。
@@ -270,7 +265,6 @@ impl LicenseManager {
             },
             email: claims.and_then(|item| item.email.clone()),
             subject: claims.map(|item| item.sub.clone()),
-            device: claims.and_then(|item| item.device.clone()),
             expires_at: claims.map(|item| item.exp),
             grace_until: claims.map(|item| item.exp + self.grace_secs),
             error,
@@ -649,8 +643,6 @@ mod tests {
             email: None,
             plans: plans.iter().map(|plan| (*plan).to_string()).collect(),
             status: "active".to_string(),
-            devices: Vec::new(),
-            device: None,
             iat: 0,
             exp: Utc::now().timestamp() + 3_600,
             v: 1,

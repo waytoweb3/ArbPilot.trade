@@ -852,9 +852,9 @@ const zh = {
     security3:
       "所有开仓指令都必须通过执行器风控，Telegram 与策略插件无法绕过。",
     security4: "自动更新只接受签名制品；升级前备份数据库并暂停新开仓。",
-    accountTitle: "账号与设备",
+    accountTitle: "账号与授权",
     accountDesc:
-      "登录只用于授权、设备数量、用户身份与策略购买同步；交易凭证、订单与数据库始终留在本机，换设备重新登录即可恢复已购内容。",
+      "登录只用于授权、用户身份与策略购买同步；交易凭证、订单与数据库始终留在本机，换设备重新登录即可恢复已购内容。",
     accountLoginTitle: "登录 ArbPilot",
     accountLoginDesc:
       "通过浏览器完成第三方登录，桌面端不会接触你的密码，也不会因此获得任何交易或提现权限。",
@@ -878,12 +878,6 @@ const zh = {
     accountPlanNone: "未订阅",
     accountPlanFree: "免费",
     accountExpires: "周期结束",
-    accountDevices: "登录设备",
-    accountDevicesDesc: "套餐限制同时在线设备数量，移除后该设备需重新登录。",
-    accountDeviceUsage: "{used} / {limit} 台",
-    accountDeviceCurrent: "本机",
-    accountDeviceLastSeen: "最近活跃 {value}",
-    accountDeviceRevoke: "移除",
     accountSubscriptions: "订阅记录",
     accountSubEmpty: "暂无订阅记录。",
     accountSubCancel: "取消订阅",
@@ -894,11 +888,11 @@ const zh = {
     accountUnreachable: "无法连接账号服务（{url}），请先启动 apps/accounts。",
     signInRequiredTitle: "先用 Google 账号登录",
     signInRequiredDesc:
-      "ArbPilot 的全部功能需要登录后才能使用；登录只用于授权、设备数量与订阅同步，不会接触交易所凭证、订单或资金。",
+      "ArbPilot 的全部功能需要登录后才能使用；登录只用于授权与订阅同步，不会接触交易所凭证、订单或资金。",
     signInRequiredHint: "本地执行器与已有数据不会被修改，登录后自动恢复。",
     billing: "订阅与账单",
     billingDesc:
-      "ArbPilot 由你自己托管运行，订阅只解锁软件模块与更新；交易所账户、API Key、订单与数据始终留在你的设备上。桌面端用第三方账号登录，只用于授权、设备数量与策略购买同步，不接触任何交易凭证。",
+      "ArbPilot 由你自己托管运行，订阅只解锁软件模块与更新；交易所账户、API Key、订单与数据始终留在你的设备上。桌面端用第三方账号登录，只用于授权与策略购买同步，不接触任何交易凭证。",
     billingSelfHostedTitle: "自托管的优势",
     billingSelfHosted: [
       "资金与 API Key 不离开你的设备，平台无法代你下单或划转",
@@ -946,7 +940,7 @@ const zh = {
       unknown: "未找到",
     },
     billingLoginPrompt:
-      "尚未登录。点击右上角头像使用 Google 登录，订阅、策略购买与设备授权才会绑定到你的账号。",
+      "尚未登录。点击右上角头像使用 Google 登录，订阅、策略购买与授权才会绑定到你的账号。",
     billingRequireLogin: "订阅需要先登录账号，请点击右上角头像登录后再试。",
     billingLicenseTitle: "执行器授权",
     billingLicenseEnforced: "已开启校验",
@@ -1952,9 +1946,9 @@ const en: typeof zh = {
       "Every entry passes through the executor risk engine. Telegram and strategy plugins cannot bypass it.",
     security4:
       "Auto-updates only accept signed artifacts. Back up the database and pause new entries before upgrading.",
-    accountTitle: "Account & devices",
+    accountTitle: "Account & licence",
     accountDesc:
-      "Signing in covers licensing, device limits, user identity and purchased strategies. Trading credentials, orders and the database stay local; signing in on a new machine restores what you bought.",
+      "Signing in covers licensing, user identity and purchased strategies. Trading credentials, orders and the database stay local; signing in on a new machine restores what you bought.",
     accountLoginTitle: "Sign in to ArbPilot",
     accountLoginDesc:
       "Complete third-party sign-in in your browser. The desktop never sees your password and gains no trading or withdrawal permission.",
@@ -1979,13 +1973,6 @@ const en: typeof zh = {
     accountPlanNone: "No subscription",
     accountPlanFree: "Free",
     accountExpires: "Period ends",
-    accountDevices: "Signed-in devices",
-    accountDevicesDesc:
-      "Your plan caps concurrent devices; removing one requires it to sign in again.",
-    accountDeviceUsage: "{used} / {limit} devices",
-    accountDeviceCurrent: "This device",
-    accountDeviceLastSeen: "Last active {value}",
-    accountDeviceRevoke: "Remove",
     accountSubscriptions: "Subscriptions",
     accountSubEmpty: "No subscriptions yet.",
     accountSubCancel: "Cancel subscription",
@@ -1998,12 +1985,12 @@ const en: typeof zh = {
       "Cannot reach the accounts service ({url}). Start apps/accounts first.",
     signInRequiredTitle: "Sign in with Google to continue",
     signInRequiredDesc:
-      "All ArbPilot features require an account. Sign-in only covers licensing, device limits and subscription sync; it never touches exchange credentials, orders or funds.",
+      "All ArbPilot features require an account. Sign-in only covers licensing and subscription sync; it never touches exchange credentials, orders or funds.",
     signInRequiredHint:
       "Your local executor and existing data stay untouched and resume after sign-in.",
     billing: "Subscription & billing",
     billingDesc:
-      "ArbPilot runs on infrastructure you control. A subscription only unlocks software modules and updates; exchange accounts, API keys, orders and data stay on your device. Third-party sign-in is used solely for licensing, device limits and purchased strategies — never for trading credentials.",
+      "ArbPilot runs on infrastructure you control. A subscription only unlocks software modules and updates; exchange accounts, API keys, orders and data stay on your device. Third-party sign-in is used solely for licensing and purchased strategies — never for trading credentials.",
     billingSelfHostedTitle: "Why self-hosted",
     billingSelfHosted: [
       "Funds and API keys never leave your device; we cannot place orders or move money for you",
@@ -2056,7 +2043,7 @@ const en: typeof zh = {
       unknown: "Not found",
     },
     billingLoginPrompt:
-      "You are not signed in. Use the avatar in the top right to continue with Google so subscriptions, strategy purchases and device licences are bound to your account.",
+      "You are not signed in. Use the avatar in the top right to continue with Google so subscriptions, strategy purchases and licences are bound to your account.",
     billingRequireLogin:
       "Sign in first — use the avatar in the top right, then try again.",
     billingLicenseTitle: "Executor licence",

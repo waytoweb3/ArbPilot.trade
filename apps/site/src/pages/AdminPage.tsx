@@ -34,13 +34,6 @@ interface AdminLicense {
   updatedAt: string | null;
 }
 
-interface AdminDevice {
-  name: string;
-  platform: string;
-  createdAt: string | null;
-  lastSeenAt: string | null;
-}
-
 interface AdminUser {
   id: string;
   email: string | null;
@@ -49,7 +42,6 @@ interface AdminUser {
   createdAt: string;
   lastSeenAt: string | null;
   providers: string[];
-  deviceCount: number;
   isAuthor: boolean;
   paid: boolean;
   plans: string[];
@@ -57,7 +49,6 @@ interface AdminUser {
   currentPeriodEnd: string | null;
   subscriptions: AdminSubscription[];
   licenses: AdminLicense[];
-  devices: AdminDevice[];
 }
 
 interface AdminSummary {
@@ -66,7 +57,6 @@ interface AdminSummary {
   paidUsers: number;
   activeSubscriptions: number;
   pastDueSubscriptions: number;
-  activeDevices: number;
   newUsers7d: number;
   newUsers30d: number;
 }
@@ -165,7 +155,7 @@ function planName(plan: string): string {
   return PLAN_LABEL[plan] ?? plan;
 }
 
-/** 运营后台：账号库里的注册用户、付费订阅与设备明细。 */
+/** 运营后台：账号库里的注册用户、付费订阅与授权明细。 */
 export default function AdminPage() {
   const { locale } = useI18n();
   usePageMeta(metaForPath("/admin", locale));
@@ -328,7 +318,7 @@ export default function AdminPage() {
         </p>
       )}
 
-      <div className="mt-6 grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-5">
+      <div className="mt-6 grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-4">
         <StatCard label="注册用户" value={summary?.totalUsers} />
         <StatCard label="免费用户" value={summary?.freeUsers} />
         <StatCard label="付费用户" value={summary?.paidUsers} accent />
@@ -336,11 +326,6 @@ export default function AdminPage() {
           label="生效订阅"
           value={summary?.activeSubscriptions}
           hint={summary?.pastDueSubscriptions ? `逾期 ${summary.pastDueSubscriptions}` : undefined}
-        />
-        <StatCard
-          label="活跃设备"
-          value={summary?.activeDevices}
-          hint={summary ? `7 日新增 ${summary.newUsers7d} 人` : undefined}
         />
       </div>
 
@@ -379,7 +364,6 @@ export default function AdminPage() {
               <th className="px-3 py-3 font-medium">套餐</th>
               <th className="px-3 py-3 font-medium">状态</th>
               <th className="px-3 py-3 font-medium">到期时间</th>
-              <th className="px-3 py-3 font-medium">设备</th>
               <th className="px-3 py-3 font-medium">注册时间</th>
               <th className="px-3 py-3 font-medium">最近活跃</th>
               <th className="px-3 py-3 font-medium" />
@@ -401,14 +385,14 @@ export default function AdminPage() {
             })}
             {!loading && users.length === 0 && (
               <tr>
-                <td colSpan={9} className="px-4 py-12 text-center text-[12.5px] text-muted">
+                <td colSpan={8} className="px-4 py-12 text-center text-[12.5px] text-muted">
                   {overview ? "没有符合条件的用户" : "暂无数据"}
                 </td>
               </tr>
             )}
             {loading && !overview && (
               <tr>
-                <td colSpan={9} className="px-4 py-12 text-center text-[12.5px] text-muted">
+                <td colSpan={8} className="px-4 py-12 text-center text-[12.5px] text-muted">
                   正在加载…
                 </td>
               </tr>
@@ -549,7 +533,6 @@ function UserRow({
             "—"
           )}
         </td>
-        <td className="px-3 py-3 font-mono text-[12px] text-body">{user.deviceCount}</td>
         <td className="px-3 py-3 text-[12px] text-muted">{formatDay(user.createdAt)}</td>
         <td className="px-3 py-3 text-[12px] text-muted">{formatTime(user.lastSeenAt)}</td>
         <td className="px-3 py-3 text-right">
@@ -566,7 +549,7 @@ function UserRow({
       </tr>
       {user.paid && open && (
         <tr className="border-b border-line/70 bg-panel-soft/60">
-          <td colSpan={9} className="px-4 py-4">
+          <td colSpan={8} className="px-4 py-4">
             <div className="grid gap-4 lg:grid-cols-2">
               <DetailBlock title={`订阅记录（${user.subscriptions.length}）`}>
                 {user.subscriptions.length === 0 ? (
@@ -631,29 +614,6 @@ function UserRow({
                             </span>
                             <span className="text-subtle">{formatDay(item.expiresAt)}</span>
                           </span>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </DetailBlock>
-
-                <DetailBlock title={`设备（${user.devices.length}）`}>
-                  {user.devices.length === 0 ? (
-                    <p className="text-[11.5px] text-muted">暂无激活设备</p>
-                  ) : (
-                    <div className="space-y-1.5">
-                      {user.devices.map((device, index) => (
-                        <div
-                          key={`${device.name}-${index}`}
-                          className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-line bg-panel px-2.5 py-1.5 text-[11px]"
-                        >
-                          <span className="text-body">
-                            {device.name}
-                            {device.platform && (
-                              <span className="ml-1.5 text-subtle">{device.platform}</span>
-                            )}
-                          </span>
-                          <span className="text-subtle">最近 {formatTime(device.lastSeenAt)}</span>
                         </div>
                       ))}
                     </div>

@@ -12,10 +12,6 @@ export interface LicenseClaims {
   /** 当前有效的套餐列表；为空表示免费用户 */
   plans: string[];
   status: Entitlement["status"];
-  /** 已激活且未撤销的设备 ID，执行器可用于校验设备绑定 */
-  devices: string[];
-  /** 当前设备的指纹；为空表示令牌来自网页端 */
-  device: string | null;
   iat: number;
   exp: number;
   v: 1;
@@ -35,8 +31,6 @@ export function issueLicenseToken(input: {
   userId: string;
   email: string | null;
   entitlement: Entitlement;
-  devices: string[];
-  deviceFingerprint: string | null;
 }): IssuedLicense {
   const now = Math.floor(Date.now() / 1000);
   const exp = now + Math.round(config.licenseTtlHours * 3600);
@@ -45,8 +39,6 @@ export function issueLicenseToken(input: {
     email: input.email,
     plans: input.entitlement.plans,
     status: input.entitlement.status,
-    devices: input.devices,
-    device: input.deviceFingerprint,
     iat: now,
     exp,
     v: 1,

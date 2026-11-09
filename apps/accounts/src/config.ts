@@ -117,12 +117,6 @@ const defaultOrigins = [
   "http://tauri.localhost",
 ];
 
-const deviceLimits: Record<string, number> = {
-  free: Number(process.env.DEVICE_LIMIT_FREE ?? 1),
-  arbitrage: Number(process.env.DEVICE_LIMIT_ARBITRAGE ?? 2),
-  strategy: Number(process.env.DEVICE_LIMIT_STRATEGY ?? 3),
-};
-
 export const config = {
   port,
   publicBaseUrl,
@@ -139,8 +133,6 @@ export const config = {
   executorToken: process.env.EXECUTOR_TOKEN ?? "dev-local-token",
   sessionTtlDays: Number(process.env.SESSION_TTL_DAYS ?? 30),
   deviceCodeTtlSecs: Number(process.env.DEVICE_CODE_TTL_SECS ?? 900),
-  /** 各套餐允许同时在线的设备数；未订阅只允许 1 台（用于登录与查看）。 */
-  deviceLimits,
   /** 权益令牌有效期；执行器可额外放宽离线宽限期。 */
   licenseTtlHours: Number(process.env.LICENSE_TTL_HOURS ?? 24),
   /** 托管与非托管用户统一使用 Google 第三方登录。 */

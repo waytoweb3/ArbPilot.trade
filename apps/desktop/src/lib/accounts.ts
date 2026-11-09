@@ -3,7 +3,6 @@ export const ACCOUNTS_URL = (
 ).replace(/\/$/, "");
 
 const SESSION_KEY = "arbpilot.session";
-const FINGERPRINT_KEY = "arbpilot.device.fingerprint";
 
 export interface AccountUser {
   id: string;
@@ -12,20 +11,10 @@ export interface AccountUser {
   avatarUrl: string | null;
 }
 
-export interface AccountDevice {
-  id: string;
-  name: string;
-  platform: string;
-  fingerprint: string;
-  createdAt: string;
-  lastSeenAt: string;
-}
-
 export interface AccountEntitlement {
   plans: string[];
   status: "active" | "canceling" | "past_due" | "none";
   expiresAt: string | null;
-  deviceLimit: number;
   /** 基础版当前周期内赠送的策略创建试用截止时间；不在试用期为 null。 */
   trialEndsAt?: string | null;
 }
@@ -33,7 +22,6 @@ export interface AccountEntitlement {
 export interface AccountMe {
   user: AccountUser;
   entitlement: AccountEntitlement;
-  devices: AccountDevice[];
 }
 
 export interface AccountSubscription {
@@ -64,7 +52,6 @@ export interface DeviceCodePoll {
   token?: string;
   expires_at?: string;
   user?: AccountUser | null;
-  device?: AccountDevice | null;
 }
 
 export class AccountError extends Error {
@@ -88,25 +75,6 @@ export function setSessionToken(token: string | null): void {
   } else {
     localStorage.removeItem(SESSION_KEY);
   }
-}
-
-/** 每台安装生成一次设备指纹，用于设备数量限制与撤销。 */
-export function deviceFingerprint(): string {
-  const existing = localStorage.getItem(FINGERPRINT_KEY);
-  if (existing) {
-    return existing;
-  }
-  const generated = crypto.randomUUID();
-  localStorage.setItem(FINGERPRINT_KEY, generated);
-  return generated;
-}
-
-export function devicePlatform(): string {
-  const agent = navigator.userAgent;
-  if (agent.includes("Mac")) return "macos";
-  if (agent.includes("Win")) return "windows";
-  if (agent.includes("Linux")) return "linux";
-  return "unknown";
 }
 
 async function request<T>(
@@ -146,11 +114,7 @@ export function fetchMe(token: string): Promise<AccountMe> {
 export function startDeviceLogin(): Promise<DeviceCodeStart> {
   return request<DeviceCodeStart>("/api/auth/device/start", {
     method: "POST",
-    body: JSON.stringify({
-      fingerprint: deviceFingerprint(),
-      client_name: "ArbPilot Desktop",
-      platform: devicePlatform(),
-    }),
+    body: JSON.stringify({ client_name: "ArbPilot Desktop" }),
   });
 }
 
@@ -184,25 +148,6 @@ export function cancelSubscription(
   );
 }
 
-export function activateDevice(token: string): Promise<{ device: AccountDevice }> {
-  return request(
-    "/api/me/devices",
-    {
-      method: "POST",
-      body: JSON.stringify({
-        fingerprint: deviceFingerprint(),
-        name: "ArbPilot Desktop",
-        platform: devicePlatform(),
-      }),
-    },
-    token,
-  );
-}
-
-export function revokeDevice(token: string, deviceId: string): Promise<{ ok: true }> {
-  return request(`/api/me/devices/${encodeURIComponent(deviceId)}`, { method: "DELETE" }, token);
-}
-
 /** 账号服务签发的短期授权令牌，由执行器用公钥离线校验。 */
 export interface LicenseGrant {
   token: string;
@@ -212,18 +157,12 @@ export interface LicenseGrant {
     email: string | null;
     plans: string[];
     status: string;
-    device: string | null;
     exp: number;
   };
 }
 
-/** 换取授权令牌；设备需先用 activateDevice 登记，否则返回 403。 */
-export function fetchLicenseToken(token: string, fingerprint: string): Promise<LicenseGrant> {
-  return request<LicenseGrant>(
-    "/api/me/license-token",
-    { method: "POST", body: JSON.stringify({ device_fingerprint: fingerprint }) },
-    token,
-  );
+export function fetchLicenseToken(token: string): Promise<LicenseGrant> {
+  return request<LicenseGrant>("/api/me/license-token", { method: "POST" }, token);
 }
 
 // ---------------------------------------------------------------------------

@@ -13,7 +13,7 @@ const copy = {
   zh: {
     eyebrow: "桌面端登录",
     title: "在浏览器中确认登录",
-    desc: "账号只用于订阅授权、设备数量与策略购买同步。API Key、签名私钥、订单与数据库始终留在你的机器上。",
+    desc: "账号只用于订阅授权与策略购买同步。API Key、签名私钥、订单与数据库始终留在你的机器上。",
     code: "配对码",
     google: "使用 Google 登录",
     redirecting: "正在跳转到授权页面…",

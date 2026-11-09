@@ -3,14 +3,11 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import {
   AccountError,
-  activateDevice,
   cancelSubscription,
-  deviceFingerprint,
   fetchLicenseToken,
   fetchMe,
   fetchSubscriptions,
   logout,
-  revokeDevice,
 } from "../lib/accounts";
 import { api, getExecutorMode, setLicenseToken } from "../lib/api";
 import { useSessionStore } from "../lib/session";
@@ -60,17 +57,6 @@ export function useCancelAccountSubscription() {
   });
 }
 
-export function useRevokeDevice() {
-  const token = useSessionStore((state) => state.token);
-  const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: (deviceId: string) => revokeDevice(token!, deviceId),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ["account"] });
-    },
-  });
-}
-
 export function useLogout() {
   const token = useSessionStore((state) => state.token);
   const setToken = useSessionStore((state) => state.setToken);
@@ -91,7 +77,7 @@ export function useLogout() {
 }
 
 /**
- * 把账号授权同步到执行器：先登记本机设备，再用设备指纹换取短期令牌。
+ * 把账号授权同步到执行器：用登录会话换取短期令牌。
  *
  * 执行器只用内置公钥离线验签，账号服务不可达时已安装的授权继续生效。
  */
@@ -100,8 +86,7 @@ async function applyLicense(token: string | null): Promise<ExecutorLicense> {
     setLicenseToken(null);
     return api.clearLicense();
   }
-  await activateDevice(token);
-  const grant = await fetchLicenseToken(token, deviceFingerprint());
+  const grant = await fetchLicenseToken(token);
   // 令牌装进执行器，同时留给访问官方只读数据接口的请求头使用。
   setLicenseToken(grant.token);
   return api.installLicense(grant.token);
