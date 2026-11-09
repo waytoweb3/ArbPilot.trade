@@ -24,7 +24,7 @@ type PollState = "pending" | "expired" | "denied";
 /**
  * 顶栏账号入口：未登录时用浏览器设备码登录，登录后显示账号与套餐。
  *
- * 登录只用于授权、设备数量与策略购买同步，不涉及交易所凭证与订单。
+ * 登录只用于订阅授权与策略购买同步，不涉及交易所凭证与订单。
  * 弹窗与菜单都渲染到 body，避免 header 的 backdrop-filter 影响 fixed 定位。
  */
 export function AccountButton() {

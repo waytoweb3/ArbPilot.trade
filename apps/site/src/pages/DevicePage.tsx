@@ -29,7 +29,7 @@ const copy = {
   en: {
     eyebrow: "Desktop sign-in",
     title: "Confirm sign-in in your browser",
-    desc: "The account is only used for licensing, device limits and purchased strategies. API keys, signing keys, orders and your database stay on your machine.",
+    desc: "The account is only used for licensing and purchased strategies. API keys, signing keys, orders and your database stay on your machine.",
     code: "Pairing code",
     google: "Continue with Google",
     redirecting: "Redirecting to the provider…",
