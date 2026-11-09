@@ -463,7 +463,13 @@ pub async fn submit_legs(
             OrderStatus::Failed
         };
         if has_filled_leg {
-            state.set_paused(true, Some("双腿失衡，等待人工确认补偿"));
+            state.set_paused(
+                true,
+                Some((
+                    "双腿失衡，等待人工确认补偿",
+                    "legs out of balance; manual compensation required",
+                )),
+            );
         }
         state.store.save_order(&order).await;
         log_event(
@@ -495,6 +501,7 @@ pub async fn submit_legs(
         let _ = state.events.send(ExecutorEvent::order_transition(
             &order,
             format!("订单 {} 状态: {:?}", order.id, order.status),
+            format!("Order {} status: {:?}", order.id, order.status),
         ));
         remember(state, &request.idempotency_key, &order);
         return Ok(PairOrderOutcome {

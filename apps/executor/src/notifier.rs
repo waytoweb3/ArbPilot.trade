@@ -16,7 +16,7 @@ use crate::{
     events::{ExecutorEvent, NoticeKind},
     news::NewsItem,
     store::{NotificationSettings, Store},
-    telegram::TelegramBot,
+    telegram::{TelegramBot, TelegramMessage},
 };
 
 /// 每轮新闻最多推送的条目数，避免首次采集时刷屏。
@@ -61,12 +61,21 @@ impl Notifier {
                 continue;
             }
             let mut message = format!("上币公告 · {}\n{}", item.source, item.title);
+            let mut message_en = format!("Listing · {}\n{}", item.source, item.title);
             if let Some(url) = &item.url {
                 message.push('\n');
                 message.push_str(url);
+                message_en.push('\n');
+                message_en.push_str(url);
             }
-            self.deliver(&settings, NoticeKind::News, item.title.clone(), message)
-                .await;
+            self.deliver(
+                &settings,
+                NoticeKind::News,
+                item.title.clone(),
+                message,
+                message_en,
+            )
+            .await;
         }
     }
 
@@ -105,13 +114,15 @@ impl Notifier {
                 cooldowns.insert(cooldown_key, now);
             }
 
-            let (headline, title) = match opportunity.kind {
+            let (headline, headline_en, title) = match opportunity.kind {
                 OpportunityKind::PerpPerpFunding => (
                     "永续-永续资金费率差",
+                    "Perp-perp funding spread",
                     format!("{} 跨所资金费率差", opportunity.symbol),
                 ),
                 _ => (
                     "资金费率套利机会",
+                    "Funding-rate arbitrage",
                     format!("{} 资金费率套利", opportunity.symbol),
                 ),
             };
@@ -124,8 +135,23 @@ impl Notifier {
                 opportunity.net_edge_bps,
                 opportunity.max_notional_usd,
             );
-            self.deliver(&settings, NoticeKind::Funding, title, message)
-                .await;
+            let message_en = format!(
+                "{headline_en}\n{}: long {} / short {}\nAnnualised {}%, net per period {} bps\nTradable notional {} USD",
+                opportunity.symbol,
+                opportunity.long_venue,
+                opportunity.short_venue,
+                annualized.round_dp(2),
+                opportunity.net_edge_bps,
+                opportunity.max_notional_usd,
+            );
+            self.deliver(
+                &settings,
+                NoticeKind::Funding,
+                title,
+                message,
+                message_en,
+            )
+            .await;
             sent += 1;
         }
     }
@@ -137,6 +163,7 @@ impl Notifier {
         kind: NoticeKind,
         title: String,
         message: String,
+        message_en: String,
     ) {
         if settings.desktop_enabled {
             let _ = self.events.send(ExecutorEvent::Notice {
@@ -147,7 +174,10 @@ impl Notifier {
             });
         }
         if settings.telegram_enabled && self.telegram.enabled() {
-            self.telegram.broadcast(&message).await;
+            // 每个绑定账号收到自己语言的版本。
+            self.telegram
+                .broadcast(&TelegramMessage::new(message, message_en))
+                .await;
         }
     }
 }

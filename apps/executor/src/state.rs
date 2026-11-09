@@ -284,12 +284,22 @@ impl AppState {
     }
 
     /// 暂停只阻止新开仓，查看仓位、撤单与风险处置始终可用。
-    pub fn set_paused(&self, paused: bool, reason: Option<&str>) {
+    /// `reason` 同时提供中英文版本，告警会按语言分别推送到桌面端与 Telegram。
+    pub fn set_paused(&self, paused: bool, reason: Option<(&str, &str)>) {
         self.paused.store(paused, Ordering::Relaxed);
-        let message = match (paused, reason) {
-            (true, Some(reason)) => format!("执行器已暂停开仓: {reason}"),
-            (true, None) => "执行器已暂停开仓".to_string(),
-            (false, _) => "执行器已恢复开仓".to_string(),
+        let (message, message_en) = match (paused, reason) {
+            (true, Some((reason, reason_en))) => (
+                format!("执行器已暂停开仓: {reason}"),
+                format!("Executor paused new entries: {reason_en}"),
+            ),
+            (true, None) => (
+                "执行器已暂停开仓".to_string(),
+                "Executor paused new entries".to_string(),
+            ),
+            (false, _) => (
+                "执行器已恢复开仓".to_string(),
+                "Executor resumed entries".to_string(),
+            ),
         };
         let _ = self.events.send(ExecutorEvent::Alert {
             level: if paused {
@@ -298,6 +308,7 @@ impl AppState {
                 AlertLevel::Info
             },
             message,
+            message_en: Some(message_en),
             at: Utc::now(),
         });
         let _ = self.events.send(self.status_event());

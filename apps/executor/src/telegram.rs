@@ -27,6 +27,67 @@ const PENDING_TTL_SECS: i64 = 120;
 /// 单个绑定用户最多保留的待确认订单数。
 const MAX_PENDING: usize = 5;
 
+/// 机器人回复与推送支持的语言。Telegram 用户可在会话里用 `/lang` 切换。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Lang {
+    #[default]
+    Zh,
+    En,
+}
+
+impl Lang {
+    /// 首次绑定时按 Telegram 的 language_code 判断；非中文一律回落到英文。
+    fn from_code(code: Option<&str>) -> Self {
+        match code {
+            Some(code) if code.to_ascii_lowercase().starts_with("zh") => Lang::Zh,
+            Some(code) if code.eq_ignore_ascii_case("cn") => Lang::Zh,
+            Some(_) => Lang::En,
+            None => Lang::Zh,
+        }
+    }
+
+    /// 解析 `/lang` 的参数。
+    fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "zh" | "cn" | "zh-cn" | "zh-hans" | "zh-hant" | "chinese" | "中文" => Some(Lang::Zh),
+            "en" | "en-us" | "en-gb" | "english" => Some(Lang::En),
+            _ => None,
+        }
+    }
+}
+
+/// 按语言取一段固定文案。
+fn pick(lang: Lang, zh: &'static str, en: &'static str) -> &'static str {
+    match lang {
+        Lang::Zh => zh,
+        Lang::En => en,
+    }
+}
+
+/// 同一条推送的中英文版本；广播时按每个绑定账号的语言选择。
+#[derive(Debug, Clone)]
+pub struct TelegramMessage {
+    pub zh: String,
+    pub en: String,
+}
+
+impl TelegramMessage {
+    pub fn new(zh: impl Into<String>, en: impl Into<String>) -> Self {
+        Self {
+            zh: zh.into(),
+            en: en.into(),
+        }
+    }
+
+    fn for_lang(&self, lang: Lang) -> &str {
+        match lang {
+            Lang::Zh => &self.zh,
+            Lang::En => &self.en,
+        }
+    }
+}
+
 /// Telegram 绑定关系，保存在执行器本机（若执行器跑在用户服务器上，就存在那台服务器）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TelegramBinding {
@@ -36,6 +97,9 @@ pub struct TelegramBinding {
     pub username: Option<String>,
     #[serde(default)]
     pub permissions: Vec<String>,
+    /// 该账号的机器人语言；旧绑定文件没有这个字段时按消息里的 language_code 判断。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lang: Option<Lang>,
     pub paired_at: DateTime<Utc>,
 }
 
@@ -69,6 +133,21 @@ struct PendingTrade {
     notional_usd: Decimal,
     leverage: Decimal,
     expires_at: DateTime<Utc>,
+}
+
+/// `/open` 的回复：校验失败时只有文案，成功时附带确认/取消按钮。
+struct PreparedOpen {
+    text: String,
+    markup: Option<Value>,
+}
+
+impl PreparedOpen {
+    fn text(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            markup: None,
+        }
+    }
 }
 
 /// Telegram 机器人：配对绑定、查询、暂停/恢复与经确认的双腿开仓。
@@ -143,7 +222,14 @@ impl TelegramBot {
         tokio::spawn(async move {
             loop {
                 match events.recv().await {
-                    Ok(ExecutorEvent::Alert { message, .. }) => bot.broadcast(&message).await,
+                    Ok(ExecutorEvent::Alert {
+                        message,
+                        message_en,
+                        ..
+                    }) => {
+                        let en = message_en.unwrap_or_else(|| message.clone());
+                        bot.broadcast(&TelegramMessage::new(message, en)).await;
+                    }
                     Ok(_) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(_) => break,
@@ -223,6 +309,9 @@ impl TelegramBot {
             if let Some(message) = update.get("message") {
                 self.handle_message(state, message).await;
             }
+            if let Some(callback) = update.get("callback_query") {
+                self.handle_callback(state, callback).await;
+            }
         }
         Ok(())
     }
@@ -239,6 +328,9 @@ impl TelegramBot {
             .pointer("/from/username")
             .and_then(Value::as_str)
             .map(str::to_string);
+        let language_code = message
+            .pointer("/from/language_code")
+            .and_then(Value::as_str);
         let text = message
             .get("text")
             .and_then(Value::as_str)
@@ -247,6 +339,9 @@ impl TelegramBot {
         if text.is_empty() {
             return;
         }
+        // 绑定文件可能被另一个执行器实例改写（例如桌面端重启后残留的旧进程），
+        // 处理指令前重新读取，避免继续用启动时的旧快照误判“尚未绑定”。
+        self.sync_bindings();
 
         let mut parts = text.split_whitespace();
         let command = parts
@@ -257,46 +352,165 @@ impl TelegramBot {
             .unwrap_or_default()
             .to_ascii_lowercase();
         let args: Vec<&str> = parts.collect();
+        let lang = self.lang_for(user_id, language_code);
 
+        let mut markup = None;
         let reply = match command.as_str() {
-            "/start" | "/help" => help_text(self.enabled()),
-            "/bind" => self.bind(chat_id, user_id, username, &args),
+            "/start" | "/help" => help_text(lang, self.enabled()),
+            "/bind" => self.bind(chat_id, user_id, username, language_code, &args),
             _ => {
                 if self.binding(user_id).is_none() {
-                    "尚未绑定。请在桌面端「设置 → Telegram」生成配对码，然后发送 /bind <配对码>。"
-                        .to_string()
+                    pick(
+                        lang,
+                        "尚未绑定。请在桌面端「设置 → Telegram」生成配对码，然后发送 /bind <配对码>。",
+                        "Not linked yet. Create a pairing code in the desktop app under Settings → Telegram, then send /bind <code>.",
+                    )
+                    .to_string()
                 } else {
                     match command.as_str() {
-                        "/status" => status_text(state),
-                        "/positions" => positions_text(state),
-                        "/orders" => orders_text(state),
-                        "/news" => news_text(state),
+                        "/status" => status_text(lang, state),
+                        "/positions" => positions_text(lang, state),
+                        "/orders" => orders_text(lang, state),
+                        "/news" => news_text(lang, state),
                         "/pause" => {
-                            state.set_paused(true, Some("Telegram 指令"));
-                            "已暂停开仓。".to_string()
+                            state.set_paused(
+                                true,
+                                Some(("Telegram 指令", "Telegram command")),
+                            );
+                            pick(lang, "已暂停开仓。", "New entries paused.").to_string()
                         }
                         "/resume" => {
                             state.set_paused(false, None);
-                            "已恢复开仓。".to_string()
+                            pick(lang, "已恢复开仓。", "New entries resumed.").to_string()
                         }
-                        "/open" => self.prepare_open(state, user_id, &args),
-                        "/confirm" => self.confirm(state, user_id, &args).await,
-                        "/cancel" => self.cancel(user_id, &args),
-                        "/unbind" => self.unbind(user_id),
-                        other => format!("未识别的指令 {other}\n\n{}", help_text(self.enabled())),
+                        "/open" => {
+                            let prepared = self.prepare_open(state, user_id, lang, &args);
+                            markup = prepared.markup;
+                            prepared.text
+                        }
+                        "/lang" | "/language" => self.set_lang(user_id, lang, &args),
+                        "/unbind" => self.unbind(user_id, lang),
+                        other => format!(
+                            "{}\n\n{}",
+                            match lang {
+                                Lang::Zh => format!("未识别的指令 {other}"),
+                                Lang::En => format!("Unknown command {other}"),
+                            },
+                            help_text(lang, self.enabled())
+                        ),
                     }
                 }
             }
         };
-        self.send(chat_id, &reply).await;
+        self.send_with_markup(chat_id, &reply, markup.as_ref()).await;
     }
 
-    fn bind(&self, chat_id: i64, user_id: i64, username: Option<String>, args: &[&str]) -> String {
+    /// 处理按钮点击：按钮回调携带待确认订单编号，用户无需手输。
+    async fn handle_callback(&self, state: &AppState, callback: &Value) {
+        let Some(callback_id) = callback.get("id").and_then(Value::as_str) else {
+            return;
+        };
+        let user_id = callback
+            .pointer("/from/id")
+            .and_then(Value::as_i64)
+            .unwrap_or_default();
+        let language_code = callback
+            .pointer("/from/language_code")
+            .and_then(Value::as_str);
+        let chat_id = callback.pointer("/message/chat/id").and_then(Value::as_i64);
+        let message_id = callback
+            .pointer("/message/message_id")
+            .and_then(Value::as_i64);
+        let data = callback.get("data").and_then(Value::as_str).unwrap_or("");
+
+        self.sync_bindings();
+        let lang = self.lang_for(user_id, language_code);
+
+        let reply = match parse_callback(data) {
+            Some((action, token)) => {
+                if self.binding(user_id).is_none() {
+                    pick(
+                        lang,
+                        "尚未绑定，无法操作待确认订单。",
+                        "This account is not linked; cannot act on the pending order.",
+                    )
+                    .to_string()
+                } else if !self.can_trade(user_id) {
+                    pick(
+                        lang,
+                        "该账号没有交易权限。",
+                        "This account has no trading permission.",
+                    )
+                    .to_string()
+                } else if action == "confirm" {
+                    self.confirm(state, user_id, lang, token).await
+                } else {
+                    self.cancel(user_id, lang, token)
+                }
+            }
+            None => pick(lang, "无法识别的操作。", "Unrecognized action.").to_string(),
+        };
+
+        // 先回应回调，避免按钮一直处于加载状态。
+        let acknowledged = self
+            .api(
+                "answerCallbackQuery",
+                &[("callback_query_id", callback_id.to_string())],
+            )
+            .await;
+        if let Err(error) = acknowledged {
+            tracing::warn!(%error, "回应 Telegram 按钮回调失败");
+        }
+
+        match (chat_id, message_id) {
+            (Some(chat_id), Some(message_id)) => {
+                // 用结果覆盖原消息并清空按钮，避免重复点击。
+                let edited = self
+                    .edit_message(chat_id, message_id, &reply)
+                    .await;
+                if let Err(error) = edited {
+                    tracing::warn!(%error, "更新 Telegram 待确认消息失败，改为发送新消息");
+                    self.send(chat_id, &reply).await;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// 已绑定的账号以绑定里记录的语言为准；旧绑定按消息的 language_code 判断并回写。
+    fn lang_for(&self, user_id: i64, language_code: Option<&str>) -> Lang {
+        let current = self.binding(user_id);
+        if let Some(lang) = current.as_ref().and_then(|binding| binding.lang) {
+            return lang;
+        }
+        let lang = Lang::from_code(language_code);
+        if current.is_some() {
+            if let Err(error) = self.store_lang(user_id, lang) {
+                tracing::warn!(%error, "写入 Telegram 绑定语言失败");
+            }
+        }
+        lang
+    }
+
+    fn bind(
+        &self,
+        chat_id: i64,
+        user_id: i64,
+        username: Option<String>,
+        language_code: Option<&str>,
+        args: &[&str],
+    ) -> String {
+        let lang = self.lang_for(user_id, language_code);
         if self.binding(user_id).is_some() {
-            return "该账号已绑定，如需换绑请先发送 /unbind。".to_string();
+            return pick(
+                lang,
+                "该账号已绑定，如需换绑请先发送 /unbind。",
+                "This account is already linked. Send /unbind first to switch.",
+            )
+            .to_string();
         }
         let Some(code) = args.first() else {
-            return "用法：/bind <配对码>".to_string();
+            return pick(lang, "用法：/bind <配对码>", "Usage: /bind <code>").to_string();
         };
 
         let matched = {
@@ -307,7 +521,12 @@ impl TelegramBot {
             )
         };
         if !matched {
-            return "配对码不正确或已过期，请在桌面端重新生成。".to_string();
+            return pick(
+                lang,
+                "配对码不正确或已过期，请在桌面端重新生成。",
+                "The pairing code is invalid or expired. Create a new one in the desktop app.",
+            )
+            .to_string();
         }
 
         *self.pairing.lock().expect("配对码锁不可用") = None;
@@ -318,60 +537,157 @@ impl TelegramBot {
                 chat_id,
                 username,
                 permissions: vec!["read".to_string(), "trade".to_string()],
+                lang: Some(lang),
                 paired_at: Utc::now(),
             });
         }
         match self.persist() {
-            Ok(()) => "绑定成功。发送 /help 查看可用指令，开仓需要二次确认。".to_string(),
-            Err(error) => format!("绑定已记录，但写入绑定文件失败：{error}"),
+            Ok(()) => pick(
+                lang,
+                "绑定成功。发送 /help 查看可用指令，开仓需要二次确认。",
+                "Linked successfully. Send /help for commands; entries need a second confirmation.",
+            )
+            .to_string(),
+            Err(error) => match lang {
+                Lang::Zh => format!("绑定已记录，但写入绑定文件失败：{error}"),
+                Lang::En => format!("Linked, but writing the bindings file failed: {error}"),
+            },
         }
     }
 
-    fn unbind(&self, user_id: i64) -> String {
+    fn unbind(&self, user_id: i64, lang: Lang) -> String {
         let mut bindings = self.bindings.write().expect("电报绑定锁不可用");
         let before = bindings.len();
         bindings.retain(|binding| binding.telegram_user_id != user_id);
         if before == bindings.len() {
-            return "该账号尚未绑定。".to_string();
+            return pick(lang, "该账号尚未绑定。", "This account is not linked.").to_string();
         }
         drop(bindings);
         match self.persist() {
-            Ok(()) => "已解除绑定，后续指令将不再响应。".to_string(),
-            Err(error) => format!("已解除绑定，但写入绑定文件失败：{error}"),
+            Ok(()) => pick(
+                lang,
+                "已解除绑定，后续指令将不再响应。",
+                "Unlinked. The bot will ignore further commands.",
+            )
+            .to_string(),
+            Err(error) => match lang {
+                Lang::Zh => format!("已解除绑定，但写入绑定文件失败：{error}"),
+                Lang::En => format!("Unlinked, but writing the bindings file failed: {error}"),
+            },
         }
     }
 
-    fn prepare_open(&self, state: &AppState, user_id: i64, args: &[&str]) -> String {
+    /// 切换当前账号的机器人语言；`/lang` 不带参数时返回当前语言与用法。
+    fn set_lang(&self, user_id: i64, current: Lang, args: &[&str]) -> String {
+        let Some(value) = args.first() else {
+            return match current {
+                Lang::Zh => "当前语言：中文。用法：/lang zh|en".to_string(),
+                Lang::En => "Current language: English. Usage: /lang zh|en".to_string(),
+            };
+        };
+        let Some(lang) = Lang::parse(value) else {
+            return pick(
+                current,
+                "不支持的语言。用法：/lang zh|en",
+                "Unsupported language. Usage: /lang zh|en",
+            )
+            .to_string();
+        };
+        match self.store_lang(user_id, lang) {
+            Ok(()) => pick(lang, "已切换为中文。", "Language switched to English.").to_string(),
+            Err(error) => match lang {
+                Lang::Zh => format!("语言已切换，但写入绑定文件失败：{error}"),
+                Lang::En => format!("Language switched, but writing the bindings file failed: {error}"),
+            },
+        }
+    }
+
+    fn store_lang(&self, user_id: i64, lang: Lang) -> anyhow::Result<()> {
+        {
+            let mut bindings = self.bindings.write().expect("电报绑定锁不可用");
+            let Some(binding) = bindings
+                .iter_mut()
+                .find(|binding| binding.telegram_user_id == user_id)
+            else {
+                return Ok(());
+            };
+            if binding.lang == Some(lang) {
+                return Ok(());
+            }
+            binding.lang = Some(lang);
+        }
+        self.persist()
+    }
+
+    fn prepare_open(
+        &self,
+        state: &AppState,
+        user_id: i64,
+        lang: Lang,
+        args: &[&str],
+    ) -> PreparedOpen {
         if !self.can_trade(user_id) {
-            return "该账号没有交易权限。".to_string();
+            return PreparedOpen::text(pick(
+                lang,
+                "该账号没有交易权限。",
+                "This account has no trading permission.",
+            ));
         }
         if args.len() < 4 {
-            return "用法：/open <交易对> <多头交易所> <空头交易所> <每条腿USD> [杠杆]\n例如：/open BTCUSDT binance okx 500 1"
-                .to_string();
+            return PreparedOpen::text(pick(
+                lang,
+                "用法：/open <交易对> <多头交易所> <空头交易所> <每条腿USD> [杠杆]\n例如：/open BTCUSDT binance okx 500 1",
+                "Usage: /open <symbol> <long venue> <short venue> <USD per leg> [leverage]\nExample: /open BTCUSDT binance okx 500 1",
+            ));
         }
         let symbol = args[0].to_ascii_uppercase();
         let long_venue = args[1].to_ascii_lowercase();
         let short_venue = args[2].to_ascii_lowercase();
         if long_venue == short_venue {
-            return "双腿交易所不能相同。".to_string();
+            return PreparedOpen::text(pick(
+                lang,
+                "双腿交易所不能相同。",
+                "The two legs cannot use the same venue.",
+            ));
         }
         let Ok(notional_usd) = args[3].parse::<Decimal>() else {
-            return "金额不是合法数字。".to_string();
+            return PreparedOpen::text(pick(
+                lang,
+                "金额不是合法数字。",
+                "The amount is not a valid number.",
+            ));
         };
         if notional_usd <= Decimal::ZERO {
-            return "金额必须大于 0。".to_string();
+            return PreparedOpen::text(pick(
+                lang,
+                "金额必须大于 0。",
+                "The amount must be greater than 0.",
+            ));
         }
         let leverage = match args.get(4) {
             Some(value) => match value.parse::<Decimal>() {
                 Ok(value) if value > Decimal::ZERO => value,
-                _ => return "杠杆不是合法数字。".to_string(),
+                _ => {
+                    return PreparedOpen::text(pick(
+                        lang,
+                        "杠杆不是合法数字。",
+                        "The leverage is not a valid number.",
+                    ))
+                }
             },
             None => Decimal::ONE,
         };
 
         for venue in [&long_venue, &short_venue] {
             if state.market.quote(venue, &symbol).is_none() {
-                return format!("{symbol} 在 {venue} 没有可用行情，无法下单。");
+                return PreparedOpen::text(match lang {
+                    Lang::Zh => {
+                        format!("{symbol} 在 {venue} 没有可用行情，无法下单。")
+                    }
+                    Lang::En => {
+                        format!("No market data for {symbol} on {venue}; cannot place the order.")
+                    }
+                });
             }
         }
 
@@ -386,7 +702,11 @@ impl TelegramBot {
                 .count()
                 >= MAX_PENDING
             {
-                return "待确认订单过多，请先 /cancel 旧订单。".to_string();
+                return PreparedOpen::text(pick(
+                    lang,
+                    "待确认订单过多，请等待旧订单过期或点击旧订单的取消按钮。",
+                    "Too many pending orders. Wait for older ones to expire or tap their Cancel buttons.",
+                ));
             }
             pending.insert(
                 token.clone(),
@@ -402,29 +722,70 @@ impl TelegramBot {
             );
         }
 
-        format!(
-            "待确认 {token}\n{symbol}：{long_venue} 多头 / {short_venue} 空头\n每条腿 {notional_usd} USD，杠杆 {leverage}x\n\n发送 /confirm {token} 在 {PENDING_TTL_SECS} 秒内确认，/cancel {token} 取消。下单仍会经过执行器风控。"
-        )
+        let text = match lang {
+            Lang::Zh => format!(
+                "待确认 {token}\n{symbol}：{long_venue} 多头 / {short_venue} 空头\n每条腿 {notional_usd} USD，杠杆 {leverage}x\n\n请点击下方按钮在 {PENDING_TTL_SECS} 秒内确认或取消。下单仍会经过执行器风控。"
+            ),
+            Lang::En => format!(
+                "Pending {token}\n{symbol}: long {long_venue} / short {short_venue}\n{notional_usd} USD per leg, leverage {leverage}x\n\nTap a button below within {PENDING_TTL_SECS}s to confirm or cancel. Risk checks still apply."
+            ),
+        };
+        let markup = serde_json::json!({
+            "inline_keyboard": [[
+                {
+                    "text": pick(lang, "确认开仓", "Confirm entry"),
+                    "callback_data": format!("confirm:{token}"),
+                },
+                {
+                    "text": pick(lang, "取消", "Cancel"),
+                    "callback_data": format!("cancel:{token}"),
+                },
+            ]],
+        });
+        PreparedOpen {
+            text,
+            markup: Some(markup),
+        }
     }
 
-    async fn confirm(&self, state: &AppState, user_id: i64, args: &[&str]) -> String {
-        let Some(token) = args.first() else {
-            return "用法：/confirm <编号>".to_string();
-        };
+    async fn confirm(
+        &self,
+        state: &AppState,
+        user_id: i64,
+        lang: Lang,
+        token: &str,
+    ) -> String {
         let token = token.to_ascii_uppercase();
         let trade = {
             let mut pending = self.pending.lock().expect("待确认订单锁不可用");
             match pending.remove(&token) {
                 Some(trade) => trade,
-                None => return "没有找到该待确认订单，可能已过期。".to_string(),
+                None => {
+                    return pick(
+                        lang,
+                        "没有找到该待确认订单，可能已过期。",
+                        "Pending order not found; it may have expired.",
+                    )
+                    .to_string()
+                }
             }
         };
 
         if trade.owner != user_id {
-            return "该订单不属于当前账号。".to_string();
+            return pick(
+                lang,
+                "该订单不属于当前账号。",
+                "This order belongs to another account.",
+            )
+            .to_string();
         }
         if trade.expires_at <= Utc::now() {
-            return "该订单已过期，请重新发起 /open。".to_string();
+            return pick(
+                lang,
+                "该订单已过期，请重新发起 /open。",
+                "The order expired. Send /open again.",
+            )
+            .to_string();
         }
 
         let outcome = gateway::submit_pair(
@@ -448,38 +809,61 @@ impl TelegramBot {
         match outcome {
             Ok(outcome) => {
                 let order = outcome.order;
-                let mut lines = vec![
-                    format!("订单 {:?}", order.status),
-                    format!("编号 {}", order.id),
-                    format!(
-                        "{}：{} 多 / {} 空，每条腿 {} USD",
-                        order.intent.legs[0].symbol,
-                        order.intent.legs[0].venue,
-                        order.intent.legs[1].venue,
-                        trade.notional_usd
-                    ),
-                ];
+                let mut lines = match lang {
+                    Lang::Zh => vec![
+                        format!("订单 {:?}", order.status),
+                        format!("编号 {}", order.id),
+                        format!(
+                            "{}：{} 多 / {} 空，每条腿 {} USD",
+                            order.intent.legs[0].symbol,
+                            order.intent.legs[0].venue,
+                            order.intent.legs[1].venue,
+                            trade.notional_usd
+                        ),
+                    ],
+                    Lang::En => vec![
+                        format!("Order {:?}", order.status),
+                        format!("ID {}", order.id),
+                        format!(
+                            "{}: long {} / short {}, {} USD per leg",
+                            order.intent.legs[0].symbol,
+                            order.intent.legs[0].venue,
+                            order.intent.legs[1].venue,
+                            trade.notional_usd
+                        ),
+                    ],
+                };
                 if let Some(note) = &order.note {
-                    lines.push(format!("备注：{note}"));
+                    lines.push(match lang {
+                        Lang::Zh => format!("备注：{note}"),
+                        Lang::En => format!("Note: {note}"),
+                    });
                 }
                 lines.join("\n")
             }
-            Err(error) => format!("下单失败：{}", describe_error(&error)),
+            Err(error) => match lang {
+                Lang::Zh => format!("下单失败：{}", describe_error(lang, &error)),
+                Lang::En => format!("Order failed: {}", describe_error(lang, &error)),
+            },
         }
     }
 
-    fn cancel(&self, user_id: i64, args: &[&str]) -> String {
-        let Some(token) = args.first() else {
-            return "用法：/cancel <编号>".to_string();
-        };
+    fn cancel(&self, user_id: i64, lang: Lang, token: &str) -> String {
         let token = token.to_ascii_uppercase();
         let mut pending = self.pending.lock().expect("待确认订单锁不可用");
         match pending.get(&token) {
             Some(trade) if trade.owner == user_id => {
                 pending.remove(&token);
-                "已取消该待确认订单。".to_string()
+                pick(lang, "已取消该待确认订单。", "Pending order cancelled.").to_string()
             }
-            _ => "没有找到该待确认订单。".to_string(),
+            _ => pick(lang, "没有找到该待确认订单。", "Pending order not found.").to_string(),
+        }
+    }
+
+    /// 从绑定文件刷新内存快照；文件缺失或损坏时保留当前内存值。
+    fn sync_bindings(&self) {
+        if let Some(bindings) = read_bindings(&self.bindings_file) {
+            *self.bindings.write().expect("电报绑定锁不可用") = bindings;
         }
     }
 
@@ -498,36 +882,56 @@ impl TelegramBot {
             .unwrap_or(false)
     }
 
-    /// 向所有已绑定账号推送一条消息，供告警与通知分发使用。
-    pub async fn broadcast(&self, text: &str) {
-        let targets: Vec<i64> = self
+    /// 向所有已绑定账号推送一条消息，供告警与通知分发使用；每个账号收到自己语言的版本。
+    pub async fn broadcast(&self, message: &TelegramMessage) {
+        let targets: Vec<(i64, Lang)> = self
             .bindings
             .read()
             .expect("电报绑定锁不可用")
             .iter()
-            .map(|binding| binding.chat_id)
+            .map(|binding| (binding.chat_id, binding.lang.unwrap_or(Lang::Zh)))
             .collect();
-        for chat_id in targets {
-            self.send(chat_id, text).await;
+        for (chat_id, lang) in targets {
+            self.send(chat_id, message.for_lang(lang)).await;
         }
     }
 
     async fn send(&self, chat_id: i64, text: &str) {
+        self.send_with_markup(chat_id, text, None).await;
+    }
+
+    /// 发送消息；`markup` 非空时附带内联键盘（如待确认订单的确认/取消按钮）。
+    async fn send_with_markup(&self, chat_id: i64, text: &str, markup: Option<&Value>) {
         // Telegram 单条消息上限 4096 字符，超出时截断避免整条发送失败。
         let text: String = text.chars().take(3900).collect();
-        let result = self
-            .api(
-                "sendMessage",
-                &[
-                    ("chat_id", chat_id.to_string()),
-                    ("text", text),
-                    ("disable_web_page_preview", "true".to_string()),
-                ],
-            )
-            .await;
+        let mut params = vec![
+            ("chat_id", chat_id.to_string()),
+            ("text", text),
+            ("disable_web_page_preview", "true".to_string()),
+        ];
+        if let Some(markup) = markup {
+            params.push(("reply_markup", markup.to_string()));
+        }
+        let result = self.api("sendMessage", &params).await;
         if let Err(error) = result {
             tracing::warn!(%error, chat_id, "发送 Telegram 消息失败");
         }
+    }
+
+    /// 用处理结果覆盖原消息并清空内联按钮，避免重复点击。
+    async fn edit_message(&self, chat_id: i64, message_id: i64, text: &str) -> anyhow::Result<()> {
+        let text: String = text.chars().take(3900).collect();
+        self.api(
+            "editMessageText",
+            &[
+                ("chat_id", chat_id.to_string()),
+                ("message_id", message_id.to_string()),
+                ("text", text),
+                ("reply_markup", r#"{"inline_keyboard":[]}"#.to_string()),
+            ],
+        )
+        .await?;
+        Ok(())
     }
 
     async fn api(&self, method: &str, params: &[(&str, String)]) -> anyhow::Result<Value> {
@@ -575,59 +979,104 @@ impl TelegramBot {
     }
 }
 
-fn help_text(enabled: bool) -> String {
+fn help_text(lang: Lang, enabled: bool) -> String {
     if !enabled {
-        return "执行器尚未配置 Telegram Bot Token，请在服务器 .env 中设置 ARBPILOT_TELEGRAM_BOT_TOKEN 后重启。".to_string();
+        return pick(
+            lang,
+            "执行器尚未配置 Telegram Bot Token，请在服务器 .env 中设置 ARBPILOT_TELEGRAM_BOT_TOKEN 后重启。",
+            "The executor has no Telegram bot token. Set ARBPILOT_TELEGRAM_BOT_TOKEN in the server .env and restart.",
+        )
+        .to_string();
     }
-    [
-        "ArbPilot 指令：",
-        "/status 执行器状态",
-        "/positions 当前仓位",
-        "/orders 最近订单",
-        "/news 最新上币公告",
-        "/pause 暂停开仓",
-        "/resume 恢复开仓",
-        "/open <交易对> <多头> <空头> <每条腿USD> [杠杆] 发起开仓",
-        "/confirm <编号> 确认开仓",
-        "/cancel <编号> 取消待确认订单",
-        "/unbind 解除绑定",
-        "",
-        "API Key 只保存在执行器所在机器，机器人不会接收密钥。",
-    ]
-    .join("\n")
+    match lang {
+        Lang::Zh => [
+            "ArbPilot 指令：",
+            "/status 执行器状态",
+            "/positions 当前仓位",
+            "/orders 最近订单",
+            "/news 最新上币公告",
+            "/pause 暂停开仓",
+            "/resume 恢复开仓",
+            "/open <交易对> <多头> <空头> <每条腿USD> [杠杆] 发起开仓",
+            "开仓会回复确认按钮，点击「确认开仓」后才真正下单",
+            "/lang zh|en 切换机器人语言",
+            "/unbind 解除绑定",
+            "",
+            "API Key 只保存在执行器所在机器，机器人不会接收密钥。",
+        ]
+        .join("\n"),
+        Lang::En => [
+            "ArbPilot commands:",
+            "/status Executor status",
+            "/positions Current positions",
+            "/orders Recent orders",
+            "/news Latest listing announcements",
+            "/pause Pause new entries",
+            "/resume Resume entries",
+            "/open <symbol> <long venue> <short venue> <USD per leg> [leverage] Prepare an entry",
+            "Entries reply with a confirm button; tap it to place the order",
+            "/lang zh|en Switch the bot language",
+            "/unbind Unlink this account",
+            "",
+            "API keys stay on the machine running the executor; the bot never receives them.",
+        ]
+        .join("\n"),
+    }
 }
 
-fn status_text(state: &AppState) -> String {
+fn status_text(lang: Lang, state: &AppState) -> String {
     let uptime = state.uptime_secs();
     let hours = uptime / 3600;
     let minutes = (uptime % 3600) / 60;
-    format!(
-        "执行器在线\n开仓：{}\n运行：{hours}h{minutes}m\n账户权益：{} USD",
-        if state.is_paused() {
-            "已暂停"
-        } else {
-            "正常"
-        },
-        state.accounts.total_equity_usd()
-    )
+    match lang {
+        Lang::Zh => format!(
+            "执行器在线\n开仓：{}\n运行：{hours}h{minutes}m\n账户权益：{} USD",
+            if state.is_paused() {
+                "已暂停"
+            } else {
+                "正常"
+            },
+            state.accounts.total_equity_usd().round_dp(2)
+        ),
+        Lang::En => format!(
+            "Executor online\nEntries: {}\nUptime: {hours}h{minutes}m\nAccount equity: {} USD",
+            if state.is_paused() {
+                "paused"
+            } else {
+                "active"
+            },
+            state.accounts.total_equity_usd().round_dp(2)
+        ),
+    }
 }
 
-fn positions_text(state: &AppState) -> String {
+fn positions_text(lang: Lang, state: &AppState) -> String {
     let positions = state.positions.read().expect("仓位锁不可用");
     if positions.is_empty() {
-        return "暂无仓位。".to_string();
+        return pick(lang, "暂无仓位。", "No open positions.").to_string();
     }
-    let mut lines = vec![format!("当前仓位 {} 条：", positions.len())];
+    let mut lines = vec![match lang {
+        Lang::Zh => format!("当前仓位 {} 条：", positions.len()),
+        Lang::En => format!("Open positions: {}", positions.len()),
+    }];
     for position in positions.iter().take(10) {
         lines.push(format!(
             "{} {} {} {} @ {}",
             position.symbol,
             position.venue,
-            if matches!(position.side, arb_core::Side::Buy) {
-                "多"
-            } else {
-                "空"
-            },
+            pick(
+                lang,
+                if matches!(position.side, arb_core::Side::Buy) {
+                    "多"
+                } else {
+                    "空"
+                },
+                if matches!(position.side, arb_core::Side::Buy) {
+                    "Long"
+                } else {
+                    "Short"
+                },
+            ),
             position.quantity,
             position.entry_price
         ));
@@ -635,12 +1084,12 @@ fn positions_text(state: &AppState) -> String {
     lines.join("\n")
 }
 
-fn orders_text(state: &AppState) -> String {
+fn orders_text(lang: Lang, state: &AppState) -> String {
     let orders = state.orders.read().expect("订单锁不可用");
     if orders.is_empty() {
-        return "暂无订单。".to_string();
+        return pick(lang, "暂无订单。", "No orders yet.").to_string();
     }
-    let mut lines = vec!["最近订单：".to_string()];
+    let mut lines = vec![pick(lang, "最近订单：", "Recent orders:").to_string()];
     for order in orders.iter().take(5) {
         lines.push(format!(
             "{:?} {} {}",
@@ -650,12 +1099,12 @@ fn orders_text(state: &AppState) -> String {
     lines.join("\n")
 }
 
-fn news_text(state: &AppState) -> String {
+fn news_text(lang: Lang, state: &AppState) -> String {
     let snapshot = state.news.snapshot(5);
     if snapshot.items.is_empty() {
-        return "暂无上币公告。".to_string();
+        return pick(lang, "暂无上币公告。", "No listing announcements.").to_string();
     }
-    let mut lines = vec!["最新上币公告：".to_string()];
+    let mut lines = vec![pick(lang, "最新上币公告：", "Latest listing announcements:").to_string()];
     for item in snapshot.items {
         let title: String = item.title.chars().take(80).collect();
         lines.push(format!("[{}] {}", item.source, title));
@@ -663,9 +1112,9 @@ fn news_text(state: &AppState) -> String {
     lines.join("\n")
 }
 
-fn describe_error(error: &ApiError) -> String {
+fn describe_error(lang: Lang, error: &ApiError) -> String {
     match error {
-        ApiError::Unauthorized => "未授权".to_string(),
+        ApiError::Unauthorized => pick(lang, "未授权", "Unauthorized").to_string(),
         ApiError::UnauthorizedWith(message)
         | ApiError::BadRequest(message)
         | ApiError::NotFound(message)
@@ -674,6 +1123,15 @@ fn describe_error(error: &ApiError) -> String {
         | ApiError::Forbidden(message)
         | ApiError::Internal(message) => message.clone(),
     }
+}
+
+/// 解析内联按钮的 `callback_data`，格式为 `confirm:<编号>` 或 `cancel:<编号>`。
+fn parse_callback(data: &str) -> Option<(&str, &str)> {
+    let (action, token) = data.split_once(':')?;
+    if token.is_empty() || !matches!(action, "confirm" | "cancel") {
+        return None;
+    }
+    Some((action, token))
 }
 
 /// Telegram 的 query 参数需要完整百分号编码，文本里的换行与空格都不能直接出现。
@@ -691,18 +1149,24 @@ fn encode(value: &str) -> String {
 }
 
 fn load_bindings(path: &Path) -> Vec<TelegramBinding> {
+    read_bindings(path).unwrap_or_default()
+}
+
+/// 读取并解析绑定文件；文件缺失或内容损坏时返回 `None`，由调用方决定是否保留内存中的旧值。
+fn read_bindings(path: &Path) -> Option<Vec<TelegramBinding>> {
     let raw = match std::fs::read(path) {
         Ok(raw) => raw,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
         Err(error) => {
             tracing::warn!(%error, path = %path.display(), "读取 Telegram 绑定文件失败");
-            return Vec::new();
+            return None;
         }
     };
-    serde_json::from_slice::<Vec<TelegramBinding>>(&raw).unwrap_or_else(|error| {
-        tracing::warn!(%error, path = %path.display(), "解析 Telegram 绑定文件失败");
-        Vec::new()
-    })
+    serde_json::from_slice::<Vec<TelegramBinding>>(&raw)
+        .map_err(|error| {
+            tracing::warn!(%error, path = %path.display(), "解析 Telegram 绑定文件失败");
+        })
+        .ok()
 }
 
 fn write_bindings(path: &Path, bindings: &[TelegramBinding]) -> anyhow::Result<()> {
@@ -743,9 +1207,46 @@ mod tests {
 
     #[test]
     fn help_lists_trade_commands() {
-        let text = help_text(true);
+        let text = help_text(Lang::Zh, true);
         assert!(text.contains("/open"));
-        assert!(text.contains("/confirm"));
+        assert!(text.contains("确认按钮"));
+        assert!(!text.contains("/confirm"));
+        assert!(!text.contains("/cancel"));
+        assert!(text.contains("/lang"));
         assert!(!text.contains("尚未配置"));
+    }
+
+    #[test]
+    fn parses_callback_data() {
+        assert_eq!(parse_callback("confirm:ABC123"), Some(("confirm", "ABC123")));
+        assert_eq!(parse_callback("cancel:ABC123"), Some(("cancel", "ABC123")));
+        assert_eq!(parse_callback("confirm:"), None);
+        assert_eq!(parse_callback("delete:ABC123"), None);
+        assert_eq!(parse_callback("ABC123"), None);
+    }
+
+    #[test]
+    fn help_is_available_in_english() {
+        let text = help_text(Lang::En, true);
+        assert!(text.contains("/open"));
+        assert!(text.contains("/lang"));
+        assert!(!text.contains("指令"));
+        assert!(help_text(Lang::En, false).contains("ARBPILOT_TELEGRAM_BOT_TOKEN"));
+    }
+
+    #[test]
+    fn detects_language_codes() {
+        assert_eq!(Lang::from_code(Some("zh-hans")), Lang::Zh);
+        assert_eq!(Lang::from_code(Some("zh-CN")), Lang::Zh);
+        assert_eq!(Lang::from_code(Some("en")), Lang::En);
+        assert_eq!(Lang::from_code(Some("ru")), Lang::En);
+        assert_eq!(Lang::from_code(None), Lang::Zh);
+    }
+
+    #[test]
+    fn parses_lang_arguments() {
+        assert_eq!(Lang::parse("zh"), Some(Lang::Zh));
+        assert_eq!(Lang::parse("EN"), Some(Lang::En));
+        assert_eq!(Lang::parse("fr"), None);
     }
 }

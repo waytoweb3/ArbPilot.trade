@@ -49,12 +49,19 @@ pub enum ExecutorEvent {
     Alert {
         level: AlertLevel,
         message: String,
+        /// 英文版本，供英文界面的桌面端与 Telegram 使用；旧客户端会忽略该字段。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_en: Option<String>,
         at: DateTime<Utc>,
     },
 }
 
 impl ExecutorEvent {
-    pub fn order_transition(order: &Order, message: impl Into<String>) -> Self {
+    pub fn order_transition(
+        order: &Order,
+        message: impl Into<String>,
+        message_en: impl Into<String>,
+    ) -> Self {
         Self::Alert {
             level: if matches!(order.status, OrderStatus::Failed) {
                 AlertLevel::Critical
@@ -62,6 +69,7 @@ impl ExecutorEvent {
                 AlertLevel::Info
             },
             message: message.into(),
+            message_en: Some(message_en.into()),
             at: Utc::now(),
         }
     }

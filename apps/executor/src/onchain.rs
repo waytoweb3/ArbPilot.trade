@@ -243,6 +243,10 @@ impl ChainFeed {
             "链上价格偏离 · {} 池子 {pool} / 预言机 {oracle}，偏离 {deviation:+} bps",
             price.symbol
         );
+        let message_en = format!(
+            "Onchain price deviation · {} pool {pool} / oracle {oracle}, deviation {deviation:+} bps",
+            price.symbol
+        );
         tracing::warn!(
             feed = %price.id,
             deviation,
@@ -253,6 +257,7 @@ impl ChainFeed {
         let _ = self.events.send(ExecutorEvent::Alert {
             level: AlertLevel::Warning,
             message,
+            message_en: Some(message_en),
             at: now,
         });
     }
