@@ -30,6 +30,7 @@ pub use market::{
 pub use order::Compensation;
 pub use risk::{
     RiskContext, RiskDecision, RiskEngine, RiskLimits, RiskViolation, RiskViolationCode,
+    VenueRiskLimits,
 };
 pub use sandbox::{
     SandboxArtifact, SandboxArtifactSource, SandboxBinding, SandboxCandle, SandboxDecision,

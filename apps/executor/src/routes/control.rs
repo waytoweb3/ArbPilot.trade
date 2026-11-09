@@ -1,4 +1,6 @@
-use arb_core::RiskLimits;
+use std::collections::BTreeMap;
+
+use arb_core::{RiskLimits, VenueRiskLimits};
 use axum::{extract::State, Json};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -21,7 +23,7 @@ pub async fn pause(
     State(state): State<AppState>,
     Json(body): Json<PauseRequest>,
 ) -> Json<ControlResponse> {
-    state.set_paused(true, body.reason.as_deref());
+    state.set_paused(true, body.reason.as_deref().map(|reason| (reason, reason)));
     Json(ControlResponse {
         paused: true,
         reason: body.reason,
@@ -68,6 +70,7 @@ pub async fn update_limits(
 
     body.allowed_symbols = normalize(body.allowed_symbols, true);
     body.allowed_venues = normalize(body.allowed_venues, false);
+    body.venue_overrides = normalize_overrides(body.venue_overrides)?;
 
     if let Some(parent) = state.config.risk_file.parent() {
         if !parent.as_os_str().is_empty() {
@@ -83,6 +86,48 @@ pub async fn update_limits(
     *state.risk_limits.write().expect("风控限额锁不可用") = body.clone();
     tracing::info!(path = %state.config.risk_file.display(), "风控限额已更新");
     Ok(Json(body))
+}
+
+/// 校验交易所覆盖并统一交易所标识与小写/去重。
+fn normalize_overrides(
+    overrides: BTreeMap<String, VenueRiskLimits>,
+) -> Result<BTreeMap<String, VenueRiskLimits>, ApiError> {
+    let mut normalized = BTreeMap::new();
+    for (venue, mut limits) in overrides {
+        let key = venue.trim().to_lowercase();
+        if key.is_empty() {
+            return Err(ApiError::BadRequest("交易所标识不能为空".into()));
+        }
+        if let Some(value) = limits.max_order_notional_usd {
+            if value <= Decimal::ZERO {
+                return Err(ApiError::BadRequest(format!(
+                    "{key} 的单笔名义上限必须大于 0"
+                )));
+            }
+        }
+        if let Some(value) = limits.max_leverage {
+            if value < Decimal::ONE {
+                return Err(ApiError::BadRequest(format!("{key} 的杠杆上限不能低于 1")));
+            }
+        }
+        if let Some(value) = limits.max_slippage_bps {
+            if value < Decimal::ZERO {
+                return Err(ApiError::BadRequest(format!("{key} 的滑点上限不能为负数")));
+            }
+        }
+        if let Some(value) = limits.max_legs {
+            if !(1..=4).contains(&value) {
+                return Err(ApiError::BadRequest(format!(
+                    "{key} 的最大腿数需在 1 到 4 之间"
+                )));
+            }
+        }
+        if let Some(symbols) = limits.allowed_symbols.take() {
+            limits.allowed_symbols = Some(normalize(symbols, true));
+        }
+        normalized.insert(key, limits);
+    }
+    Ok(normalized)
 }
 
 /// 去空、去重；交易对统一大写，交易所统一小写。

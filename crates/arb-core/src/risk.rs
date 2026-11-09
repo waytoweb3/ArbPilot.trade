@@ -1,8 +1,27 @@
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
 use crate::types::OrderIntent;
+
+/// 单个交易所的可选覆盖。未填写的字段沿用全局默认。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VenueRiskLimits {
+    /// 该交易所单腿名义价值上限。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_order_notional_usd: Option<Decimal>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_leverage: Option<Decimal>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_slippage_bps: Option<Decimal>,
+    /// 覆盖该交易所的交易对白名单；空列表表示不限制。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_symbols: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_legs: Option<usize>,
+}
 
 /// 执行器级风控限额。所有订单（桌面 / Telegram / 策略）共用同一份限制。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -19,6 +38,10 @@ pub struct RiskLimits {
     pub allowed_symbols: Vec<String>,
     pub allowed_venues: Vec<String>,
     pub max_legs: usize,
+    /// 按交易所覆盖；键为小写交易所标识。未设置的字段沿用全局默认，
+    /// 数值型覆盖只会进一步收紧上限。
+    #[serde(default)]
+    pub venue_overrides: BTreeMap<String, VenueRiskLimits>,
 }
 
 impl Default for RiskLimits {
@@ -47,7 +70,15 @@ impl Default for RiskLimits {
                 "bingx".to_string(),
             ],
             max_legs: 2,
+            venue_overrides: BTreeMap::new(),
         }
+    }
+}
+
+impl RiskLimits {
+    /// 按小写交易所标识查找覆盖配置。
+    pub fn venue(&self, venue: &str) -> Option<&VenueRiskLimits> {
+        self.venue_overrides.get(&venue.to_lowercase())
     }
 }
 
@@ -117,6 +148,25 @@ impl RiskEngine {
         // 交易范围都不应阻止离场，否则用户可能无法退出已有风险。
         let closing = !intent.legs.is_empty() && intent.legs.iter().all(|leg| leg.reduce_only);
 
+        // 数值型交易所覆盖只会收紧上限，取全局与各腿覆盖中的最严格值。
+        let mut max_legs = limits.max_legs;
+        let mut max_leverage = limits.max_leverage;
+        let mut max_slippage_bps = limits.max_slippage_bps;
+        for leg in &intent.legs {
+            let Some(override_limits) = limits.venue(&leg.venue) else {
+                continue;
+            };
+            if let Some(value) = override_limits.max_legs {
+                max_legs = max_legs.min(value);
+            }
+            if let Some(value) = override_limits.max_leverage {
+                max_leverage = max_leverage.min(value);
+            }
+            if let Some(value) = override_limits.max_slippage_bps {
+                max_slippage_bps = max_slippage_bps.min(value);
+            }
+        }
+
         if context.paused && !closing {
             violations.push(RiskViolation::new(
                 RiskViolationCode::ExecutorPaused,
@@ -124,13 +174,13 @@ impl RiskEngine {
             ));
         }
 
-        if intent.legs.is_empty() || intent.legs.len() > limits.max_legs {
+        if intent.legs.is_empty() || intent.legs.len() > max_legs {
             violations.push(RiskViolation::new(
                 RiskViolationCode::LegCountUnsupported,
                 format!(
                     "订单腿数 {} 不在支持范围 1..={}",
                     intent.legs.len(),
-                    limits.max_legs
+                    max_legs
                 ),
             ));
         }
@@ -158,30 +208,48 @@ impl RiskEngine {
                     format!("交易所 {} 不在允许列表内", leg.venue),
                 ));
             }
-            if !closing
-                && !limits.allowed_symbols.is_empty()
-                && !limits.allowed_symbols.contains(&leg.symbol)
-            {
+            let allowed_symbols = limits
+                .venue(&leg.venue)
+                .and_then(|override_limits| override_limits.allowed_symbols.as_deref())
+                .unwrap_or(limits.allowed_symbols.as_slice());
+            if !closing && !allowed_symbols.is_empty() && !allowed_symbols.contains(&leg.symbol) {
                 violations.push(RiskViolation::new(
                     RiskViolationCode::SymbolNotAllowed,
                     format!("交易对 {} 不在允许列表内", leg.symbol),
                 ));
             }
+            if !closing {
+                if let Some(cap) = limits
+                    .venue(&leg.venue)
+                    .and_then(|override_limits| override_limits.max_order_notional_usd)
+                {
+                    let leg_notional = leg.quantity * leg.limit_price;
+                    if leg_notional > cap {
+                        violations.push(RiskViolation::new(
+                            RiskViolationCode::NotionalTooLarge,
+                            format!(
+                                "{} 单腿名义价值 {} 超过该交易所上限 {}",
+                                leg.venue, leg_notional, cap
+                            ),
+                        ));
+                    }
+                }
+            }
         }
 
-        if !closing && intent.leverage > limits.max_leverage {
+        if !closing && intent.leverage > max_leverage {
             violations.push(RiskViolation::new(
                 RiskViolationCode::LeverageTooHigh,
-                format!("杠杆 {} 超过上限 {}", intent.leverage, limits.max_leverage),
+                format!("杠杆 {} 超过上限 {}", intent.leverage, max_leverage),
             ));
         }
 
-        if intent.max_slippage_bps > limits.max_slippage_bps {
+        if intent.max_slippage_bps > max_slippage_bps {
             violations.push(RiskViolation::new(
                 RiskViolationCode::SlippageTooHigh,
                 format!(
                     "最大滑点 {} bps 超过上限 {} bps",
-                    intent.max_slippage_bps, limits.max_slippage_bps
+                    intent.max_slippage_bps, max_slippage_bps
                 ),
             ));
         }
@@ -296,5 +364,65 @@ mod tests {
         let stale = now - chrono::Duration::seconds(30);
         let decision = RiskEngine::preflight(&intent(stale), &context(now, false));
         assert!(!decision.is_approved());
+    }
+
+    #[test]
+    fn venue_override_restricts_symbols() {
+        let now = Utc::now();
+        let mut limits = RiskLimits::default();
+        limits.venue_overrides.insert(
+            "binance".into(),
+            VenueRiskLimits {
+                allowed_symbols: Some(vec!["ETHUSDT".into()]),
+                ..Default::default()
+            },
+        );
+        let context = RiskContext {
+            now,
+            limits,
+            open_notional_usd: Decimal::ZERO,
+            paused: false,
+        };
+        assert!(!RiskEngine::preflight(&intent(now), &context).is_approved());
+    }
+
+    #[test]
+    fn venue_override_caps_leg_notional() {
+        let now = Utc::now();
+        let mut limits = RiskLimits::default();
+        limits.venue_overrides.insert(
+            "binance".into(),
+            VenueRiskLimits {
+                max_order_notional_usd: Some(dec!(100)),
+                ..Default::default()
+            },
+        );
+        let context = RiskContext {
+            now,
+            limits,
+            open_notional_usd: Decimal::ZERO,
+            paused: false,
+        };
+        assert!(!RiskEngine::preflight(&intent(now), &context).is_approved());
+    }
+
+    #[test]
+    fn venue_override_tightens_leverage() {
+        let now = Utc::now();
+        let mut limits = RiskLimits::default();
+        limits.venue_overrides.insert(
+            "okx".into(),
+            VenueRiskLimits {
+                max_leverage: Some(dec!(0.5)),
+                ..Default::default()
+            },
+        );
+        let context = RiskContext {
+            now,
+            limits,
+            open_notional_usd: Decimal::ZERO,
+            paused: false,
+        };
+        assert!(!RiskEngine::preflight(&intent(now), &context).is_approved());
     }
 }
