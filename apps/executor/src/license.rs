@@ -168,6 +168,13 @@ impl LicenseManager {
         self.verify_token(token)
     }
 
+    /// 请求携带的用户令牌是否处于登录态：只校验签名与有效期，不要求已订阅。
+    ///
+    /// 免费账号也能登录使用客户端，具体模块再由 [`require_plan`] 按套餐限制。
+    pub fn identity_valid(&self, claims: &LicenseClaims) -> bool {
+        claims.exp + self.grace_secs > Utc::now().timestamp()
+    }
+
     pub fn clear(&self) {
         *self.claims.write().expect("授权令牌锁不可用") = None;
         *self.error.write().expect("授权令牌锁不可用") = None;
@@ -346,8 +353,8 @@ fn persist_token(path: &Path, token: &str) -> anyhow::Result<()> {
 
 /// 各路由所属套餐；返回 None 表示免费模块，不校验授权。
 ///
-/// `arbitrage`（$49 自托管部署）覆盖套利/新闻、浏览与使用市场策略、运行已导入策略；
-/// `strategy`（+$50 策略创建附加包）覆盖创建/编辑/回测/发布策略与沙盒。
+/// `arbitrage`（$19 自托管部署）覆盖套利/新闻、浏览与使用市场策略、运行已导入策略；
+/// `strategy`（+$10 策略创建附加包）覆盖创建/编辑/回测/发布策略与沙盒。
 pub fn required_plan(method: &str, path: &str) -> Option<&'static str> {
     let path = path.strip_prefix("/api/v1").unwrap_or(path);
     if path.starts_with("/opportunities")
@@ -416,13 +423,25 @@ pub async fn attach_identity(
         .map(str::to_owned)
         .or_else(|| query_param(request.uri().query(), "license"));
     if let Some(token) = token {
-        let claims = state
-            .license
-            .verify_claims(&token)
-            .map_err(|error| ApiError::UnauthorizedWith(format!("授权令牌无效: {error}")))?;
-        request.extensions_mut().insert(claims);
+        match state.license.verify_claims(&token) {
+            Ok(claims) => {
+                request.extensions_mut().insert(claims);
+            }
+            // 授权接口允许用新令牌覆盖本机已失效的旧令牌，否则无法重新登录。
+            Err(_) if is_license_path(request.uri().path()) => {}
+            // 未开启授权校验的实例（如桌面端内置执行器）按整机授权运行，
+            // 桌面端登录后附带的用户令牌即便无法校验也不应拦截请求。
+            Err(_) if !state.license.required() => {}
+            Err(error) => {
+                return Err(ApiError::UnauthorizedWith(format!("授权令牌无效: {error}")));
+            }
+        }
     }
     Ok(next.run(request).await)
+}
+
+fn is_license_path(path: &str) -> bool {
+    path.strip_prefix("/api/v1").unwrap_or(path) == "/license"
 }
 
 fn query_param(query: Option<&str>, key: &str) -> Option<String> {
@@ -430,6 +449,45 @@ fn query_param(query: Option<&str>, key: &str) -> Option<String> {
         let (name, value) = pair.split_once('=')?;
         (name == key && !value.is_empty()).then(|| value.to_string())
     })
+}
+
+/// 中间件：开启授权校验后，除授权管理接口外，所有功能都必须先登录账号。
+///
+/// 与 [`require_plan`] 不同，这里只要求登录态有效，不校验套餐。
+/// 自托管实例允许整机授权兜底（桌面端登录后写入执行器）。
+pub async fn require_login(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    if !state.license.required() {
+        return Ok(next.run(request).await);
+    }
+    // 登录与退出需要读写授权本身；健康检查不在这层路由里。
+    if is_license_path(request.uri().path()) {
+        return Ok(next.run(request).await);
+    }
+    // 官网匿名读取的公开数据保持可用，与 require_plan 的豁免保持一致。
+    if state.config.public_mode
+        && crate::public_mode::allows_anonymous(request.method(), request.uri().path())
+    {
+        return Ok(next.run(request).await);
+    }
+
+    let identity = request.extensions().get::<LicenseClaims>().cloned();
+    let allowed = match identity.as_ref() {
+        Some(claims) => state.license.identity_valid(claims),
+        // 托管实例按请求里的用户身份计费，不回退到整机授权。
+        None if state.config.public_mode => false,
+        None => state.license.is_valid(),
+    };
+    if allowed {
+        return Ok(next.run(request).await);
+    }
+
+    Err(ApiError::UnauthorizedWith(
+        "使用 ArbPilot 前请先用 Google 账号登录".to_string(),
+    ))
 }
 
 /// 中间件：按套餐限制付费模块。未开启校验时直接放行。

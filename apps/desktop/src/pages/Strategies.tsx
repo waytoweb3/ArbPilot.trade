@@ -698,7 +698,7 @@ function StrategyPublishCard({ record }: { record: StrategyRecord }) {
     sourceVisibility: "open_source" as SourceVisibility,
     pricing: "monthly" as PricingModel,
     price: "19",
-    trial: "7",
+    trial: "3",
     limits: "",
   });
 
@@ -1363,7 +1363,7 @@ export default function StrategiesPage() {
   const account = useAccount();
   const plans = account.data?.entitlement?.plans ?? [];
   const hasBasePlan = plans.includes("arbitrage");
-  /** 策略创建是 +$50/月 附加包；基础版每个计费周期含 7 天免费试用。 */
+  /** 策略创建是 +$10/月 附加包；基础版每个计费周期含 3 天免费试用。 */
   const canCreateStrategy = hasBasePlan && plans.includes("strategy");
   const strategies = useStrategies();
   const updateStrategy = useUpdateStrategy();

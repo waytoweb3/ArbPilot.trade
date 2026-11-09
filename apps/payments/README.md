@@ -49,7 +49,7 @@ pnpm --filter @arbpilot/payments dev               # http://127.0.0.1:8788
 
 ## 商品
 
-首次创建收银台时会按 `WAFFO_STORE_ID` 自动创建「自托管部署 $49/月」与「策略创建附加包 +$50/月」商品并 `publish()`，ID 写入
+首次创建收银台时会按 `WAFFO_STORE_ID` 自动创建「自托管部署 $19/月」与「策略创建附加包 +$10/月」商品并 `publish()`，ID 写入
 `products.json` 复用；也可用 `WAFFO_PRODUCT_ARBITRAGE` / `WAFFO_PRODUCT_STRATEGY` 指定已有商品。
 
 ## 前端接入

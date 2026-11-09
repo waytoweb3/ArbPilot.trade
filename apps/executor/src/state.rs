@@ -96,6 +96,7 @@ impl AppState {
         // 账户余额采集与行情共用同一套 TLS / 代理配置。
         let account_endpoints = AccountEndpoints {
             binance_spot: config.binance_spot_url.clone(),
+            binance_fapi: config.binance_fapi_url.clone(),
             okx: config.okx_base_url.clone(),
             bybit: config.bybit_base_url.clone(),
             bitget: config.bitget_base_url.clone(),

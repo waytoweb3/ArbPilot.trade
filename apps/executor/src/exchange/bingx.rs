@@ -108,7 +108,7 @@ impl BingxFundingClient {
     pub fn book(&self, symbol: &str) -> anyhow::Result<BookSnapshot> {
         let contract = bingx_contract(symbol)?;
         let url = format!(
-            "{}/openApi/swap/v2/quote/depth?symbol={contract}&limit=1",
+            "{}/openApi/swap/v2/quote/depth?symbol={contract}&limit=5",
             self.base_url
         );
         let value = self.http.get_json(&url)?;

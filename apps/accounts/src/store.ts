@@ -252,7 +252,7 @@ export function deviceLimitFor(plans: string[]): number {
 }
 
 /** 基础版每个计费周期附带的策略创建试用天数。 */
-const STRATEGY_TRIAL_DAYS = 7;
+const STRATEGY_TRIAL_DAYS = 3;
 
 /** 当前周期起点：按月计费，用周期末往前推一个自然月；缺周期末时退回订阅创建时间。 */
 function periodStart(subscription: SubscriptionView): number | null {
@@ -282,7 +282,7 @@ export async function entitlements(userId: string): Promise<Entitlement> {
     ),
   ];
 
-  // 基础版每个周期前 7 天免费开放策略创建；购买附加包后不再标记试用。
+  // 基础版每个周期前 3 天免费开放策略创建；购买附加包后不再标记试用。
   let trialEndsAt: string | null = null;
   if (!plans.includes("strategy")) {
     const base = subscriptions.find(

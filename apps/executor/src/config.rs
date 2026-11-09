@@ -130,6 +130,25 @@ pub struct Config {
     pub binance_futures_ws_url: String,
     /// OKX 公共 WebSocket 地址（盘口与当期资金费率推送）。
     pub okx_ws_url: String,
+    /// Bybit 永续 / 现货 WebSocket 地址。
+    pub bybit_ws_url: String,
+    pub bybit_spot_ws_url: String,
+    /// Bitget 公共 WebSocket 地址。
+    pub bitget_ws_url: String,
+    /// Gate USDT 本位永续 WebSocket 地址。
+    pub gate_ws_url: String,
+    /// Aster 合约 WebSocket 地址（Binance 兼容组合流）。
+    pub aster_ws_url: String,
+    /// HTX USDT 本位永续 WebSocket 地址。
+    pub htx_ws_url: String,
+    /// MEXC 合约 WebSocket 地址。
+    pub mexc_ws_url: String,
+    /// BingX 合约 WebSocket 地址。
+    pub bingx_ws_url: String,
+    /// Hyperliquid WebSocket 地址。
+    pub hyperliquid_ws_url: String,
+    /// Lighter WebSocket 地址。
+    pub lighter_ws_url: String,
     /// 盘口轮询间隔（秒）。
     pub quote_poll_secs: u64,
     /// 手动指定的资金费率交易对；为空时自动发现交易所全部 USDT 本位永续。
@@ -302,6 +321,27 @@ impl Config {
 
         let okx_ws_url = env::var("ARBPILOT_OKX_WS_URL")
             .unwrap_or_else(|_| "wss://ws.okx.com/ws/v5/public".to_string());
+
+        let bybit_ws_url = env::var("ARBPILOT_BYBIT_WS_URL")
+            .unwrap_or_else(|_| "wss://stream.bybit.com/v5/public/linear".to_string());
+        let bybit_spot_ws_url = env::var("ARBPILOT_BYBIT_SPOT_WS_URL")
+            .unwrap_or_else(|_| "wss://stream.bybit.com/v5/public/spot".to_string());
+        let bitget_ws_url = env::var("ARBPILOT_BITGET_WS_URL")
+            .unwrap_or_else(|_| "wss://ws.bitget.com/v2/ws/public".to_string());
+        let gate_ws_url = env::var("ARBPILOT_GATE_WS_URL")
+            .unwrap_or_else(|_| "wss://fx-ws.gateio.ws/v4/ws/usdt".to_string());
+        let aster_ws_url = env::var("ARBPILOT_ASTER_WS_URL")
+            .unwrap_or_else(|_| "wss://fstream.asterdex.com".to_string());
+        let htx_ws_url = env::var("ARBPILOT_HTX_WS_URL")
+            .unwrap_or_else(|_| "wss://api.hbdm.com/linear-swap-ws".to_string());
+        let mexc_ws_url = env::var("ARBPILOT_MEXC_WS_URL")
+            .unwrap_or_else(|_| "wss://contract.mexc.com/edge".to_string());
+        let bingx_ws_url = env::var("ARBPILOT_BINGX_WS_URL")
+            .unwrap_or_else(|_| "wss://open-api-swap.bingx.com/swap-market".to_string());
+        let hyperliquid_ws_url = env::var("ARBPILOT_HYPERLIQUID_WS_URL")
+            .unwrap_or_else(|_| "wss://api.hyperliquid.xyz/ws".to_string());
+        let lighter_ws_url = env::var("ARBPILOT_LIGHTER_WS_URL")
+            .unwrap_or_else(|_| "wss://mainnet.zklighter.elliot.ai/stream".to_string());
 
         let quote_poll_secs = env::var("ARBPILOT_QUOTE_POLL_SECS")
             .unwrap_or_else(|_| "3".to_string())
@@ -546,6 +586,16 @@ impl Config {
             binance_spot_ws_url,
             binance_futures_ws_url,
             okx_ws_url,
+            bybit_ws_url,
+            bybit_spot_ws_url,
+            bitget_ws_url,
+            gate_ws_url,
+            aster_ws_url,
+            htx_ws_url,
+            mexc_ws_url,
+            bingx_ws_url,
+            hyperliquid_ws_url,
+            lighter_ws_url,
             quote_poll_secs,
             funding_symbols,
             market_symbols,

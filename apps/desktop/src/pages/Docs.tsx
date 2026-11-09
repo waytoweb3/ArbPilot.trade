@@ -85,7 +85,7 @@ export default function DocsPage({ embedded = false }: { embedded?: boolean }) {
   const queryClient = useQueryClient();
   const desktop = isDesktopRuntime();
   const account = useAccount();
-  /** 自托管部署属于 $49/月基础版权益。 */
+  /** 自托管部署属于 $19/月基础版权益。 */
   const hasDeployPlan = account.data?.entitlement?.plans.includes("arbitrage") ?? false;
 
   const [form, setForm] = useState<ServerForm>(() => ({

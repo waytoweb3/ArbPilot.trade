@@ -83,22 +83,23 @@ impl WebSocket {
         self.send_frame(0x1, payload.as_bytes())
     }
 
-    /// 读取一条文本消息。
+    /// 读取一条消息。
     ///
-    /// - 有完整消息时返回 `Ok(Some(text))`；
+    /// - 有完整消息时返回 `Ok(Some(event))`；
     /// - 轮询超时内没有新数据时返回 `Ok(None)`，调用方可继续做心跳；
     /// - 连接关闭或协议错误时返回 `Err`，调用方负责重连。
     ///
     /// 先消费解析器里已缓冲的帧，缓冲不足时才读 socket；否则高频率行情会让
     /// 缓冲无限增长，ping 得不到及时回复而被交易所断开。
-    pub fn poll(&mut self) -> anyhow::Result<Option<String>> {
+    pub fn poll(&mut self) -> anyhow::Result<Option<WsEvent>> {
         if self.closed {
             bail!("WebSocket 已关闭");
         }
 
         loop {
             match self.parser.next_event()? {
-                Some(WsEvent::Text(text)) => return Ok(Some(text)),
+                Some(WsEvent::Text(text)) => return Ok(Some(WsEvent::Text(text))),
+                Some(WsEvent::Binary(bytes)) => return Ok(Some(WsEvent::Binary(bytes))),
                 Some(WsEvent::Ping(payload)) => self.send_frame(0xA, &payload)?,
                 Some(WsEvent::Close) => {
                     self.closed = true;
@@ -171,6 +172,8 @@ impl WebSocket {
 #[derive(Debug, PartialEq, Eq)]
 pub enum WsEvent {
     Text(String),
+    /// 二进制消息（部分交易所如 HTX / BingX 用 gzip 压缩后再以二进制帧下发）。
+    Binary(Vec<u8>),
     Ping(Vec<u8>),
     Close,
 }
@@ -179,6 +182,8 @@ pub enum WsEvent {
 pub struct FrameParser {
     buffer: Vec<u8>,
     fragments: Vec<u8>,
+    /// 分片消息的首帧类型：0x1 文本、0x2 二进制。
+    fragment_opcode: Option<u8>,
 }
 
 impl FrameParser {
@@ -186,6 +191,7 @@ impl FrameParser {
         Self {
             buffer: Vec::new(),
             fragments: Vec::new(),
+            fragment_opcode: None,
         }
     }
 
@@ -203,9 +209,14 @@ impl FrameParser {
                 0x0 => {
                     self.fragments.extend_from_slice(&payload);
                     if fin {
-                        let text = String::from_utf8(std::mem::take(&mut self.fragments))
-                            .context("WebSocket 文本帧不是合法 UTF-8")?;
-                        return Ok(Some(WsEvent::Text(text)));
+                        let opcode = self.fragment_opcode.take().unwrap_or(0x1);
+                        let bytes = std::mem::take(&mut self.fragments);
+                        return match opcode {
+                            0x2 => Ok(Some(WsEvent::Binary(bytes))),
+                            _ => String::from_utf8(bytes)
+                                .map(|text| Some(WsEvent::Text(text)))
+                                .context("WebSocket 文本帧不是合法 UTF-8"),
+                        };
                     }
                 }
                 0x1 => {
@@ -215,6 +226,14 @@ impl FrameParser {
                             .context("WebSocket 文本帧不是合法 UTF-8");
                     }
                     self.fragments = payload;
+                    self.fragment_opcode = Some(0x1);
+                }
+                0x2 => {
+                    if fin {
+                        return Ok(Some(WsEvent::Binary(payload)));
+                    }
+                    self.fragments = payload;
+                    self.fragment_opcode = Some(0x2);
                 }
                 0x8 => return Ok(Some(WsEvent::Close)),
                 0x9 => return Ok(Some(WsEvent::Ping(payload))),

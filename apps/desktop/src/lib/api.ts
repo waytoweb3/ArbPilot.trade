@@ -242,9 +242,14 @@ async function request<T>(
   init: RequestInit = {},
   acceptedStatuses: number[] = [],
 ): Promise<T> {
+  // 内置执行器不校验用户授权（也没有公钥可验签），不要附带仅供托管实例使用的令牌。
+  const license = getExecutorMode() === "local" ? "" : getLicenseToken();
   return send<T>(
     `${getExecutorUrl()}${path}`,
-    { Authorization: `Bearer ${getApiToken()}` },
+    {
+      Authorization: `Bearer ${getApiToken()}`,
+      ...(license ? { "X-ArbPilot-License": license } : {}),
+    },
     init,
     acceptedStatuses,
   );
@@ -622,6 +627,11 @@ export const api = {
 
   eventsUrl: () => {
     const params = new URLSearchParams({ token: getApiToken() });
+    // 与 request 保持一致：内置执行器不需要用户授权令牌。
+    const license = getExecutorMode() === "local" ? "" : getLicenseToken();
+    if (license) {
+      params.set("license", license);
+    }
     return `${getExecutorUrl().replace(/^http/, "ws")}/api/v1/events?${params.toString()}`;
   },
 };

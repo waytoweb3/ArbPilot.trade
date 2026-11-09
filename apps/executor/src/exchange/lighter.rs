@@ -251,6 +251,11 @@ impl LighterFundingClient {
         Ok(self.remember(&self.books()?))
     }
 
+    /// `symbol → market_id` 映射，供 WebSocket 盘口订阅使用。
+    pub fn symbol_market_ids(&self) -> anyhow::Result<HashMap<String, i64>> {
+        Ok((*self.market_ids(false)?).clone())
+    }
+
     /// 永续的买一/卖一档；`remaining_base_amount` 单位是币。
     pub fn book(&self, symbol: &str) -> anyhow::Result<BookSnapshot> {
         let mut market_id = self.market_ids(false)?.get(symbol).copied();

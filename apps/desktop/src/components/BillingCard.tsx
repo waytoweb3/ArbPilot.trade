@@ -12,6 +12,7 @@ import { useBillingPlans, useCreateCheckout } from "../hooks/useBilling";
 import { useAccountDialog } from "../lib/accountDialog";
 import { BillingError, PAYMENTS_URL, type BillingPlan, type BillingPlanId } from "../lib/billing";
 import { fmt, useI18n } from "../lib/i18n";
+import { openExternal } from "../lib/openExternal";
 import { useSessionStore } from "../lib/session";
 import { useTheme } from "../lib/theme";
 import { Badge } from "./ui/badge";
@@ -21,7 +22,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "./ui/
 const FALLBACK_PLANS: BillingPlan[] = [
   {
     id: "arbitrage",
-    amount: "49.00",
+    amount: "19.00",
     billingPeriod: "monthly",
     name: {
       zh: "ArbPilot · 自托管部署",
@@ -32,7 +33,7 @@ const FALLBACK_PLANS: BillingPlan[] = [
   },
   {
     id: "strategy",
-    amount: "50.00",
+    amount: "10.00",
     billingPeriod: "monthly",
     name: { zh: "ArbPilot · 策略创建", en: "ArbPilot · Strategy Creation" },
     requires: "arbitrage",
@@ -85,7 +86,7 @@ export function BillingCard() {
   const license = licenseQuery.data;
   const activePlans = entitlement?.plans ?? [];
   const hasBasePlan = activePlans.includes("arbitrage");
-  /** 基础版每周期赠送 7 天策略创建试用，试用期内 plans 里会带上 strategy。 */
+  /** 基础版每周期赠送 3 天策略创建试用，试用期内 plans 里会带上 strategy。 */
   const trialEndsAt = entitlement?.trialEndsAt ?? null;
   const dateText = (value: string | null | undefined) =>
     value ? new Date(value).toLocaleDateString(locale === "zh" ? "zh-CN" : "en-US") : "—";
@@ -135,7 +136,7 @@ export function BillingCard() {
       {
         onSuccess: ({ checkoutUrl: nextUrl }) => {
           setCheckoutUrl(nextUrl);
-          window.open(nextUrl, "_blank", "noopener,noreferrer");
+          void openExternal(nextUrl);
         },
         onError: (cause) => {
           if (cause instanceof BillingError && cause.status === 401) {

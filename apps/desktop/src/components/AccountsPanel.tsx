@@ -1,4 +1,4 @@
-import { RefreshCw, ShieldAlert, Trash2, Wallet } from "lucide-react";
+import { Plus, RefreshCw, ShieldAlert, Trash2, Wallet } from "lucide-react";
 import { useMemo, useState, type FormEvent } from "react";
 
 import {
@@ -63,6 +63,12 @@ export function AccountsPanel() {
           <CardTitle>{t.accounts.title}</CardTitle>
           <CardDescription>{t.accounts.subtitle}</CardDescription>
         </div>
+        {list.length > 0 && (
+          <Button size="sm" variant="secondary" onClick={() => setDialogOpen(true)}>
+            <Plus size={14} />
+            {t.accounts.emptyCta}
+          </Button>
+        )}
       </CardHeader>
       <CardContent className="space-y-5">
         {accounts.isError ? (

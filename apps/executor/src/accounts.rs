@@ -55,6 +55,8 @@ pub fn is_wallet_venue(venue: &str) -> bool {
 #[derive(Debug, Clone)]
 pub struct AccountEndpoints {
     pub binance_spot: String,
+    /// 合约钱包余额与持仓走 USDT 本位永续接口，和现货不是同一个域名。
+    pub binance_fapi: String,
     pub okx: String,
     pub bybit: String,
     pub bitget: String,
@@ -487,8 +489,9 @@ impl Accounts {
         let venue = credentials.venue.clone();
         let label = credentials.label.clone();
         let credentials = credentials.clone();
+        let binance_fapi = self.endpoints.binance_fapi.clone();
         let result = tokio::task::spawn_blocking(move || {
-            fetch_snapshot(&http, &base_url, &credentials, &prices)
+            fetch_snapshot(&http, &base_url, &binance_fapi, &credentials, &prices)
         })
         .await;
 
@@ -680,11 +683,12 @@ fn aggregate(points: Vec<EquityPoint>, bucket_secs: i64) -> Vec<EquityPoint> {
 fn fetch_snapshot(
     http: &HttpClient,
     base_url: &str,
+    binance_fapi: &str,
     credentials: &AccountCredentials,
     prices: &HashMap<String, Decimal>,
 ) -> anyhow::Result<(Decimal, Vec<AssetBalance>)> {
     let (raw, override_equity) = match credentials.venue.as_str() {
-        "binance" => fetch_binance(http, base_url, credentials)?,
+        "binance" => fetch_binance(http, base_url, binance_fapi, credentials)?,
         "okx" => fetch_okx(http, base_url, credentials)?,
         "bybit" => fetch_bybit(http, base_url, credentials)?,
         "bitget" => fetch_bitget(http, base_url, credentials)?,
@@ -753,12 +757,13 @@ fn usd_price(asset: &str, prices: &HashMap<String, Decimal>) -> Option<Decimal> 
     if STABLES.contains(&asset) {
         return Some(Decimal::ONE);
     }
-    prices.get(&format!("{asset}USDT")).copied()
+    prices.get(asset).copied()
 }
 
 fn fetch_binance(
     http: &HttpClient,
     base_url: &str,
+    fapi_url: &str,
     credentials: &AccountCredentials,
 ) -> anyhow::Result<(RawBalances, Option<Decimal>)> {
     let base_url = base_url.trim_end_matches('/');
@@ -782,8 +787,11 @@ fn fetch_binance(
         balances.push((asset.to_string(), free, locked));
     }
 
-    // 合约钱包与现货钱包相互独立，权益需要相加。
-    let futures_url = format!("{base_url}/fapi/v2/account?{query}&signature={signature}");
+    // 合约钱包与现货钱包相互独立，权益需要相加；合约接口必须走 fapi 域名。
+    let futures_url = format!(
+        "{}/fapi/v2/account?{query}&signature={signature}",
+        fapi_url.trim_end_matches('/')
+    );
     if let Ok(futures) = http.get_json_with_headers(
         &futures_url,
         &[("X-MBX-APIKEY", credentials.api_key.as_str())],

@@ -6,13 +6,13 @@ import type { PlanId, PlanInfo } from "../lib/payments";
 const FALLBACK_PLANS: PlanInfo[] = [
   {
     id: "arbitrage",
-    amount: "49.00",
+    amount: "19.00",
     billingPeriod: "monthly",
     name: { zh: "自托管部署", en: "Self-hosted Deployment" },
   },
   {
     id: "strategy",
-    amount: "50.00",
+    amount: "10.00",
     billingPeriod: "monthly",
     name: { zh: "策略创建", en: "Strategy Creation" },
   },

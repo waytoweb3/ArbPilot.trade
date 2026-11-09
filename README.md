@@ -34,7 +34,7 @@
 
 - 只监听 `127.0.0.1` 的随机端口，访问令牌每次启动随机生成，仅通过 Tauri 命令交给前端；
 - 业务数据写入本机 SQLite（macOS `~/Library/Application Support/trade.arbpilot.desktop/executor.db`），用户无需安装 PostgreSQL；
-- 交易所 API Key 由执行器保存在本机文件（权限 600），不经过官方服务器，也不进入前端。
+- 交易所 API Key 由执行器保存在本机文件（macOS/Linux 权限 600，Windows 由用户目录 ACL 保护），不经过官方服务器；桌面端只显示首尾各 4 位的掩码预览，Secret 与 Passphrase 不回传。
 
 官方托管实例只提供行情、资金费率与资讯等只读数据接口（`ARBPILOT_PUBLIC_MODE=true`），不承接账户、下单或策略写入。
 

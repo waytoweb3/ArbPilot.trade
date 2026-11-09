@@ -1,6 +1,8 @@
 import { Route, Routes } from "react-router-dom";
 
 import { AppShell } from "./components/layout/AppShell";
+import { LoginGate } from "./components/layout/LoginGate";
+import { useSessionStore } from "./lib/session";
 import BasisPage from "./pages/Basis";
 import FundingPage from "./pages/Funding";
 import FundingHistoryPage from "./pages/FundingHistory";
@@ -13,6 +15,13 @@ import StrategiesPage from "./pages/Strategies";
 import TradePage from "./pages/Trade";
 
 export default function App() {
+  const token = useSessionStore((state) => state.token);
+
+  // 未登录 Google 账号前不挂载任何功能页面。
+  if (!token) {
+    return <LoginGate />;
+  }
+
   return (
     <Routes>
       <Route element={<AppShell />}>

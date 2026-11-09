@@ -22,7 +22,7 @@ const DESCRIPTIONS: Record<
 > = {
   zh: {
     pricing:
-      "ArbPilot 价格：Google 登录后可免费查看行情；自托管部署 $49/月，每个计费周期含 7 天策略创建试用，之后 +$50/月，策略市场由作者定价，可免费或按月收费。",
+      "ArbPilot 价格：Google 登录后可免费查看行情；自托管部署 $19/月，每个计费周期含 3 天策略创建试用，之后 +$10/月，策略市场由作者定价，可免费或按月收费。",
     privacy:
       "ArbPilot 隐私政策：说明订阅与访问官网时我们收集哪些信息、如何使用与共享，以及自托管架构下 API 密钥、订单与交易数据为何始终留在你的设备。",
     terms:
@@ -32,7 +32,7 @@ const DESCRIPTIONS: Record<
   },
   en: {
     pricing:
-      "ArbPilot pricing: free read-only access with Google sign-in; self-hosted deployment is $49/mo with a 7-day strategy-creation trial each billing period, then +$50/mo, and market strategies are author-priced, free or monthly.",
+      "ArbPilot pricing: free read-only access with Google sign-in; self-hosted deployment is $19/mo with a 3-day strategy-creation trial each billing period, then +$10/mo, and market strategies are author-priced, free or monthly.",
     privacy:
       "ArbPilot privacy policy: what we collect when you subscribe or browse the site, how it is used, and why API keys, orders and trading data stay on your device.",
     terms:

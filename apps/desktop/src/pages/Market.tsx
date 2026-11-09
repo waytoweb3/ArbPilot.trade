@@ -17,6 +17,7 @@ import { useAccount } from "../hooks/useAccount";
 import { formatDateTime, formatNumber, formatPercentValue, formatUsd } from "../lib/format";
 import { BillingError, PAYMENTS_URL, createStrategyCheckout } from "../lib/billing";
 import { fmt, useI18n } from "../lib/i18n";
+import { openExternal } from "../lib/openExternal";
 import { useSessionStore } from "../lib/session";
 import type { PublicationStatus, RiskLevel, SubscriptionStatus } from "../lib/types";
 
@@ -96,7 +97,7 @@ export default function MarketPage() {
         session,
       });
       setCheckoutUrl(created.checkoutUrl);
-      window.open(created.checkoutUrl, "_blank", "noopener,noreferrer");
+      void openExternal(created.checkoutUrl);
     } catch (cause) {
       if (cause instanceof BillingError && cause.status === 401) {
         setCheckoutError(copy.checkoutLoginRequired);

@@ -125,6 +125,8 @@ export function useSyncLicense() {
     mutationFn: applyLicense,
     onSuccess: (license) => {
       queryClient.setQueryData(["license"], license);
+      // 首次登录时授权同步晚于功能页挂载，重试此前因未登录失败的请求。
+      void queryClient.invalidateQueries();
     },
   });
 }

@@ -154,6 +154,12 @@ impl MexcFundingClient {
         book_from_depth(&data, contract_size)
     }
 
+    /// 一张合约对应的标的数量，供 WebSocket 盘口把张数折算成币。
+    pub fn symbol_contract_size(&self, symbol: &str) -> anyhow::Result<Decimal> {
+        let contract = mexc_contract(symbol)?;
+        self.contract_size(&contract)
+    }
+
     /// 合约面值：一张合约对应的标的数量。
     fn contract_size(&self, contract: &str) -> anyhow::Result<Decimal> {
         if let Some(size) = self

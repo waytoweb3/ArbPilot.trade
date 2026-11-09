@@ -102,11 +102,19 @@ struct HistoryRow {
 }
 
 #[derive(Debug, Deserialize)]
+struct OrderBookLevel {
+    /// 价格（字符串）。
+    p: Value,
+    /// 数量（张），Gate 返回的是数字。
+    s: Value,
+}
+
+#[derive(Debug, Deserialize)]
 struct OrderBookRow {
     #[serde(default)]
-    bids: Vec<Vec<Value>>,
+    bids: Vec<OrderBookLevel>,
     #[serde(default)]
-    asks: Vec<Vec<Value>>,
+    asks: Vec<OrderBookLevel>,
 }
 
 /// Gate.io USDT 本位永续公开资金费率客户端。
@@ -164,21 +172,24 @@ impl GateFundingClient {
         );
         let row: OrderBookRow = serde_json::from_value(self.http.get_json(&url)?)
             .context("解析 Gate order_book 失败")?;
-        let level = |rows: &[Vec<Value>], label: &str| -> anyhow::Result<(Decimal, Decimal)> {
+        let level = |rows: &[OrderBookLevel], label: &str| -> anyhow::Result<(Decimal, Decimal)> {
             let level = rows
                 .first()
                 .ok_or_else(|| anyhow!("Gate order_book 缺少{label}: {contract}"))?;
-            if level.len() < 2 {
-                bail!("Gate order_book {label}字段不足: {level:?}");
-            }
             Ok((
-                parse_json_decimal(&level[0])?,
-                parse_json_decimal(&level[1])?,
+                parse_json_decimal(&level.p)?,
+                parse_json_decimal(&level.s)?,
             ))
         };
         let (bid, bid_size) = level(&row.bids, "买一")?;
         let (ask, ask_size) = level(&row.asks, "卖一")?;
         make_book(bid, bid_size * multiplier, ask, ask_size * multiplier)
+    }
+
+    /// 一张合约对应的标的数量，供 WebSocket 盘口把张数折算成币。
+    pub fn symbol_multiplier(&self, symbol: &str) -> anyhow::Result<Decimal> {
+        let contract = gate_contract(symbol)?;
+        self.quanto_multiplier(&contract)
     }
 
     /// 合约乘数：一张合约对应的标的数量。
@@ -276,6 +287,18 @@ mod tests {
         assert_eq!(internal_symbol("BTC_USDC"), None);
         assert_eq!(gate_contract("btcusdt").unwrap(), "BTC_USDT");
         assert!(gate_contract("BTCUSDC").is_err());
+    }
+
+    #[test]
+    fn parses_object_order_book_levels() {
+        // Gate v4 的盘口档位是 `{"p": 价格, "s": 数量}` 对象，不是数组。
+        let row: OrderBookRow = serde_json::from_value(serde_json::json!({
+            "bids": [{ "p": "75722.5", "s": "12" }],
+            "asks": [{ "p": "75723", "s": 8 }],
+        }))
+        .expect("应能解析对象形式的盘口");
+        assert_eq!(row.bids[0].p, "75722.5");
+        assert_eq!(row.asks[0].s, 8);
     }
 
     #[test]

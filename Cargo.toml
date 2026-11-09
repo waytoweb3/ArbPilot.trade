@@ -15,6 +15,7 @@ axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 dotenvy = "0.15"
+flate2 = "1"
 hex = "0.4"
 hmac = "0.12"
 k256 = { version = "0.13", features = ["ecdsa"] }

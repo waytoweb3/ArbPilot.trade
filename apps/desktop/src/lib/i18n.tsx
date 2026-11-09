@@ -70,7 +70,7 @@ const zh = {
     check: "检查更新",
     checking: "检查中…",
     deploy: "一键部署",
-    deployRequiresPlan: "自托管部署需要 $49/月的订阅，请先在设置中完成订阅。",
+    deployRequiresPlan: "自托管部署需要 $19/月的订阅，请先在设置中完成订阅。",
     update: "更新到 {version}",
     redeploy: "重新部署",
     upToDate: "已是最新",
@@ -130,7 +130,7 @@ const zh = {
   accounts: {
     title: "交易账户",
     subtitle:
-      "导入 CEX 的 API Key，或填入 DEX 钱包地址与签名私钥，自动汇总各账户余额与权益变化。凭证只保存在执行器本机，不进入桌面端。",
+      "导入 CEX 的 API Key，或填入 DEX 钱包地址与签名私钥，自动汇总各账户余额与权益变化。凭证只在导入时提交给执行器，之后桌面端只能看到掩码预览。",
     totalEquity: "总权益",
     change: "区间变化",
     changeHint: "较 {value} 前",
@@ -190,7 +190,7 @@ const zh = {
     keyLabel: "Key {value}",
     walletLabel: "地址 {value}",
     secretNote:
-      "API Key、Secret、钱包地址与签名私钥只写入执行器本机文件（权限 600），不会回传桌面端或写入数据库。",
+      "凭证处理按执行器部署方式区分：随桌面端启动的本机执行器会把凭证写入应用数据目录的 accounts.json（macOS/Linux 权限 600，Windows 由用户目录 ACL 保护）；自托管执行器在导入时接收桌面端提交的凭证，写入服务器的 data/accounts.json（远程访问请走 HTTPS）。之后执行器只会向桌面端返回 API Key / 钱包地址的掩码预览（一般为首尾各 4 位），Secret、Passphrase 与签名私钥永不回传；数据库中的账户数据只有账户 UUID、交易所与权益快照，没有任何凭证。",
     venues: {
       binance: "Binance",
       okx: "OKX",
@@ -299,9 +299,9 @@ const zh = {
     stop: "停止策略",
     create: "新建策略",
     createRequiresPlan:
-      "创建策略需要先订阅「自托管部署」基础版（$49/月），再叠加「策略创建」附加包（+$50/月）。",
+      "创建策略需要先订阅「自托管部署」基础版（$19/月），再叠加「策略创建」附加包（+$10/月）。",
     createTrialEnded:
-      "本期 7 天策略创建试用已结束，订阅「策略创建」附加包（+$50/月）后可继续创建。",
+      "本期 3 天策略创建试用已结束，订阅「策略创建」附加包（+$10/月）后可继续创建。",
     createTitle: "新建资金费率策略",
     templatesTitle: "内置模板",
     templatesDesc: "模板存在数据库里，启动时编译成沙箱模块；实例化后仍走统一风控。",
@@ -850,6 +850,10 @@ const zh = {
     accountSubFailed: "取消失败：{message}",
     accountRefresh: "刷新",
     accountUnreachable: "无法连接账号服务（{url}），请先启动 apps/accounts。",
+    signInRequiredTitle: "先用 Google 账号登录",
+    signInRequiredDesc:
+      "ArbPilot 的全部功能需要登录后才能使用；登录只用于授权、设备数量与订阅同步，不会接触交易所凭证、订单或资金。",
+    signInRequiredHint: "本地执行器与已有数据不会被修改，登录后自动恢复。",
     billing: "订阅与账单",
     billingDesc:
       "ArbPilot 由你自己托管运行，订阅只解锁软件模块与更新；交易所账户、API Key、订单与数据始终留在你的设备上。桌面端用第三方账号登录，只用于授权、设备数量与策略购买同步，不接触任何交易凭证。",
@@ -1059,7 +1063,7 @@ const en: typeof zh = {
     checking: "Checking…",
     deploy: "One-click deploy",
     deployRequiresPlan:
-      "Self-hosted deployment requires the $49/month subscription. Subscribe in Settings first.",
+      "Self-hosted deployment requires the $19/month subscription. Subscribe in Settings first.",
     update: "Update to {version}",
     redeploy: "Redeploy",
     upToDate: "Up to date",
@@ -1120,7 +1124,7 @@ const en: typeof zh = {
   accounts: {
     title: "Trading accounts",
     subtitle:
-      "Import CEX API keys, or DEX wallet addresses plus a signing key, to aggregate balances and equity changes. Credentials stay on the executor host and never reach the desktop.",
+      "Import CEX API keys, or DEX wallet addresses plus a signing key, to aggregate balances and equity changes. Credentials are submitted to the executor only at import time; afterwards the desktop sees masked previews only.",
     totalEquity: "Total equity",
     change: "Range change",
     changeHint: "vs {value} ago",
@@ -1183,7 +1187,7 @@ const en: typeof zh = {
     keyLabel: "Key {value}",
     walletLabel: "Wallet {value}",
     secretNote:
-      "API keys, secrets, wallet addresses and signing keys are written only to a local executor file (mode 600) and never returned to the desktop or stored in the database.",
+      "Where credentials are stored depends on the executor: the bundled local executor writes them to accounts.json in the app data directory (mode 600 on macOS/Linux; protected by the user-profile ACL on Windows), while a self-hosted executor receives them from the desktop at import time and writes them to data/accounts.json on that server (use HTTPS for remote access). Afterwards the executor only returns a masked preview of the API key or wallet address (usually the first and last 4 characters); secrets, passphrases and signing keys are never sent back. Account data in the database is limited to account UUIDs, venues and equity snapshots — no credentials.",
     venues: {
       binance: "Binance",
       okx: "OKX",
@@ -1297,9 +1301,9 @@ const en: typeof zh = {
     stop: "Stop strategy",
     create: "New strategy",
     createRequiresPlan:
-      "Creating strategies requires the self-hosted deployment base plan ($49/mo) plus the Strategy Creation add-on (+$50/mo).",
+      "Creating strategies requires the self-hosted deployment base plan ($19/mo) plus the Strategy Creation add-on (+$10/mo).",
     createTrialEnded:
-      "The 7-day strategy creation trial for this billing period has ended. Subscribe to the Strategy Creation add-on (+$50/mo) to keep creating.",
+      "The 3-day strategy creation trial for this billing period has ended. Subscribe to the Strategy Creation add-on (+$10/mo) to keep creating.",
     createTitle: "New funding-rate strategy",
     templatesTitle: "Built-in templates",
     templatesDesc:
@@ -1870,6 +1874,11 @@ const en: typeof zh = {
     accountSubFailed: "Could not cancel: {message}",
     accountRefresh: "Refresh",
     accountUnreachable: "Cannot reach the accounts service ({url}). Start apps/accounts first.",
+    signInRequiredTitle: "Sign in with Google to continue",
+    signInRequiredDesc:
+      "All ArbPilot features require an account. Sign-in only covers licensing, device limits and subscription sync; it never touches exchange credentials, orders or funds.",
+    signInRequiredHint:
+      "Your local executor and existing data stay untouched and resume after sign-in.",
     billing: "Subscription & billing",
     billingDesc:
       "ArbPilot runs on infrastructure you control. A subscription only unlocks software modules and updates; exchange accounts, API keys, orders and data stay on your device. Third-party sign-in is used solely for licensing, device limits and purchased strategies — never for trading credentials.",

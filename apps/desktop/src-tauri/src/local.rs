@@ -98,6 +98,8 @@ pub fn start(app: &AppHandle) -> ExecutorRuntime {
             data_dir.join("telegram_bindings.json"),
         )
         .env("ARBPILOT_PUBLIC_MODE", "false")
+        // 内置执行器由桌面端登录态控制授权，不做执行器级校验；显式置空，避免继承仓库根 .env 的 true。
+        .env("ARBPILOT_LICENSE_REQUIRED", "false")
         // 内置执行器永远用本地 SQLite：置空而不是删除，防止 dotenvy 从上级目录的 .env 里补回 PostgreSQL 配置。
         .env("DATABASE_URL", "")
         .stdin(Stdio::null())
