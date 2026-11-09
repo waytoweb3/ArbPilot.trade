@@ -353,8 +353,9 @@ fn persist_token(path: &Path, token: &str) -> anyhow::Result<()> {
 
 /// 各路由所属套餐；返回 None 表示免费模块，不校验授权。
 ///
-/// `arbitrage`（$19 自托管部署）覆盖套利/新闻、浏览与使用市场策略、运行已导入策略；
-/// `strategy`（+$10 策略创建附加包）覆盖创建/编辑/回测/发布策略与沙盒。
+/// `arbitrage`（$19 自托管部署）覆盖套利、新闻与资金费率数据；
+/// `strategy`（+$10 策略创建附加包）覆盖从零创建策略、回测、沙盒与发布市场。
+/// 订阅并导入市场策略后的使用（查看、编辑定义、配置范围、启停、删除）不要求套餐。
 pub fn required_plan(method: &str, path: &str) -> Option<&'static str> {
     let path = path.strip_prefix("/api/v1").unwrap_or(path);
     if path.starts_with("/opportunities")
@@ -367,11 +368,8 @@ pub fn required_plan(method: &str, path: &str) -> Option<&'static str> {
     let write = !matches!(method, "GET" | "HEAD" | "OPTIONS");
 
     if path.starts_with("/templates") {
-        return if write && path.ends_with("/instantiate") {
-            Some("strategy")
-        } else {
-            Some("arbitrage")
-        };
+        // 模板列表只用于浏览与“从模板新建”，免费；实例化会创建策略，属于策略附加包。
+        return if write { Some("strategy") } else { None };
     }
 
     if path.starts_with("/sandbox") {
@@ -395,14 +393,18 @@ pub fn required_plan(method: &str, path: &str) -> Option<&'static str> {
     }
 
     if path.starts_with("/strategies") {
-        if !write {
-            return Some("arbitrage");
+        // 使用策略免费：查看、编辑定义、配置范围、校验、回滚、启停与删除都不要求套餐，
+        // 这样订阅市场里的免费策略后即可在本机编辑、配置与运行。
+        // 从零创建策略、回测，以及沙盒与代码生成/编译/部署仍属于策略创建附加包。
+        let creation = path == "/strategies" && write;
+        let authoring = path.ends_with("/backtest")
+            || path.ends_with("/sandbox")
+            || (path.ends_with("/code") && write)
+            || path.contains("/code/");
+        if creation || authoring {
+            return Some("strategy");
         }
-        // 启停/删除已导入的策略不需要创建权限。
-        if path.ends_with("/scope") || method == "DELETE" {
-            return Some("arbitrage");
-        }
-        return Some("strategy");
+        return None;
     }
 
     None
@@ -570,11 +572,31 @@ mod tests {
         );
         assert_eq!(
             required_plan("GET", "/api/v1/strategies/abc"),
-            Some("arbitrage")
+            None
+        );
+        assert_eq!(
+            required_plan("PATCH", "/api/v1/strategies/abc"),
+            None
         );
         assert_eq!(
             required_plan("PATCH", "/api/v1/strategies/abc/scope"),
-            Some("arbitrage")
+            None
+        );
+        assert_eq!(
+            required_plan("GET", "/api/v1/strategies/abc/code"),
+            None
+        );
+        assert_eq!(
+            required_plan("PUT", "/api/v1/strategies/abc/code"),
+            Some("strategy")
+        );
+        assert_eq!(
+            required_plan("GET", "/api/v1/templates"),
+            None
+        );
+        assert_eq!(
+            required_plan("POST", "/api/v1/templates/turtle-breakout/instantiate"),
+            Some("strategy")
         );
         assert_eq!(
             required_plan("POST", "/api/v1/strategies/abc/backtest"),
