@@ -8,12 +8,15 @@ use serde_json::{json, Value};
 
 use super::{
     make_book, make_depth, parse_decimal, parse_json_decimal, BookSnapshot, Candle, DepthSnapshot,
-    FundingRate, FundingSnapshot, FundingVenueClient,
+    FundingRate, FundingSnapshot, FundingVenueClient, MinOrderSpec,
 };
 use crate::http_client::HttpClient;
 
 /// Hyperliquid 的交易所标识。
 pub const VENUE: &str = "hyperliquid";
+
+/// Hyperliquid 对所有交易对统一要求的最小下单名义额（美元）。
+const MIN_ORDER_NOTIONAL_USD: i64 = 10;
 
 /// Hyperliquid 的 `fundingHistory` 单次最多返回 500 条（每小时一条）。
 const HISTORY_LIMIT: u32 = 500;
@@ -145,6 +148,13 @@ impl HyperliquidFundingClient {
     fn info(&self, payload: Value) -> anyhow::Result<Value> {
         self.http
             .post_json(&format!("{}/info", self.base_url), &payload)
+    }
+
+    /// Hyperliquid 对所有永续统一要求最低 $10 名义额，无逐币数量限制。
+    pub fn min_order(&self, symbol: &str) -> anyhow::Result<Option<MinOrderSpec>> {
+        let mut spec = MinOrderSpec::new(VENUE, symbol);
+        spec.min_notional_usd = Some(Decimal::from(MIN_ORDER_NOTIONAL_USD));
+        Ok(Some(spec))
     }
 
     /// 永续的买一/卖一档；`l2Book` 的数量单位是币。

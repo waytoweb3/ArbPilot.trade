@@ -29,7 +29,7 @@ pub use hyperliquid::{HyperliquidFundingClient, VENUE as HYPERLIQUID_VENUE};
 pub use lighter::{LighterFundingClient, VENUE as LIGHTER_VENUE};
 pub use live::{LiveEndpoints, LiveExchange};
 pub use mexc::{MexcFundingClient, VENUE as MEXC_VENUE};
-pub use okx::{OkxFundingClient, OkxMarketClient, VENUE as OKX_VENUE};
+pub use okx::{ContractSpec, OkxFundingClient, OkxMarketClient, VENUE as OKX_VENUE};
 
 /// Aster 的合约接口与 Binance 完全兼容，只换域名与交易所标识。
 pub const ASTER_VENUE: &str = "aster";
@@ -111,6 +111,33 @@ pub struct DepthSnapshot {
     /// 卖盘，价格由低到高。
     pub asks: Vec<DepthLevel>,
     pub observed_at: DateTime<Utc>,
+}
+
+/// 交易所对单个交易对的最小下单限制。
+///
+/// 多数交易所同时限制最小数量与最小名义额，二者取较大值才是实际门槛；
+/// 字段缺失表示交易所未公开该限制，由下单接口做最终校验。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MinOrderSpec {
+    pub venue: String,
+    pub symbol: String,
+    /// 最小下单数量（基础币）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_quantity: Option<Decimal>,
+    /// 最小下单名义额（USDT）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_notional_usd: Option<Decimal>,
+}
+
+impl MinOrderSpec {
+    pub fn new(venue: &str, symbol: &str) -> Self {
+        Self {
+            venue: venue.to_string(),
+            symbol: symbol.trim().to_ascii_uppercase(),
+            min_quantity: None,
+            min_notional_usd: None,
+        }
+    }
 }
 
 /// 一根 K 线，两个交易所统一为同一结构。

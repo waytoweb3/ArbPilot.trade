@@ -7,7 +7,7 @@ use serde_json::Value;
 
 use super::{
     depth_rows, make_book, make_depth, millis_to_time, parse_json_decimal, value_to_millis,
-    BookSnapshot, DepthSnapshot, FundingRate, FundingSnapshot, FundingVenueClient,
+    BookSnapshot, DepthSnapshot, FundingRate, FundingSnapshot, FundingVenueClient, MinOrderSpec,
 };
 use crate::http_client::HttpClient;
 
@@ -151,6 +151,36 @@ impl BingxFundingClient {
             depth_rows(data, "asks")?,
             Decimal::ONE,
         )
+    }
+
+    /// 单个 USDT 本位永续的最小下单数量与最小名义额。
+    pub fn min_order(&self, symbol: &str) -> anyhow::Result<Option<MinOrderSpec>> {
+        let contract = bingx_contract(symbol)?;
+        let url = format!(
+            "{}/openApi/swap/v2/quote/contracts?symbol={contract}",
+            self.base_url
+        );
+        let rows = rows(self.http.get_json(&url)?, "contracts")?;
+        let Some(row) = rows
+            .into_iter()
+            .find(|row| {
+                field(row, "symbol")
+                    .and_then(Value::as_str)
+                    .map(|value| value.eq_ignore_ascii_case(&contract))
+                    .unwrap_or(false)
+            })
+        else {
+            return Ok(None);
+        };
+
+        let mut spec = MinOrderSpec::new(VENUE, symbol);
+        spec.min_quantity = field(&row, "tradeMinQuantity")
+            .and_then(|value| parse_json_decimal(value).ok())
+            .filter(|value| *value > Decimal::ZERO);
+        spec.min_notional_usd = field(&row, "tradeMinUSDT")
+            .and_then(|value| parse_json_decimal(value).ok())
+            .filter(|value| *value > Decimal::ZERO);
+        Ok(Some(spec))
     }
 
     /// 一次请求返回全部 USDT 本位永续的当期费率、标记价与下次结算时间。

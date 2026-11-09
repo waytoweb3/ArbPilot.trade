@@ -11,7 +11,7 @@ use serde_json::Value;
 
 use super::{
     depth_rows, make_book, make_depth, millis_to_time, parse_json_decimal, value_to_millis,
-    BookSnapshot, DepthSnapshot, FundingRate, FundingSnapshot, FundingVenueClient,
+    BookSnapshot, DepthSnapshot, FundingRate, FundingSnapshot, FundingVenueClient, MinOrderSpec,
 };
 use crate::http_client::HttpClient;
 
@@ -223,6 +223,15 @@ impl HtxFundingClient {
             .expect("HTX 合约面值锁不可用")
             .insert(contract.to_string(), size);
         Ok(size)
+    }
+
+    /// 单个 USDT 本位永续的最小下单数量：最小张数（1 张）× 合约面值。
+    pub fn min_order(&self, symbol: &str) -> anyhow::Result<Option<MinOrderSpec>> {
+        let contract = htx_contract(symbol)?;
+        let size = self.contract_size(&contract)?;
+        let mut spec = MinOrderSpec::new(VENUE, symbol);
+        spec.min_quantity = Some(size);
+        Ok(Some(spec))
     }
 
     fn batch(&self) -> anyhow::Result<Vec<BatchRow>> {

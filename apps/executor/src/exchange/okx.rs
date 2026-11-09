@@ -12,7 +12,7 @@ use serde_json::Value;
 use super::{
     candles_from_rows, depth_rows, make_book, make_depth, millis_to_time, parse_decimal,
     BookSnapshot, Candle, DeliveryContract, DepthSnapshot, FundingRate, FundingSnapshot,
-    FundingVenueClient, Segment,
+    FundingVenueClient, MinOrderSpec, Segment,
 };
 use crate::http_client::HttpClient;
 
@@ -116,6 +116,20 @@ struct OkxTicker {
 struct OkxInstrument {
     #[serde(default)]
     ct_val: Option<String>,
+    /// 最小下单张数；OKX 按「张」撮合，低于该值时直接拒单。
+    #[serde(default)]
+    min_sz: Option<String>,
+    /// 下单张数步长；OKX 的 minSz 可能是 0.01 张，并非整数张。
+    #[serde(default)]
+    lot_sz: Option<String>,
+}
+
+/// 合约规格：每张对应的基础币数量、最小下单张数与张数步长。
+#[derive(Debug, Clone, Copy)]
+pub struct ContractSpec {
+    pub ct_val: Decimal,
+    pub min_sz: Decimal,
+    pub lot_sz: Decimal,
 }
 
 #[derive(Debug, Deserialize)]
@@ -332,8 +346,9 @@ impl FundingVenueClient for OkxFundingClient {
 pub struct OkxMarketClient {
     base_url: String,
     http: Arc<HttpClient>,
-    /// 永续合约面值缓存：OKX 的盘口数量单位是「张」，需乘 ctVal 换成币本位。
-    ct_values: RwLock<HashMap<String, Decimal>>,
+    /// 合约规格缓存：OKX 的盘口数量单位是「张」，需乘 ctVal 换成币本位；
+    /// 下单前还要按 minSz 校验张数。
+    contracts: RwLock<HashMap<String, ContractSpec>>,
 }
 
 impl OkxMarketClient {
@@ -341,7 +356,7 @@ impl OkxMarketClient {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             http,
-            ct_values: RwLock::new(HashMap::new()),
+            contracts: RwLock::new(HashMap::new()),
         }
     }
 
@@ -441,7 +456,21 @@ impl OkxMarketClient {
     /// 永续合约面值（1 张 = ctVal 个基础币），供 WebSocket 盘口把「张」换算成币。
     pub fn swap_contract_value(&self, symbol: &str) -> anyhow::Result<Decimal> {
         let inst_id = swap_inst_id(symbol)?;
-        self.contract_value(&inst_id)
+        self.contract_spec(&inst_id).map(|spec| spec.ct_val)
+    }
+
+    /// 永续合约规格（每张面值、最小张数、张数步长），下单前用于对齐数量。
+    pub fn swap_contract_spec(&self, symbol: &str) -> anyhow::Result<ContractSpec> {
+        let inst_id = swap_inst_id(symbol)?;
+        self.contract_spec(&inst_id)
+    }
+
+    /// 单个永续的最小下单数量：最小张数 × 每张面值。
+    pub fn min_order(&self, symbol: &str) -> anyhow::Result<Option<MinOrderSpec>> {
+        let spec = self.swap_contract_spec(symbol)?;
+        let mut order = MinOrderSpec::new(VENUE, symbol);
+        order.min_quantity = Some(spec.ct_val * spec.min_sz);
+        Ok(Some(order))
     }
 
     /// 当前在交易的 USDT 本位交割合约；每个交易对只保留最近到期的一张。
@@ -503,16 +532,21 @@ impl OkxMarketClient {
         Ok(contracts)
     }
 
-    /// 永续合约面值（1 张 = ctVal 个基础币），按合约缓存，进程内只查一次。
+    /// 永续合约面值（1 张 = ctVal 个基础币）。
     fn contract_value(&self, inst_id: &str) -> anyhow::Result<Decimal> {
-        if let Some(value) = self
-            .ct_values
+        self.contract_spec(inst_id).map(|spec| spec.ct_val)
+    }
+
+    /// 合约规格（ctVal 与 minSz），按合约缓存，进程内只查一次。
+    fn contract_spec(&self, inst_id: &str) -> anyhow::Result<ContractSpec> {
+        if let Some(spec) = self
+            .contracts
             .read()
-            .expect("ctVal 缓存锁不可用")
+            .expect("合约规格缓存锁不可用")
             .get(inst_id)
             .copied()
         {
-            return Ok(value);
+            return Ok(spec);
         }
 
         // 交割合约在 FUTURES 下查询，永续在 SWAP 下查询。
@@ -538,12 +572,31 @@ impl OkxMarketClient {
         if ct_val <= Decimal::ZERO {
             bail!("OKX 合约 {inst_id} 的 ctVal 非正数: {ct_val}");
         }
+        // minSz 缺失或非法时按 1 张处理，与实际下单拒单口径一致。
+        let min_sz = instrument
+            .min_sz
+            .as_deref()
+            .and_then(|raw| parse_decimal(raw).ok())
+            .filter(|value| *value > Decimal::ZERO)
+            .unwrap_or(Decimal::ONE);
+        // lotSz 是张数步长；缺失时按整数张处理。
+        let lot_sz = instrument
+            .lot_sz
+            .as_deref()
+            .and_then(|raw| parse_decimal(raw).ok())
+            .filter(|value| *value > Decimal::ZERO)
+            .unwrap_or(Decimal::ONE);
 
-        self.ct_values
+        let spec = ContractSpec {
+            ct_val,
+            min_sz,
+            lot_sz,
+        };
+        self.contracts
             .write()
-            .expect("ctVal 缓存锁不可用")
-            .insert(inst_id.to_string(), ct_val);
-        Ok(ct_val)
+            .expect("合约规格缓存锁不可用")
+            .insert(inst_id.to_string(), spec);
+        Ok(spec)
     }
 }
 
@@ -589,6 +642,29 @@ mod tests {
         assert_eq!(
             symbols,
             vec!["BTCUSDT".to_string(), "1INCHUSDT".to_string()]
+        );
+    }
+
+    #[test]
+    fn parses_contract_spec() {
+        let envelope: Envelope<OkxInstrument> = serde_json::from_str(
+            r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT-SWAP","ctVal":"0.01","minSz":"0.01","lotSz":"0.01"}]}"#,
+        )
+        .expect("fixture 应可解析");
+
+        let instrument = into_data(envelope, "public/instruments").unwrap().remove(0);
+        assert_eq!(
+            parse_decimal(instrument.ct_val.as_deref().unwrap()).unwrap(),
+            dec!(0.01)
+        );
+        // OKX 的最小下单量与步长都以「张」为单位，BTC-USDT-SWAP 为 0.01 张。
+        assert_eq!(
+            parse_decimal(instrument.min_sz.as_deref().unwrap()).unwrap(),
+            dec!(0.01)
+        );
+        assert_eq!(
+            parse_decimal(instrument.lot_sz.as_deref().unwrap()).unwrap(),
+            dec!(0.01)
         );
     }
 

@@ -8,7 +8,7 @@ use serde_json::Value;
 
 use super::{
     candles_from_rows, depth_rows, make_book, make_depth, BookSnapshot, Candle, DeliveryContract,
-    DepthSnapshot, FundingRate, FundingSnapshot, FundingVenueClient, Segment,
+    DepthSnapshot, FundingRate, FundingSnapshot, FundingVenueClient, MinOrderSpec, Segment,
 };
 use crate::http_client::HttpClient;
 
@@ -314,6 +314,56 @@ impl BinanceMarketClient {
         contracts.sort_by_key(|contract| contract.expiry);
         Ok(contracts)
     }
+
+    /// 单个交易对的最小下单数量与最小名义额；交易所未公开时对应字段为 `None`。
+    pub fn min_order(
+        &self,
+        venue: &str,
+        symbol: &str,
+        segment: Segment,
+    ) -> anyhow::Result<Option<MinOrderSpec>> {
+        let symbol = symbol.trim().to_ascii_uppercase();
+        let (base_url, path) = match segment {
+            Segment::Spot => (&self.spot_base_url, "/api/v3/exchangeInfo"),
+            Segment::Swap | Segment::Delivery => (&self.futures_base_url, "/fapi/v1/exchangeInfo"),
+        };
+        let url = format!("{base_url}{path}?symbol={symbol}");
+        let payload: ExchangeInfo = serde_json::from_value(self.http.get_json(&url)?)
+            .context("解析 exchangeInfo 失败")?;
+        let Some(row) = payload
+            .symbols
+            .into_iter()
+            .find(|row| row.symbol.eq_ignore_ascii_case(&symbol))
+        else {
+            return Ok(None);
+        };
+
+        let mut spec = MinOrderSpec::new(venue, &symbol);
+        for filter in &row.filters {
+            match filter.filter_type.as_str() {
+                "LOT_SIZE" => {
+                    spec.min_quantity = filter.min_qty.as_deref().and_then(parse_decimal);
+                }
+                // 合约用 notional，现货用 minNotional；两者都存在时以较大值为准。
+                "MIN_NOTIONAL" | "NOTIONAL" => {
+                    let notional = filter
+                        .notional
+                        .as_deref()
+                        .or(filter.min_notional.as_deref())
+                        .and_then(parse_decimal);
+                    if let Some(notional) = notional {
+                        spec.min_notional_usd = Some(
+                            spec.min_notional_usd
+                                .map(|current| current.max(notional))
+                                .unwrap_or(notional),
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(Some(spec))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -376,6 +426,22 @@ struct ExchangeSymbol {
     /// 交割合约的到期时间（毫秒）；永续为 0。
     #[serde(default)]
     delivery_date: Option<i64>,
+    /// 下单限制：LOT_SIZE / MIN_NOTIONAL 等。
+    #[serde(default)]
+    filters: Vec<ExchangeFilter>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExchangeFilter {
+    #[serde(default)]
+    filter_type: String,
+    #[serde(default)]
+    min_qty: Option<String>,
+    #[serde(default)]
+    min_notional: Option<String>,
+    #[serde(default)]
+    notional: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use super::{
     depth_rows, make_book, make_depth, millis_to_time, parse_json_decimal, value_to_millis,
-    BookSnapshot, DepthSnapshot, FundingRate, FundingSnapshot, FundingVenueClient,
+    BookSnapshot, DepthSnapshot, FundingRate, FundingSnapshot, FundingVenueClient, MinOrderSpec,
 };
 use crate::http_client::HttpClient;
 
@@ -203,6 +203,28 @@ impl MexcFundingClient {
             .expect("MEXC 合约面值锁不可用")
             .insert(contract.to_string(), size);
         Ok(size)
+    }
+
+    /// 单个 USDT 本位永续的最小下单数量：最小张数 × 合约面值。
+    pub fn min_order(&self, symbol: &str) -> anyhow::Result<Option<MinOrderSpec>> {
+        let contract = mexc_contract(symbol)?;
+        let url = format!("{}/api/v1/contract/detail?symbol={contract}", self.base_url);
+        let envelope: Envelope =
+            serde_json::from_value(self.fetch(&url)?).context("解析 MEXC 合约信息失败")?;
+        let data = into_data(envelope, "contract/detail")?;
+        let mut spec = MinOrderSpec::new(VENUE, symbol);
+        let contract_size = data
+            .get("contractSize")
+            .and_then(|value| parse_json_decimal(value).ok())
+            .unwrap_or(Decimal::ZERO);
+        let min_vol = data
+            .get("minVol")
+            .and_then(|value| parse_json_decimal(value).ok())
+            .unwrap_or(Decimal::ZERO);
+        if contract_size > Decimal::ZERO && min_vol > Decimal::ZERO {
+            spec.min_quantity = Some(contract_size * min_vol);
+        }
+        Ok(Some(spec))
     }
 
     /// 按最小间隔串行化请求，避免触发 MEXC 的频率限制。

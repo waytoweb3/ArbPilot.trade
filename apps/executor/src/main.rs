@@ -18,6 +18,7 @@ mod public_mode;
 mod realtime;
 mod routes;
 mod sandbox;
+mod selftest;
 mod sqlite_store;
 mod state;
 mod store;
@@ -42,6 +43,10 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = config::Config::from_env()?;
+    // 临时自检入口：逐家交易所下小额单并平仓，不启动 HTTP 服务。
+    if std::env::var("ARBPILOT_SELFTEST").is_ok() {
+        return selftest::run(config).await;
+    }
     if config.api_token == "dev-local-token" {
         tracing::warn!("正在使用默认访问令牌，正式部署前请设置 ARBPILOT_API_TOKEN");
     }

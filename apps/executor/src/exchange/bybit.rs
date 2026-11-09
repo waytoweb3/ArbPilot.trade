@@ -9,7 +9,7 @@ use serde_json::Value;
 use super::{
     candles_from_rows, depth_rows, make_book, make_depth, millis_to_time, parse_decimal,
     BookSnapshot, Candle, DeliveryContract, DepthSnapshot, FundingRate, FundingSnapshot,
-    FundingVenueClient,
+    FundingVenueClient, MinOrderSpec,
 };
 use crate::http_client::HttpClient;
 
@@ -102,6 +102,18 @@ struct InstrumentRow {
     /// 交割合约到期时间（毫秒）。
     #[serde(default)]
     delivery_time: Option<String>,
+    /// 下单限制：最小数量与最小名义额。
+    #[serde(default)]
+    lot_size_filter: Option<LotSizeFilter>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LotSizeFilter {
+    #[serde(default)]
+    min_order_qty: Option<String>,
+    #[serde(default)]
+    min_notional_value: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -259,6 +271,37 @@ impl BybitFundingClient {
         symbols.sort();
         symbols.dedup();
         Ok(symbols)
+    }
+
+    /// 单个线性永续的最小下单数量与最小名义额。
+    pub fn min_order(&self, symbol: &str) -> anyhow::Result<Option<MinOrderSpec>> {
+        let url = format!(
+            "{}/v5/market/instruments-info?category=linear&symbol={symbol}",
+            self.base_url
+        );
+        let envelope: Envelope<InstrumentResult> =
+            serde_json::from_value(self.http.get_json(&url)?).context("解析 Bybit instruments 失败")?;
+        let Some(row) = into_result(envelope, "market/instruments-info")?
+            .list
+            .into_iter()
+            .next()
+        else {
+            return Ok(None);
+        };
+
+        let mut spec = MinOrderSpec::new(VENUE, symbol);
+        if let Some(filter) = row.lot_size_filter {
+            spec.min_quantity = filter
+                .min_order_qty
+                .as_deref()
+                .and_then(|value| parse_decimal(value).ok());
+            spec.min_notional_usd = filter
+                .min_notional_value
+                .as_deref()
+                .and_then(|value| parse_decimal(value).ok())
+                .filter(|value| *value > Decimal::ZERO);
+        }
+        Ok(Some(spec))
     }
 
     /// 当前在交易的 USDT 本位交割合约；每个交易对只保留最近到期的一张。

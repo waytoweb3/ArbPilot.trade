@@ -1,6 +1,6 @@
 import { useState } from "react";
 
-import { useAccountLeverage, useAccounts, useCreateOrder, useRiskLimits } from "../hooks/useApi";
+import { useAccountLeverage, useAccounts, useCreateOrder, useMinOrder, useRiskLimits } from "../hooks/useApi";
 import { toNumber } from "../lib/api";
 import {
   formatFundingRate,
@@ -34,6 +34,30 @@ const chipClass =
   "rounded-md border border-line bg-panel-soft px-2 py-1 text-[11px] text-muted transition-colors hover:border-accent/50 hover:text-fg";
 const NOTIONAL_PRESETS = [200, 500, 1_000, 2_000, 5_000];
 
+/** 有效最小下单额：名义额与「最小数量 × 当前价」取较大值。 */
+function effectiveMinNotional(
+  spec: { min_quantity?: number | string | null; min_notional_usd?: number | string | null } | null | undefined,
+  price: number | null,
+): number | null {
+  if (!spec) {
+    return null;
+  }
+  const candidates: number[] = [];
+  if (spec.min_notional_usd !== undefined && spec.min_notional_usd !== null) {
+    candidates.push(toNumber(spec.min_notional_usd));
+  }
+  if (
+    spec.min_quantity !== undefined &&
+    spec.min_quantity !== null &&
+    price &&
+    price > 0
+  ) {
+    candidates.push(toNumber(spec.min_quantity) * price);
+  }
+  const positive = candidates.filter((value) => Number.isFinite(value) && value > 0);
+  return positive.length > 0 ? Math.max(...positive) : null;
+}
+
 /** 开仓前必须二次确认；提交后由执行器重新做风控校验。 */
 export function TradePanel({
   symbol,
@@ -51,6 +75,8 @@ export function TradePanel({
   const limits = useRiskLimits();
   const longLeverageQuery = useAccountLeverage(longVenue, symbol);
   const shortLeverageQuery = useAccountLeverage(shortVenue, symbol);
+  const longMinOrder = useMinOrder(longVenue, symbol);
+  const shortMinOrder = useMinOrder(shortVenue, symbol);
   const [notional, setNotional] = useState("500");
   const [confirmed, setConfirmed] = useState(false);
   const [result, setResult] = useState<CreateOrderResponse | null>(null);
@@ -62,6 +88,10 @@ export function TradePanel({
   const maxNotional = toNumber(limits.data?.max_order_notional_usd);
   const notionalValue = Number(notional);
   const validSize = Number.isFinite(notionalValue) && notionalValue > 0;
+  // 各交易所按币种返回最小下单限制；两腿金额相同，取更严格的作为门槛。
+  const longMinNotional = effectiveMinNotional(longMinOrder.data, longPrice);
+  const shortMinNotional = effectiveMinNotional(shortMinOrder.data, shortPrice);
+  const legMinNotional = Math.max(longMinNotional ?? 0, shortMinNotional ?? 0);
 
   const legAccount = (venue: string) =>
     (accounts.data?.accounts ?? []).find((account) => account.venue === venue) ?? null;
@@ -106,6 +136,8 @@ export function TradePanel({
     (shortMargin !== null && shortAvailable !== null && shortAvailable < shortMargin);
   const overLimit =
     maxNotional > 0 && validSize && notionalValue > maxNotional;
+  const belowMinimum =
+    legMinNotional > 0 && validSize && notionalValue < legMinNotional;
 
   const submit = () => {
     if (!ready) {
@@ -187,6 +219,7 @@ export function TradePanel({
               account: longAccount,
               available: longAvailable,
               leverage: longLeverage,
+              minNotional: longMinNotional,
             },
             {
               index: 2,
@@ -194,25 +227,33 @@ export function TradePanel({
               account: shortAccount,
               available: shortAvailable,
               leverage: shortLeverage,
+              minNotional: shortMinNotional,
             },
           ].map((leg) => (
-            <div
-              key={leg.index}
-              className="flex items-center justify-between gap-2 rounded-md border border-line bg-panel-soft px-2.5 py-1.5 text-[11px]"
-            >
-              <span className="text-muted">
-                {leg.venue.toUpperCase()} · {t.trade.availableMargin}
-              </span>
-              {!leg.account ? (
-                <span className="text-warning">{fmt(t.trade.accountMissing, { venue: leg.venue.toUpperCase() })}</span>
-              ) : (
-                <span className="flex items-center gap-2 font-mono text-body">
-                  <span>{leg.available === null ? "—" : formatUsd(leg.available)}</span>
-                  <span className="text-subtle">
-                    {t.trade.leverage} {leg.leverage === null ? "—" : `${leg.leverage}x`}
-                  </span>
+            <div key={leg.index} className="space-y-1">
+              <div className="flex items-center justify-between gap-2 rounded-md border border-line bg-panel-soft px-2.5 py-1.5 text-[11px]">
+                <span className="text-muted">
+                  {leg.venue.toUpperCase()} · {t.trade.availableMargin}
                 </span>
-              )}
+                {!leg.account ? (
+                  <span className="text-warning">{fmt(t.trade.accountMissing, { venue: leg.venue.toUpperCase() })}</span>
+                ) : (
+                  <span className="flex items-center gap-2 font-mono text-body">
+                    <span>{leg.available === null ? "—" : formatUsd(leg.available)}</span>
+                    <span className="text-subtle">
+                      {t.trade.leverage} {leg.leverage === null ? "—" : `${leg.leverage}x`}
+                    </span>
+                  </span>
+                )}
+              </div>
+              <div className="flex items-center justify-between gap-2 px-2.5 text-[11px]">
+                <span className="text-muted">
+                  {leg.venue.toUpperCase()} · {t.trade.minOrderLabel}
+                </span>
+                <span className="font-mono text-body">
+                  {leg.minNotional === null ? "—" : formatUsd(leg.minNotional, 2)}
+                </span>
+              </div>
             </div>
           ))}
         </div>
@@ -225,7 +266,7 @@ export function TradePanel({
           <input
             className={inputClass}
             type="number"
-            min={10}
+            min={legMinNotional || 10}
             step={10}
             value={notional}
             onChange={(event) => setNotional(event.target.value)}
@@ -293,6 +334,11 @@ export function TradePanel({
             {fmt(t.trade.notionalLimit, { value: formatUsd(maxNotional) })}
           </p>
         )}
+        {belowMinimum && (
+          <p className="rounded-lg border border-warning/30 bg-warning/10 px-3 py-2 text-xs text-warning">
+            {fmt(t.trade.minNotional, { value: formatUsd(legMinNotional) })}
+          </p>
+        )}
 
         <label className="flex items-start gap-2 text-xs text-muted">
           <input
@@ -306,7 +352,7 @@ export function TradePanel({
 
         <Button
           className="w-full"
-          disabled={!ready || !confirmed || insufficient || mutation.isPending}
+          disabled={!ready || !confirmed || insufficient || belowMinimum || mutation.isPending}
           onClick={submit}
         >
           {mutation.isPending ? t.trade.submitting : t.trade.submit}
@@ -327,7 +373,10 @@ export function TradePanel({
               </Badge>
             </div>
             <p className="font-mono text-muted">{result.order.id}</p>
-            {result.order.note && <p className="text-warning">{result.order.note}</p>}
+            {/* 风控拒绝的原因由下方 violations 结构化展示，避免同一句话出现两次。 */}
+            {result.order.note && result.decision?.decision !== "rejected" && (
+              <p className="text-warning">{result.order.note}</p>
+            )}
             {result.decision?.decision === "approved" && (
               <p className="text-accent">
                 {fmt(t.trade.approved, {

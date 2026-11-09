@@ -8,7 +8,7 @@ use serde_json::Value;
 
 use super::{
     make_book, make_depth, parse_decimal, parse_json_decimal, BookSnapshot, Candle, DepthSnapshot,
-    FundingRate, FundingSnapshot, FundingVenueClient,
+    FundingRate, FundingSnapshot, FundingVenueClient, MinOrderSpec,
 };
 use crate::http_client::HttpClient;
 
@@ -64,6 +64,9 @@ struct ContractRow {
     /// 一张合约对应的标的数量，用于把盘口张数折算成币。
     #[serde(default)]
     quanto_multiplier: Option<String>,
+    /// 最小下单张数。
+    #[serde(default)]
+    order_size_min: Option<i64>,
 }
 
 impl ContractRow {
@@ -269,6 +272,25 @@ impl GateFundingClient {
             .as_deref()
             .ok_or_else(|| anyhow!("Gate contract 缺少 quanto_multiplier: {contract}"))
             .and_then(parse_decimal)
+    }
+
+    /// 单个 USDT 本位永续的最小下单数量：最小张数 × 每张面值。
+    pub fn min_order(&self, symbol: &str) -> anyhow::Result<Option<MinOrderSpec>> {
+        let contract = gate_contract(symbol)?;
+        let url = format!("{}/api/v4/futures/usdt/contracts/{contract}", self.base_url);
+        let row: ContractRow = serde_json::from_value(self.http.get_json(&url)?)
+            .with_context(|| format!("解析 Gate contract 失败: {contract}"))?;
+        let mut spec = MinOrderSpec::new(VENUE, symbol);
+        let multiplier = row
+            .quanto_multiplier
+            .as_deref()
+            .and_then(|value| parse_decimal(value).ok())
+            .unwrap_or(Decimal::ZERO);
+        let min_contracts = row.order_size_min.unwrap_or(0);
+        if multiplier > Decimal::ZERO && min_contracts > 0 {
+            spec.min_quantity = Some(multiplier * Decimal::from(min_contracts));
+        }
+        Ok(Some(spec))
     }
 
     /// 当前正在交易的 USDT 本位永续合约清单。

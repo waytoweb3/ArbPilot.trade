@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use super::{
     make_book, make_depth, parse_decimal, parse_json_decimal, BookSnapshot, Candle, DepthSnapshot,
-    FundingRate, FundingSnapshot, FundingVenueClient,
+    FundingRate, FundingSnapshot, FundingVenueClient, MinOrderSpec,
 };
 use crate::http_client::HttpClient;
 
@@ -103,6 +103,12 @@ struct MarketRow {
     mark_price: Option<String>,
     #[serde(default)]
     index_price: Option<String>,
+    /// 最小下单数量（基础币）。
+    #[serde(default)]
+    min_base_amount: Option<String>,
+    /// 最小下单名义额（USDT）。
+    #[serde(default)]
+    min_quote_amount: Option<String>,
 }
 
 impl MarketRow {
@@ -362,6 +368,29 @@ impl LighterFundingClient {
         bids.truncate(cap as usize);
         asks.truncate(cap as usize);
         make_depth(VENUE, symbol, bids, asks, Decimal::ONE)
+    }
+
+    /// 单个永续的最小下单数量与最小名义额。
+    pub fn min_order(&self, symbol: &str) -> anyhow::Result<Option<MinOrderSpec>> {
+        let Some(row) = self.books()?.into_iter().find(|row| {
+            internal_symbol(&row.symbol)
+                .map(|value| value.eq_ignore_ascii_case(symbol))
+                .unwrap_or(false)
+        }) else {
+            return Ok(None);
+        };
+        let mut spec = MinOrderSpec::new(VENUE, symbol);
+        spec.min_quantity = row
+            .min_base_amount
+            .as_deref()
+            .and_then(|value| parse_decimal(value).ok())
+            .filter(|value| *value > Decimal::ZERO);
+        spec.min_notional_usd = row
+            .min_quote_amount
+            .as_deref()
+            .and_then(|value| parse_decimal(value).ok())
+            .filter(|value| *value > Decimal::ZERO);
+        Ok(Some(spec))
     }
 
     /// 永续 K 线；`/api/v1/candles` 单次最多返回 500 根。

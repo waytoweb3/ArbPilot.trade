@@ -4,7 +4,7 @@ use arb_core::{ExchangeError, PlaceOrderRequest, Side, VenueOrderAck};
 use base64::Engine as _;
 use chrono::{SecondsFormat, Utc};
 use hmac::{Hmac, Mac};
-use rust_decimal::{prelude::ToPrimitive, Decimal};
+use rust_decimal::{prelude::ToPrimitive, Decimal, RoundingStrategy};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256, Sha512};
 
@@ -18,7 +18,7 @@ use crate::{
             LighterOrder, LIGHTER_MAINNET_CHAIN_ID,
         },
     },
-    http_client::HttpClient,
+    http_client::{HttpClient, HttpStatusError},
 };
 
 /// 实盘下单使用的各交易所私有接口根地址，复用行情配置里的域名。
@@ -954,6 +954,24 @@ fn hyperliquid_leverage(
     Ok(())
 }
 
+/// Lighter 的 nonce 按 API Key 严格递增（`previous_nonce + 1`），不是时间戳；
+/// 直接从 `nextNonce` 接口取，避免同一毫秒内重复导致 21104 invalid nonce。
+fn lighter_next_nonce(
+    http: &HttpClient,
+    base_url: &str,
+    account_index: i64,
+    api_key_index: u8,
+) -> Result<i64, ExchangeError> {
+    let value = http
+        .get_json(&format!(
+            "{base_url}/api/v1/nextNonce?account_index={account_index}&api_key_index={api_key_index}"
+        ))
+        .map_err(transport)?;
+    value["nonce"]
+        .as_i64()
+        .ok_or_else(|| ExchangeError::Rejected(format!("Lighter nextNonce 响应异常: {value}")))
+}
+
 /// Lighter 通过 `L2UpdateLeverage` 交易设置逐市场杠杆（全仓）。
 fn lighter_leverage(
     http: &HttpClient,
@@ -992,8 +1010,13 @@ fn lighter_leverage(
         .filter(|value| *value > 0)
         .ok_or_else(|| ExchangeError::Rejected(format!("{coin} 杠杆超出 Lighter 支持范围")))?;
 
-    let nonce = now_millis();
-    let expired_at = nonce + 24 * 60 * 60 * 1000;
+    let nonce = lighter_next_nonce(
+        http,
+        base_url,
+        account_index,
+        credentials.key_index.unwrap_or(0),
+    )?;
+    let expired_at = now_millis() + 24 * 60 * 60 * 1000;
     let chain_id = if base_url.contains("testnet") {
         300
     } else {
@@ -1149,6 +1172,32 @@ fn aster_place(
     Ok(ack(order_id.to_string(), client_order_id))
 }
 
+/// 读取 OKX 账户的持仓模式：`net_mode`（单向）或 `long_short_mode`（双向）。
+fn okx_position_mode(
+    http: &HttpClient,
+    base_url: &str,
+    key: &str,
+    secret: &str,
+    passphrase: &str,
+) -> Result<String, ExchangeError> {
+    let path = "/api/v5/account/config";
+    let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+    let signature = hmac_base64(secret, &format!("{timestamp}GET{path}"))?;
+    let headers = [
+        ("OK-ACCESS-KEY", key),
+        ("OK-ACCESS-SIGN", signature.as_str()),
+        ("OK-ACCESS-TIMESTAMP", timestamp.as_str()),
+        ("OK-ACCESS-PASSPHRASE", passphrase),
+    ];
+    let value = http
+        .get_json_with_headers(&format!("{base_url}{path}"), &headers)
+        .map_err(transport)?;
+    Ok(value["data"][0]["posMode"]
+        .as_str()
+        .unwrap_or("net_mode")
+        .to_string())
+}
+
 /// OKX 永续按张数下单，先用公开合约信息把币数量换算成张数。
 fn okx_place(
     http: &HttpClient,
@@ -1177,14 +1226,31 @@ fn okx_place(
             "OKX {inst_id} 合约面值异常: {contract_value}"
         )));
     }
-    let contracts = (request.quantity / contract_value).floor();
-    if contracts < Decimal::ONE {
+    // OKX 的数量单位是「张」：minSz / lotSz 都以张计，BTC-USDT-SWAP 为 0.01 张
+    // （即 0.0001 BTC），并非整数张。按步长向下取整后再校验最小张数。
+    let min_contracts = decimal(&instrument["data"][0]["minSz"])
+        .filter(|value| *value > Decimal::ZERO)
+        .unwrap_or(Decimal::ONE);
+    let lot_size = decimal(&instrument["data"][0]["lotSz"])
+        .filter(|value| *value > Decimal::ZERO)
+        .unwrap_or(Decimal::ONE);
+    // 开仓向下取整避免超量；平仓按最接近的整手数取整：持仓数量由名义价值折算而来，
+    // 直接向下取整会不足最小张数（如 0.009986 张）。
+    let lots = (request.quantity / contract_value) / lot_size;
+    let contracts = if request.reduce_only {
+        lots.round() * lot_size
+    } else {
+        lots.floor() * lot_size
+    };
+    if contracts < min_contracts {
         return Err(ExchangeError::Rejected(format!(
-            "OKX {inst_id} 数量不足 1 张（每张 {contract_value}）"
+            "OKX {inst_id} 数量不足 {min_contracts} 张（每张 {contract_value}，步长 {lot_size} 张）"
         )));
     }
 
-    let body = json!({
+    // 双向持仓（long_short_mode）必须显式指定 posSide，且 reduceOnly 仅适用于
+    // 单向持仓（net_mode）；单向持仓则不能带 posSide。
+    let mut body = json!({
         "instId": inst_id,
         "tdMode": "cross",
         "side": if request.side == Side::Buy { "buy" } else { "sell" },
@@ -1192,9 +1258,20 @@ fn okx_place(
         "px": num(request.limit_price),
         "sz": num(contracts),
         "clOrdId": client_order_id,
-        "reduceOnly": request.reduce_only,
-    })
-    .to_string();
+    });
+    if okx_position_mode(http, base_url, key, secret, passphrase)? == "long_short_mode" {
+        let pos_side = if request.reduce_only {
+            if request.side == Side::Buy { "short" } else { "long" }
+        } else if request.side == Side::Buy {
+            "long"
+        } else {
+            "short"
+        };
+        body["posSide"] = json!(pos_side);
+    } else {
+        body["reduceOnly"] = json!(request.reduce_only);
+    }
+    let body = body.to_string();
     let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
     let signature = hmac_base64(secret, &format!("{timestamp}POST/api/v5/trade/order{body}"))?;
     let headers = [
@@ -1266,6 +1343,37 @@ fn bybit_place(
     Ok(ack(order_id, client_order_id))
 }
 
+/// 读取 Bitget 合约账户的持仓模式：`one_way_mode`（单向）或 `hedge_mode`（双向）。
+fn bitget_position_mode(
+    http: &HttpClient,
+    base_url: &str,
+    credentials: &AccountCredentials,
+    symbol: &str,
+) -> Result<String, ExchangeError> {
+    let path = format!(
+        "/api/v2/mix/account/account?symbol={symbol}&productType=USDT-FUTURES&marginCoin=USDT"
+    );
+    let timestamp = now_millis().to_string();
+    let signature = hmac_base64(
+        &credentials.api_secret,
+        &format!("{timestamp}GET{path}"),
+    )?;
+    let headers = [
+        ("ACCESS-KEY", credentials.api_key.as_str()),
+        ("ACCESS-SIGN", signature.as_str()),
+        ("ACCESS-TIMESTAMP", timestamp.as_str()),
+        ("ACCESS-PASSPHRASE", credentials.passphrase.as_deref().unwrap_or("")),
+        ("locale", "zh-CN"),
+    ];
+    let value = http
+        .get_json_with_headers(&format!("{base_url}{path}"), &headers)
+        .map_err(transport)?;
+    Ok(value["data"]["posMode"]
+        .as_str()
+        .unwrap_or("one_way_mode")
+        .to_string())
+}
+
 /// Bitget 合约下单，数量单位与下单币种一致。
 fn bitget_place(
     http: &HttpClient,
@@ -1280,8 +1388,11 @@ fn bitget_place(
         .as_deref()
         .ok_or_else(|| ExchangeError::Credentials("Bitget 需要 Passphrase".to_string()))?;
     let base_url = base_url.trim_end_matches('/');
-    let body = json!({
-        "symbol": internal_symbol(request),
+    let symbol = internal_symbol(request);
+    // 双向持仓必须用 tradeSide + holdSide 表达开平与方向，单向持仓则只能用
+    // reduceOnly；混用会被拒为 40774。
+    let mut body = json!({
+        "symbol": symbol.clone(),
         "productType": "USDT-FUTURES",
         "marginMode": "crossed",
         "marginCoin": "USDT",
@@ -1290,9 +1401,24 @@ fn bitget_place(
         "side": if request.side == Side::Buy { "buy" } else { "sell" },
         "orderType": "limit",
         "clientOid": client_order_id,
-        "reduceOnly": if request.reduce_only { "YES" } else { "NO" },
-    })
-    .to_string();
+    });
+    if bitget_position_mode(http, base_url, credentials, &symbol)? == "hedge_mode" {
+        // 双向持仓下 `side` 表示持仓方向（buy=多、sell=空），开平由 tradeSide 表达；
+        // 平多要发 side=buy + tradeSide=close，否则会报 22002「暂无仓位可平」。
+        let hold_side = if request.reduce_only {
+            if request.side == Side::Buy { "short" } else { "long" }
+        } else if request.side == Side::Buy {
+            "long"
+        } else {
+            "short"
+        };
+        body["side"] = json!(if hold_side == "long" { "buy" } else { "sell" });
+        body["tradeSide"] = json!(if request.reduce_only { "close" } else { "open" });
+        body["holdSide"] = json!(hold_side);
+    } else {
+        body["reduceOnly"] = json!(if request.reduce_only { "YES" } else { "NO" });
+    }
+    let body = body.to_string();
     let timestamp = now_millis().to_string();
     let signature = hmac_base64(
         secret,
@@ -1708,6 +1834,11 @@ fn hyperliquid_place(
     let base_url = base_url.trim_end_matches('/');
     let coin = base_asset(request)?;
 
+    // 现货与永续是独立账本：开仓前先确认永续账户有足够保证金。
+    if !request.reduce_only {
+        hyperliquid_ensure_perp_margin(http, base_url, credentials, request)?;
+    }
+
     // `asset` 索引与 `szDecimals` 都在 meta.universe 的下标里，下单前必须查一次。
     let meta = http
         .post_json(&format!("{base_url}/info"), &json!({ "type": "meta" }))
@@ -1777,6 +1908,101 @@ fn hyperliquid_place(
     Ok(ack(order_id.to_string(), client_order_id))
 }
 
+/// Hyperliquid 现货与永续的账本关系由「账户抽象模式」决定。
+///
+/// - `unifiedAccount` / `portfolioMargin`：每个币种只有一个余额，现货 USDC 直接
+///   作为永续保证金；官方文档说明此时 API 返回的永续 `clearinghouseState`
+///   对用户没有参考意义，余额只看现货清算状态。
+/// - `standard` / `dexAbstraction`：现货与永续独立，现货 USDC 不能直接当保证金。
+fn hyperliquid_ensure_perp_margin(
+    http: &HttpClient,
+    base_url: &str,
+    credentials: &AccountCredentials,
+    request: &PlaceOrderRequest,
+) -> Result<(), ExchangeError> {
+    let address = credentials.wallet_address.as_deref().ok_or_else(|| {
+        ExchangeError::Credentials("Hyperliquid 划转需要主账户钱包地址".to_string())
+    })?;
+    // Hyperliquid 要求签名前把地址统一转成小写。
+    let address = address.trim().to_ascii_lowercase();
+
+    let notional = request.quantity * request.limit_price;
+    let leverage = request
+        .leverage
+        .filter(|value| *value > Decimal::ZERO)
+        .unwrap_or(Decimal::ONE);
+    // 开仓所需保证金，向上取整到分。
+    let required =
+        (notional / leverage).round_dp_with_strategy(2, RoundingStrategy::ToPositiveInfinity);
+
+    let mode = http
+        .post_json(
+            &format!("{base_url}/info"),
+            &json!({ "type": "userAbstraction", "user": address }),
+        )
+        .map(|value| value.as_str().unwrap_or("standard").to_string())
+        .unwrap_or_else(|_| "standard".to_string());
+    let unified = matches!(mode.as_str(), "unifiedAccount" | "portfolioMargin");
+
+    // 统一账户的永续状态对 API 用户没有意义，直接用现货余额判断。
+    let perp_available = if unified {
+        Decimal::ZERO
+    } else {
+        let perp = http
+            .post_json(
+                &format!("{base_url}/info"),
+                &json!({ "type": "clearinghouseState", "user": address }),
+            )
+            .map_err(transport)?;
+        let account_value = decimal(&perp["crossMarginSummary"]["accountValue"]).unwrap_or_default();
+        let margin_used = decimal(&perp["crossMarginSummary"]["totalMarginUsed"]).unwrap_or_default();
+        (account_value - margin_used).max(Decimal::ZERO)
+    };
+    if perp_available >= required {
+        return Ok(());
+    }
+
+    let spot_available = hyperliquid_spot_usdc(http, base_url, &address)?;
+    if unified && spot_available >= required {
+        return Ok(());
+    }
+
+    // 现货与永续是独立账本且只有主钱包能划转；API Wallet（Agent）签名的划转会被
+    // 服务端当成 Agent 自己的账户而报 "Must deposit before performing actions"。
+    let hint = if unified {
+        "统一账户的现货余额就是永续保证金，请确认这笔 USDC 是否被挂单占用"
+    } else {
+        "API Wallet 无法在现货与永续之间划转，请先在 Hyperliquid 网页端把 USDC 划转到永续账户"
+    };
+    Err(ExchangeError::Rejected(format!(
+        "Hyperliquid 可用保证金 {perp_available} USDC，本次下单需要 {required} USDC\
+         （现货可用 {spot_available} USDC，账户模式 {mode}）。{hint}"
+    )))
+}
+
+/// 现货清算状态里的 USDC 可用余额（总额减去挂单占用）。
+fn hyperliquid_spot_usdc(
+    http: &HttpClient,
+    base_url: &str,
+    address: &str,
+) -> Result<Decimal, ExchangeError> {
+    let spot = http
+        .post_json(
+            &format!("{base_url}/info"),
+            &json!({ "type": "spotClearinghouseState", "user": address }),
+        )
+        .map_err(transport)?;
+    Ok(spot["balances"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|row| row["coin"].as_str() == Some("USDC")))
+        .map(|row| {
+            let total = decimal(&row["total"]).unwrap_or_default();
+            let hold = decimal(&row["hold"]).unwrap_or_default();
+            (total - hold).max(Decimal::ZERO)
+        })
+        .unwrap_or_default())
+}
+
 /// Lighter 永续限价单：市场精度取自 `orderBookDetails`，签名后按表单提交。
 fn lighter_place(
     http: &HttpClient,
@@ -1816,9 +2042,28 @@ fn lighter_place(
     let size_decimals = row["size_decimals"].as_u64().unwrap_or(0) as u32;
     let price_decimals = row["price_decimals"].as_u64().unwrap_or(0) as u32;
 
-    let nonce = now_millis();
+    // Lighter 对 GTC 挂单同时限制币本位数量与 USDC 名义额，低于任一阈值
+    // 会被序列器以 21706（invalid order base or quote amount）拒单。
+    let min_base = decimal_field(&row["min_base_amount"]).unwrap_or_default();
+    let min_quote = decimal_field(&row["min_quote_amount"]).unwrap_or_default();
+    let notional = request.quantity * request.limit_price;
+    if (min_base > Decimal::ZERO && request.quantity < min_base)
+        || (min_quote > Decimal::ZERO && notional < min_quote)
+    {
+        return Err(ExchangeError::Rejected(format!(
+            "Lighter {coin} 最小下单量 {min_base} {coin} / {min_quote} USDC，当前 {} {coin} / {notional} USDC",
+            request.quantity
+        )));
+    }
+
+    let nonce = lighter_next_nonce(
+        http,
+        base_url,
+        account_index,
+        credentials.key_index.unwrap_or(0),
+    )?;
     // 限价单挂单有效期 24 小时，避免旧签名长期有效。
-    let expired_at = nonce + 24 * 60 * 60 * 1000;
+    let expired_at = now_millis() + 24 * 60 * 60 * 1000;
     let order = LighterOrder {
         account_index,
         api_key_index: credentials.key_index.unwrap_or(0),
@@ -1874,6 +2119,14 @@ fn key_pair(credentials: &AccountCredentials) -> Result<(&str, &str), ExchangeEr
         )));
     }
     Ok((&credentials.api_key, &credentials.api_secret))
+}
+
+/// 交易所返回的金额字段可能是字符串或数字，统一解析成 `Decimal`。
+fn decimal_field(value: &Value) -> Option<Decimal> {
+    value
+        .as_str()
+        .and_then(|raw| raw.parse::<Decimal>().ok())
+        .or_else(|| value.as_f64().and_then(|raw| Decimal::try_from(raw).ok()))
 }
 
 /// 内部交易对（如 `BTCUSDT`）的币种部分，非 USDT 本位返回错误。
@@ -1948,6 +2201,16 @@ fn pct(value: &str) -> String {
 }
 
 fn transport(error: anyhow::Error) -> ExchangeError {
+    // 4xx 是交易所对请求本身作出的业务答复（如参数不合法、余额不足），
+    // 与网络故障区分开，避免下单失败被显示成「传输失败」。
+    if let Some(status) = error.downcast_ref::<HttpStatusError>() {
+        if (400..500).contains(&status.status) {
+            return ExchangeError::Rejected(format!(
+                "交易所拒单（HTTP {}）: {}",
+                status.status, status.body
+            ));
+        }
+    }
     ExchangeError::Transport(error.to_string())
 }
 

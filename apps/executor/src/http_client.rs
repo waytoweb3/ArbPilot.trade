@@ -155,6 +155,11 @@ impl HttpClient {
                 Ok(read) => raw.extend_from_slice(&buffer[..read]),
                 // 部分服务端直接断开而不发 close_notify，已收到的数据仍然完整。
                 Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                // 经代理转发时对端常直接回 RST：数据可能已经收全，先尝试解析。
+                Err(error) if !raw.is_empty() => match parse_response(&raw) {
+                    Ok(body) => return Ok(body),
+                    Err(_) => return Err(error).context("读取响应失败"),
+                },
                 Err(error) => return Err(error).context("读取响应失败"),
             }
         }
@@ -407,6 +412,21 @@ impl Proxy {
     }
 }
 
+/// 非 2xx 响应：保留状态码与响应体，供调用方区分交易所业务拒单与网络故障。
+#[derive(Debug, Clone)]
+pub struct HttpStatusError {
+    pub status: u16,
+    pub body: String,
+}
+
+impl std::fmt::Display for HttpStatusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "HTTP {}: {}", self.status, self.body)
+    }
+}
+
+impl std::error::Error for HttpStatusError {}
+
 fn parse_response(raw: &[u8]) -> anyhow::Result<Vec<u8>> {
     let split = find(raw, b"\r\n\r\n").ok_or_else(|| anyhow!("响应缺少头部结束标记"))?;
     let (head, body) = raw.split_at(split);
@@ -439,7 +459,11 @@ fn parse_response(raw: &[u8]) -> anyhow::Result<Vec<u8>> {
     // 不同交易所的成功码并不统一（Gate v4 下单返回 201），2xx 一律视为成功。
     if !(200..300).contains(&code) {
         let snippet = String::from_utf8_lossy(&body[..body.len().min(200)]).replace('\n', " ");
-        bail!("HTTP {code}: {snippet}");
+        return Err(HttpStatusError {
+            status: code,
+            body: snippet,
+        }
+        .into());
     }
 
     if chunked {

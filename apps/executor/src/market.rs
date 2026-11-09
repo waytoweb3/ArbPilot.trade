@@ -16,11 +16,11 @@ use crate::{
     events::ExecutorEvent,
     exchange::{
         BinanceMarketClient, BingxFundingClient, BitgetFundingClient, BookSnapshot,
-        BybitFundingClient, Candle, DeliveryContract, DepthSnapshot, FundingRate,
+        BybitFundingClient, Candle, ContractSpec, DeliveryContract, DepthSnapshot, FundingRate,
         GateFundingClient, HtxFundingClient, HyperliquidFundingClient, LighterFundingClient,
-        MexcFundingClient, OkxMarketClient, Segment, ASTER_VENUE, BINGX_VENUE, BITGET_VENUE,
-        BYBIT_VENUE, GATE_VENUE, HTX_VENUE, HYPERLIQUID_VENUE, LIGHTER_VENUE, MEXC_VENUE,
-        OKX_VENUE, VENUE,
+        MexcFundingClient, MinOrderSpec, OkxMarketClient, Segment, ASTER_VENUE, BINGX_VENUE,
+        BITGET_VENUE, BYBIT_VENUE, GATE_VENUE, HTX_VENUE, HYPERLIQUID_VENUE, LIGHTER_VENUE,
+        MEXC_VENUE, OKX_VENUE, VENUE,
     },
     funding::{annualize, FundingFeed},
     http_client::HttpClient,
@@ -313,6 +313,101 @@ impl BookClients {
             other => bail!("不支持的行情来源: {other}"),
         }
     }
+
+    /// 最小下单限制；按 venue 分派到对应交易所的合约规格接口。
+    fn min_order(
+        &self,
+        venue: &str,
+        symbol: &str,
+        segment: Segment,
+    ) -> anyhow::Result<Option<MinOrderSpec>> {
+        match venue {
+            SPOT_VENUE | VENUE => self
+                .binance
+                .as_ref()
+                .ok_or_else(|| anyhow!("Binance 行情客户端未初始化"))?
+                .min_order(venue, symbol, segment),
+            OKX_SPOT_VENUE | OKX_VENUE => self
+                .okx
+                .as_ref()
+                .ok_or_else(|| anyhow!("OKX 行情客户端未启用"))?
+                .min_order(symbol),
+            BYBIT_SPOT_VENUE | BYBIT_VENUE => self
+                .bybit
+                .as_ref()
+                .ok_or_else(|| anyhow!("Bybit 行情客户端未启用"))?
+                .min_order(symbol),
+            BITGET_VENUE => self
+                .bitget
+                .as_ref()
+                .ok_or_else(|| anyhow!("Bitget 行情客户端未启用"))?
+                .min_order(symbol),
+            GATE_VENUE => self
+                .gate
+                .as_ref()
+                .ok_or_else(|| anyhow!("Gate 行情客户端未启用"))?
+                .min_order(symbol),
+            ASTER_VENUE => self
+                .aster
+                .as_ref()
+                .ok_or_else(|| anyhow!("Aster 行情客户端未启用"))?
+                .min_order(venue, symbol, Segment::Swap),
+            HYPERLIQUID_VENUE => self
+                .hyperliquid
+                .as_ref()
+                .ok_or_else(|| anyhow!("Hyperliquid 行情客户端未启用"))?
+                .min_order(symbol),
+            LIGHTER_VENUE => self
+                .lighter
+                .as_ref()
+                .ok_or_else(|| anyhow!("Lighter 行情客户端未启用"))?
+                .min_order(symbol),
+            HTX_VENUE => self
+                .htx
+                .as_ref()
+                .ok_or_else(|| anyhow!("HTX 行情客户端未启用"))?
+                .min_order(symbol),
+            MEXC_VENUE => self
+                .mexc
+                .as_ref()
+                .ok_or_else(|| anyhow!("MEXC 行情客户端未启用"))?
+                .min_order(symbol),
+            BINGX_VENUE => self
+                .bingx
+                .as_ref()
+                .ok_or_else(|| anyhow!("BingX 行情客户端未启用"))?
+                .min_order(symbol),
+            other => bail!("不支持的行情来源: {other}"),
+        }
+    }
+}
+
+/// 自检用：单次拉取某交易所某交易对的买一/卖一，不启动后台行情采集。
+pub fn fetch_book_quote(
+    config: &Config,
+    http: Arc<HttpClient>,
+    venue: &str,
+    symbol: &str,
+) -> anyhow::Result<BookSnapshot> {
+    let venue = venue.trim().to_ascii_lowercase();
+    let book = match venue.as_str() {
+        VENUE => BinanceMarketClient::new(&config.binance_spot_url, &config.binance_fapi_url, http)
+            .book(symbol, Segment::Swap)?,
+        OKX_VENUE => OkxMarketClient::new(&config.okx_base_url, http).book(symbol, Segment::Swap)?,
+        BYBIT_VENUE => BybitFundingClient::new(&config.bybit_base_url, http).book(symbol)?,
+        BITGET_VENUE => BitgetFundingClient::new(&config.bitget_base_url, http).book(symbol)?,
+        GATE_VENUE => GateFundingClient::new(&config.gate_base_url, http).book(symbol)?,
+        ASTER_VENUE => {
+            BinanceMarketClient::new(&config.aster_base_url, &config.aster_base_url, http)
+                .book(symbol, Segment::Swap)?
+        }
+        HYPERLIQUID_VENUE => {
+            HyperliquidFundingClient::new(&config.hyperliquid_base_url, http).book(symbol)?
+        }
+        LIGHTER_VENUE => LighterFundingClient::new(&config.lighter_base_url, http).book(symbol)?,
+        other => bail!("自检暂不支持该交易所: {other}"),
+    };
+    Ok(book)
 }
 
 /// 真实行情源：WebSocket 推送优先，REST 只在推送缺失或过期时兜底。
@@ -813,6 +908,110 @@ impl MarketFeed {
         snapshot.bids.truncate(limit as usize);
         snapshot.asks.truncate(limit as usize);
         Ok(snapshot)
+    }
+
+    /// 某交易所某交易对的最小下单限制，供桌面端展示与校验。
+    ///
+    /// `venue` 规则与 [`MarketFeed::depth`] 一致：`-spot` 结尾走现货，其余走永续。
+    pub async fn min_order(
+        &self,
+        venue: &str,
+        symbol: &str,
+    ) -> anyhow::Result<Option<MinOrderSpec>> {
+        let symbol = normalize_symbol(symbol)?;
+        let requested = venue.trim().to_ascii_lowercase();
+        let segment = if requested.ends_with("-spot") {
+            Segment::Spot
+        } else {
+            Segment::Swap
+        };
+        let clients = BookClients {
+            binance: self.binance.clone(),
+            okx: self.okx.clone(),
+            bybit: self.bybit.clone(),
+            bitget: self.bitget.clone(),
+            gate: self.gate.clone(),
+            aster: self.aster.clone(),
+            hyperliquid: self.hyperliquid.clone(),
+            lighter: self.lighter.clone(),
+            htx: self.htx.clone(),
+            mexc: self.mexc.clone(),
+            bingx: self.bingx.clone(),
+        };
+        let target = requested.clone();
+        tokio::task::spawn_blocking(move || clients.min_order(&target, &symbol, segment))
+            .await
+            .map_err(|error| anyhow!("最小下单限制任务异常退出: {error}"))?
+    }
+
+    /// 下单前向交易所 REST 取一次最新盘口。
+    ///
+    /// [`MarketFeed::quote`] 读取的是轮询缓存：采集间隔、WebSocket 推送稀疏
+    /// （只在价格变化时推送）或采集清单之外的交易对，都会让缓存报价超过风控
+    /// 允许的行情延迟。下单时用这里的实时报价做校验，避免把有效行情误判为过期。
+    pub async fn refresh_quote(&self, venue: &str, symbol: &str) -> anyhow::Result<Quote> {
+        let requested = venue.trim().to_ascii_lowercase();
+        let symbol = symbol.trim().to_ascii_uppercase();
+        let segment = if requested.ends_with("-spot") {
+            Segment::Spot
+        } else {
+            Segment::Swap
+        };
+        let clients = BookClients {
+            binance: self.binance.clone(),
+            okx: self.okx.clone(),
+            bybit: self.bybit.clone(),
+            bitget: self.bitget.clone(),
+            gate: self.gate.clone(),
+            aster: self.aster.clone(),
+            hyperliquid: self.hyperliquid.clone(),
+            lighter: self.lighter.clone(),
+            htx: self.htx.clone(),
+            mexc: self.mexc.clone(),
+            bingx: self.bingx.clone(),
+        };
+        let target = requested.clone();
+        let symbol_for_client = symbol.clone();
+        let (snapshot, observed_at) = tokio::task::spawn_blocking(move || {
+            let snapshot = clients.book(&target, &symbol_for_client, segment)?;
+            Ok::<_, anyhow::Error>((snapshot, Utc::now()))
+        })
+        .await
+        .map_err(|error| anyhow!("盘口刷新任务异常退出: {error}"))??;
+        if snapshot.bid <= Decimal::ZERO || snapshot.ask <= Decimal::ZERO {
+            bail!("{symbol} 在 {requested} 的最新盘口无效");
+        }
+        Ok(Quote {
+            venue: requested,
+            symbol,
+            bid: snapshot.bid,
+            ask: snapshot.ask,
+            observed_at,
+        })
+    }
+
+    /// OKX 永续的合约规格（每张面值、最小张数、张数步长）。
+    ///
+    /// 其他交易所按基础币数量下单，返回 `None`；查询失败时同样返回 `None`，
+    /// 由交易所下单接口做最终校验，避免因合约信息接口抖动阻断正常下单。
+    pub async fn swap_contract_spec(&self, venue: &str, symbol: &str) -> Option<ContractSpec> {
+        if !venue.trim().eq_ignore_ascii_case(OKX_VENUE) {
+            return None;
+        }
+        let client = self.okx.clone()?;
+        let symbol = symbol.trim().to_ascii_uppercase();
+        let target = symbol.clone();
+        match tokio::task::spawn_blocking(move || client.swap_contract_spec(&target)).await {
+            Ok(Ok(spec)) => Some(spec),
+            Ok(Err(error)) => {
+                tracing::warn!(symbol = %symbol, %error, "查询 OKX 合约规格失败，跳过数量粒度校验");
+                None
+            }
+            Err(error) => {
+                tracing::warn!(%error, "OKX 合约规格任务异常退出，跳过数量粒度校验");
+                None
+            }
+        }
     }
 
     /// 交割合约清单：缓存一小时内有效，避免每轮行情都拉取各所合约信息。

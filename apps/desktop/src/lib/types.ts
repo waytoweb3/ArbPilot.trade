@@ -570,6 +570,14 @@ export interface DepthSnapshot {
   observed_at: string;
 }
 
+/** 交易所对单个交易对的最小下单限制；缺失字段表示交易所未公开该限制。 */
+export interface MinOrderSpec {
+  venue: string;
+  symbol: string;
+  min_quantity?: Decimal | null;
+  min_notional_usd?: Decimal | null;
+}
+
 export type ConditionalStatus =
   | "active"
   | "triggered"

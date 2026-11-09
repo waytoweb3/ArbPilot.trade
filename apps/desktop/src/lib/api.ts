@@ -18,6 +18,7 @@ import type {
   ExecutorLicense,
   LeaderboardEntry,
   MarketConfig,
+  MinOrderSpec,
   SandboxDryRunRequest,
   SandboxRunReport,
   SettlementStatus,
@@ -345,6 +346,12 @@ export const api = {
       limit: String(limit),
     });
     return request<DepthSnapshot>(`/api/v1/depth?${params.toString()}`);
+  },
+
+  /** 某交易所某交易对的最小下单限制，用于交易页展示最小下单金额。 */
+  minOrder: (venue: string, symbol: string) => {
+    const params = new URLSearchParams({ venue, symbol });
+    return request<MinOrderSpec | null>(`/api/v1/min-order?${params.toString()}`);
   },
 
   conditionalOrders: () => request<ConditionalOrder[]>("/api/v1/conditional-orders"),

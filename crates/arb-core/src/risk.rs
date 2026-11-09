@@ -49,10 +49,11 @@ impl Default for RiskLimits {
         Self {
             max_order_notional_usd: Decimal::from(5_000),
             max_total_notional_usd: Decimal::from(25_000),
-            max_leverage: Decimal::from(3),
+            max_leverage: Decimal::from(10),
             max_slippage_bps: Decimal::from(25),
             max_quote_age_secs: 5,
-            allowed_symbols: vec!["BTCUSDT".to_string(), "ETHUSDT".to_string()],
+            // 默认不限制交易对，由各交易所实际支持的合约决定。
+            allowed_symbols: Vec::new(),
             allowed_venues: vec![
                 "binance".to_string(),
                 "binance-spot".to_string(),
@@ -65,9 +66,6 @@ impl Default for RiskLimits {
                 "aster".to_string(),
                 "hyperliquid".to_string(),
                 "lighter".to_string(),
-                "htx".to_string(),
-                "mexc".to_string(),
-                "bingx".to_string(),
             ],
             max_legs: 2,
             venue_overrides: BTreeMap::new(),
@@ -82,6 +80,17 @@ impl RiskLimits {
     }
 }
 
+/// 交易所硬性最小下单名义额（美元）。低于该值时交易所会直接拒单。
+///
+/// Lighter 的永续合约要求 GTC 挂单单腿名义额不低于 10 USDC，
+/// 与 `min_base_amount` 取较大者；这里只前置拦截名义额部分。
+pub fn venue_min_notional_usd(venue: &str) -> Option<Decimal> {
+    match venue.to_ascii_lowercase().as_str() {
+        "lighter" => Some(Decimal::from(10)),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RiskViolationCode {
@@ -92,6 +101,7 @@ pub enum RiskViolationCode {
     VenueNotAllowed,
     SymbolNotAllowed,
     NotionalTooLarge,
+    NotionalTooSmall,
     TotalNotionalTooLarge,
     LeverageTooHigh,
     SlippageTooHigh,
@@ -219,11 +229,22 @@ impl RiskEngine {
                 ));
             }
             if !closing {
+                let leg_notional = leg.quantity * leg.limit_price;
+                if let Some(minimum) = venue_min_notional_usd(&leg.venue) {
+                    if leg_notional < minimum {
+                        violations.push(RiskViolation::new(
+                            RiskViolationCode::NotionalTooSmall,
+                            format!(
+                                "{} 单腿名义价值 {} 低于交易所最小下单额 {}",
+                                leg.venue, leg_notional, minimum
+                            ),
+                        ));
+                    }
+                }
                 if let Some(cap) = limits
                     .venue(&leg.venue)
                     .and_then(|override_limits| override_limits.max_order_notional_usd)
                 {
-                    let leg_notional = leg.quantity * leg.limit_price;
                     if leg_notional > cap {
                         violations.push(RiskViolation::new(
                             RiskViolationCode::NotionalTooLarge,
@@ -424,5 +445,45 @@ mod tests {
             paused: false,
         };
         assert!(!RiskEngine::preflight(&intent(now), &context).is_approved());
+    }
+
+    #[test]
+    fn rejects_leg_below_venue_minimum() {
+        let now = Utc::now();
+        let mut intent = intent(now);
+        intent.legs[0] = OrderLegIntent {
+            venue: "lighter".into(),
+            symbol: "ETHUSDT".into(),
+            side: Side::Buy,
+            // 0.0033 * 3000 = 9.9 USDC，低于 Lighter 的 10 USDC 下限。
+            quantity: dec!(0.0033),
+            limit_price: dec!(3000),
+            reduce_only: false,
+        };
+        intent.legs[1] = OrderLegIntent {
+            venue: "binance".into(),
+            symbol: "ETHUSDT".into(),
+            side: Side::Sell,
+            quantity: dec!(0.0033),
+            limit_price: dec!(3000),
+            reduce_only: false,
+        };
+        match RiskEngine::preflight(&intent, &context(now, false)) {
+            RiskDecision::Rejected { violations } => assert!(violations
+                .iter()
+                .any(|violation| violation.code == RiskViolationCode::NotionalTooSmall)),
+            RiskDecision::Approved { .. } => panic!("低于最小下单额应被拒绝"),
+        }
+    }
+
+    #[test]
+    fn closing_order_ignores_venue_minimum() {
+        let now = Utc::now();
+        let mut intent = intent(now);
+        intent.legs.iter_mut().for_each(|leg| leg.reduce_only = true);
+        intent.legs[0].venue = "lighter".into();
+        intent.legs[0].quantity = dec!(0.001);
+        intent.legs[0].limit_price = dec!(3000);
+        assert!(RiskEngine::preflight(&intent, &context(now, false)).is_approved());
     }
 }

@@ -77,6 +77,16 @@ export function useDepth(venue: string, symbol: string, limit = 12) {
   });
 }
 
+/** 最小下单限制：交易所与交易对的合约规格变化不频繁，低频刷新即可。 */
+export function useMinOrder(venue: string, symbol: string) {
+  return useQuery({
+    queryKey: ["min-order", venue, symbol],
+    queryFn: () => api.minOrder(venue, symbol),
+    staleTime: 30_000,
+    enabled: Boolean(venue) && Boolean(symbol),
+  });
+}
+
 /** 条件单列表：等待触发与已结束的记录都在这里。 */
 export function useConditionalOrders() {
   return useQuery({

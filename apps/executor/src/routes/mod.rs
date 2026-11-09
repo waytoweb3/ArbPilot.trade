@@ -39,6 +39,7 @@ pub fn build(state: AppState) -> Router {
         .route("/opportunities/basis", get(opportunities::basis))
         .route("/candles", get(candles::list))
         .route("/depth", get(depth::get))
+        .route("/min-order", get(depth::min_order))
         .route("/orders", get(orders::list).post(orders::create))
         .route(
             "/conditional-orders",

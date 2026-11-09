@@ -721,7 +721,8 @@ export default function TradePage() {
 
           {/* 工作区：左侧「图表 + 盘口」并排，底部面板横跨这两列，右侧下单 */}
           <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_340px]">
-            <div className="order-1 grid min-w-0 gap-4 xl:grid-cols-[minmax(0,1fr)_240px]">
+            {/* content-start 防止行高被右侧下单列拉高后摊到两行之间 */}
+            <div className="order-1 grid min-w-0 gap-4 xl:grid-cols-[minmax(0,1fr)_240px] xl:content-start">
               <Card className={cn(WORKSPACE_CARD_HEIGHT, "xl:col-start-1 xl:row-start-1")}>
                 <CardHeader className="flex-wrap gap-2">
                   <div>

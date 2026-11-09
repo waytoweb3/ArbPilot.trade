@@ -88,6 +88,7 @@ create table if not exists sandbox_modules (
 const SEED_VENUES: &[(&str, &str, &str, i64)] = &[
     ("binance-spot", "spot", "Binance Spot", 10),
     ("okx-spot", "spot", "OKX Spot", 20),
+    ("bybit-spot", "spot", "Bybit Spot", 30),
     ("binance", "perp", "Binance Perp", 10),
     ("okx", "perp", "OKX Swap", 20),
     ("bybit", "perp", "Bybit Perp", 30),
@@ -96,9 +97,6 @@ const SEED_VENUES: &[(&str, &str, &str, i64)] = &[
     ("aster", "perp", "Aster Perp", 60),
     ("hyperliquid", "perp", "Hyperliquid Perp", 70),
     ("lighter", "perp", "Lighter Perp", 80),
-    ("htx", "perp", "HTX Perp", 90),
-    ("mexc", "perp", "MEXC Perp", 100),
-    ("bingx", "perp", "BingX Perp", 110),
 ];
 
 const SEED_SYMBOLS: &[&str] = &[
@@ -115,10 +113,10 @@ const SEED_UNIVERSE: &[&str] = &[
     "aster",
     "hyperliquid",
     "lighter",
-    "htx",
-    "mexc",
-    "bingx",
 ];
+
+/// 已下线的交易所：旧库启动时清理，避免继续出现在可选列表里。
+const RETIRED_VENUES: &[&str] = &["htx", "mexc", "bingx"];
 
 /// 本地 SQLite 存储。
 #[derive(Debug, Clone)]
@@ -842,6 +840,17 @@ impl SqliteStore {
 }
 
 async fn seed_market_config(pool: &SqlitePool) -> anyhow::Result<()> {
+    for venue in RETIRED_VENUES {
+        sqlx::query("delete from exchange_venues where venue = ?")
+            .bind(venue)
+            .execute(pool)
+            .await?;
+        sqlx::query("delete from tradable_symbols where venue = ?")
+            .bind(venue)
+            .execute(pool)
+            .await?;
+    }
+
     for (venue, segment, display_name, sort_order) in SEED_VENUES {
         sqlx::query(
             r#"

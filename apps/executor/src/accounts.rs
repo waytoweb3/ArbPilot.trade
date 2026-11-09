@@ -463,6 +463,14 @@ impl Accounts {
             .collect()
     }
 
+    /// 查询单个交易所当前的真实持仓（自检与调试用）。
+    pub async fn open_positions_for(&self, venue: &str) -> anyhow::Result<Vec<Position>> {
+        let credentials = self
+            .credentials_for(venue)
+            .ok_or_else(|| anyhow!("{venue} 尚未导入账户"))?;
+        self.fetch_open_positions(&credentials).await
+    }
+
     async fn fetch_open_positions(
         &self,
         credentials: &AccountCredentials,
@@ -1696,7 +1704,7 @@ fn positions_bitget(
     credentials: &AccountCredentials,
 ) -> anyhow::Result<Vec<RawPosition>> {
     let base_url = base_url.trim_end_matches('/');
-    let path = "/api/v2/mix/position/allPosition?productType=USDT-FUTURES&marginCoin=USDT";
+    let path = "/api/v2/mix/position/all-position?productType=USDT-FUTURES&marginCoin=USDT";
     let timestamp = Utc::now().timestamp_millis().to_string();
     let signature = hmac_sha256_base64(&credentials.api_secret, &format!("{timestamp}GET{path}"))?;
     let passphrase = credentials

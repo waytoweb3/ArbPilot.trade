@@ -1,6 +1,6 @@
 use arb_core::{
     LegStatus, Order, OrderIntent, OrderLegIntent, OrderOrigin, OrderStatus, PlaceOrderRequest,
-    Position, RiskContext, RiskDecision, RiskEngine, Side,
+    Position, Quote, RiskContext, RiskDecision, RiskEngine, Side,
 };
 use std::time::Duration;
 
@@ -79,6 +79,14 @@ fn origin_label(origin: OrderOrigin) -> &'static str {
         OrderOrigin::Telegram => "telegram",
         OrderOrigin::Strategy => "strategy",
     }
+}
+
+/// 报价是否可直接用于风控：观测时间不能超前，且延迟不超过上限（口径与风控一致）。
+fn is_quote_fresh(quote: &Quote, max_age_secs: i64) -> bool {
+    let age = Utc::now()
+        .signed_duration_since(quote.observed_at)
+        .num_seconds();
+    (0..=max_age_secs).contains(&age)
 }
 
 /// 订单动作统一落库到 `order_events`；数据库不可用时 Store 内部退化为本地日志。
@@ -243,9 +251,31 @@ pub async fn submit_legs(
     let mut observed_at = Utc::now();
     let mut legs = Vec::with_capacity(request.legs.len());
     for leg in &request.legs {
-        let Some(quote) = state.market.quote(&leg.venue, &leg.symbol) else {
-            let reason = format!("{} 在 {} 没有可用行情", leg.symbol, leg.venue);
-            return Err(reject_request(state, &request, reason).await);
+        let cached = state.market.quote(&leg.venue, &leg.symbol);
+        let quote = match cached {
+            // 缓存报价在风控允许的延迟内，直接使用，省掉一次 REST 往返。
+            Some(quote) if is_quote_fresh(&quote, limits.max_quote_age_secs) => quote,
+            // 轮询缓存可能因采集节奏、WebSocket 只在价格变化时推送，或交易对不在
+            // 采集清单内而超过延迟上限；下单前向交易所取一次最新盘口再交给风控。
+            cached => match state.market.refresh_quote(&leg.venue, &leg.symbol).await {
+                Ok(quote) => quote,
+                Err(error) => match cached {
+                    Some(quote) => {
+                        tracing::warn!(
+                            venue = %leg.venue,
+                            symbol = %leg.symbol,
+                            %error,
+                            "刷新盘口失败，沿用缓存报价"
+                        );
+                        quote
+                    }
+                    None => {
+                        let reason =
+                            format!("{} 在 {} 没有可用行情: {error}", leg.symbol, leg.venue);
+                        return Err(reject_request(state, &request, reason).await);
+                    }
+                },
+            },
         };
         // 市价腿按对手价成交：买入看卖一，卖出看买一。
         let price = leg.limit_price.unwrap_or(if leg.side == Side::Buy {
@@ -257,12 +287,34 @@ pub async fn submit_legs(
             let reason = format!("{} 在 {} 的成交价无效", leg.symbol, leg.venue);
             return Err(reject_request(state, &request, reason).await);
         }
-        let quantity = match leg.quantity {
+        let mut quantity = match leg.quantity {
             Some(quantity) => quantity,
             None => (leg.notional_usd / price).round_dp(6),
         };
         if quantity <= Decimal::ZERO {
             return Err(reject_request(state, &request, "下单数量过小").await);
+        }
+        // OKX 永续按「张」撮合：数量需向下对齐到 lotSz 的整数倍（BTC-USDT-SWAP
+        // 为 0.01 张 = 0.0001 BTC），低于 minSz 时交易所会直接拒单。风控只看名义额，
+        // 这里提前拦截并给出可执行的下限提示；对齐后的数量同时写回订单腿，
+        // 避免本地记录与实际成交量不一致。
+        if !request.closing {
+            if let Some(spec) = state.market.swap_contract_spec(&leg.venue, &leg.symbol).await {
+                let contracts = ((quantity / spec.ct_val) / spec.lot_sz).floor() * spec.lot_sz;
+                if contracts < spec.min_sz {
+                    let reason = format!(
+                        "{} {} 最小下单 {} 张（每张 {}，约 {} USDT）；当前委托约 {} USDT",
+                        leg.venue.to_ascii_uppercase(),
+                        leg.symbol,
+                        spec.min_sz,
+                        spec.ct_val,
+                        (spec.min_sz * spec.ct_val * price).round_dp(2),
+                        (quantity * price).round_dp(2),
+                    );
+                    return Err(reject_request(state, &request, reason).await);
+                }
+                quantity = contracts * spec.ct_val;
+            }
         }
         observed_at = observed_at.min(quote.observed_at);
         legs.push(OrderLegIntent {

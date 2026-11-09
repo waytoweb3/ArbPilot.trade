@@ -7,6 +7,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "../co
 import { useNews } from "../hooks/useApi";
 import { formatDateTime } from "../lib/format";
 import { fmt, useI18n } from "../lib/i18n";
+import { openExternal } from "../lib/openExternal";
 import {
   NEWS_SOURCES,
   countUnread,
@@ -124,6 +125,7 @@ export default function NewsPage() {
             <ul>
               {paged.map((item) => {
                 const isNew = Date.parse(item.published_at) > (prefs.readAt[item.source] ?? 0);
+                const url = item.url;
                 return (
                   <li
                     key={item.id}
@@ -131,20 +133,19 @@ export default function NewsPage() {
                   >
                     <Badge tone="neutral">{sourceName(item.source)}</Badge>
                     <div className="min-w-0 flex-1">
-                      <p className="text-sm text-body">{item.title}</p>
+                      <p className="text-sm break-words text-body">{item.title}</p>
                       <p className="mt-1 text-[11px] text-subtle">{formatDateTime(item.published_at)}</p>
                     </div>
                     {isNew && <Badge tone="info">{t.news.newBadge}</Badge>}
-                    {item.url && (
-                      <a
-                        href={item.url}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="inline-flex items-center gap-1 text-[11px] text-accent transition-colors hover:text-accent/80"
+                    {url && (
+                      <button
+                        type="button"
+                        onClick={() => void openExternal(url)}
+                        className="inline-flex shrink-0 items-center gap-1 text-[11px] text-accent transition-colors hover:text-accent/80"
                       >
                         {t.news.open}
                         <ExternalLink size={11} />
-                      </a>
+                      </button>
                     )}
                   </li>
                 );

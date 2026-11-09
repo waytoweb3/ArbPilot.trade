@@ -9,6 +9,7 @@ use serde_json::Value;
 use super::{
     candles_from_rows, depth_rows, make_book, make_depth, millis_to_time, parse_decimal,
     BookSnapshot, Candle, DepthSnapshot, FundingRate, FundingSnapshot, FundingVenueClient,
+    MinOrderSpec,
 };
 use crate::http_client::HttpClient;
 
@@ -71,6 +72,12 @@ struct ContractRow {
     symbol_status: Option<String>,
     #[serde(default)]
     quote_coin: Option<String>,
+    /// 最小下单数量（基础币）。
+    #[serde(default)]
+    min_trade_num: Option<String>,
+    /// 最小下单名义额（USDT）。Bitget 字段名里 `USDT` 是全大写。
+    #[serde(rename = "minTradeUSDT", default)]
+    min_trade_usdt: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -307,6 +314,35 @@ impl BitgetFundingClient {
         symbols.sort();
         symbols.dedup();
         Ok(symbols)
+    }
+
+    /// 单个 USDT 本位永续的最小下单数量与最小名义额。
+    pub fn min_order(&self, symbol: &str) -> anyhow::Result<Option<MinOrderSpec>> {
+        let wanted = symbol.trim().to_ascii_uppercase();
+        let url = format!(
+            "{}/api/v2/mix/market/contracts?productType=usdt-futures&symbol={wanted}",
+            self.base_url
+        );
+        let envelope: Envelope<ContractRow> = serde_json::from_value(self.http.get_json(&url)?)
+            .context("解析 Bitget contracts 失败")?;
+        let Some(row) = into_data(envelope, "market/contracts")?
+            .into_iter()
+            .find(|row| row.symbol.eq_ignore_ascii_case(&wanted))
+        else {
+            return Ok(None);
+        };
+
+        let mut spec = MinOrderSpec::new(VENUE, &wanted);
+        spec.min_quantity = row
+            .min_trade_num
+            .as_deref()
+            .and_then(|value| parse_decimal(value).ok());
+        spec.min_notional_usd = row
+            .min_trade_usdt
+            .as_deref()
+            .and_then(|value| parse_decimal(value).ok())
+            .filter(|value| *value > Decimal::ZERO);
+        Ok(Some(spec))
     }
 
     /// 历史已结算费率，按结算时间升序返回。
