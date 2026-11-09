@@ -32,7 +32,9 @@ pub struct LegOrderRequest {
 #[derive(Debug, Clone)]
 pub struct OrderBatchRequest {
     pub legs: Vec<LegOrderRequest>,
-    pub leverage: Decimal,
+    /// 要设置到交易所的杠杆；`None` 表示沿用交易所当前设置，
+    /// 风控与仓位记录仍按 1 倍处理。
+    pub leverage: Option<Decimal>,
     pub max_slippage_bps: Option<Decimal>,
     pub strategy_id: Option<Uuid>,
     pub origin: OrderOrigin,
@@ -51,7 +53,8 @@ pub struct PairOrderRequest {
     pub short_venue: String,
     /// 每条腿的名义价值（美元）。
     pub notional_usd: Decimal,
-    pub leverage: Decimal,
+    /// 要设置到交易所的杠杆；`None` 表示沿用交易所当前设置。
+    pub leverage: Option<Decimal>,
     pub max_slippage_bps: Option<Decimal>,
     pub strategy_id: Option<Uuid>,
     pub origin: OrderOrigin,
@@ -277,7 +280,7 @@ pub async fn submit_legs(
         origin: request.origin,
         strategy_id: request.strategy_id,
         legs,
-        leverage: request.leverage,
+        leverage: request.leverage.unwrap_or(Decimal::ONE),
         max_slippage_bps: request.max_slippage_bps.unwrap_or(limits.max_slippage_bps),
         quote_observed_at: observed_at,
         created_at: Utc::now(),
@@ -361,6 +364,40 @@ pub async fn submit_legs(
     for index in 0..order.intent.legs.len() {
         let leg = order.intent.legs[index].clone();
         let venue = leg.venue.clone();
+        // 开仓前先把杠杆写到交易所；设置失败则不下单，避免按交易所默认杠杆开出
+        // 与风控/仓位记录不一致的仓位。平仓只为降低敞口，不做杠杆调整。
+        if let (Some(leverage), false) = (request.leverage, request.closing) {
+            log_event(
+                state,
+                order.id,
+                "leverage_submitting",
+                json!({
+                    "index": index,
+                    "venue": &venue,
+                    "symbol": &leg.symbol,
+                    "leverage": leverage,
+                }),
+            )
+            .await;
+            if let Err(error) = state.exchange.set_leverage(&venue, &leg.symbol, leverage).await {
+                order.legs[index].status = LegStatus::Rejected;
+                log_event(
+                    state,
+                    order.id,
+                    "leg_leverage_failed",
+                    json!({
+                        "index": index,
+                        "venue": &venue,
+                        "symbol": &leg.symbol,
+                        "leverage": leverage,
+                        "error": error.to_string(),
+                    }),
+                )
+                .await;
+                failure = Some(format!("第 {} 腿设置杠杆失败: {error}", index + 1));
+                break;
+            }
+        }
         let place = PlaceOrderRequest {
             symbol: leg.symbol.clone(),
             side: leg.side,
@@ -368,6 +405,7 @@ pub async fn submit_legs(
             limit_price: leg.limit_price,
             reduce_only: leg.reduce_only,
             client_order_id: format!("{}-{index}", request.idempotency_key),
+            leverage: request.leverage,
         };
         // 每条腿都按自己的交易所取凭证并签名，同一笔订单可以跨交易所。
         log_event(

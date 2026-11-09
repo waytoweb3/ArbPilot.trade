@@ -1,5 +1,6 @@
 import type {
   AccountsResponse,
+  AccountLeverageResponse,
   BacktestReport,
   Candle,
   CompileStrategyCodeResponse,
@@ -364,6 +365,12 @@ export const api = {
 
   /** 导入的交易所账户、余额与权益汇总。 */
   accounts: () => request<AccountsResponse>("/api/v1/accounts"),
+
+  /** 交易所在指定合约上当前设置的杠杆，只读查询。 */
+  accountLeverage: (venue: string, symbol: string) =>
+    request<AccountLeverageResponse>(
+      `/api/v1/accounts/leverage?venue=${encodeURIComponent(venue)}&symbol=${encodeURIComponent(symbol)}`,
+    ),
 
   importAccount: (body: ImportAccountRequest) =>
     request<TradingAccount>("/api/v1/accounts", {

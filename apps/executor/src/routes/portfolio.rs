@@ -62,7 +62,7 @@ pub async fn close(
                 // 用交易所同步回来的持仓数量，避免按名义价值换算后留下零头。
                 quantity: Some(position.quantity),
             }],
-            leverage: position.leverage,
+            leverage: Some(position.leverage),
             max_slippage_bps: None,
             strategy_id: position.strategy_id,
             origin: OrderOrigin::Desktop,
@@ -135,11 +135,13 @@ pub async fn close_group(
         OrderBatchRequest {
             legs,
             // 同一批下单共用一个杠杆，取组内最大值以免低估保证金需求。
-            leverage: members
-                .iter()
-                .map(|position| position.leverage)
-                .max()
-                .unwrap_or(Decimal::ONE),
+            leverage: Some(
+                members
+                    .iter()
+                    .map(|position| position.leverage)
+                    .max()
+                    .unwrap_or(Decimal::ONE),
+            ),
             max_slippage_bps: None,
             strategy_id: members.iter().find_map(|position| position.strategy_id),
             origin: OrderOrigin::Desktop,

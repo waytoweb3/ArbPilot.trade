@@ -372,17 +372,6 @@ impl TelegramBot {
                         "/positions" => positions_text(lang, state),
                         "/orders" => orders_text(lang, state),
                         "/news" => news_text(lang, state),
-                        "/pause" => {
-                            state.set_paused(
-                                true,
-                                Some(("Telegram 指令", "Telegram command")),
-                            );
-                            pick(lang, "已暂停开仓。", "New entries paused.").to_string()
-                        }
-                        "/resume" => {
-                            state.set_paused(false, None);
-                            pick(lang, "已恢复开仓。", "New entries resumed.").to_string()
-                        }
                         "/open" => {
                             let prepared = self.prepare_open(state, user_id, lang, &args);
                             markup = prepared.markup;
@@ -795,7 +784,7 @@ impl TelegramBot {
                 long_venue: trade.long_venue.clone(),
                 short_venue: trade.short_venue.clone(),
                 notional_usd: trade.notional_usd,
-                leverage: trade.leverage,
+                leverage: Some(trade.leverage),
                 max_slippage_bps: None,
                 strategy_id: None,
                 origin: OrderOrigin::Telegram,
@@ -995,8 +984,6 @@ fn help_text(lang: Lang, enabled: bool) -> String {
             "/positions 当前仓位",
             "/orders 最近订单",
             "/news 最新上币公告",
-            "/pause 暂停开仓",
-            "/resume 恢复开仓",
             "/open <交易对> <多头> <空头> <每条腿USD> [杠杆] 发起开仓",
             "开仓会回复确认按钮，点击「确认开仓」后才真正下单",
             "/lang zh|en 切换机器人语言",
@@ -1011,8 +998,6 @@ fn help_text(lang: Lang, enabled: bool) -> String {
             "/positions Current positions",
             "/orders Recent orders",
             "/news Latest listing announcements",
-            "/pause Pause new entries",
-            "/resume Resume entries",
             "/open <symbol> <long venue> <short venue> <USD per leg> [leverage] Prepare an entry",
             "Entries reply with a confirm button; tap it to place the order",
             "/lang zh|en Switch the bot language",

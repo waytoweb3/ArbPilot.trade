@@ -1,6 +1,6 @@
 import { useState } from "react";
 
-import { useAccounts, useCreateOrder, useRiskLimits } from "../hooks/useApi";
+import { useAccountLeverage, useAccounts, useCreateOrder, useRiskLimits } from "../hooks/useApi";
 import { toNumber } from "../lib/api";
 import {
   formatFundingRate,
@@ -49,6 +49,8 @@ export function TradePanel({
   const mutation = useCreateOrder();
   const accounts = useAccounts();
   const limits = useRiskLimits();
+  const longLeverageQuery = useAccountLeverage(longVenue, symbol);
+  const shortLeverageQuery = useAccountLeverage(shortVenue, symbol);
   const [notional, setNotional] = useState("500");
   const [confirmed, setConfirmed] = useState(false);
   const [result, setResult] = useState<CreateOrderResponse | null>(null);
@@ -61,29 +63,47 @@ export function TradePanel({
   const notionalValue = Number(notional);
   const validSize = Number.isFinite(notionalValue) && notionalValue > 0;
 
-  const marginPerLeg = validSize ? notionalValue : null;
-  const totalMargin = marginPerLeg === null ? null : marginPerLeg * 2;
+  const legAccount = (venue: string) =>
+    (accounts.data?.accounts ?? []).find((account) => account.venue === venue) ?? null;
+  const longAccount = legAccount(longVenue);
+  const shortAccount = legAccount(shortVenue);
+  /** 优先使用合约账户可用保证金；接口未提供时退回账户权益。 */
+  const availableOf = (account: ReturnType<typeof legAccount>): number | null => {
+    const available = account?.snapshot?.available_margin_usd;
+    if (available !== undefined && available !== null) {
+      return toNumber(available);
+    }
+    const equity = account?.snapshot?.equity_usd;
+    return equity === undefined || equity === null ? null : toNumber(equity);
+  };
+  const leverageOf = (data?: { leverage: string | number | null }): number | null => {
+    if (!data || data.leverage === null || data.leverage === undefined) {
+      return null;
+    }
+    const value = toNumber(data.leverage);
+    return Number.isFinite(value) && value > 0 ? value : null;
+  };
+  const longAvailable = availableOf(longAccount);
+  const shortAvailable = availableOf(shortAccount);
+  const longLeverage = leverageOf(longLeverageQuery.data);
+  const shortLeverage = leverageOf(shortLeverageQuery.data);
+
+  // 杠杆未知时按 1x 估算保证金，避免低估占用。
+  const marginAt = (leverage: number | null): number | null =>
+    validSize ? notionalValue / (leverage ?? 1) : null;
+  const longMargin = marginAt(longLeverage);
+  const shortMargin = marginAt(shortLeverage);
+  const totalMargin =
+    longMargin === null || shortMargin === null ? null : longMargin + shortMargin;
   const perSettle = netRate !== null && validSize ? notionalValue * netRate : null;
   const annualIncome =
     netAnnualizedPct !== null && validSize ? (notionalValue * netAnnualizedPct) / 100 : null;
   const longQty = longPrice && validSize ? notionalValue / longPrice : null;
   const shortQty = shortPrice && validSize ? notionalValue / shortPrice : null;
 
-  const legAccount = (venue: string) =>
-    (accounts.data?.accounts ?? []).find((account) => account.venue === venue) ?? null;
-  const longAccount = legAccount(longVenue);
-  const shortAccount = legAccount(shortVenue);
-  const equityOf = (account: ReturnType<typeof legAccount>): number | null => {
-    const value = account?.snapshot?.equity_usd;
-    return value === undefined || value === null ? null : toNumber(value);
-  };
-  const longEquity = equityOf(longAccount);
-  const shortEquity = equityOf(shortAccount);
-
   const insufficient =
-    marginPerLeg !== null &&
-    ((longEquity !== null && longEquity < marginPerLeg) ||
-      (shortEquity !== null && shortEquity < marginPerLeg));
+    (longMargin !== null && longAvailable !== null && longAvailable < longMargin) ||
+    (shortMargin !== null && shortAvailable !== null && shortAvailable < shortMargin);
   const overLimit =
     maxNotional > 0 && validSize && notionalValue > maxNotional;
 
@@ -161,20 +181,37 @@ export function TradePanel({
 
         <div className="space-y-1.5">
           {[
-            { index: 1, venue: longVenue, equity: longEquity },
-            { index: 2, venue: shortVenue, equity: shortEquity },
+            {
+              index: 1,
+              venue: longVenue,
+              account: longAccount,
+              available: longAvailable,
+              leverage: longLeverage,
+            },
+            {
+              index: 2,
+              venue: shortVenue,
+              account: shortAccount,
+              available: shortAvailable,
+              leverage: shortLeverage,
+            },
           ].map((leg) => (
             <div
               key={leg.index}
               className="flex items-center justify-between gap-2 rounded-md border border-line bg-panel-soft px-2.5 py-1.5 text-[11px]"
             >
               <span className="text-muted">
-                {leg.venue.toUpperCase()} · {t.trade.accountEquity}
+                {leg.venue.toUpperCase()} · {t.trade.availableMargin}
               </span>
-              {leg.equity !== null ? (
-                <span className="font-mono text-body">{formatUsd(leg.equity)}</span>
-              ) : (
+              {!leg.account ? (
                 <span className="text-warning">{fmt(t.trade.accountMissing, { venue: leg.venue.toUpperCase() })}</span>
+              ) : (
+                <span className="flex items-center gap-2 font-mono text-body">
+                  <span>{leg.available === null ? "—" : formatUsd(leg.available)}</span>
+                  <span className="text-subtle">
+                    {t.trade.leverage} {leg.leverage === null ? "—" : `${leg.leverage}x`}
+                  </span>
+                </span>
               )}
             </div>
           ))}
@@ -269,7 +306,7 @@ export function TradePanel({
 
         <Button
           className="w-full"
-          disabled={!ready || !confirmed || mutation.isPending}
+          disabled={!ready || !confirmed || insufficient || mutation.isPending}
           onClick={submit}
         >
           {mutation.isPending ? t.trade.submitting : t.trade.submit}

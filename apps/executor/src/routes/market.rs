@@ -877,6 +877,7 @@ async fn install_bundle(
         arb_core::StrategySource::Manual,
         StrategyStatus::Stopped,
     );
+    record.source_publication_id = Some(bundle.publication_id);
     record.sandbox = Some(SandboxBinding::new(&artifact, state.config.sandbox));
     record.runtime.record(
         StrategyEventLevel::Info,

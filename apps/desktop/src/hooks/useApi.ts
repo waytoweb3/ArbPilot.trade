@@ -264,6 +264,16 @@ export function useAccounts(enabled = true) {
   });
 }
 
+/** 交易所在指定合约上当前设置的杠杆，1 分钟刷新一次。 */
+export function useAccountLeverage(venue: string, symbol: string, enabled = true) {
+  return useQuery({
+    queryKey: ["account-leverage", venue, symbol],
+    queryFn: () => api.accountLeverage(venue, symbol),
+    refetchInterval: 60_000,
+    enabled: enabled && Boolean(venue) && Boolean(symbol),
+  });
+}
+
 /** 账户权益历史曲线，按所选时间范围聚合。 */
 export function useAccountHistory(hours: number, enabled = true) {
   return useQuery({

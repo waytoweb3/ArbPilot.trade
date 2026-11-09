@@ -54,6 +54,20 @@ pub struct HistoryQuery {
     pub hours: i64,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct LeverageQuery {
+    pub venue: String,
+    pub symbol: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LeverageResponse {
+    pub venue: String,
+    pub symbol: String,
+    /// 交易所在该合约上当前设置的杠杆；无持仓或交易所不提供查询时为 null。
+    pub leverage: Option<Decimal>,
+}
+
 fn default_hours() -> i64 {
     168
 }
@@ -127,6 +141,28 @@ pub async fn refresh(
         .await
         .map_err(|error| ApiError::NotFound(error.to_string()))?;
     Ok(Json(view))
+}
+
+/// 查询交易所在该合约上当前设置的杠杆，只读，不会修改账户配置。
+pub async fn leverage(
+    State(state): State<AppState>,
+    Query(query): Query<LeverageQuery>,
+) -> Result<Json<LeverageResponse>, ApiError> {
+    let venue = query.venue.trim().to_ascii_lowercase();
+    let symbol = query.symbol.trim().to_ascii_uppercase();
+    if venue.is_empty() || symbol.is_empty() {
+        return Err(ApiError::BadRequest("缺少 venue 或 symbol".to_string()));
+    }
+    let leverage = state
+        .exchange
+        .current_leverage(&venue, &symbol)
+        .await
+        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    Ok(Json(LeverageResponse {
+        venue,
+        symbol,
+        leverage,
+    }))
 }
 
 /// 权益历史，按时间范围自动选择聚合粒度。

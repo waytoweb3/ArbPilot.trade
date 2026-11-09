@@ -1047,6 +1047,9 @@ pub struct StrategyRecord {
     pub id: Uuid,
     pub status: StrategyStatus,
     pub source: StrategySource,
+    /// 从策略市场导入时的来源发布 ID；退订前据此清理本机导入的策略。
+    #[serde(default)]
+    pub source_publication_id: Option<Uuid>,
     pub version: u32,
     pub definition: StrategyDefinition,
     pub validation: StrategyValidation,
@@ -1075,6 +1078,7 @@ impl StrategyRecord {
             id: Uuid::new_v4(),
             status,
             source,
+            source_publication_id: None,
             version: 1,
             definition,
             validation: StrategyValidation::default(),

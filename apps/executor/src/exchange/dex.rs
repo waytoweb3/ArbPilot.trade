@@ -10,9 +10,9 @@ use sha2::{Digest as _, Sha256};
 use sha3::Keccak256;
 
 use lighters::{
-    constants::{GOOD_TILL_TIME, LIMIT_ORDER, MAX_ORDER_EXPIRY, TX_TYPE_L2_CREATE_ORDER},
+    constants::{CROSS_MARGIN, GOOD_TILL_TIME, LIMIT_ORDER, MAX_ORDER_EXPIRY, TX_TYPE_L2_CREATE_ORDER},
     signer::KeyManager,
-    transactions::{sign_tx, CreateOrder, OrderInfo, TxInfo},
+    transactions::{sign_tx, CreateOrder, OrderInfo, TxInfo, UpdateLeverage},
 };
 
 /// Lighter 主网 chain id；测试网为 300。
@@ -168,6 +168,21 @@ impl HyperliquidOrder<'_> {
             "grouping": "na",
         }))
     }
+}
+
+/// Hyperliquid `updateLeverage` action 的 msgpack 序列化，字段顺序与官方 SDK 一致。
+pub fn hyperliquid_update_leverage_action(asset: u32, is_cross: bool, leverage: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(96);
+    msgpack_map(&mut out, 4);
+    msgpack_str(&mut out, "type");
+    msgpack_str(&mut out, "updateLeverage");
+    msgpack_str(&mut out, "asset");
+    msgpack_uint(&mut out, u64::from(asset));
+    msgpack_str(&mut out, "isCross");
+    msgpack_bool(&mut out, is_cross);
+    msgpack_str(&mut out, "leverage");
+    msgpack_uint(&mut out, u64::from(leverage));
+    out
 }
 
 /// Hyperliquid 的签名结果，`v` 为 27/28。
@@ -398,6 +413,45 @@ pub fn sign_lighter_order(
         tx_info: tx
             .to_json()
             .map_err(|error| anyhow!("Lighter 订单序列化失败: {error}"))?,
+    })
+}
+
+/// Lighter 杠杆设置参数，`initial_margin_fraction` 以 1e-4 为单位。
+pub struct LighterLeverage {
+    pub account_index: i64,
+    pub api_key_index: u8,
+    pub market_index: i16,
+    pub initial_margin_fraction: u16,
+    pub nonce: i64,
+    pub expired_at: i64,
+}
+
+/// 签名一笔 `L2UpdateLeverage` 交易，按全仓模式提交。
+pub fn sign_lighter_leverage(
+    leverage: &LighterLeverage,
+    private_key: &str,
+    chain_id: u32,
+) -> anyhow::Result<LighterSigned> {
+    let key = KeyManager::from_hex(private_key)
+        .map_err(|error| anyhow!("Lighter 私钥不合法: {error}"))?;
+    let mut tx = UpdateLeverage {
+        account_index: leverage.account_index,
+        api_key_index: leverage.api_key_index,
+        market_index: leverage.market_index,
+        initial_margin_fraction: leverage.initial_margin_fraction,
+        margin_mode: CROSS_MARGIN,
+        expired_at: leverage.expired_at,
+        nonce: leverage.nonce,
+        sig: Vec::new(),
+        signed_hash: String::new(),
+        attributes: None,
+    };
+    sign_tx(&mut tx, &key, chain_id).map_err(|error| anyhow!("Lighter 签名失败: {error}"))?;
+    Ok(LighterSigned {
+        tx_type: tx.tx_type(),
+        tx_info: tx
+            .to_json()
+            .map_err(|error| anyhow!("Lighter 杠杆交易序列化失败: {error}"))?,
     })
 }
 

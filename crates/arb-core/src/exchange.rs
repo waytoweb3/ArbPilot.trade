@@ -30,6 +30,10 @@ pub struct PlaceOrderRequest {
     pub reduce_only: bool,
     /// 幂等标识，交易所不支持时由执行器本地去重。
     pub client_order_id: String,
+    /// 该腿应使用的杠杆；`None` 表示沿用交易所当前设置。
+    /// 部分交易所（如 MEXC / HTX）直接把杠杆放在下单请求里。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leverage: Option<Decimal>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

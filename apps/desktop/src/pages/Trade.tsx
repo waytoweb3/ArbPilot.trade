@@ -14,6 +14,7 @@ import {
   useClosePositionGroup,
   useFundingHistory,
   useFundingStatus,
+  useOrders,
   usePositions,
 } from "../hooks/useApi";
 import { usePriceStream } from "../hooks/usePriceStream";
@@ -27,7 +28,10 @@ import {
   formatInterval,
   formatNumber,
   formatPercentValue,
+  formatTime,
   formatUsd,
+  orderStatusLabel,
+  orderStatusTone,
 } from "../lib/format";
 import { fmt, useI18n } from "../lib/i18n";
 import type { FundingRate, FundingSymbolStatus, Position } from "../lib/types";
@@ -36,9 +40,22 @@ import { cn } from "../lib/utils";
 type Direction = "long1_short2" | "short1_long2";
 type ChartMode = "price" | "funding";
 type FundingRange = 30 | 90 | 180 | "all";
+type BottomTab = "positions" | "openOrders" | "history" | "trades";
 
-const PRICE_INTERVALS = ["30s", "1m", "5m", "10m"] as const;
+/** 仍在执行中的订单状态：与仓位页的历史订单口径相反。 */
+const OPEN_ORDER_STATUSES = new Set([
+  "pending_risk",
+  "submitting",
+  "partially_filled",
+  "unwinding",
+]);
+
+const PRICE_INTERVALS = ["30s", "1m", "5m", "10m", "30m", "1h", "4h"] as const;
 const FUNDING_RANGES: FundingRange[] = [30, 90, 180, "all"];
+
+/** 盘口与图表共用同一高度，宽屏下底边对齐。 */
+const WORKSPACE_CARD_HEIGHT =
+  "xl:flex xl:h-[calc(100vh_-_330px)] xl:min-h-[520px] xl:max-h-[700px] xl:flex-col";
 const QUOTES = ["USDT", "USDC", "USD"];
 
 /** `BTCUSDT` → base `BTC`、quote `USDT`。 */
@@ -150,6 +167,20 @@ export default function TradePage() {
     [statuses, symbol],
   );
 
+  // 交易页可直接切换币种，只保留至少两个交易所有报价的标的。
+  const symbolOptions = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const item of statuses) {
+      for (const entry of item.symbols) {
+        counts.set(entry.symbol, (counts.get(entry.symbol) ?? 0) + 1);
+      }
+    }
+    return [...counts.entries()]
+      .filter(([, count]) => count >= 2)
+      .map(([value]) => value)
+      .sort();
+  }, [statuses]);
+
   const requested1 = params.get("venue1");
   const requested2 = params.get("venue2");
   const venue1 = requested1 && available.includes(requested1) ? requested1 : (available[0] ?? "");
@@ -185,13 +216,6 @@ export default function TradePage() {
       : null;
   const netRate = longRate !== null && shortRate !== null ? shortRate - longRate : null;
   const netAnn = longAnn !== null && shortAnn !== null ? shortAnn - longAnn : null;
-
-  const priceGapBps =
-    longEntry?.mark_price != null && shortEntry?.mark_price != null
-      ? ((toNumber(shortEntry.mark_price) - toNumber(longEntry.mark_price)) /
-          toNumber(longEntry.mark_price)) *
-        10_000
-      : null;
 
   const sameInterval =
     longEntry !== null &&
@@ -239,6 +263,23 @@ export default function TradePage() {
     [longVenue, shortVenue, symbol],
   );
   const livePrices = usePriceStream(priceLegs);
+
+  // 部分交易所（如 OKX、HTX）的资金费接口不带标记价，用实时盘口中间价兜底。
+  const priceOf = (venue: string, entry: FundingSymbolStatus | null): number | null => {
+    const markPrice = entry?.mark_price;
+    if (markPrice != null) {
+      return toNumber(markPrice);
+    }
+    const live = livePrices[venue]?.price;
+    return live !== undefined && Number.isFinite(live) && live > 0 ? live : null;
+  };
+
+  const longPrice = priceOf(longVenue, longEntry);
+  const shortPrice = priceOf(shortVenue, shortEntry);
+  const priceGapBps =
+    longPrice !== null && longPrice > 0 && shortPrice !== null
+      ? ((shortPrice - longPrice) / longPrice) * 10_000
+      : null;
 
   const longView = useMemo(() => {
     if (fundingRange === "all") {
@@ -325,6 +366,42 @@ export default function TradePage() {
     }
     return [...groups.entries()];
   }, [symbolPositions]);
+
+  // 底部面板：持仓 / 当前委托 / 历史委托 / 成交记录，统一按当前交易对过滤。
+  const [bottomTab, setBottomTab] = useState<BottomTab>("positions");
+  const orders = useOrders();
+  const symbolOrders = useMemo(
+    () =>
+      (orders.data ?? []).filter((order) =>
+        order.intent.legs.some((leg) => leg.symbol === symbol),
+      ),
+    [orders.data, symbol],
+  );
+  const openOrders = useMemo(
+    () => symbolOrders.filter((order) => OPEN_ORDER_STATUSES.has(order.status)),
+    [symbolOrders],
+  );
+  const closedOrders = useMemo(
+    () => symbolOrders.filter((order) => !OPEN_ORDER_STATUSES.has(order.status)),
+    [symbolOrders],
+  );
+  // 成交记录直接从双腿的成交回报里展开，无需额外接口。
+  const fills = useMemo(
+    () =>
+      symbolOrders.flatMap((order) =>
+        order.legs
+          .filter((leg) => leg.intent.symbol === symbol && toNumber(leg.filled_quantity) > 0)
+          .map((leg) => ({ order, leg })),
+      ),
+    [symbolOrders, symbol],
+  );
+  const bottomOrderList = bottomTab === "history" ? closedOrders : openOrders;
+  const bottomTabs = [
+    { id: "positions" as const, label: t.trade.bottomPositions, count: symbolPositions.length },
+    { id: "openOrders" as const, label: t.trade.bottomOpenOrders, count: openOrders.length },
+    { id: "history" as const, label: t.trade.bottomHistory, count: closedOrders.length },
+    { id: "trades" as const, label: t.trade.bottomTrades, count: fills.length },
+  ];
 
   const setParam = (key: string, value: string) => {
     const next = new URLSearchParams(params);
@@ -420,6 +497,24 @@ export default function TradePage() {
               pair: `${venue1 ? venue1.toUpperCase() : "—"} / ${venue2 ? venue2.toUpperCase() : "—"}`,
             })}
           </p>
+        </div>
+        <div className="flex items-center gap-2">
+          <span className="text-[11px] text-muted">{t.trade.symbolLabel}</span>
+          <select
+            value={symbol}
+            aria-label={t.trade.symbolLabel}
+            onChange={(event) => setParam("symbol", event.target.value)}
+            className="max-w-[180px] rounded-md border border-line bg-panel-soft px-2 py-1.5 font-mono text-xs text-fg uppercase outline-none focus:border-accent/60"
+          >
+            {symbol && !symbolOptions.includes(symbol) && (
+              <option value={symbol}>{symbol}</option>
+            )}
+            {symbolOptions.map((item) => (
+              <option key={item} value={item}>
+                {item}
+              </option>
+            ))}
+          </select>
         </div>
       </header>
 
@@ -624,105 +719,10 @@ export default function TradePage() {
             />
           </section>
 
-          <Card>
-            <CardHeader>
-              <div>
-                <CardTitle>{t.trade.positionsTitle}</CardTitle>
-                <CardDescription>{fmt(t.positions.summary, { count: symbolPositions.length, value: "—", pnl: "—" })}</CardDescription>
-              </div>
-              <Link to="/positions" className="text-[11px] text-muted hover:text-body">
-                {t.trade.viewAll}
-              </Link>
-            </CardHeader>
-            <CardContent className="p-0">
-              {positionGroups.length > 0 && (
-                <div className="flex flex-wrap items-center gap-2 border-b border-line px-4 py-2">
-                  {positionGroups.map(([groupId, members]) => (
-                    <div
-                      key={groupId}
-                      className="flex items-center gap-2 rounded-md border border-line bg-panel-soft px-2 py-1 text-[11px]"
-                    >
-                      <span className="text-muted">{t.trade.groupLabel}</span>
-                      <span className="font-mono text-body">{groupId.slice(0, 8)}</span>
-                      <span className="text-subtle">
-                        {members.length} {t.trade.groupLegs}
-                      </span>
-                      <button
-                        type="button"
-                        disabled={closeGroup.isPending}
-                        onClick={() => closeGroup.mutate(groupId)}
-                        className="text-danger transition-opacity hover:opacity-80 disabled:opacity-50"
-                      >
-                        {closeGroup.isPending ? t.trade.groupClosing : t.trade.closeGroup}
-                      </button>
-                    </div>
-                  ))}
-                </div>
-              )}
-              {closeGroup.error && (
-                <p className="border-b border-line px-4 py-1.5 text-[11px] text-danger">
-                  {closeGroup.error instanceof Error
-                    ? closeGroup.error.message
-                    : t.errors.unknown}
-                </p>
-              )}
-              {symbolPositions.length === 0 ? (
-                <p className="px-4 py-8 text-center text-xs text-muted">{t.trade.positionsEmpty}</p>
-              ) : (
-                <div className="overflow-x-auto">
-                  <table className="w-full min-w-[620px] border-collapse text-xs">
-                    <thead>
-                      <tr className="border-b border-line text-[10px] tracking-wide text-muted uppercase">
-                        <th className="px-4 py-2 text-left font-medium">{t.positions.venue}</th>
-                        <th className="px-4 py-2 text-left font-medium">{t.trade.groupLabel}</th>
-                        <th className="px-4 py-2 text-left font-medium">{t.positions.side}</th>
-                        <th className="px-4 py-2 text-right font-medium">{t.positions.quantity}</th>
-                        <th className="px-4 py-2 text-right font-medium">{t.positions.entry}</th>
-                        <th className="px-4 py-2 text-right font-medium">{t.positions.mark}</th>
-                        <th className="px-4 py-2 text-right font-medium">{t.positions.pnl}</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {symbolPositions.map((position: Position) => (
-                        <tr key={position.id} className="border-b border-line/70 last:border-0">
-                          <td className="px-4 py-2 font-mono text-body uppercase">{position.venue}</td>
-                          <td className="px-4 py-2 font-mono text-[10px] text-muted">
-                            {position.group_id ? position.group_id.slice(0, 8) : "—"}
-                          </td>
-                          <td className="px-4 py-2">
-                            <Badge tone={position.side === "buy" ? "success" : "danger"}>
-                              {position.side === "buy" ? t.positions.long : t.positions.short}
-                            </Badge>
-                          </td>
-                          <td className="px-4 py-2 text-right font-mono text-body">
-                            {formatNumber(position.quantity, 6)}
-                          </td>
-                          <td className="px-4 py-2 text-right font-mono text-body">
-                            {formatNumber(position.entry_price, 2)}
-                          </td>
-                          <td className="px-4 py-2 text-right font-mono text-body">
-                            {formatNumber(position.mark_price, 2)}
-                          </td>
-                          <td
-                            className={cn(
-                              "px-4 py-2 text-right font-mono",
-                              toNumber(position.unrealized_pnl) >= 0 ? "text-accent" : "text-danger",
-                            )}
-                          >
-                            {formatUsd(position.unrealized_pnl)}
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              )}
-            </CardContent>
-          </Card>
-
-          <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_360px]">
-            <div className="min-w-0 space-y-4">
-              <Card>
+          {/* 工作区：左侧「图表 + 盘口」并排，底部面板横跨这两列，右侧下单 */}
+          <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_340px]">
+            <div className="order-1 grid min-w-0 gap-4 xl:grid-cols-[minmax(0,1fr)_240px]">
+              <Card className={cn(WORKSPACE_CARD_HEIGHT, "xl:col-start-1 xl:row-start-1")}>
                 <CardHeader className="flex-wrap gap-2">
                   <div>
                     <CardTitle>
@@ -796,39 +796,43 @@ export default function TradePage() {
                     </div>
                   </div>
                 </CardHeader>
-                <CardContent className="p-3">
+                <CardContent className="p-3 xl:flex xl:min-h-0 xl:flex-1 xl:flex-col">
                   {chartMode === "price" ? (
                     <>
-                      <div className="mb-2 flex flex-wrap items-center gap-4 px-1 text-[11px] text-muted">
+                      <div className="mb-2 flex shrink-0 flex-wrap items-center gap-4 px-1 text-[11px] text-muted">
                         {priceSeries.map((item) => (
                           <LegendDot key={item.venue} color={item.up} label={liveLabel(item)} />
                         ))}
                       </div>
-                      <PriceChart
-                        series={priceSeries}
-                        interval={priceInterval}
-                        live={livePrices}
-                        fitKey={`${longVenue}:${shortVenue}:${symbol}:${priceInterval}`}
-                        heightClass="h-[320px] w-full"
-                      />
+                      <div className="xl:min-h-0 xl:flex-1">
+                        <PriceChart
+                          series={priceSeries}
+                          interval={priceInterval}
+                          live={livePrices}
+                          fitKey={`${longVenue}:${shortVenue}:${symbol}:${priceInterval}`}
+                          heightClass="h-[320px] w-full xl:h-full"
+                        />
+                      </div>
                       {!hasPriceData && (
-                        <p className="pt-2 text-center text-xs text-muted">{t.trade.priceEmpty}</p>
+                        <p className="shrink-0 pt-2 text-center text-xs text-muted">{t.trade.priceEmpty}</p>
                       )}
                     </>
                   ) : (
                     <>
-                      <div className="mb-2 flex flex-wrap items-center gap-4 px-1 text-[11px] text-muted">
+                      <div className="mb-2 flex shrink-0 flex-wrap items-center gap-4 px-1 text-[11px] text-muted">
                         <LegendDot color="#2563eb" label={`${t.trade.legendLong} ${longVenue.toUpperCase()}`} />
                         <LegendDot color="#d97706" label={`${t.trade.legendShort} ${shortVenue.toUpperCase()}`} />
                         <LegendDot color="#059669" label={t.trade.legendNet} />
                       </div>
                       {hasFundingHistory ? (
-                        <FundingChart
-                          rates={longView}
-                          compare={shortView}
-                          net={netBars}
-                          heightClass="h-[320px] w-full"
-                        />
+                        <div className="xl:min-h-0 xl:flex-1">
+                          <FundingChart
+                            rates={longView}
+                            compare={shortView}
+                            net={netBars}
+                            heightClass="h-[320px] w-full xl:h-full"
+                          />
+                        </div>
                       ) : (
                         <p className="py-24 text-center text-xs text-muted">{t.trade.noChart}</p>
                       )}
@@ -837,29 +841,275 @@ export default function TradePage() {
                 </CardContent>
               </Card>
 
-              <Card>
-                <CardHeader>
-                  <div>
-                    <CardTitle>{t.trade.depthTitle}</CardTitle>
-                    <CardDescription>{t.trade.depthDesc}</CardDescription>
+              {/* 盘口：图表右侧，与图表等高 */}
+              <div className="order-3 min-w-0 xl:col-start-2 xl:row-start-1">
+                <Card className={WORKSPACE_CARD_HEIGHT}>
+                  <CardHeader className="flex-wrap gap-2">
+                    <div>
+                      <CardTitle>{t.trade.depthTitle}</CardTitle>
+                      <CardDescription>{t.trade.depthDesc}</CardDescription>
+                    </div>
+                  </CardHeader>
+                  <CardContent className="grid gap-3 p-3 sm:grid-cols-2 xl:min-h-0 xl:flex-1 xl:grid-cols-1 xl:grid-rows-2">
+                    <OrderBookDepth
+                      venue={longVenue}
+                      symbol={symbol}
+                      label={`${t.trade.longBadge} · ${longVenue.toUpperCase()}`}
+                      className="min-h-0"
+                    />
+                    <OrderBookDepth
+                      venue={shortVenue}
+                      symbol={symbol}
+                      label={`${t.trade.shortBadge} · ${shortVenue.toUpperCase()}`}
+                      className="min-h-0"
+                    />
+                  </CardContent>
+                </Card>
+              </div>
+
+          {/* 持仓 / 委托 / 成交面板：横跨图表与盘口两列 */}
+          <Card className="order-2 min-w-0 xl:col-span-2 xl:row-start-2">
+            <div className="flex flex-wrap items-center justify-between gap-2 border-b border-line px-2 py-1.5">
+              <div className="flex min-w-0 items-center gap-1 overflow-x-auto">
+                {bottomTabs.map((tab) => (
+                  <button
+                    key={tab.id}
+                    type="button"
+                    onClick={() => setBottomTab(tab.id)}
+                    className={cn(
+                      "flex shrink-0 items-center gap-1.5 rounded-md px-2.5 py-1 text-xs transition-colors",
+                      bottomTab === tab.id
+                        ? "bg-panel-soft font-medium text-fg"
+                        : "text-muted hover:text-body",
+                    )}
+                  >
+                    {tab.label}
+                    {tab.count > 0 && (
+                      <span
+                        className={cn(
+                          "rounded-full px-1.5 py-0.5 font-mono text-[10px]",
+                          bottomTab === tab.id
+                            ? "bg-accent/15 text-accent"
+                            : "bg-panel-soft text-subtle",
+                        )}
+                      >
+                        {tab.count}
+                      </span>
+                    )}
+                  </button>
+                ))}
+              </div>
+              <Link to="/positions" className="shrink-0 pr-1 text-[11px] text-muted hover:text-body">
+                {t.trade.viewAll}
+              </Link>
+            </div>
+            <CardContent className="p-0">
+              {bottomTab === "positions" && (
+                <>
+                  {positionGroups.length > 0 && (
+                    <div className="flex flex-wrap items-center gap-2 border-b border-line px-4 py-2">
+                      {positionGroups.map(([groupId, members]) => (
+                        <div
+                          key={groupId}
+                          className="flex items-center gap-2 rounded-md border border-line bg-panel-soft px-2 py-1 text-[11px]"
+                        >
+                          <span className="text-muted">{t.trade.groupLabel}</span>
+                          <span className="font-mono text-body">{groupId.slice(0, 8)}</span>
+                          <span className="text-subtle">
+                            {members.length} {t.trade.groupLegs}
+                          </span>
+                          <button
+                            type="button"
+                            disabled={closeGroup.isPending}
+                            onClick={() => closeGroup.mutate(groupId)}
+                            className="text-danger transition-opacity hover:opacity-80 disabled:opacity-50"
+                          >
+                            {closeGroup.isPending ? t.trade.groupClosing : t.trade.closeGroup}
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  {closeGroup.error && (
+                    <p className="border-b border-line px-4 py-1.5 text-[11px] text-danger">
+                      {closeGroup.error instanceof Error
+                        ? closeGroup.error.message
+                        : t.errors.unknown}
+                    </p>
+                  )}
+                  {symbolPositions.length === 0 ? (
+                    <p className="px-4 py-8 text-center text-xs text-muted">{t.trade.positionsEmpty}</p>
+                  ) : (
+                    <div className="overflow-x-auto">
+                      <table className="w-full min-w-[620px] border-collapse text-xs">
+                        <thead>
+                          <tr className="border-b border-line text-[10px] tracking-wide text-muted uppercase">
+                            <th className="px-4 py-2 text-left font-medium">{t.positions.venue}</th>
+                            <th className="px-4 py-2 text-left font-medium">{t.trade.groupLabel}</th>
+                            <th className="px-4 py-2 text-left font-medium">{t.positions.side}</th>
+                            <th className="px-4 py-2 text-right font-medium">{t.positions.quantity}</th>
+                            <th className="px-4 py-2 text-right font-medium">{t.positions.entry}</th>
+                            <th className="px-4 py-2 text-right font-medium">{t.positions.mark}</th>
+                            <th className="px-4 py-2 text-right font-medium">{t.positions.pnl}</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {symbolPositions.map((position: Position) => (
+                            <tr key={position.id} className="border-b border-line/70 last:border-0">
+                              <td className="px-4 py-2 font-mono text-body uppercase">{position.venue}</td>
+                              <td className="px-4 py-2 font-mono text-[10px] text-muted">
+                                {position.group_id ? position.group_id.slice(0, 8) : "—"}
+                              </td>
+                              <td className="px-4 py-2">
+                                <Badge tone={position.side === "buy" ? "success" : "danger"}>
+                                  {position.side === "buy" ? t.positions.long : t.positions.short}
+                                </Badge>
+                              </td>
+                              <td className="px-4 py-2 text-right font-mono text-body">
+                                {formatNumber(position.quantity, 6)}
+                              </td>
+                              <td className="px-4 py-2 text-right font-mono text-body">
+                                {formatNumber(position.entry_price, 2)}
+                              </td>
+                              <td className="px-4 py-2 text-right font-mono text-body">
+                                {formatNumber(position.mark_price, 2)}
+                              </td>
+                              <td
+                                className={cn(
+                                  "px-4 py-2 text-right font-mono",
+                                  toNumber(position.unrealized_pnl) >= 0 ? "text-accent" : "text-danger",
+                                )}
+                              >
+                                {formatUsd(position.unrealized_pnl)}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </>
+              )}
+
+              {(bottomTab === "openOrders" || bottomTab === "history") &&
+                (bottomOrderList.length === 0 ? (
+                  <p className="px-4 py-8 text-center text-xs text-muted">
+                    {bottomTab === "openOrders" ? t.trade.ordersEmpty : t.trade.historyEmpty}
+                  </p>
+                ) : (
+                  <div className="overflow-x-auto">
+                    <table className="w-full min-w-[760px] border-collapse text-xs">
+                      <thead>
+                        <tr className="border-b border-line text-[10px] tracking-wide text-muted uppercase">
+                          <th className="px-4 py-2 text-left font-medium">{t.positions.order}</th>
+                          <th className="px-4 py-2 text-left font-medium">{t.positions.legs}</th>
+                          <th className="px-4 py-2 text-right font-medium">{t.positions.notional}</th>
+                          <th className="px-4 py-2 text-left font-medium">{t.positions.status}</th>
+                          <th className="px-4 py-2 text-right font-medium">{t.positions.time}</th>
+                          <th className="px-4 py-2 text-left font-medium">{t.positions.note}</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {bottomOrderList.map((order) => (
+                          <tr key={order.id} className="border-b border-line/70 last:border-0">
+                            <td className="px-4 py-2 font-mono text-[11px] text-muted">
+                              {order.id.slice(0, 8)}
+                            </td>
+                            <td className="px-4 py-2 font-mono text-[11px] text-muted">
+                              {order.intent.legs
+                                .map(
+                                  (leg) =>
+                                    `${leg.venue} ${leg.side === "buy" ? t.positions.buy : t.positions.sell}`,
+                                )
+                                .join(" / ")}
+                            </td>
+                            <td className="px-4 py-2 text-right font-mono text-body">
+                              {formatUsd(
+                                order.intent.legs.reduce(
+                                  (sum, leg) => sum + toNumber(leg.quantity) * toNumber(leg.limit_price),
+                                  0,
+                                ),
+                              )}
+                            </td>
+                            <td className="px-4 py-2">
+                              <Badge tone={orderStatusTone[order.status]}>
+                                {orderStatusLabel(order.status)}
+                              </Badge>
+                            </td>
+                            <td className="px-4 py-2 text-right font-mono text-[11px] text-muted">
+                              {formatTime(order.created_at)}
+                            </td>
+                            <td className="max-w-[220px] px-4 py-2 text-[11px] text-warning">
+                              {order.note ?? "—"}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
                   </div>
-                </CardHeader>
-                <CardContent className="grid gap-3 sm:grid-cols-2">
-                  <OrderBookDepth
-                    venue={longVenue}
-                    symbol={symbol}
-                    label={`${t.trade.longBadge} · ${longVenue.toUpperCase()}`}
-                  />
-                  <OrderBookDepth
-                    venue={shortVenue}
-                    symbol={symbol}
-                    label={`${t.trade.shortBadge} · ${shortVenue.toUpperCase()}`}
-                  />
-                </CardContent>
-              </Card>
+                ))}
+
+              {bottomTab === "trades" &&
+                (fills.length === 0 ? (
+                  <p className="px-4 py-8 text-center text-xs text-muted">{t.trade.tradesEmpty}</p>
+                ) : (
+                  <div className="overflow-x-auto">
+                    <table className="w-full min-w-[760px] border-collapse text-xs">
+                      <thead>
+                        <tr className="border-b border-line text-[10px] tracking-wide text-muted uppercase">
+                          <th className="px-4 py-2 text-left font-medium">{t.positions.order}</th>
+                          <th className="px-4 py-2 text-left font-medium">{t.positions.venue}</th>
+                          <th className="px-4 py-2 text-left font-medium">{t.positions.side}</th>
+                          <th className="px-4 py-2 text-right font-medium">{t.trade.orderPrice}</th>
+                          <th className="px-4 py-2 text-right font-medium">{t.trade.orderQty}</th>
+                          <th className="px-4 py-2 text-right font-medium">{t.positions.notional}</th>
+                          <th className="px-4 py-2 text-right font-medium">{t.positions.time}</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {fills.map(({ order, leg }) => (
+                          <tr
+                            key={`${order.id}-${leg.intent.venue}`}
+                            className="border-b border-line/70 last:border-0"
+                          >
+                            <td className="px-4 py-2 font-mono text-[11px] text-muted">
+                              {order.id.slice(0, 8)}
+                            </td>
+                            <td className="px-4 py-2 font-mono text-body uppercase">
+                              {leg.intent.venue}
+                            </td>
+                            <td className="px-4 py-2">
+                              <Badge tone={leg.intent.side === "buy" ? "success" : "danger"}>
+                                {leg.intent.side === "buy" ? t.positions.long : t.positions.short}
+                              </Badge>
+                            </td>
+                            <td className="px-4 py-2 text-right font-mono text-body">
+                              {leg.average_price === null ? "—" : formatNumber(leg.average_price, 4)}
+                            </td>
+                            <td className="px-4 py-2 text-right font-mono text-body">
+                              {formatNumber(leg.filled_quantity, 6)}
+                            </td>
+                            <td className="px-4 py-2 text-right font-mono text-body">
+                              {leg.average_price === null
+                                ? "—"
+                                : formatUsd(
+                                    toNumber(leg.filled_quantity) * toNumber(leg.average_price),
+                                  )}
+                            </td>
+                            <td className="px-4 py-2 text-right font-mono text-[11px] text-muted">
+                              {formatTime(order.created_at)}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                ))}
+            </CardContent>
+          </Card>
             </div>
 
-            <div className="h-fit space-y-4 xl:sticky xl:top-4">
+            <div className="order-2 h-fit space-y-4 xl:col-start-2 xl:row-start-1 xl:sticky xl:top-4">
               <TradePanel
                 symbol={symbol}
                 longVenue={longVenue}
@@ -879,6 +1129,7 @@ export default function TradePage() {
                 longPrice={longEntry?.mark_price == null ? null : toNumber(longEntry.mark_price)}
               />
             </div>
+
           </div>
         </>
       )}

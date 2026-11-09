@@ -148,6 +148,8 @@ pub struct AccountSnapshotView {
     pub venue: String,
     pub label: String,
     pub equity_usd: Decimal,
+    /// 合约账户当前可用于开仓的保证金（美元）；无法取得时为 null。
+    pub available_margin_usd: Option<Decimal>,
     pub balances: Vec<AssetBalance>,
     pub observed_at: DateTime<Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -533,6 +535,7 @@ impl Accounts {
             venue: credentials.venue.clone(),
             label: credentials.label.clone(),
             equity_usd: Decimal::ZERO,
+            available_margin_usd: None,
             balances: Vec::new(),
             observed_at: now,
             error: Some(error),
@@ -556,10 +559,11 @@ impl Accounts {
         .await;
 
         match result {
-            Ok(Ok((equity, balances))) => AccountSnapshotView {
+            Ok(Ok((equity, available_margin, balances))) => AccountSnapshotView {
                 venue,
                 label,
                 equity_usd: equity,
+                available_margin_usd: available_margin,
                 balances,
                 observed_at: Utc::now(),
                 error: None,
@@ -746,8 +750,8 @@ fn fetch_snapshot(
     binance_fapi: &str,
     credentials: &AccountCredentials,
     prices: &HashMap<String, Decimal>,
-) -> anyhow::Result<(Decimal, Vec<AssetBalance>)> {
-    let (raw, override_equity) = match credentials.venue.as_str() {
+) -> anyhow::Result<(Decimal, Option<Decimal>, Vec<AssetBalance>)> {
+    let (raw, override_equity, available_margin) = match credentials.venue.as_str() {
         "binance" => fetch_binance(http, base_url, binance_fapi, credentials)?,
         "okx" => fetch_okx(http, base_url, credentials)?,
         "bybit" => fetch_bybit(http, base_url, credentials)?,
@@ -763,7 +767,11 @@ fn fetch_snapshot(
     };
 
     let (valued, balances) = value_balances(raw, prices);
-    Ok((override_equity.unwrap_or(valued), balances))
+    Ok((
+        override_equity.unwrap_or(valued),
+        available_margin,
+        balances,
+    ))
 }
 
 type RawBalances = Vec<(String, Decimal, Decimal)>;
@@ -825,7 +833,7 @@ fn fetch_binance(
     base_url: &str,
     fapi_url: &str,
     credentials: &AccountCredentials,
-) -> anyhow::Result<(RawBalances, Option<Decimal>)> {
+) -> anyhow::Result<(RawBalances, Option<Decimal>, Option<Decimal>)> {
     let base_url = base_url.trim_end_matches('/');
     let query = format!(
         "timestamp={}&recvWindow=5000",
@@ -857,6 +865,7 @@ fn fetch_binance(
         &[("X-MBX-APIKEY", credentials.api_key.as_str())],
     ) {
         if let Some(rows) = futures["assets"].as_array() {
+            let mut available_margin = Decimal::ZERO;
             for row in rows {
                 let asset = row.get("asset").and_then(Value::as_str).unwrap_or_default();
                 let wallet =
@@ -864,20 +873,24 @@ fn fetch_binance(
                 let available = decimal(row.get("availableBalance").unwrap_or(&Value::Null))
                     .unwrap_or_default();
                 if wallet > Decimal::ZERO {
+                    if asset == "USDT" {
+                        available_margin += available;
+                    }
                     balances.push((asset.to_string(), available, wallet - available));
                 }
             }
+            return Ok((balances, None, Some(available_margin)));
         }
     }
 
-    Ok((balances, None))
+    Ok((balances, None, None))
 }
 
 fn fetch_okx(
     http: &HttpClient,
     base_url: &str,
     credentials: &AccountCredentials,
-) -> anyhow::Result<(RawBalances, Option<Decimal>)> {
+) -> anyhow::Result<(RawBalances, Option<Decimal>, Option<Decimal>)> {
     let base_url = base_url.trim_end_matches('/');
     let path = "/api/v5/account/balance";
     let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
@@ -909,7 +922,9 @@ fn fetch_okx(
     let equity = decimal(&account["totalEq"]).filter(|value| *value > Decimal::ZERO);
 
     let mut balances = Vec::new();
+    let mut available_margin = None;
     if let Some(details) = account["details"].as_array() {
+        let mut available_total = Decimal::ZERO;
         for detail in details {
             let asset = detail
                 .get("ccy")
@@ -920,21 +935,25 @@ fn fetch_okx(
                 .unwrap_or_default();
             let available =
                 decimal(detail.get("availBal").unwrap_or(&Value::Null)).unwrap_or_default();
+            if asset == "USDT" {
+                available_total += available;
+            }
             balances.push((
                 asset.to_string(),
                 available,
                 (total - available).max(Decimal::ZERO),
             ));
         }
+        available_margin = Some(available_total);
     }
-    Ok((balances, equity))
+    Ok((balances, equity, available_margin))
 }
 
 fn fetch_bybit(
     http: &HttpClient,
     base_url: &str,
     credentials: &AccountCredentials,
-) -> anyhow::Result<(RawBalances, Option<Decimal>)> {
+) -> anyhow::Result<(RawBalances, Option<Decimal>, Option<Decimal>)> {
     let base_url = base_url.trim_end_matches('/');
     let timestamp = Utc::now().timestamp_millis().to_string();
     let recv_window = "5000";
@@ -965,6 +984,8 @@ fn fetch_bybit(
         .cloned()
         .unwrap_or(Value::Null);
     let equity = decimal(&account["totalEquity"]).filter(|value| *value > Decimal::ZERO);
+    // 统一账户的可用保证金以账户级字段为准，避免把已占用保证金算成可用。
+    let available_margin = decimal(&account["totalAvailableBalance"]);
 
     let mut balances = Vec::new();
     if let Some(coins) = account["coin"].as_array() {
@@ -980,14 +1001,14 @@ fn fetch_bybit(
             ));
         }
     }
-    Ok((balances, equity))
+    Ok((balances, equity, available_margin))
 }
 
 fn fetch_bitget(
     http: &HttpClient,
     base_url: &str,
     credentials: &AccountCredentials,
-) -> anyhow::Result<(RawBalances, Option<Decimal>)> {
+) -> anyhow::Result<(RawBalances, Option<Decimal>, Option<Decimal>)> {
     let base_url = base_url.trim_end_matches('/');
     let passphrase = credentials
         .passphrase
@@ -1047,6 +1068,7 @@ fn fetch_bitget(
         ("locale", "zh-CN"),
     ];
     let mut futures_equity = Decimal::ZERO;
+    let mut futures_available = None;
     let mut futures_error = None;
     match http.get_json_with_headers(&format!("{base_url}{futures_path}"), &futures_headers) {
         Ok(futures) if futures["code"].as_str().unwrap_or("00000") == "00000" => {
@@ -1063,6 +1085,7 @@ fn fetch_bitget(
                         .first()
                         .and_then(|row| decimal(row.get("available").unwrap_or(&Value::Null)))
                         .unwrap_or_default();
+                    futures_available = Some(available);
                     balances.push((
                         "USDT".to_string(),
                         available,
@@ -1085,14 +1108,14 @@ fn fetch_bitget(
         bail!("{spot}；{futures}。请在 Bitget API Key 中开启现货或合约的读取权限");
     }
 
-    Ok((balances, None))
+    Ok((balances, None, futures_available))
 }
 
 fn fetch_gate(
     http: &HttpClient,
     base_url: &str,
     credentials: &AccountCredentials,
-) -> anyhow::Result<(RawBalances, Option<Decimal>)> {
+) -> anyhow::Result<(RawBalances, Option<Decimal>, Option<Decimal>)> {
     let base_url = base_url.trim_end_matches('/');
     let spot_path = "/api/v4/spot/accounts";
     let spot = gate_get(http, base_url, spot_path, credentials)?;
@@ -1111,10 +1134,12 @@ fn fetch_gate(
     }
 
     let futures_path = "/api/v4/futures/usdt/accounts";
+    let mut futures_available = None;
     if let Ok(futures) = gate_get(http, base_url, futures_path, credentials) {
         let total = decimal(&futures["total"]).unwrap_or_default();
         let available = decimal(&futures["available"]).unwrap_or_default();
         if total > Decimal::ZERO {
+            futures_available = Some(available);
             balances.push((
                 "USDT".to_string(),
                 available,
@@ -1123,7 +1148,7 @@ fn fetch_gate(
         }
     }
 
-    Ok((balances, None))
+    Ok((balances, None, futures_available))
 }
 
 /// Aster V3 不再支持 API Key，改为「主账户地址 + 已授权的 API 钱包私钥」。
@@ -1146,7 +1171,7 @@ fn fetch_aster(
     http: &HttpClient,
     base_url: &str,
     credentials: &AccountCredentials,
-) -> anyhow::Result<(RawBalances, Option<Decimal>)> {
+) -> anyhow::Result<(RawBalances, Option<Decimal>, Option<Decimal>)> {
     let signer = aster_signer(credentials)?;
     let value = aster::request(http, "GET", base_url, "/fapi/v3/account", &signer, &[])
         .map_err(|error| {
@@ -1164,12 +1189,16 @@ fn fetch_aster(
         .as_array()
         .ok_or_else(|| anyhow!(aster::error_of(&value)))?;
     let mut balances = Vec::with_capacity(rows.len());
+    let mut available_margin = Decimal::ZERO;
     for row in rows {
         let asset = row.get("asset").and_then(Value::as_str).unwrap_or_default();
         let wallet = decimal(row.get("walletBalance").unwrap_or(&Value::Null)).unwrap_or_default();
         let available =
             decimal(row.get("availableBalance").unwrap_or(&Value::Null)).unwrap_or_default();
         if wallet > Decimal::ZERO {
+            if asset == "USDT" {
+                available_margin += available;
+            }
             balances.push((
                 asset.to_string(),
                 available,
@@ -1179,7 +1208,7 @@ fn fetch_aster(
     }
 
     let equity = decimal(&value["totalWalletBalance"]).filter(|value| *value > Decimal::ZERO);
-    Ok((balances, equity))
+    Ok((balances, equity, Some(available_margin)))
 }
 
 /// Hyperliquid 余额查询：永续账户权益走 `clearinghouseState`，现货余额走 `spotClearinghouseState`。
@@ -1187,7 +1216,7 @@ fn fetch_hyperliquid(
     http: &HttpClient,
     base_url: &str,
     credentials: &AccountCredentials,
-) -> anyhow::Result<(RawBalances, Option<Decimal>)> {
+) -> anyhow::Result<(RawBalances, Option<Decimal>, Option<Decimal>)> {
     let base_url = base_url.trim_end_matches('/');
     let address = credentials
         .wallet_address
@@ -1198,6 +1227,8 @@ fn fetch_hyperliquid(
         &format!("{base_url}/info"),
         &json!({ "type": "clearinghouseState", "user": address }),
     )?;
+    // 永续账户的 withdrawable 才是当前可动用的保证金。
+    let available_margin = decimal(&perp["withdrawable"]);
     let mut balances = Vec::new();
     if let Some(account_value) = decimal(&perp["marginSummary"]["accountValue"]) {
         if account_value > Decimal::ZERO {
@@ -1223,7 +1254,7 @@ fn fetch_hyperliquid(
         }
     }
 
-    Ok((balances, None))
+    Ok((balances, None, available_margin))
 }
 
 /// Lighter 余额查询：按 L1 地址或数字账户索引查询全部子账户的资产。
@@ -1235,7 +1266,7 @@ fn fetch_lighter(
     http: &HttpClient,
     base_url: &str,
     credentials: &AccountCredentials,
-) -> anyhow::Result<(RawBalances, Option<Decimal>)> {
+) -> anyhow::Result<(RawBalances, Option<Decimal>, Option<Decimal>)> {
     let base_url = base_url.trim_end_matches('/');
     let target = credentials
         .wallet_address
@@ -1259,15 +1290,23 @@ fn fetch_lighter(
     }
 
     let mut equity = Decimal::ZERO;
+    let mut available_margin = None;
     for account in accounts {
         let value = decimal(account.get("total_asset_value").unwrap_or(&Value::Null))
             .ok_or_else(|| anyhow!("Lighter 响应缺少 total_asset_value"))?;
         equity += value;
+        if let Some(available) = decimal(account.get("available_balance").unwrap_or(&Value::Null)) {
+            *available_margin.get_or_insert(Decimal::ZERO) += available;
+        }
     }
 
     // Lighter 的权益本身就是 USDC 计价，按 1:1 计入。
     let free = equity.max(Decimal::ZERO);
-    Ok((vec![("USDC".to_string(), free, Decimal::ZERO)], Some(equity)))
+    Ok((
+        vec![("USDC".to_string(), free, Decimal::ZERO)],
+        Some(equity),
+        available_margin,
+    ))
 }
 
 /// HTX（火币）U 本位永续：只读取全仓保证金账户的 USDT 权益。
@@ -1275,7 +1314,7 @@ fn fetch_htx(
     http: &HttpClient,
     base_url: &str,
     credentials: &AccountCredentials,
-) -> anyhow::Result<(RawBalances, Option<Decimal>)> {
+) -> anyhow::Result<(RawBalances, Option<Decimal>, Option<Decimal>)> {
     let path = "/linear-swap-api/v1/swap_cross_account_info";
     let value = htx_get(http, base_url, path, &[], credentials)?;
     if value["status"].as_str() != Some("ok") {
@@ -1294,7 +1333,7 @@ fn fetch_htx(
         ));
     }
 
-    Ok((balances, None))
+    Ok((balances, None, Some(available)))
 }
 
 /// MEXC 合约账户：私有接口用 `ApiKey + 时间戳 + 参数串` 做 HMAC-SHA256。
@@ -1302,7 +1341,7 @@ fn fetch_mexc(
     http: &HttpClient,
     base_url: &str,
     credentials: &AccountCredentials,
-) -> anyhow::Result<(RawBalances, Option<Decimal>)> {
+) -> anyhow::Result<(RawBalances, Option<Decimal>, Option<Decimal>)> {
     let base_url = base_url.trim_end_matches('/');
     let value = mexc_get(
         http,
@@ -1322,6 +1361,7 @@ fn fetch_mexc(
         .as_array()
         .ok_or_else(|| anyhow!("MEXC 响应缺少 data"))?;
     let mut balances = Vec::with_capacity(rows.len());
+    let mut available_margin = Decimal::ZERO;
     for row in rows {
         let currency = row
             .get("currency")
@@ -1330,6 +1370,9 @@ fn fetch_mexc(
         let equity = decimal(&row["equity"]).unwrap_or_default();
         let available = decimal(&row["availableBalance"]).unwrap_or_default();
         if equity > Decimal::ZERO {
+            if currency == "USDT" {
+                available_margin += available;
+            }
             balances.push((
                 currency.to_string(),
                 available,
@@ -1338,7 +1381,7 @@ fn fetch_mexc(
         }
     }
 
-    Ok((balances, None))
+    Ok((balances, None, Some(available_margin)))
 }
 
 /// BingX 永续账户：签名是 `timestamp` 参数串的 HMAC-SHA256，放在 query 上。
@@ -1346,7 +1389,7 @@ fn fetch_bingx(
     http: &HttpClient,
     base_url: &str,
     credentials: &AccountCredentials,
-) -> anyhow::Result<(RawBalances, Option<Decimal>)> {
+) -> anyhow::Result<(RawBalances, Option<Decimal>, Option<Decimal>)> {
     let base_url = base_url.trim_end_matches('/');
     let path = "/openApi/swap/v2/user/balance";
     let timestamp = Utc::now().timestamp_millis();
@@ -1372,7 +1415,7 @@ fn fetch_bingx(
         balances.push((asset, available, (total - available).max(Decimal::ZERO)));
     }
 
-    Ok((balances, None))
+    Ok((balances, None, Some(available)))
 }
 
 /// 各交易所持仓解析后的统一结构。

@@ -11,6 +11,7 @@ interface OrderBookDepthProps {
   /** 顶部展示的腿标签，例如「做多 · BINANCE」。 */
   label: string;
   rows?: number;
+  className?: string;
 }
 
 /** 价格越小数位越多，保持展示稳定。 */
@@ -26,7 +27,7 @@ function priceDigits(value: number): number {
  *
  * 数据来自执行器 `/api/v1/depth`，由各交易所的公开行情接口实时拉取。
  */
-export function OrderBookDepth({ venue, symbol, label, rows = 8 }: OrderBookDepthProps) {
+export function OrderBookDepth({ venue, symbol, label, rows = 8, className }: OrderBookDepthProps) {
   const { t } = useI18n();
   const depth = useDepth(venue, symbol, rows);
   const bids = (depth.data?.bids ?? []).slice(0, rows);
@@ -70,8 +71,13 @@ export function OrderBookDepth({ venue, symbol, label, rows = 8 }: OrderBookDept
   };
 
   return (
-    <div className="rounded-lg border border-line bg-panel-soft">
-      <div className="flex items-center justify-between border-b border-line px-2.5 py-1.5">
+    <div
+      className={cn(
+        "flex min-h-0 flex-col rounded-lg border border-line bg-panel-soft",
+        className,
+      )}
+    >
+      <div className="flex shrink-0 items-center justify-between border-b border-line px-2.5 py-1.5">
         <span className="text-[11px] font-medium text-body">{label}</span>
         <span className="font-mono text-[10px] text-muted">
           {t.trade.depthSpread} {spreadBps === null ? "—" : formatBps(spreadBps)}
@@ -80,7 +86,7 @@ export function OrderBookDepth({ venue, symbol, label, rows = 8 }: OrderBookDept
       {bids.length === 0 && asks.length === 0 ? (
         <p className="px-2.5 py-6 text-center text-[11px] text-muted">{t.trade.depthEmpty}</p>
       ) : (
-        <div className="py-1 text-[11px]">
+        <div className="min-h-0 flex-1 overflow-y-auto py-1 text-[11px]">
           <div className="flex items-center justify-between px-2 pb-1 text-[10px] text-subtle">
             <span>{t.trade.depthPrice}</span>
             <span>{t.trade.depthQty}</span>

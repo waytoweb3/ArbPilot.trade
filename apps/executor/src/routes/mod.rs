@@ -56,6 +56,7 @@ pub fn build(state: AppState) -> Router {
         )
         .route("/accounts", get(accounts::list).post(accounts::import))
         .route("/accounts/history", get(accounts::history))
+        .route("/accounts/leverage", get(accounts::leverage))
         .route("/accounts/{id}", delete(accounts::remove))
         .route("/accounts/{id}/refresh", post(accounts::refresh))
         .route(

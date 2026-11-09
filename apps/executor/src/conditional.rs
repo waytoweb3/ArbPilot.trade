@@ -295,7 +295,7 @@ async fn evaluate(state: &AppState) {
                 long_venue: triggered.long_venue.clone(),
                 short_venue: triggered.short_venue.clone(),
                 notional_usd: triggered.notional_usd,
-                leverage: triggered.leverage,
+                leverage: Some(triggered.leverage),
                 max_slippage_bps: None,
                 strategy_id: None,
                 origin: OrderOrigin::Desktop,

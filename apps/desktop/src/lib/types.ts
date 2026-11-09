@@ -265,6 +265,8 @@ export interface StrategyRecord {
   id: string;
   status: StrategyStatus;
   source: StrategySource;
+  /** 从策略市场导入时的来源发布 ID。 */
+  source_publication_id?: string | null;
   version: number;
   definition: StrategyDefinition;
   validation: StrategyValidation;
@@ -448,6 +450,8 @@ export interface AccountSnapshotView {
   venue: string;
   label: string;
   equity_usd: Decimal;
+  /** 合约账户当前可用于开仓的保证金；交易所不提供时为 null。 */
+  available_margin_usd?: Decimal | null;
   balances: AssetBalance[];
   observed_at: string;
   error?: string | null;
@@ -469,6 +473,13 @@ export interface AccountsResponse {
   accounts: TradingAccount[];
   total_equity_usd: Decimal;
   observed_at: string;
+}
+
+/** 交易所在指定合约上当前设置的杠杆；无法查询时为 null。 */
+export interface AccountLeverageResponse {
+  venue: string;
+  symbol: string;
+  leverage: Decimal | null;
 }
 
 export interface EquityPoint {

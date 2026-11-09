@@ -21,15 +21,11 @@ pub struct CreateOrderRequest {
     pub short_venue: String,
     /// 每条腿的名义价值（美元）。
     pub notional_usd: Decimal,
-    #[serde(default = "default_leverage")]
-    pub leverage: Decimal,
+    /// 要设置到交易所的杠杆；不传则沿用交易所当前设置。
+    pub leverage: Option<Decimal>,
     pub max_slippage_bps: Option<Decimal>,
     pub strategy_id: Option<Uuid>,
     pub origin: Option<OrderOrigin>,
-}
-
-fn default_leverage() -> Decimal {
-    Decimal::ONE
 }
 
 #[derive(Debug, Serialize)]
