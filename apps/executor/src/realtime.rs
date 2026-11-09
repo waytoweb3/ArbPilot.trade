@@ -19,6 +19,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use anyhow::bail;
 use chrono::{DateTime, Utc};
 use flate2::read::GzDecoder;
 use rust_decimal::Decimal;
@@ -84,12 +85,15 @@ pub struct FundingUpdate {
     pub observed_at: DateTime<Utc>,
 }
 
-/// 资金费率 WebSocket 订阅的交易对清单。
+/// WebSocket 订阅的交易对清单。
 ///
-/// 交易对由 `FundingFeed` 自动发现后写入；订阅线程按版本号增量补订阅。
+/// `symbols` 是全局 watchlist（资金费率由 `FundingFeed` 自动发现后写入）；
+/// `venue_symbols` 记录持仓涉及的交易对，只向对应交易所订阅，避免各所互相订阅
+/// 不存在的合约。订阅线程按版本号变化重建连接。
 #[derive(Default)]
 pub struct SymbolRegistry {
     symbols: RwLock<Vec<String>>,
+    venue_symbols: RwLock<HashMap<String, Vec<String>>>,
     version: AtomicU64,
 }
 
@@ -110,12 +114,51 @@ impl SymbolRegistry {
         self.version.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// 记录某交易所持仓涉及的交易对；只追加不删除，内容变化时提升版本号。
+    pub fn extend_venue(&self, venue: &str, symbols: Vec<String>) {
+        if symbols.is_empty() {
+            return;
+        }
+        let mut changed = false;
+        {
+            let mut venue_symbols = self.venue_symbols.write().expect("订阅清单锁不可用");
+            let entry = venue_symbols.entry(venue.to_string()).or_default();
+            for symbol in symbols {
+                if !symbol.is_empty() && !entry.contains(&symbol) {
+                    entry.push(symbol);
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.version.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     fn version(&self) -> u64 {
         self.version.load(Ordering::Relaxed)
     }
 
     fn snapshot(&self) -> Vec<String> {
         self.symbols.read().expect("订阅清单锁不可用").clone()
+    }
+
+    /// 某交易所需要订阅的全部交易对：全局 watchlist + 该交易所持仓。
+    fn symbols_for(&self, venue: &str) -> Vec<String> {
+        let mut symbols = self.snapshot();
+        if let Some(extra) = self
+            .venue_symbols
+            .read()
+            .expect("订阅清单锁不可用")
+            .get(venue)
+        {
+            for symbol in extra {
+                if !symbols.contains(symbol) {
+                    symbols.push(symbol.clone());
+                }
+            }
+        }
+        symbols
     }
 }
 
@@ -124,6 +167,8 @@ pub struct RealtimeFeed {
     books: RwLock<HashMap<(String, String), BookUpdate>>,
     funding: RwLock<HashMap<(String, String), FundingUpdate>>,
     funding_symbols: Arc<SymbolRegistry>,
+    /// 盘口订阅清单：watchlist + 各交易所的持仓交易对。
+    book_symbols: Arc<SymbolRegistry>,
 }
 
 impl RealtimeFeed {
@@ -135,17 +180,19 @@ impl RealtimeFeed {
         http: Arc<HttpClient>,
         okx: Option<Arc<OkxMarketClient>>,
     ) -> Arc<Self> {
+        let book_symbols = Arc::new(SymbolRegistry::new());
+        book_symbols.set(config.market_symbols.clone());
         let feed = Arc::new(Self {
             books: RwLock::new(HashMap::new()),
             funding: RwLock::new(HashMap::new()),
             funding_symbols: Arc::new(SymbolRegistry::new()),
+            book_symbols: book_symbols.clone(),
         });
-        let symbols = config.market_symbols.clone();
 
         let binance_spot = feed.clone();
         let spot_http = http.clone();
         let spot_url = config.binance_spot_ws_url.clone();
-        let spot_symbols = symbols.clone();
+        let spot_symbols = book_symbols.clone();
         spawn("binance-spot-ws", move || {
             run_binance_books(binance_spot, spot_http, spot_url, SPOT_VENUE, spot_symbols)
         });
@@ -153,7 +200,7 @@ impl RealtimeFeed {
         let binance_futures = feed.clone();
         let futures_http = http.clone();
         let futures_url = config.binance_futures_ws_url.clone();
-        let futures_symbols = symbols.clone();
+        let futures_symbols = book_symbols.clone();
         spawn("binance-futures-ws", move || {
             run_binance_books(
                 binance_futures,
@@ -169,16 +216,9 @@ impl RealtimeFeed {
             let okx_ws_url = config.okx_ws_url.clone();
             let registry = feed.funding_symbols();
             let okx_http = http.clone();
-            let okx_symbols = symbols.clone();
+            let okx_symbols = book_symbols.clone();
             spawn("okx-ws", move || {
-                run_okx(
-                    okx_feed,
-                    okx_http,
-                    okx_ws_url,
-                    client,
-                    okx_symbols,
-                    registry,
-                )
+                run_okx(okx_feed, okx_http, okx_ws_url, client, okx_symbols, registry)
             });
         }
 
@@ -186,7 +226,7 @@ impl RealtimeFeed {
             let aster_feed = feed.clone();
             let aster_http = http.clone();
             let aster_url = config.aster_ws_url.clone();
-            let aster_symbols = symbols.clone();
+            let aster_symbols = book_symbols.clone();
             spawn("aster-ws", move || {
                 run_binance_books(
                     aster_feed,
@@ -202,7 +242,7 @@ impl RealtimeFeed {
             let bybit_feed = feed.clone();
             let bybit_http = http.clone();
             let bybit_url = config.bybit_ws_url.clone();
-            let bybit_symbols = symbols.clone();
+            let bybit_symbols = book_symbols.clone();
             spawn_loop("bybit-ws", move || {
                 stream_bybit(
                     &bybit_feed,
@@ -216,7 +256,7 @@ impl RealtimeFeed {
             let spot_feed = feed.clone();
             let spot_http = http.clone();
             let spot_ws_url = config.bybit_spot_ws_url.clone();
-            let bybit_spot_symbols = symbols.clone();
+            let bybit_spot_symbols = book_symbols.clone();
             spawn_loop("bybit-spot-ws", move || {
                 stream_bybit(
                     &spot_feed,
@@ -232,7 +272,7 @@ impl RealtimeFeed {
             let bitget_feed = feed.clone();
             let bitget_http = http.clone();
             let bitget_url = config.bitget_ws_url.clone();
-            let bitget_symbols = symbols.clone();
+            let bitget_symbols = book_symbols.clone();
             spawn_loop("bitget-ws", move || {
                 stream_bitget(
                     &bitget_feed,
@@ -245,49 +285,34 @@ impl RealtimeFeed {
 
         if config.gate_enabled {
             let client = Arc::new(GateFundingClient::new(&config.gate_base_url, http.clone()));
-            let multipliers = fetch_multipliers(&client, &symbols);
             let gate_feed = feed.clone();
             let gate_http = http.clone();
             let gate_url = config.gate_ws_url.clone();
-            let gate_symbols = symbols.clone();
+            let gate_symbols = book_symbols.clone();
             spawn_loop("gate-ws", move || {
-                stream_gate(
-                    &gate_feed,
-                    &gate_http,
-                    &gate_url,
-                    &gate_symbols,
-                    &multipliers,
-                )
+                stream_gate(&gate_feed, &gate_http, &gate_url, &gate_symbols, &client)
             });
         }
 
         if config.htx_enabled {
             let client = Arc::new(HtxFundingClient::new(&config.htx_base_url, http.clone()));
-            let sizes = fetch_contract_sizes(&client, &symbols);
             let htx_feed = feed.clone();
             let htx_http = http.clone();
             let htx_url = config.htx_ws_url.clone();
-            let htx_symbols = symbols.clone();
+            let htx_symbols = book_symbols.clone();
             spawn_loop("htx-ws", move || {
-                stream_htx(&htx_feed, &htx_http, &htx_url, &htx_symbols, &sizes)
+                stream_htx(&htx_feed, &htx_http, &htx_url, &htx_symbols, &client)
             });
         }
 
         if config.mexc_enabled {
             let client = Arc::new(MexcFundingClient::new(&config.mexc_base_url, http.clone()));
-            let sizes = fetch_mexc_sizes(&client, &symbols);
             let mexc_feed = feed.clone();
             let mexc_http = http.clone();
             let mexc_url = config.mexc_ws_url.clone();
-            let mexc_symbols = symbols.clone();
+            let mexc_symbols = book_symbols.clone();
             spawn_loop("mexc-ws", move || {
-                stream_mexc(
-                    &mexc_feed,
-                    &mexc_http,
-                    &mexc_url,
-                    &mexc_symbols,
-                    &sizes,
-                )
+                stream_mexc(&mexc_feed, &mexc_http, &mexc_url, &mexc_symbols, &client)
             });
         }
 
@@ -295,7 +320,7 @@ impl RealtimeFeed {
             let bingx_feed = feed.clone();
             let bingx_http = http.clone();
             let bingx_url = config.bingx_ws_url.clone();
-            let bingx_symbols = symbols.clone();
+            let bingx_symbols = book_symbols.clone();
             spawn_loop("bingx-ws", move || {
                 stream_bingx(
                     &bingx_feed,
@@ -310,7 +335,7 @@ impl RealtimeFeed {
             let hl_feed = feed.clone();
             let hl_http = http.clone();
             let hl_url = config.hyperliquid_ws_url.clone();
-            let hl_symbols = symbols.clone();
+            let hl_symbols = book_symbols.clone();
             spawn_loop("hyperliquid-ws", move || {
                 stream_hyperliquid(&hl_feed, &hl_http, &hl_url, &hl_symbols)
             });
@@ -321,23 +346,18 @@ impl RealtimeFeed {
                 &config.lighter_base_url,
                 http.clone(),
             ));
-            let markets = client
-                .symbol_market_ids()
-                .map(|ids| {
-                    symbols
-                        .iter()
-                        .filter_map(|symbol| ids.get(symbol).map(|id| (symbol.clone(), *id)))
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_else(|error| {
-                    tracing::warn!(%error, "获取 Lighter 交易对映射失败，暂用 REST 盘口");
-                    Vec::new()
-                });
             let lighter_feed = feed.clone();
             let lighter_http = http.clone();
             let lighter_url = config.lighter_ws_url.clone();
+            let lighter_symbols = book_symbols.clone();
             spawn_loop("lighter-ws", move || {
-                stream_lighter(&lighter_feed, &lighter_http, &lighter_url, &markets)
+                stream_lighter(
+                    &lighter_feed,
+                    &lighter_http,
+                    &lighter_url,
+                    &lighter_symbols,
+                    &client,
+                )
             });
         }
 
@@ -347,6 +367,20 @@ impl RealtimeFeed {
     /// 资金费率订阅清单，由 `FundingFeed` 自动发现后写入。
     pub fn funding_symbols(&self) -> Arc<SymbolRegistry> {
         self.funding_symbols.clone()
+    }
+
+    /// 盘口订阅清单，持仓同步后把持仓交易对追加进来即可实时收到价格。
+    pub fn book_symbols(&self) -> Arc<SymbolRegistry> {
+        self.book_symbols.clone()
+    }
+
+    /// 读取某交易对的最新推送盘口。
+    pub fn book(&self, venue: &str, symbol: &str) -> Option<BookUpdate> {
+        self.books
+            .read()
+            .expect("实时行情锁不可用")
+            .get(&(venue.to_string(), symbol.to_string()))
+            .cloned()
     }
 
     pub fn funding(&self, venue: &str, symbol: &str) -> Option<FundingUpdate> {
@@ -423,6 +457,27 @@ where
             thread::sleep(RECONNECT_DELAY);
         }
     });
+}
+
+/// 订阅清单变化时是否需要重新连接。
+///
+/// 版本号是全局的，但只有本交易所的交易对列表真的变了才需要重连，
+/// 其它交易所新增持仓不应打断本连接。
+fn needs_reconnect(
+    registry: &SymbolRegistry,
+    venue: &str,
+    symbols: &[String],
+    version: &mut u64,
+) -> bool {
+    let current = registry.version();
+    if current == *version {
+        return false;
+    }
+    if registry.symbols_for(venue) == symbols {
+        *version = current;
+        return false;
+    }
+    true
 }
 
 /// 把文本 / 二进制（可选 gzip）消息还原成 JSON 文本。
@@ -524,9 +579,13 @@ fn stream_bybit(
     feed: &RealtimeFeed,
     http: &HttpClient,
     url: &str,
-    symbols: &[String],
+    registry: &SymbolRegistry,
     venue: &str,
 ) -> anyhow::Result<()> {
+    let symbols = registry.symbols_for(venue);
+    if symbols.is_empty() {
+        bail!("没有可订阅的交易对");
+    }
     let mut ws = WebSocket::connect(http, url, HANDSHAKE_TIMEOUT, POLL_TIMEOUT)?;
     let args = symbols
         .iter()
@@ -535,8 +594,13 @@ fn stream_bybit(
         .join(",");
     ws.send_text(&format!(r#"{{"op":"subscribe","args":[{args}]}}"#))?;
 
+    let mut version = registry.version();
     let mut last_ping = Instant::now();
     loop {
+        // 本交易所持仓变化时断开重连，用新的交易对清单重新订阅。
+        if needs_reconnect(registry, venue, &symbols, &mut version) {
+            return Ok(());
+        }
         if last_ping.elapsed() >= BYBIT_PING_INTERVAL {
             ws.send_text(r#"{"op":"ping"}"#)?;
             last_ping = Instant::now();
@@ -588,8 +652,12 @@ fn stream_bitget(
     feed: &RealtimeFeed,
     http: &HttpClient,
     url: &str,
-    symbols: &[String],
+    registry: &SymbolRegistry,
 ) -> anyhow::Result<()> {
+    let symbols = registry.symbols_for(BITGET_VENUE);
+    if symbols.is_empty() {
+        bail!("没有可订阅的交易对");
+    }
     let mut ws = WebSocket::connect(http, url, HANDSHAKE_TIMEOUT, POLL_TIMEOUT)?;
     let args = symbols
         .iter()
@@ -603,8 +671,12 @@ fn stream_bitget(
         .join(",");
     ws.send_text(&format!(r#"{{"op":"subscribe","args":[{args}]}}"#))?;
 
+    let mut version = registry.version();
     let mut last_ping = Instant::now();
     loop {
+        if needs_reconnect(registry, BITGET_VENUE, &symbols, &mut version) {
+            return Ok(());
+        }
         if last_ping.elapsed() >= BITGET_PING_INTERVAL {
             ws.send_text("ping")?;
             last_ping = Instant::now();
@@ -656,9 +728,15 @@ fn stream_gate(
     feed: &RealtimeFeed,
     http: &HttpClient,
     url: &str,
-    symbols: &[String],
-    multipliers: &HashMap<String, Decimal>,
+    registry: &SymbolRegistry,
+    client: &GateFundingClient,
 ) -> anyhow::Result<()> {
+    let symbols = registry.symbols_for(GATE_VENUE);
+    if symbols.is_empty() {
+        bail!("没有可订阅的交易对");
+    }
+    // 连接建立时预取合约乘数，失败只影响名义金额，不影响价格。
+    let multipliers = fetch_multipliers(client, &symbols);
     let mut ws = WebSocket::connect(http, url, HANDSHAKE_TIMEOUT, POLL_TIMEOUT)?;
     let payload = symbols
         .iter()
@@ -674,8 +752,12 @@ fn stream_gate(
         .to_string(),
     )?;
 
+    let mut version = registry.version();
     let mut last_ping = Instant::now();
     loop {
+        if needs_reconnect(registry, GATE_VENUE, &symbols, &mut version) {
+            return Ok(());
+        }
         if last_ping.elapsed() >= GATE_PING_INTERVAL {
             ws.send_text(
                 &json!({ "time": Utc::now().timestamp(), "channel": "futures.ping" })
@@ -756,11 +838,17 @@ fn stream_htx(
     feed: &RealtimeFeed,
     http: &HttpClient,
     url: &str,
-    symbols: &[String],
-    sizes: &HashMap<String, Decimal>,
+    registry: &SymbolRegistry,
+    client: &HtxFundingClient,
 ) -> anyhow::Result<()> {
+    let symbols = registry.symbols_for(HTX_VENUE);
+    if symbols.is_empty() {
+        bail!("没有可订阅的交易对");
+    }
+    // 连接建立时预取合约面值，失败只影响名义金额，不影响价格。
+    let sizes = fetch_contract_sizes(client, &symbols);
     let mut ws = WebSocket::connect(http, url, HANDSHAKE_TIMEOUT, POLL_TIMEOUT)?;
-    for symbol in symbols {
+    for symbol in &symbols {
         if let Some(contract) = dash_contract(symbol) {
             ws.send_text(
                 &json!({ "sub": format!("market.{contract}.bbo"), "id": "arbpilot" })
@@ -769,8 +857,12 @@ fn stream_htx(
         }
     }
 
+    let mut version = registry.version();
     let mut last_ping = Instant::now();
     loop {
+        if needs_reconnect(registry, HTX_VENUE, &symbols, &mut version) {
+            return Ok(());
+        }
         if last_ping.elapsed() >= HTX_PING_INTERVAL {
             ws.send_text(&json!({ "ping": Utc::now().timestamp_millis() }).to_string())?;
             last_ping = Instant::now();
@@ -825,11 +917,17 @@ fn stream_mexc(
     feed: &RealtimeFeed,
     http: &HttpClient,
     url: &str,
-    symbols: &[String],
-    sizes: &HashMap<String, Decimal>,
+    registry: &SymbolRegistry,
+    client: &MexcFundingClient,
 ) -> anyhow::Result<()> {
+    let symbols = registry.symbols_for(MEXC_VENUE);
+    if symbols.is_empty() {
+        bail!("没有可订阅的交易对");
+    }
+    // 连接建立时预取合约面值，失败只影响名义金额，不影响价格。
+    let sizes = fetch_mexc_sizes(client, &symbols);
     let mut ws = WebSocket::connect(http, url, HANDSHAKE_TIMEOUT, POLL_TIMEOUT)?;
-    for symbol in symbols {
+    for symbol in &symbols {
         if let Some(contract) = mexc_contract(symbol) {
             ws.send_text(
                 &json!({
@@ -841,8 +939,12 @@ fn stream_mexc(
         }
     }
 
+    let mut version = registry.version();
     let mut last_ping = Instant::now();
     loop {
+        if needs_reconnect(registry, MEXC_VENUE, &symbols, &mut version) {
+            return Ok(());
+        }
         if last_ping.elapsed() >= MEXC_PING_INTERVAL {
             ws.send_text(&json!({ "method": "ping" }).to_string())?;
             last_ping = Instant::now();
@@ -899,10 +1001,14 @@ fn stream_bingx(
     feed: &RealtimeFeed,
     http: &HttpClient,
     url: &str,
-    symbols: &[String],
+    registry: &SymbolRegistry,
 ) -> anyhow::Result<()> {
+    let symbols = registry.symbols_for(BINGX_VENUE);
+    if symbols.is_empty() {
+        bail!("没有可订阅的交易对");
+    }
     let mut ws = WebSocket::connect(http, url, HANDSHAKE_TIMEOUT, POLL_TIMEOUT)?;
-    for symbol in symbols {
+    for symbol in &symbols {
         if let Some(contract) = dash_contract(symbol) {
             ws.send_text(
                 &json!({
@@ -915,8 +1021,12 @@ fn stream_bingx(
         }
     }
 
+    let mut version = registry.version();
     let mut last_ping = Instant::now();
     loop {
+        if needs_reconnect(registry, BINGX_VENUE, &symbols, &mut version) {
+            return Ok(());
+        }
         if last_ping.elapsed() >= BINGX_PING_INTERVAL {
             ws.send_text(&json!({ "ping": Utc::now().timestamp_millis().to_string() }).to_string())?;
             last_ping = Instant::now();
@@ -966,10 +1076,14 @@ fn stream_hyperliquid(
     feed: &RealtimeFeed,
     http: &HttpClient,
     url: &str,
-    symbols: &[String],
+    registry: &SymbolRegistry,
 ) -> anyhow::Result<()> {
+    let symbols = registry.symbols_for(HYPERLIQUID_VENUE);
+    if symbols.is_empty() {
+        bail!("没有可订阅的交易对");
+    }
     let mut ws = WebSocket::connect(http, url, HANDSHAKE_TIMEOUT, POLL_TIMEOUT)?;
-    for symbol in symbols {
+    for symbol in &symbols {
         if let Some(coin) = hyperliquid_coin(symbol) {
             ws.send_text(
                 &json!({ "method": "subscribe", "subscription": { "type": "bbo", "coin": coin } })
@@ -978,8 +1092,12 @@ fn stream_hyperliquid(
         }
     }
 
+    let mut version = registry.version();
     let mut last_ping = Instant::now();
     loop {
+        if needs_reconnect(registry, HYPERLIQUID_VENUE, &symbols, &mut version) {
+            return Ok(());
+        }
         if last_ping.elapsed() >= HYPERLIQUID_PING_INTERVAL {
             ws.send_text(&json!({ "method": "ping" }).to_string())?;
             last_ping = Instant::now();
@@ -1032,21 +1150,40 @@ fn stream_lighter(
     feed: &RealtimeFeed,
     http: &HttpClient,
     url: &str,
-    markets: &[(String, i64)],
+    registry: &SymbolRegistry,
+    client: &LighterFundingClient,
 ) -> anyhow::Result<()> {
+    let symbols = registry.symbols_for(LIGHTER_VENUE);
+    let markets = match client.symbol_market_ids() {
+        Ok(ids) => symbols
+            .iter()
+            .filter_map(|symbol| ids.get(symbol).map(|id| (symbol.clone(), *id)))
+            .collect::<Vec<_>>(),
+        Err(error) => {
+            tracing::warn!(%error, "获取 Lighter 交易对映射失败，暂用 REST 盘口");
+            Vec::new()
+        }
+    };
+    if markets.is_empty() {
+        bail!("没有可订阅的交易对");
+    }
     let mut ws = WebSocket::connect(http, url, HANDSHAKE_TIMEOUT, POLL_TIMEOUT)?;
-    for (_, market_id) in markets {
+    for (_, market_id) in &markets {
         ws.send_text(
             &json!({ "type": "subscribe", "channel": format!("order_book/{market_id}") })
                 .to_string(),
         )?;
     }
     let mut by_id: HashMap<i64, &str> = HashMap::new();
-    for (symbol, market_id) in markets {
+    for (symbol, market_id) in &markets {
         by_id.insert(*market_id, symbol);
     }
 
+    let mut version = registry.version();
     loop {
+        if needs_reconnect(registry, LIGHTER_VENUE, &symbols, &mut version) {
+            return Ok(());
+        }
         let Some(event) = ws.poll()? else {
             continue;
         };
@@ -1098,25 +1235,28 @@ fn run_binance_books(
     http: Arc<HttpClient>,
     base_url: String,
     venue: &'static str,
-    symbols: Vec<String>,
+    registry: Arc<SymbolRegistry>,
 ) {
-    if symbols.is_empty() {
-        return;
-    }
-    let streams = symbols
-        .iter()
-        .map(|symbol| format!("{}@bookTicker", symbol.to_ascii_lowercase()))
-        .collect::<Vec<_>>()
-        .join("/");
-    let url = format!(
-        "{}/stream?streams={streams}",
-        base_url.trim_end_matches('/')
-    );
-
-    tracing::info!(venue, url = %url, "Binance WebSocket 盘口订阅已启动");
+    tracing::info!(venue, "Binance WebSocket 盘口线程已启动");
     let mut last_error: Option<Instant> = None;
     loop {
-        match stream_binance(&feed, &http, &url, venue) {
+        // 每次重连都按当前订阅清单重建 URL，新开仓的交易对随之生效。
+        let symbols = registry.symbols_for(venue);
+        if symbols.is_empty() {
+            thread::sleep(RECONNECT_DELAY);
+            continue;
+        }
+        let streams = symbols
+            .iter()
+            .map(|symbol| format!("{}@bookTicker", symbol.to_ascii_lowercase()))
+            .collect::<Vec<_>>()
+            .join("/");
+        let url = format!(
+            "{}/stream?streams={streams}",
+            base_url.trim_end_matches('/')
+        );
+
+        match stream_binance(&feed, &http, &url, venue, &registry) {
             Ok(()) => tracing::warn!(venue, "Binance WebSocket 已结束，准备重连"),
             Err(error) => {
                 let now = Instant::now();
@@ -1138,9 +1278,15 @@ fn stream_binance(
     http: &HttpClient,
     url: &str,
     venue: &str,
+    registry: &SymbolRegistry,
 ) -> anyhow::Result<()> {
+    let symbols = registry.symbols_for(venue);
     let mut ws = WebSocket::connect(http, url, HANDSHAKE_TIMEOUT, POLL_TIMEOUT)?;
+    let mut version = registry.version();
     loop {
+        if needs_reconnect(registry, venue, &symbols, &mut version) {
+            return Ok(());
+        }
         let Some(event) = ws.poll()? else {
             continue;
         };
@@ -1166,26 +1312,39 @@ fn run_okx(
     http: Arc<HttpClient>,
     url: String,
     client: Arc<OkxMarketClient>,
-    symbols: Vec<String>,
-    registry: Arc<SymbolRegistry>,
+    books: Arc<SymbolRegistry>,
+    funding: Arc<SymbolRegistry>,
 ) {
-    // 永续盘口数量单位是「张」，先从 REST 拉一次面值，失败则跳过该合约的实时盘口。
-    let mut ct_values = HashMap::new();
-    for symbol in &symbols {
-        match client.swap_contract_value(symbol) {
-            Ok(value) => {
-                ct_values.insert(symbol.clone(), value);
-            }
-            Err(error) => {
-                tracing::warn!(symbol, %error, "获取 OKX 合约面值失败，该合约暂用 REST 盘口")
-            }
-        }
-    }
-
-    tracing::info!(url = %url, symbols = ?symbols, "OKX WebSocket 行情订阅已启动");
+    tracing::info!(url = %url, "OKX WebSocket 行情线程已启动");
     let mut last_error: Option<Instant> = None;
     loop {
-        match stream_okx(&feed, &http, &url, &symbols, &ct_values, &registry) {
+        let symbols = books.symbols_for(OKX_VENUE);
+        if symbols.is_empty() {
+            thread::sleep(RECONNECT_DELAY);
+            continue;
+        }
+        // 永续盘口数量单位是「张」，每次连接前拉取面值，失败则跳过该合约的实时盘口。
+        let mut ct_values = HashMap::new();
+        for symbol in &symbols {
+            match client.swap_contract_value(symbol) {
+                Ok(value) => {
+                    ct_values.insert(symbol.clone(), value);
+                }
+                Err(error) => {
+                    tracing::warn!(symbol, %error, "获取 OKX 合约面值失败，该合约暂用 REST 盘口")
+                }
+            }
+        }
+
+        match stream_okx(
+            &feed,
+            &http,
+            &url,
+            &symbols,
+            &ct_values,
+            &books,
+            &funding,
+        ) {
             Ok(()) => tracing::warn!("OKX WebSocket 已结束，准备重连"),
             Err(error) => {
                 let now = Instant::now();
@@ -1208,20 +1367,25 @@ fn stream_okx(
     url: &str,
     symbols: &[String],
     ct_values: &HashMap<String, Decimal>,
-    registry: &SymbolRegistry,
+    books: &SymbolRegistry,
+    funding: &SymbolRegistry,
 ) -> anyhow::Result<()> {
     let mut ws = WebSocket::connect(http, url, HANDSHAKE_TIMEOUT, POLL_TIMEOUT)?;
 
-    // 盘口只订阅 watchlist（逐币 REST 兜底成本高），资金费率则覆盖全量永续。
+    // 盘口只订阅 watchlist（逐币 REST 兜底成本高），资金费率则覆盖全量永续；
+    // 持仓交易对（`symbols` 中 watchlist 之外的部分）只订阅永续盘口。
+    let watchlist = books.snapshot();
     let mut book_args = Vec::new();
     for symbol in symbols {
         book_args.push(format!(
             r#"{{"channel":"tickers","instId":"{}"}}"#,
-            okx_inst_id(symbol, false)
+            okx_inst_id(symbol, true)
         ));
+    }
+    for symbol in &watchlist {
         book_args.push(format!(
             r#"{{"channel":"tickers","instId":"{}"}}"#,
-            okx_inst_id(symbol, true)
+            okx_inst_id(symbol, false)
         ));
     }
     for chunk in book_args.chunks(OKX_SUBSCRIBE_CHUNK) {
@@ -1235,12 +1399,17 @@ fn stream_okx(
     }
 
     let mut subscribed: HashSet<String> = HashSet::new();
+    let mut book_version = books.version();
     let mut version = u64::MAX;
     let mut last_ping = Instant::now();
     loop {
-        if registry.version() != version {
-            version = registry.version();
-            let pending: Vec<String> = registry
+        // 持仓交易对变化时断开重连，用新的清单重新订阅盘口。
+        if needs_reconnect(books, OKX_VENUE, symbols, &mut book_version) {
+            return Ok(());
+        }
+        if funding.version() != version {
+            version = funding.version();
+            let pending: Vec<String> = funding
                 .snapshot()
                 .into_iter()
                 .filter(|symbol| !subscribed.contains(symbol))

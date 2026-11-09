@@ -6,13 +6,16 @@ use chrono::{SecondsFormat, Utc};
 use hmac::{Hmac, Mac};
 use rust_decimal::{prelude::ToPrimitive, Decimal};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha512};
 
 use crate::{
     accounts::{AccountCredentials, Accounts},
-    exchange::dex::{
-        hyperliquid_cloid, sign_hyperliquid_action, sign_lighter_order, HyperliquidOrder,
-        LighterOrder, LIGHTER_MAINNET_CHAIN_ID,
+    exchange::{
+        aster,
+        dex::{
+            hyperliquid_cloid, sign_hyperliquid_action, sign_lighter_order, HyperliquidOrder,
+            LighterOrder, LIGHTER_MAINNET_CHAIN_ID,
+        },
     },
     http_client::HttpClient,
 };
@@ -91,7 +94,6 @@ fn place(
     }
     let client_order_id = client_id(&request.client_order_id);
     match venue {
-        // Aster 的合约下单接口与 Binance 完全兼容。
         "binance" => binance_place(
             http,
             &endpoints.binance,
@@ -99,7 +101,8 @@ fn place(
             request,
             &client_order_id,
         ),
-        "aster" => binance_place(
+        // Aster V3 用主账户地址 + API 钱包私钥签名，接口与字段仍是 Binance 风格。
+        "aster" => aster_place(
             http,
             &endpoints.aster,
             credentials,
@@ -200,6 +203,61 @@ fn binance_place(
     let order_id = value["orderId"]
         .as_i64()
         .ok_or_else(|| ExchangeError::Rejected(format!("Binance 响应缺少 orderId: {value}")))?;
+    Ok(ack(order_id.to_string(), client_order_id))
+}
+
+/// Aster V3 下单：参数表单带上 user / signer / nonce / signature。
+fn aster_place(
+    http: &HttpClient,
+    base_url: &str,
+    credentials: &AccountCredentials,
+    request: &PlaceOrderRequest,
+    client_order_id: &str,
+) -> Result<VenueOrderAck, ExchangeError> {
+    let user = credentials
+        .wallet_address
+        .as_deref()
+        .ok_or_else(|| ExchangeError::Credentials("Aster 需要主账户钱包地址".to_string()))?;
+    let signer_key = credentials
+        .signer_key
+        .as_deref()
+        .ok_or_else(|| ExchangeError::Credentials("Aster 需要 API 钱包私钥".to_string()))?;
+    let signer = aster::AsterSigner::new(user, signer_key)
+        .map_err(|error| ExchangeError::Credentials(error.to_string()))?;
+
+    let mut params = vec![
+        ("symbol", internal_symbol(request)),
+        (
+            "side",
+            if request.side == Side::Buy {
+                "BUY".to_string()
+            } else {
+                "SELL".to_string()
+            },
+        ),
+        ("type", "LIMIT".to_string()),
+        ("timeInForce", "GTC".to_string()),
+        ("quantity", num(request.quantity)),
+        ("price", num(request.limit_price)),
+        ("newClientOrderId", client_order_id.to_string()),
+    ];
+    if request.reduce_only {
+        params.push(("reduceOnly", "true".to_string()));
+    }
+
+    let value = aster::request(http, "POST", base_url, "/fapi/v3/order", &signer, &params)
+        .map_err(transport)?;
+    if let Some(code) = value["code"].as_i64() {
+        if code != 200 {
+            return Err(ExchangeError::Rejected(format!(
+                "Aster 拒单: {}",
+                value["msg"].as_str().unwrap_or("未知错误")
+            )));
+        }
+    }
+    let order_id = value["orderId"]
+        .as_i64()
+        .ok_or_else(|| ExchangeError::Rejected(format!("Aster 响应缺少 orderId: {value}")))?;
     Ok(ack(order_id.to_string(), client_order_id))
 }
 
@@ -416,13 +474,7 @@ fn gate_place(
     })
     .to_string();
     let timestamp = Utc::now().timestamp().to_string();
-    let signature = hmac_hex(
-        secret,
-        &format!(
-            "POST\n{path}\n\n{}\n{timestamp}",
-            hex::encode(Sha256::digest(body.as_bytes()))
-        ),
-    )?;
+    let signature = gate_sign(secret, "POST", path, "", &body, &timestamp)?;
     let headers = [
         ("KEY", key),
         ("SIGN", signature.as_str()),
@@ -449,13 +501,7 @@ fn gate_multiplier(
 ) -> Result<Decimal, ExchangeError> {
     let path = format!("/api/v4/futures/usdt/contracts/{contract}");
     let timestamp = Utc::now().timestamp().to_string();
-    let signature = hmac_hex(
-        &credentials.api_secret,
-        &format!(
-            "GET\n{path}\n\n{}\n{timestamp}",
-            hex::encode(Sha256::digest(b""))
-        ),
-    )?;
+    let signature = gate_sign(&credentials.api_secret, "GET", &path, "", "", &timestamp)?;
     let headers = [
         ("KEY", credentials.api_key.as_str()),
         ("SIGN", signature.as_str()),
@@ -994,6 +1040,23 @@ fn pct(value: &str) -> String {
 
 fn transport(error: anyhow::Error) -> ExchangeError {
     ExchangeError::Transport(error.to_string())
+}
+
+/// Gate v4 签名：`METHOD\nPATH\nQUERY\nSHA512_HEX(body)\nTIMESTAMP`，HMAC-SHA512 后转 hex。
+fn gate_sign(
+    secret: &str,
+    method: &str,
+    path: &str,
+    query: &str,
+    body: &str,
+    timestamp: &str,
+) -> Result<String, ExchangeError> {
+    let hashed_payload = hex::encode(Sha512::digest(body.as_bytes()));
+    let message = format!("{method}\n{path}\n{query}\n{hashed_payload}\n{timestamp}");
+    let mut mac = Hmac::<Sha512>::new_from_slice(secret.as_bytes())
+        .map_err(|_| ExchangeError::Credentials("密钥长度非法".to_string()))?;
+    mac.update(message.as_bytes());
+    Ok(hex::encode(mac.finalize().into_bytes()))
 }
 
 fn hmac_hex(secret: &str, payload: &str) -> Result<String, ExchangeError> {

@@ -17,15 +17,16 @@ import { AccountEquityChart } from "./AccountEquityChart";
 import { Badge } from "./ui/badge";
 import { Button } from "./ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "./ui/card";
+import { ConfirmDialog } from "./ui/confirm-dialog";
 
-/** CEX 用 API Key 签名；DEX 用钱包地址查询余额，用签名私钥下单。 */
+/** CEX 用 API Key 签名；DEX 与 Aster 用钱包地址查询余额，用签名私钥下单。 */
 const VENUES: { id: AccountVenue; kind: AccountKind }[] = [
   { id: "binance", kind: "api_key" },
   { id: "okx", kind: "api_key" },
   { id: "bybit", kind: "api_key" },
   { id: "bitget", kind: "api_key" },
   { id: "gate", kind: "api_key" },
-  { id: "aster", kind: "api_key" },
+  { id: "aster", kind: "wallet" },
   { id: "hyperliquid", kind: "wallet" },
   { id: "lighter", kind: "wallet" },
 ];
@@ -43,6 +44,8 @@ export function AccountsPanel() {
   const removeAccount = useRemoveAccount();
   const refreshAccount = useRefreshAccount();
   const [dialogOpen, setDialogOpen] = useState(false);
+  const [pendingRemove, setPendingRemove] = useState<string | null>(null);
+  const [removeError, setRemoveError] = useState<string | null>(null);
 
   const rangeLabels: Record<number, string> = {
     24: t.accounts.range24h,
@@ -143,9 +146,8 @@ export function AccountsPanel() {
                   refreshing={refreshAccount.isPending && refreshAccount.variables === account.id}
                   onRefresh={() => refreshAccount.mutate(account.id)}
                   onRemove={() => {
-                    if (window.confirm(t.accounts.removeConfirm)) {
-                      removeAccount.mutate(account.id);
-                    }
+                    setRemoveError(null);
+                    setPendingRemove(account.id);
                   }}
                 />
               ))}
@@ -155,6 +157,38 @@ export function AccountsPanel() {
       </CardContent>
 
       {dialogOpen && <ImportAccountDialog onClose={() => setDialogOpen(false)} />}
+
+      <ConfirmDialog
+        open={pendingRemove !== null}
+        title={t.accounts.remove}
+        message={t.accounts.removeConfirm}
+        confirmLabel={t.accounts.remove}
+        cancelLabel={t.accounts.cancel}
+        pending={removeAccount.isPending}
+        error={removeError}
+        onCancel={() => {
+          if (removeAccount.isPending) {
+            return;
+          }
+          setPendingRemove(null);
+          setRemoveError(null);
+        }}
+        onConfirm={() => {
+          if (!pendingRemove) {
+            return;
+          }
+          setRemoveError(null);
+          removeAccount.mutate(pendingRemove, {
+            onSuccess: () => setPendingRemove(null),
+            onError: (error) =>
+              setRemoveError(
+                fmt(t.accounts.removeFailed, {
+                  message: error instanceof Error ? error.message : String(error),
+                }),
+              ),
+          });
+        }}
+      />
     </Card>
   );
 }
@@ -357,7 +391,11 @@ function ImportAccountDialog({ onClose }: { onClose: () => void }) {
             <>
               <label className="block space-y-1.5">
                 <span className="text-xs text-muted">
-                  {venue === "lighter" ? t.accounts.lighterAddress : t.accounts.walletAddress}
+                  {venue === "lighter"
+                    ? t.accounts.lighterAddress
+                    : venue === "aster"
+                      ? t.accounts.asterAddress
+                      : t.accounts.walletAddress}
                 </span>
                 <input
                   className={`${inputClass} font-mono`}
@@ -384,7 +422,11 @@ function ImportAccountDialog({ onClose }: { onClose: () => void }) {
                   spellCheck={false}
                 />
                 <span className="block text-[11px] leading-relaxed text-muted">
-                  {venue === "lighter" ? t.accounts.signerKeyLighterHint : t.accounts.signerKeyHint}
+                  {venue === "lighter"
+                    ? t.accounts.signerKeyLighterHint
+                    : venue === "aster"
+                      ? t.accounts.signerKeyAsterHint
+                      : t.accounts.signerKeyHint}
                 </span>
                 {signerKeyInvalid && (
                   <span className="block text-[11px] text-danger">

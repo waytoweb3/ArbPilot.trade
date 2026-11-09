@@ -23,6 +23,9 @@ pub struct LegOrderRequest {
     pub notional_usd: Decimal,
     /// 指定成交价；为空表示市价腿，用当前对手价作为保护价。
     pub limit_price: Option<Decimal>,
+    /// 指定下单数量（币）；平仓时直接使用持仓数量，避免按价格换算后
+    /// 因盘口与标记价的差异少平或多平。
+    pub quantity: Option<Decimal>,
 }
 
 /// 一次提交的订单：可以是单腿、配对双腿，或其他多腿组合。
@@ -161,6 +164,7 @@ pub async fn submit_pair(
                     side: long_side,
                     notional_usd: request.notional_usd,
                     limit_price: None,
+                    quantity: None,
                 },
                 LegOrderRequest {
                     venue: request.short_venue,
@@ -168,6 +172,7 @@ pub async fn submit_pair(
                     side: short_side,
                     notional_usd: request.notional_usd,
                     limit_price: None,
+                    quantity: None,
                 },
             ],
             leverage: request.leverage,
@@ -249,7 +254,10 @@ pub async fn submit_legs(
             let reason = format!("{} 在 {} 的成交价无效", leg.symbol, leg.venue);
             return Err(reject_request(state, &request, reason).await);
         }
-        let quantity = (leg.notional_usd / price).round_dp(6);
+        let quantity = match leg.quantity {
+            Some(quantity) => quantity,
+            None => (leg.notional_usd / price).round_dp(6),
+        };
         if quantity <= Decimal::ZERO {
             return Err(reject_request(state, &request, "下单数量过小").await);
         }

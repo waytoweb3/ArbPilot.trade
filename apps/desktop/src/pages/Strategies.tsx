@@ -18,6 +18,7 @@ import {
 import { Badge } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "../components/ui/card";
+import { ConfirmDialog } from "../components/ui/confirm-dialog";
 import { useAccount } from "../hooks/useAccount";
 import {
   useBacktestStrategy,
@@ -1379,6 +1380,12 @@ export default function StrategiesPage() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const [backtestDays, setBacktestDays] = useState(30);
+  /** 删除/回滚的二次确认；Tauri 的 macOS WebView 不支持 window.confirm。 */
+  const [confirmAction, setConfirmAction] = useState<{
+    message: string;
+    label: string;
+    run: () => void;
+  } | null>(null);
 
   const list = strategies.data ?? [];
   const selected = creating ? null : (list.find((record) => record.id === selectedId) ?? list[0] ?? null);
@@ -1581,17 +1588,20 @@ export default function StrategiesPage() {
                 backtestStrategy.mutate({ id: selected.id, days: backtestDays })
               }
               onRollback={(version) => {
-                if (!window.confirm(t.strategies.rollbackConfirm)) {
-                  return;
-                }
-                rollbackStrategy.mutate({ id: selected.id, version });
+                setConfirmAction({
+                  message: t.strategies.rollbackConfirm,
+                  label: t.strategies.rollback,
+                  run: () => rollbackStrategy.mutate({ id: selected.id, version }),
+                });
               }}
               onDelete={() => {
-                if (!window.confirm(t.strategies.deleteConfirm)) {
-                  return;
-                }
-                deleteStrategy.mutate(selected.id, {
-                  onSuccess: () => setSelectedId(null),
+                setConfirmAction({
+                  message: t.strategies.deleteConfirm,
+                  label: t.strategies.delete,
+                  run: () =>
+                    deleteStrategy.mutate(selected.id, {
+                      onSuccess: () => setSelectedId(null),
+                    }),
                 });
               }}
               pending={{
@@ -1605,6 +1615,19 @@ export default function StrategiesPage() {
           )}
         </div>
       </div>
+
+      <ConfirmDialog
+        open={confirmAction !== null}
+        message={confirmAction?.message ?? ""}
+        confirmLabel={confirmAction?.label ?? ""}
+        cancelLabel={t.strategies.cancel}
+        onCancel={() => setConfirmAction(null)}
+        onConfirm={() => {
+          const action = confirmAction;
+          setConfirmAction(null);
+          action?.run();
+        }}
+      />
     </div>
   );
 }

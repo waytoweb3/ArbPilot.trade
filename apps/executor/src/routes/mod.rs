@@ -37,6 +37,7 @@ pub fn build(state: AppState) -> Router {
         .route("/candles", get(candles::list))
         .route("/orders", get(orders::list).post(orders::create))
         .route("/positions", get(portfolio::positions))
+        .route("/positions/{id}/close", post(portfolio::close))
         .route("/accounts", get(accounts::list).post(accounts::import))
         .route("/accounts/history", get(accounts::history))
         .route("/accounts/{id}", delete(accounts::remove))

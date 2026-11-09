@@ -113,7 +113,11 @@ impl RiskEngine {
         let limits = &context.limits;
         let mut violations = Vec::new();
 
-        if context.paused {
+        // 全部为只减仓的订单（平仓）只降低敞口：暂停、杠杆、名义限额与
+        // 交易范围都不应阻止离场，否则用户可能无法退出已有风险。
+        let closing = !intent.legs.is_empty() && intent.legs.iter().all(|leg| leg.reduce_only);
+
+        if context.paused && !closing {
             violations.push(RiskViolation::new(
                 RiskViolationCode::ExecutorPaused,
                 "执行器已暂停新开仓",
@@ -145,13 +149,19 @@ impl RiskEngine {
                     format!("订单腿数量或价格无效: {} {}", leg.venue, leg.symbol),
                 ));
             }
-            if !limits.allowed_venues.is_empty() && !limits.allowed_venues.contains(&leg.venue) {
+            if !closing
+                && !limits.allowed_venues.is_empty()
+                && !limits.allowed_venues.contains(&leg.venue)
+            {
                 violations.push(RiskViolation::new(
                     RiskViolationCode::VenueNotAllowed,
                     format!("交易所 {} 不在允许列表内", leg.venue),
                 ));
             }
-            if !limits.allowed_symbols.is_empty() && !limits.allowed_symbols.contains(&leg.symbol) {
+            if !closing
+                && !limits.allowed_symbols.is_empty()
+                && !limits.allowed_symbols.contains(&leg.symbol)
+            {
                 violations.push(RiskViolation::new(
                     RiskViolationCode::SymbolNotAllowed,
                     format!("交易对 {} 不在允许列表内", leg.symbol),
@@ -159,7 +169,7 @@ impl RiskEngine {
             }
         }
 
-        if intent.leverage > limits.max_leverage {
+        if !closing && intent.leverage > limits.max_leverage {
             violations.push(RiskViolation::new(
                 RiskViolationCode::LeverageTooHigh,
                 format!("杠杆 {} 超过上限 {}", intent.leverage, limits.max_leverage),
@@ -189,24 +199,26 @@ impl RiskEngine {
         }
 
         let notional = intent.notional_usd();
-        if notional > limits.max_order_notional_usd {
-            violations.push(RiskViolation::new(
-                RiskViolationCode::NotionalTooLarge,
-                format!(
-                    "单笔名义价值 {} 超过上限 {}",
-                    notional, limits.max_order_notional_usd
-                ),
-            ));
-        }
-        if context.open_notional_usd + notional > limits.max_total_notional_usd {
-            violations.push(RiskViolation::new(
-                RiskViolationCode::TotalNotionalTooLarge,
-                format!(
-                    "总敞口 {} 超过上限 {}",
-                    context.open_notional_usd + notional,
-                    limits.max_total_notional_usd
-                ),
-            ));
+        if !closing {
+            if notional > limits.max_order_notional_usd {
+                violations.push(RiskViolation::new(
+                    RiskViolationCode::NotionalTooLarge,
+                    format!(
+                        "单笔名义价值 {} 超过上限 {}",
+                        notional, limits.max_order_notional_usd
+                    ),
+                ));
+            }
+            if context.open_notional_usd + notional > limits.max_total_notional_usd {
+                violations.push(RiskViolation::new(
+                    RiskViolationCode::TotalNotionalTooLarge,
+                    format!(
+                        "总敞口 {} 超过上限 {}",
+                        context.open_notional_usd + notional,
+                        limits.max_total_notional_usd
+                    ),
+                ));
+            }
         }
 
         if violations.is_empty() {

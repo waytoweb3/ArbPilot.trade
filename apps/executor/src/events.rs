@@ -1,4 +1,4 @@
-use arb_core::{Order, OrderStatus};
+use arb_core::{Order, OrderStatus, Position};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
@@ -35,6 +35,11 @@ pub enum ExecutorEvent {
     },
     OrderUpdated {
         order: Order,
+    },
+    /// 仓位价格随 WebSocket 行情更新后的完整快照，桌面端据此即时刷新。
+    PositionsUpdated {
+        positions: Vec<Position>,
+        at: DateTime<Utc>,
     },
     ExecutorStatus {
         paused: bool,

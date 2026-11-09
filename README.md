@@ -127,7 +127,7 @@ docker compose -f deploy/docker-compose.yml up -d
 
 ## 当前实现边界
 
-- 行情与账户余额取自真实交易所公开/私有接口；订单经统一风控后直接提交到真实交易所，已覆盖 Binance / Aster / OKX / Bybit / Bitget / Gate 的 USDT 本位永续；Hyperliquid 与 Lighter 用钱包地址查询余额，填入签名私钥（Hyperliquid API Wallet、Lighter API Key）后同样在本机签名下单。
+- 行情与账户余额取自真实交易所公开/私有接口；订单经统一风控后直接提交到真实交易所，已覆盖 Binance / Aster / OKX / Bybit / Bitget / Gate 的 USDT 本位永续；Aster 走 V3 API 钱包（主账户地址 + API 钱包私钥，本机 EIP-712 签名），Hyperliquid 与 Lighter 用钱包地址查询余额，填入签名私钥（Hyperliquid API Wallet、Lighter API Key）后同样在本机签名下单。
 - 资金费率走各交易所公开接口（无需 API Key）：首次启动回填历史，但只保留最近 1 个月的结算记录（超期数据定期清理），之后按结算时间增量入库；未配置 `DATABASE_URL` 时只保留内存数据，重启即丢。
 - 风控、幂等、双腿补偿状态机、订阅不影响仓位管理等约束已在核心层实现；自定义策略在 Wasmtime 沙箱内运行，只输出订单意图，统一经风控网关下单。
 - 策略沙箱、内置模板、AI 生成策略代码、WASM 回测、Telegram、订阅支付均已接入；执行器与桌面客户端都支持「检查更新 + 一键升级」。

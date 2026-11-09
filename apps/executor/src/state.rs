@@ -7,14 +7,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-use arb_core::{Order, Position, RiskLimits, StrategyRecord};
+use arb_core::{Order, Position, RiskLimits, Side, StrategyRecord};
 use chrono::Utc;
 use rust_decimal::Decimal;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use crate::{
-    accounts::{AccountEndpoints, Accounts},
+    accounts::{AccountEndpoints, Accounts, VenuePositions},
     config::Config,
     events::{AlertLevel, ExecutorEvent},
     exchange::{LiveEndpoints, LiveExchange, OkxMarketClient},
@@ -32,6 +32,13 @@ use crate::{
 
 /// 共享 HTTP 客户端的请求超时。
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 交易所真实持仓的刷新间隔；只用于发现开/平仓与数量变化，
+/// 价格与浮动盈亏由 WebSocket 推送实时刷新。
+const POSITION_SYNC_INTERVAL: Duration = Duration::from_secs(30);
+
+/// 用 WebSocket 盘口重算仓位价格的节拍；价格本身来自推送，这里只做汇总广播。
+const POSITION_PRICING_INTERVAL: Duration = Duration::from_secs(1);
 
 /// 执行器共享状态。所有写操作通过锁保护；副作用操作必须先写幂等表。
 #[derive(Clone)]
@@ -177,7 +184,90 @@ impl AppState {
         // 行情侧需要结算间隔来归一跨所资金费率。
         state.market.attach_funding(state.funding.clone());
         state.news.attach_notifier(notifier);
+        // 交易所真实持仓同步：桌面端与 Telegram 展示的仓位以交易所为准。
+        state.spawn_position_sync();
+        // 价格与浮盈由 WebSocket 推送驱动，与持仓同步周期解耦。
+        state.spawn_position_pricing();
         state
+    }
+
+    /// 定期把交易所的真实持仓并入内存仓位，替换本机订单留下的过期记录。
+    fn spawn_position_sync(&self) {
+        let state = self.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(POSITION_SYNC_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                let snapshots = state.accounts.sync_open_positions().await;
+                if snapshots.is_empty() {
+                    continue;
+                }
+                // 持仓币种可能不在 watchlist；加入订阅后才能收到实时盘口。
+                for snapshot in &snapshots {
+                    let symbols = snapshot
+                        .positions
+                        .iter()
+                        .map(|position| position.symbol.clone())
+                        .collect::<Vec<_>>();
+                    state
+                        .market
+                        .watch_position_symbols(&snapshot.venue, &symbols);
+                }
+                merge_exchange_positions(
+                    &mut state.positions.write().expect("仓位锁不可用"),
+                    snapshots,
+                );
+            }
+        });
+    }
+
+    /// 用 WebSocket 最新盘口刷新标记价与浮动盈亏，变化时推送给桌面端。
+    fn spawn_position_pricing(&self) {
+        let state = self.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(POSITION_PRICING_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                let changed = {
+                    let mut positions = state.positions.write().expect("仓位锁不可用");
+                    state.apply_realtime_prices(&mut positions)
+                };
+                if !changed {
+                    continue;
+                }
+                let positions = state.positions.read().expect("仓位锁不可用").clone();
+                let _ = state.events.send(ExecutorEvent::PositionsUpdated {
+                    positions,
+                    at: Utc::now(),
+                });
+            }
+        });
+    }
+
+    /// 用 WebSocket 盘口覆盖仓位的标记价并重算浮动盈亏；返回是否有变化。
+    pub fn apply_realtime_prices(&self, positions: &mut [Position]) -> bool {
+        let mut changed = false;
+        for position in positions {
+            let Some(mark_price) = self
+                .market
+                .realtime_price(&position.venue, &position.symbol)
+            else {
+                continue;
+            };
+            if mark_price == position.mark_price {
+                continue;
+            }
+            position.unrealized_pnl = match position.side {
+                Side::Buy => (mark_price - position.entry_price) * position.quantity,
+                Side::Sell => (position.entry_price - mark_price) * position.quantity,
+            };
+            position.mark_price = mark_price;
+            position.updated_at = Utc::now();
+            changed = true;
+        }
+        changed
     }
 
     pub fn uptime_secs(&self) -> u64 {
@@ -234,5 +324,31 @@ impl AppState {
             uptime_secs: self.uptime_secs(),
             server_time: Utc::now(),
         }
+    }
+}
+
+/// 用交易所真实持仓覆盖某交易所的内存仓位。
+///
+/// 同一 (交易所, 交易对, 方向) 若已有本机订单产生的记录，保留其策略归属与
+/// UUID；交易所已不存在的仓位直接移除，保证展示与真实敞口一致。
+fn merge_exchange_positions(positions: &mut Vec<Position>, snapshots: Vec<VenuePositions>) {
+    for snapshot in snapshots {
+        let (mut local, mut retained): (Vec<Position>, Vec<Position>) = positions
+            .drain(..)
+            .partition(|position| position.venue == snapshot.venue);
+
+        for mut position in snapshot.positions {
+            if let Some(index) = local
+                .iter()
+                .position(|item| item.symbol == position.symbol && item.side == position.side)
+            {
+                let existing = local.remove(index);
+                position.id = existing.id;
+                position.strategy_id = existing.strategy_id;
+            }
+            retained.push(position);
+        }
+
+        *positions = retained;
     }
 }

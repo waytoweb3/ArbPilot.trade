@@ -51,7 +51,9 @@ export function usePositions() {
   return useQuery({
     queryKey: ["positions"],
     queryFn: api.positions,
-    refetchInterval: 5_000,
+    // 实时价格与浮盈由执行器 WebSocket 推送（positions_updated）写入缓存；
+    // 这里只做低频兜底，用于断线或漏事件时重新对齐。
+    refetchInterval: 15_000,
   });
 }
 
@@ -60,6 +62,25 @@ export function useOrders() {
     queryKey: ["orders"],
     queryFn: api.orders,
     refetchInterval: 5_000,
+  });
+}
+
+/** 一键平仓：成交后立即刷新仓位与订单列表。 */
+export function useClosePosition() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (id: string) => {
+      const result = await api.closePosition(id);
+      // 风控拒绝会以 422 + 订单体返回，这里转成错误让界面展示拒绝原因。
+      if (result.order.status === "rejected") {
+        throw new Error(result.order.note ?? "平仓被风控拒绝");
+      }
+      return result;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["positions"] });
+      queryClient.invalidateQueries({ queryKey: ["orders"] });
+    },
   });
 }
 

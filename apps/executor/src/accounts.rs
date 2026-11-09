@@ -6,21 +6,23 @@ use std::{
 };
 
 use anyhow::{anyhow, bail, Context};
+use arb_core::{Position, Side};
 use base64::Engine as _;
 use chrono::{DateTime, SecondsFormat, TimeZone, Utc};
 use hmac::{Hmac, Mac};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha512};
 use uuid::Uuid;
 
 use crate::{
+    exchange::aster,
     http_client::HttpClient,
     store::{EquityPoint, Store},
 };
 
-/// 支持导入 API Key 的 CEX，以及用钱包地址查询、用签名私钥下单的 DEX。
+/// 支持导入 API Key 的 CEX，以及用钱包地址 + 签名私钥认证的 DEX 与 Aster。
 pub const SUPPORTED_VENUES: [&str; 11] = [
     "binance",
     "okx",
@@ -35,8 +37,9 @@ pub const SUPPORTED_VENUES: [&str; 11] = [
     "lighter",
 ];
 
-/// 这些 DEX 用钱包地址（Lighter 也可用账户索引）查询公开接口，用签名私钥下单。
-pub const WALLET_VENUES: [&str; 2] = ["hyperliquid", "lighter"];
+/// 这些交易所用钱包地址（Lighter 也可用账户索引）查询私有接口，用签名私钥在本机签名。
+/// Aster 的 V3 接口同样走「主账户地址 + API 钱包私钥」，不再使用 API Key。
+pub const WALLET_VENUES: [&str; 3] = ["hyperliquid", "lighter", "aster"];
 
 /// 这些交易所在签名之外还需要 passphrase。
 pub fn requires_passphrase(venue: &str) -> bool {
@@ -163,6 +166,12 @@ pub struct AccountView {
     pub can_trade: bool,
     pub created_at: DateTime<Utc>,
     pub snapshot: Option<AccountSnapshotView>,
+}
+
+/// 某个交易所当前的真实持仓，用于覆盖执行器内存里的仓位记录。
+pub struct VenuePositions {
+    pub venue: String,
+    pub positions: Vec<Position>,
 }
 
 /// 账户池：凭证文件 + 最新快照 + 权益历史。
@@ -422,6 +431,57 @@ impl Accounts {
             let snapshot = self.fetch(&account).await;
             self.commit_snapshot(&account, snapshot).await;
         }
+    }
+
+    /// 拉取所有已导入账户在交易所的真实持仓。
+    ///
+    /// 只有该交易所的全部账户都查询成功时才返回结果；任一账户失败则跳过该
+    /// 交易所，避免网络抖动把用户真实仓位误判为已平仓。
+    pub async fn sync_open_positions(&self) -> Vec<VenuePositions> {
+        let accounts = self.accounts.read().expect("账户锁不可用").clone();
+        let mut grouped: HashMap<String, (bool, Vec<Position>)> = HashMap::new();
+
+        for account in accounts {
+            let entry = grouped
+                .entry(account.venue.clone())
+                .or_insert((true, Vec::new()));
+            match self.fetch_open_positions(&account).await {
+                Ok(positions) => entry.1.extend(positions),
+                Err(error) => {
+                    tracing::warn!(venue = %account.venue, %error, "拉取交易所持仓失败");
+                    entry.0 = false;
+                }
+            }
+        }
+
+        grouped
+            .into_iter()
+            .filter(|(_, (ok, _))| *ok)
+            .map(|(venue, (_, positions))| VenuePositions { venue, positions })
+            .collect()
+    }
+
+    async fn fetch_open_positions(
+        &self,
+        credentials: &AccountCredentials,
+    ) -> anyhow::Result<Vec<Position>> {
+        let http = self
+            .http
+            .clone()
+            .ok_or_else(|| anyhow!("行情 HTTP 客户端不可用"))?;
+        let base_url = self
+            .endpoints
+            .get(&credentials.venue)
+            .map(str::to_string)
+            .ok_or_else(|| anyhow!("暂不支持该交易所: {}", credentials.venue))?;
+        let binance_fapi = self.endpoints.binance_fapi.clone();
+        let credentials = credentials.clone();
+
+        tokio::task::spawn_blocking(move || {
+            fetch_positions(&http, &base_url, &binance_fapi, &credentials)
+        })
+        .await
+        .context("查询持仓任务失败")?
     }
 
     /// 权益历史：按小时或 5 分钟桶聚合，返回总权益曲线。
@@ -1047,25 +1107,43 @@ fn fetch_gate(
     Ok((balances, None))
 }
 
-/// Aster 合约私有接口与 Binance 完全兼容，签名方式一致。
+/// Aster V3 不再支持 API Key，改为「主账户地址 + 已授权的 API 钱包私钥」。
+fn aster_signer(
+    credentials: &AccountCredentials,
+) -> anyhow::Result<crate::exchange::aster::AsterSigner> {
+    let user = credentials
+        .wallet_address
+        .as_deref()
+        .ok_or_else(|| anyhow!("Aster 需要填写主账户钱包地址"))?;
+    let key = credentials
+        .signer_key
+        .as_deref()
+        .ok_or_else(|| anyhow!("Aster 需要填写 API 钱包私钥"))?;
+    aster::AsterSigner::new(user, key)
+}
+
+/// Aster 合约账户信息，签名参数全部拼在查询串上。
 fn fetch_aster(
     http: &HttpClient,
     base_url: &str,
     credentials: &AccountCredentials,
 ) -> anyhow::Result<(RawBalances, Option<Decimal>)> {
-    let base_url = base_url.trim_end_matches('/');
-    let query = format!(
-        "timestamp={}&recvWindow=5000",
-        Utc::now().timestamp_millis()
-    );
-    let signature = hmac_sha256_hex(&credentials.api_secret, &query)?;
-    let url = format!("{base_url}/fapi/v2/account?{query}&signature={signature}");
-    let value =
-        http.get_json_with_headers(&url, &[("X-MBX-APIKEY", credentials.api_key.as_str())])?;
+    let signer = aster_signer(credentials)?;
+    let value = aster::request(http, "GET", base_url, "/fapi/v3/account", &signer, &[])
+        .map_err(|error| {
+            // 私钥对应的 API 钱包没有在主账户下授权时，服务端只回 No agent found。
+            if error.to_string().contains("No agent found") {
+                anyhow!(
+                    "该私钥对应的 API 钱包未在主账户下授权（No agent found），请到 https://www.asterdex.com/zh-CN/api-wallet 重新授权并确认主账户地址"
+                )
+            } else {
+                error
+            }
+        })?;
 
     let rows = value["assets"]
         .as_array()
-        .ok_or_else(|| binance_error(&value))?;
+        .ok_or_else(|| anyhow!(aster::error_of(&value)))?;
     let mut balances = Vec::with_capacity(rows.len());
     for row in rows {
         let asset = row.get("asset").and_then(Value::as_str).unwrap_or_default();
@@ -1288,6 +1366,667 @@ fn fetch_bingx(
     Ok((balances, None))
 }
 
+/// 各交易所持仓解析后的统一结构。
+struct RawPosition {
+    symbol: String,
+    side: Side,
+    quantity: Decimal,
+    entry_price: Decimal,
+    mark_price: Decimal,
+    leverage: Decimal,
+    unrealized_pnl: Decimal,
+}
+
+fn fetch_positions(
+    http: &HttpClient,
+    base_url: &str,
+    binance_fapi: &str,
+    credentials: &AccountCredentials,
+) -> anyhow::Result<Vec<Position>> {
+    let raw = match credentials.venue.as_str() {
+        "binance" => positions_binance(http, binance_fapi, credentials)?,
+        // Aster 的 V3 持仓接口与 Binance 字段一致，但认证方式不同。
+        "aster" => positions_aster(http, base_url, credentials)?,
+        "okx" => positions_okx(http, base_url, credentials)?,
+        "bybit" => positions_bybit(http, base_url, credentials)?,
+        "bitget" => positions_bitget(http, base_url, credentials)?,
+        "gate" => positions_gate(http, base_url, credentials)?,
+        "htx" => positions_htx(http, base_url, credentials)?,
+        "mexc" => positions_mexc(http, base_url, credentials)?,
+        "bingx" => positions_bingx(http, base_url, credentials)?,
+        "hyperliquid" => positions_hyperliquid(http, base_url, credentials)?,
+        "lighter" => positions_lighter(http, base_url, credentials)?,
+        other => bail!("暂不支持该交易所: {other}"),
+    };
+
+    Ok(raw
+        .into_iter()
+        .filter_map(|item| to_position(credentials.id, &credentials.venue, item))
+        .collect())
+}
+
+/// 同一账户、同一交易对与方向生成固定 UUID，避免每次轮询都把仓位当成新记录。
+fn to_position(account_id: Uuid, venue: &str, raw: RawPosition) -> Option<Position> {
+    if raw.quantity <= Decimal::ZERO || raw.symbol.is_empty() {
+        return None;
+    }
+    let side_label = match raw.side {
+        Side::Buy => "long",
+        Side::Sell => "short",
+    };
+    let mark_price = if raw.mark_price > Decimal::ZERO {
+        raw.mark_price
+    } else {
+        raw.entry_price
+    };
+    Some(Position {
+        id: Uuid::new_v5(
+            &Uuid::NAMESPACE_OID,
+            format!("{account_id}:{venue}:{}:{side_label}", raw.symbol).as_bytes(),
+        ),
+        strategy_id: None,
+        venue: venue.to_string(),
+        symbol: raw.symbol,
+        side: raw.side,
+        quantity: raw.quantity,
+        entry_price: raw.entry_price,
+        mark_price,
+        leverage: if raw.leverage > Decimal::ZERO {
+            raw.leverage
+        } else {
+            Decimal::ONE
+        },
+        unrealized_pnl: raw.unrealized_pnl,
+        updated_at: Utc::now(),
+    })
+}
+
+/// 统一各交易所的合约名：`BTC-USDT-SWAP` / `BTC_USDT` / `BTC` 都转成 `BTCUSDT`。
+fn normalized_symbol(raw: &str) -> String {
+    let upper = raw.trim().to_ascii_uppercase();
+    let stripped = upper.strip_suffix("-SWAP").unwrap_or(&upper);
+    let mut compact = stripped.replace('-', "").replace('_', "");
+    if compact.is_empty() {
+        return compact;
+    }
+    if !(compact.ends_with("USDT") || compact.ends_with("USDC") || compact.ends_with("USD")) {
+        compact.push_str("USDT");
+    }
+    compact
+}
+
+fn positions_binance(
+    http: &HttpClient,
+    base_url: &str,
+    credentials: &AccountCredentials,
+) -> anyhow::Result<Vec<RawPosition>> {
+    let base_url = base_url.trim_end_matches('/');
+    let query = format!(
+        "timestamp={}&recvWindow=5000",
+        Utc::now().timestamp_millis()
+    );
+    let signature = hmac_sha256_hex(&credentials.api_secret, &query)?;
+    let url = format!("{base_url}/fapi/v2/positionRisk?{query}&signature={signature}");
+    let value =
+        http.get_json_with_headers(&url, &[("X-MBX-APIKEY", credentials.api_key.as_str())])?;
+    let rows = value.as_array().ok_or_else(|| binance_error(&value))?;
+    Ok(parse_binance_positions(rows))
+}
+
+/// `/fapi/v3/positionRisk` 的返回字段与 Binance 一致，可直接复用解析逻辑。
+fn positions_aster(
+    http: &HttpClient,
+    base_url: &str,
+    credentials: &AccountCredentials,
+) -> anyhow::Result<Vec<RawPosition>> {
+    let signer = aster_signer(credentials)?;
+    let value = aster::request(http, "GET", base_url, "/fapi/v3/positionRisk", &signer, &[])?;
+    let rows = value
+        .as_array()
+        .ok_or_else(|| anyhow!(aster::error_of(&value)))?;
+    Ok(parse_binance_positions(rows))
+}
+
+fn parse_binance_positions(rows: &[Value]) -> Vec<RawPosition> {
+    let mut positions = Vec::new();
+    for row in rows {
+        let Some(amount) = decimal(&row["positionAmt"]) else {
+            continue;
+        };
+        if amount.is_zero() {
+            continue;
+        }
+        positions.push(RawPosition {
+            symbol: normalized_symbol(row["symbol"].as_str().unwrap_or_default()),
+            side: if amount > Decimal::ZERO {
+                Side::Buy
+            } else {
+                Side::Sell
+            },
+            quantity: amount.abs(),
+            entry_price: decimal(&row["entryPrice"]).unwrap_or_default(),
+            mark_price: decimal(&row["markPrice"]).unwrap_or_default(),
+            leverage: decimal(&row["leverage"]).unwrap_or(Decimal::ONE),
+            unrealized_pnl: decimal(&row["unRealizedProfit"]).unwrap_or_default(),
+        });
+    }
+    positions
+}
+
+fn positions_okx(
+    http: &HttpClient,
+    base_url: &str,
+    credentials: &AccountCredentials,
+) -> anyhow::Result<Vec<RawPosition>> {
+    let base_url = base_url.trim_end_matches('/');
+    let path = "/api/v5/account/positions?instType=SWAP";
+    let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+    let signature = hmac_sha256_base64(&credentials.api_secret, &format!("{timestamp}GET{path}"))?;
+    let passphrase = credentials
+        .passphrase
+        .as_deref()
+        .ok_or_else(|| anyhow!("OKX 需要 Passphrase"))?;
+
+    let headers = [
+        ("OK-ACCESS-KEY", credentials.api_key.as_str()),
+        ("OK-ACCESS-SIGN", signature.as_str()),
+        ("OK-ACCESS-TIMESTAMP", timestamp.as_str()),
+        ("OK-ACCESS-PASSPHRASE", passphrase),
+    ];
+    let value = http.get_json_with_headers(&format!("{base_url}{path}"), &headers)?;
+    if value["code"].as_str().unwrap_or("0") != "0" {
+        bail!(
+            "OKX 返回错误: {}",
+            value["msg"].as_str().unwrap_or("未知错误")
+        );
+    }
+
+    let mut positions = Vec::new();
+    if let Some(rows) = value["data"].as_array() {
+        for row in rows {
+            let Some(pos) = decimal(&row["pos"]) else {
+                continue;
+            };
+            let mark = decimal(&row["markPx"]).unwrap_or_default();
+            let notional = decimal(&row["notionalUsd"]).unwrap_or_default().abs();
+            // OKX 的 pos 单位是张数，用名义价值除以标记价格换算成币数量。
+            let quantity = if mark > Decimal::ZERO && notional > Decimal::ZERO {
+                notional / mark
+            } else {
+                pos.abs()
+            };
+            let is_long = match row["posSide"].as_str().unwrap_or("net") {
+                "long" => true,
+                "short" => false,
+                _ => pos > Decimal::ZERO,
+            };
+            positions.push(RawPosition {
+                symbol: normalized_symbol(row["instId"].as_str().unwrap_or_default()),
+                side: if is_long { Side::Buy } else { Side::Sell },
+                quantity,
+                entry_price: decimal(&row["avgPx"]).unwrap_or_default(),
+                mark_price: mark,
+                leverage: decimal(&row["lever"]).unwrap_or(Decimal::ONE),
+                unrealized_pnl: decimal(&row["upl"]).unwrap_or_default(),
+            });
+        }
+    }
+    Ok(positions)
+}
+
+fn positions_bybit(
+    http: &HttpClient,
+    base_url: &str,
+    credentials: &AccountCredentials,
+) -> anyhow::Result<Vec<RawPosition>> {
+    let base_url = base_url.trim_end_matches('/');
+    let timestamp = Utc::now().timestamp_millis().to_string();
+    let recv_window = "5000";
+    let query = "category=linear&settleCoin=USDT&limit=200";
+    let signature = hmac_sha256_hex(
+        &credentials.api_secret,
+        &format!("{timestamp}{}{recv_window}{query}", credentials.api_key),
+    )?;
+
+    let headers = [
+        ("X-BAPI-API-KEY", credentials.api_key.as_str()),
+        ("X-BAPI-TIMESTAMP", timestamp.as_str()),
+        ("X-BAPI-SIGN", signature.as_str()),
+        ("X-BAPI-RECV-WINDOW", recv_window),
+    ];
+    let value =
+        http.get_json_with_headers(&format!("{base_url}/v5/position/list?{query}"), &headers)?;
+    if value["retCode"].as_i64().unwrap_or(0) != 0 {
+        bail!(
+            "Bybit 返回错误: {}",
+            value["retMsg"].as_str().unwrap_or("未知错误")
+        );
+    }
+
+    let mut positions = Vec::new();
+    if let Some(rows) = value["result"]["list"].as_array() {
+        for row in rows {
+            let Some(size) = decimal(&row["size"]) else {
+                continue;
+            };
+            if size.is_zero() {
+                continue;
+            }
+            let side = match row["side"].as_str().unwrap_or_default() {
+                "Buy" => Side::Buy,
+                "Sell" => Side::Sell,
+                _ => {
+                    if size > Decimal::ZERO {
+                        Side::Buy
+                    } else {
+                        Side::Sell
+                    }
+                }
+            };
+            positions.push(RawPosition {
+                symbol: normalized_symbol(row["symbol"].as_str().unwrap_or_default()),
+                side,
+                quantity: size.abs(),
+                entry_price: decimal(&row["avgPrice"]).unwrap_or_default(),
+                mark_price: decimal(&row["markPrice"]).unwrap_or_default(),
+                leverage: decimal(&row["leverage"]).unwrap_or(Decimal::ONE),
+                unrealized_pnl: decimal(&row["unrealisedPnl"]).unwrap_or_default(),
+            });
+        }
+    }
+    Ok(positions)
+}
+
+fn positions_bitget(
+    http: &HttpClient,
+    base_url: &str,
+    credentials: &AccountCredentials,
+) -> anyhow::Result<Vec<RawPosition>> {
+    let base_url = base_url.trim_end_matches('/');
+    let path = "/api/v2/mix/position/allPosition?productType=USDT-FUTURES&marginCoin=USDT";
+    let timestamp = Utc::now().timestamp_millis().to_string();
+    let signature = hmac_sha256_base64(&credentials.api_secret, &format!("{timestamp}GET{path}"))?;
+    let passphrase = credentials
+        .passphrase
+        .as_deref()
+        .ok_or_else(|| anyhow!("Bitget 需要 Passphrase"))?;
+
+    let headers = [
+        ("ACCESS-KEY", credentials.api_key.as_str()),
+        ("ACCESS-SIGN", signature.as_str()),
+        ("ACCESS-TIMESTAMP", timestamp.as_str()),
+        ("ACCESS-PASSPHRASE", passphrase),
+        ("locale", "zh-CN"),
+    ];
+    let value = http.get_json_with_headers(&format!("{base_url}{path}"), &headers)?;
+    if value["code"].as_str().unwrap_or("00000") != "00000" {
+        bail!(
+            "Bitget 返回错误: {}",
+            value["msg"].as_str().unwrap_or("未知错误")
+        );
+    }
+
+    let mut positions = Vec::new();
+    if let Some(rows) = value["data"].as_array() {
+        for row in rows {
+            let Some(total) = decimal(&row["total"]) else {
+                continue;
+            };
+            if total.is_zero() {
+                continue;
+            }
+            positions.push(RawPosition {
+                symbol: normalized_symbol(row["symbol"].as_str().unwrap_or_default()),
+                side: if row["holdSide"].as_str() == Some("short") {
+                    Side::Sell
+                } else {
+                    Side::Buy
+                },
+                quantity: total.abs(),
+                entry_price: decimal(&row["openPriceAvg"]).unwrap_or_default(),
+                mark_price: decimal(&row["markPrice"]).unwrap_or_default(),
+                leverage: decimal(&row["leverage"]).unwrap_or(Decimal::ONE),
+                unrealized_pnl: decimal(&row["unrealizedPL"]).unwrap_or_default(),
+            });
+        }
+    }
+    Ok(positions)
+}
+
+fn positions_gate(
+    http: &HttpClient,
+    base_url: &str,
+    credentials: &AccountCredentials,
+) -> anyhow::Result<Vec<RawPosition>> {
+    let rows = gate_get(
+        http,
+        base_url.trim_end_matches('/'),
+        "/api/v4/futures/usdt/positions",
+        credentials,
+    )?;
+    let rows = rows.as_array().cloned().unwrap_or_default();
+
+    let mut positions = Vec::new();
+    for row in &rows {
+        let size = decimal(&row["size"]).unwrap_or_default();
+        if size.is_zero() {
+            continue;
+        }
+        let mark = decimal(&row["mark_price"]).unwrap_or_default();
+        // Gate 的持仓数量是张数，`value` 是名义价值，可直接换算成币数量。
+        let value = decimal(&row["value"]).unwrap_or_default().abs();
+        let quantity = if mark > Decimal::ZERO && value > Decimal::ZERO {
+            value / mark
+        } else {
+            size.abs()
+        };
+        let mode = row["mode"].as_str().unwrap_or_default();
+        let side = if mode.contains("short") {
+            Side::Sell
+        } else if mode.contains("long") || size > Decimal::ZERO {
+            Side::Buy
+        } else {
+            Side::Sell
+        };
+        // Gate 全仓模式的 `leverage` 恒为 0，实际杠杆上限在 `cross_leverage_limit`。
+        let leverage = decimal(&row["leverage"])
+            .filter(|value| *value > Decimal::ZERO)
+            .or_else(|| {
+                decimal(&row["cross_leverage_limit"]).filter(|value| *value > Decimal::ZERO)
+            })
+            .unwrap_or(Decimal::ONE);
+        positions.push(RawPosition {
+            symbol: normalized_symbol(row["contract"].as_str().unwrap_or_default()),
+            side,
+            quantity,
+            entry_price: decimal(&row["entry_price"]).unwrap_or_default(),
+            mark_price: mark,
+            leverage,
+            unrealized_pnl: decimal(&row["unrealised_pnl"]).unwrap_or_default(),
+        });
+    }
+    Ok(positions)
+}
+
+fn positions_htx(
+    http: &HttpClient,
+    base_url: &str,
+    credentials: &AccountCredentials,
+) -> anyhow::Result<Vec<RawPosition>> {
+    let value = htx_get(
+        http,
+        base_url,
+        "/linear-swap-api/v1/swap_cross_position_info",
+        &[],
+        credentials,
+    )?;
+    if value["status"].as_str() != Some("ok") {
+        bail!("HTX 返回错误: {}", htx_error(&value));
+    }
+
+    let mut positions = Vec::new();
+    if let Some(rows) = value["data"].as_array() {
+        for row in rows {
+            let volume = decimal(&row["volume"]).unwrap_or_default();
+            if volume.is_zero() {
+                continue;
+            }
+            let last = decimal(&row["last_price"]).unwrap_or_default();
+            let margin = decimal(&row["position_margin"]).unwrap_or_default();
+            let lever = decimal(&row["lever_rate"]).unwrap_or(Decimal::ONE);
+            // HTX 返回张数；保证金 × 杠杆即名义价值，再换算成币数量。
+            let quantity = if last > Decimal::ZERO && margin > Decimal::ZERO {
+                (margin * lever / last).abs()
+            } else {
+                volume.abs()
+            };
+            positions.push(RawPosition {
+                symbol: normalized_symbol(row["contract_code"].as_str().unwrap_or_default()),
+                side: if row["direction"].as_str() == Some("sell") {
+                    Side::Sell
+                } else {
+                    Side::Buy
+                },
+                quantity,
+                entry_price: decimal(&row["cost_open"]).unwrap_or_default(),
+                mark_price: last,
+                leverage: lever,
+                unrealized_pnl: decimal(&row["profit_unreal"]).unwrap_or_default(),
+            });
+        }
+    }
+    Ok(positions)
+}
+
+fn positions_mexc(
+    http: &HttpClient,
+    base_url: &str,
+    credentials: &AccountCredentials,
+) -> anyhow::Result<Vec<RawPosition>> {
+    let value = mexc_get(
+        http,
+        base_url.trim_end_matches('/'),
+        "/api/v1/private/position/open_positions",
+        "",
+        credentials,
+    )?;
+    if value["success"].as_bool() != Some(true) {
+        bail!(
+            "MEXC 返回错误: {}",
+            value["message"].as_str().unwrap_or("未知错误")
+        );
+    }
+
+    let mut positions = Vec::new();
+    if let Some(rows) = value["data"].as_array() {
+        for row in rows {
+            if row["state"].as_i64().unwrap_or(1) != 1 {
+                continue;
+            }
+            let hold_vol = decimal(&row["holdVol"]).unwrap_or_default();
+            if hold_vol.is_zero() {
+                continue;
+            }
+            let price = decimal(&row["holdAvgPrice"])
+                .or_else(|| decimal(&row["openAvgPrice"]))
+                .unwrap_or_default();
+            let margin = decimal(&row["im"]).unwrap_or_default();
+            let lever = decimal(&row["leverage"]).unwrap_or(Decimal::ONE);
+            // holdVol 是张数，im × 杠杆得到名义价值，再换算成币数量。
+            let quantity = if price > Decimal::ZERO && margin > Decimal::ZERO {
+                (margin * lever / price).abs()
+            } else {
+                hold_vol.abs()
+            };
+            positions.push(RawPosition {
+                symbol: normalized_symbol(row["symbol"].as_str().unwrap_or_default()),
+                side: if row["positionType"].as_i64() == Some(2) {
+                    Side::Sell
+                } else {
+                    Side::Buy
+                },
+                quantity,
+                entry_price: price,
+                mark_price: price,
+                leverage: lever,
+                unrealized_pnl: Decimal::ZERO,
+            });
+        }
+    }
+    Ok(positions)
+}
+
+fn positions_bingx(
+    http: &HttpClient,
+    base_url: &str,
+    credentials: &AccountCredentials,
+) -> anyhow::Result<Vec<RawPosition>> {
+    let base_url = base_url.trim_end_matches('/');
+    let path = "/openApi/swap/v2/user/positions";
+    let timestamp = Utc::now().timestamp_millis();
+    let params = format!("timestamp={timestamp}");
+    let signature = hmac_sha256_hex(&credentials.api_secret, &params)?;
+    let value = http.get_json_with_headers(
+        &format!("{base_url}{path}?{params}&signature={signature}"),
+        &[("X-BX-APIKEY", credentials.api_key.as_str())],
+    )?;
+    if value["code"].as_i64().unwrap_or(-1) != 0 {
+        bail!(
+            "BingX 返回错误: {}",
+            value["msg"].as_str().unwrap_or("未知错误")
+        );
+    }
+
+    let mut positions = Vec::new();
+    if let Some(rows) = value["data"].as_array() {
+        for row in rows {
+            let Some(amount) = decimal(&row["positionAmt"]) else {
+                continue;
+            };
+            if amount.is_zero() {
+                continue;
+            }
+            let side = match row["positionSide"].as_str().unwrap_or_default() {
+                "LONG" => Side::Buy,
+                "SHORT" => Side::Sell,
+                _ => {
+                    if amount > Decimal::ZERO {
+                        Side::Buy
+                    } else {
+                        Side::Sell
+                    }
+                }
+            };
+            positions.push(RawPosition {
+                symbol: normalized_symbol(row["symbol"].as_str().unwrap_or_default()),
+                side,
+                quantity: amount.abs(),
+                entry_price: decimal(&row["avgPrice"]).unwrap_or_default(),
+                mark_price: decimal(&row["markPrice"]).unwrap_or_default(),
+                leverage: decimal(&row["leverage"]).unwrap_or(Decimal::ONE),
+                unrealized_pnl: decimal(&row["unrealizedProfit"]).unwrap_or_default(),
+            });
+        }
+    }
+    Ok(positions)
+}
+
+fn positions_hyperliquid(
+    http: &HttpClient,
+    base_url: &str,
+    credentials: &AccountCredentials,
+) -> anyhow::Result<Vec<RawPosition>> {
+    let address = credentials
+        .wallet_address
+        .as_deref()
+        .ok_or_else(|| anyhow!("Hyperliquid 需要钱包地址"))?;
+    let value = http.post_json(
+        &format!("{}/info", base_url.trim_end_matches('/')),
+        &json!({ "type": "clearinghouseState", "user": address }),
+    )?;
+
+    let mut positions = Vec::new();
+    if let Some(rows) = value["assetPositions"].as_array() {
+        for row in rows {
+            let position = &row["position"];
+            let Some(size) = decimal(&position["szi"]) else {
+                continue;
+            };
+            if size.is_zero() {
+                continue;
+            }
+            let entry = decimal(&position["entryPx"]).unwrap_or_default();
+            let notional = decimal(&position["positionValue"])
+                .unwrap_or_default()
+                .abs();
+            let quantity = size.abs();
+            let mark = if notional > Decimal::ZERO {
+                notional / quantity
+            } else {
+                entry
+            };
+            positions.push(RawPosition {
+                symbol: normalized_symbol(position["coin"].as_str().unwrap_or_default()),
+                side: if size > Decimal::ZERO {
+                    Side::Buy
+                } else {
+                    Side::Sell
+                },
+                quantity,
+                entry_price: entry,
+                mark_price: mark,
+                leverage: decimal(&position["leverage"]["value"]).unwrap_or(Decimal::ONE),
+                unrealized_pnl: decimal(&position["unrealizedPnl"]).unwrap_or_default(),
+            });
+        }
+    }
+    Ok(positions)
+}
+
+fn positions_lighter(
+    http: &HttpClient,
+    base_url: &str,
+    credentials: &AccountCredentials,
+) -> anyhow::Result<Vec<RawPosition>> {
+    let base_url = base_url.trim_end_matches('/');
+    let target = credentials
+        .wallet_address
+        .as_deref()
+        .ok_or_else(|| anyhow!("Lighter 需要钱包地址或账户索引"))?;
+    let by = if target.chars().all(|ch| ch.is_ascii_digit()) {
+        "index"
+    } else {
+        "l1_address"
+    };
+    let value = http.get_json(&format!("{base_url}/api/v1/account?by={by}&value={target}"))?;
+    if value["code"].as_i64().unwrap_or(0) != 200 {
+        bail!("Lighter 返回错误: {}", value["code"]);
+    }
+
+    let mut positions = Vec::new();
+    if let Some(accounts) = value["accounts"].as_array() {
+        for account in accounts {
+            let Some(rows) = account["positions"].as_array() else {
+                continue;
+            };
+            for row in rows {
+                let Some(size) = decimal(&row["position"]) else {
+                    continue;
+                };
+                if size.is_zero() {
+                    continue;
+                }
+                let sign =
+                    row["sign"]
+                        .as_i64()
+                        .unwrap_or_else(|| if size < Decimal::ZERO { -1 } else { 1 });
+                let quantity = size.abs();
+                let position_value = decimal(&row["position_value"]).unwrap_or_default().abs();
+                let entry = decimal(&row["avg_entry_price"]).unwrap_or_default();
+                let mark = if position_value > Decimal::ZERO {
+                    position_value / quantity
+                } else {
+                    entry
+                };
+                let leverage = decimal(&row["initial_margin_fraction"])
+                    .filter(|value| *value > Decimal::ZERO)
+                    .map(|value| Decimal::from(10_000) / value)
+                    .unwrap_or(Decimal::ONE);
+                positions.push(RawPosition {
+                    symbol: normalized_symbol(row["symbol"].as_str().unwrap_or_default()),
+                    side: if sign < 0 { Side::Sell } else { Side::Buy },
+                    quantity,
+                    entry_price: entry,
+                    mark_price: mark,
+                    leverage,
+                    unrealized_pnl: decimal(&row["unrealized_pnl"]).unwrap_or_default(),
+                });
+            }
+        }
+    }
+    Ok(positions)
+}
+
 fn gate_get(
     http: &HttpClient,
     base_url: &str,
@@ -1295,9 +2034,11 @@ fn gate_get(
     credentials: &AccountCredentials,
 ) -> anyhow::Result<Value> {
     let timestamp = Utc::now().timestamp().to_string();
-    let hashed_payload = hex::encode(Sha256::digest(b""));
-    let sign_string = format!("GET\n{path}\n\n{hashed_payload}\n{timestamp}");
-    let signature = hmac_sha256_hex(&credentials.api_secret, &sign_string)?;
+    // Gate v4 要求：查询串与路径分开，body 哈希与 HMAC 均为 SHA-512。
+    let (url_path, query) = path.split_once('?').unwrap_or((path, ""));
+    let hashed_payload = hex::encode(Sha512::digest(b""));
+    let sign_string = format!("GET\n{url_path}\n{query}\n{hashed_payload}\n{timestamp}");
+    let signature = hmac_sha512_hex(&credentials.api_secret, &sign_string)?;
     let headers = [
         ("KEY", credentials.api_key.as_str()),
         ("SIGN", signature.as_str()),
@@ -1409,6 +2150,13 @@ fn decimal(value: &Value) -> Option<Decimal> {
 
 fn hmac_sha256_hex(secret: &str, payload: &str) -> anyhow::Result<String> {
     let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
+        .context("初始化 HMAC 失败（密钥长度非法）")?;
+    mac.update(payload.as_bytes());
+    Ok(hex::encode(mac.finalize().into_bytes()))
+}
+
+fn hmac_sha512_hex(secret: &str, payload: &str) -> anyhow::Result<String> {
+    let mut mac = Hmac::<Sha512>::new_from_slice(secret.as_bytes())
         .context("初始化 HMAC 失败（密钥长度非法）")?;
     mac.update(payload.as_bytes());
     Ok(hex::encode(mac.finalize().into_bytes()))

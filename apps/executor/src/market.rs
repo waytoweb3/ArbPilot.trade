@@ -39,6 +39,8 @@ pub const BYBIT_SPOT_VENUE: &str = "bybit-spot";
 const LEG_FEE_BPS: i64 = 4;
 /// 双腿滑点估算（bps）。
 const SLIPPAGE_BPS: i64 = 1;
+/// 仓位实时定价允许的 WebSocket 快照最大年龄；超过视为断线，回退交易所标记价。
+const REALTIME_PRICE_MAX_AGE_SECS: i64 = 30;
 /// 交割合约清单的刷新间隔：合约按季度挂牌，无需每轮行情都重新拉取。
 const DELIVERY_REFRESH_SECS: i64 = 3_600;
 /// 跨所比较以 `funding_annualized_pct`（年化）为准；bps 字段仍按 8 小时一期展示，
@@ -387,12 +389,59 @@ impl MarketFeed {
     }
 
     pub fn quote(&self, venue: &str, symbol: &str) -> Option<Quote> {
-        self.state
+        if let Some(quote) = self
+            .state
             .read()
             .expect("行情锁不可用")
             .books
             .get(&(venue.to_string(), symbol.to_string()))
             .map(|book| book.quote.clone())
+        {
+            return Some(quote);
+        }
+        // 扫描清单之外的交易对（例如账户同步回来的持仓）只订阅了 WebSocket，
+        // 这里用推送盘口兜底，否则平仓会误报“没有可用行情”。
+        let update = self.realtime.as_ref()?.book(venue, symbol)?;
+        let age_ms = Utc::now()
+            .signed_duration_since(update.observed_at)
+            .num_milliseconds();
+        if age_ms < 0 || age_ms > REALTIME_PRICE_MAX_AGE_SECS * 1_000 {
+            return None;
+        }
+        let (bid, ask) = (update.snapshot.bid, update.snapshot.ask);
+        if bid <= Decimal::ZERO || ask <= Decimal::ZERO {
+            return None;
+        }
+        Some(Quote {
+            venue: venue.to_string(),
+            symbol: symbol.to_string(),
+            bid,
+            ask,
+            observed_at: update.observed_at,
+        })
+    }
+
+    /// 读取 WebSocket 推送的最新盘口中间价，不受 REST 轮询节奏影响。
+    ///
+    /// 仓位与浮动盈亏用它实时定价；推送过期（断线）时返回 `None`，由调用方
+    /// 保留交易所返回的标记价。
+    pub fn realtime_price(&self, venue: &str, symbol: &str) -> Option<Decimal> {
+        let update = self.realtime.as_ref()?.book(venue, symbol)?;
+        let age_ms = Utc::now()
+            .signed_duration_since(update.observed_at)
+            .num_milliseconds();
+        if age_ms < 0 || age_ms > REALTIME_PRICE_MAX_AGE_SECS * 1_000 {
+            return None;
+        }
+        let mid = (update.snapshot.bid + update.snapshot.ask) / Decimal::from(2);
+        (mid > Decimal::ZERO).then_some(mid)
+    }
+
+    /// 把持仓涉及的交易对加入 WebSocket 订阅，价格变化即可实时反映到仓位。
+    pub fn watch_position_symbols(&self, venue: &str, symbols: &[String]) {
+        if let Some(feed) = &self.realtime {
+            feed.book_symbols().extend_venue(venue, symbols.to_vec());
+        }
     }
 
     /// K 线，供桌面端图表与策略指标使用。

@@ -34,10 +34,12 @@ fn private_key_bytes(raw: &str) -> anyhow::Result<[u8; 32]> {
     Ok(key)
 }
 
-/// 导入时校验签名私钥格式：Hyperliquid 为 32 字节，Lighter 的 API Key 为 40 字节。
+/// 导入时校验签名私钥格式：Hyperliquid 为 32 字节，Lighter 的 API Key 为 40 字节，
+/// Aster 的 API 钱包私钥为 32 字节。
 pub fn validate_signer_key(venue: &str, key: &str) -> anyhow::Result<()> {
     match venue {
         "hyperliquid" => private_key_bytes(key).map(|_| ()),
+        "aster" => crate::exchange::aster::AsterWallet::from_private_key(key).map(|_| ()),
         "lighter" => KeyManager::from_hex(key)
             .map(|_| ())
             .map_err(|error| anyhow!("Lighter 私钥不合法: {error}")),

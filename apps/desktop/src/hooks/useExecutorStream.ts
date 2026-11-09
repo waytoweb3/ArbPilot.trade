@@ -2,6 +2,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useEffect } from "react";
 
 import { api } from "../lib/api";
+import type { Position } from "../lib/types";
 import { useExecutorStore } from "../state/executor";
 
 /** 订阅执行器 WebSocket 事件；断线时自动重连（指数退避上限 10s）。 */
@@ -42,6 +43,7 @@ export function useExecutorStream() {
             title?: string;
             message?: string;
             at?: string;
+            positions?: Position[];
           };
           const type = payload.type ?? "unknown";
           pushEvent(type);
@@ -56,6 +58,10 @@ export function useExecutorStream() {
           if (type === "order_updated") {
             queryClient.invalidateQueries({ queryKey: ["orders"] });
             queryClient.invalidateQueries({ queryKey: ["positions"] });
+          }
+          // 仓位价格来自执行器的 WebSocket 行情推送，直接写入缓存即可即时刷新。
+          if (type === "positions_updated" && payload.positions) {
+            queryClient.setQueryData(["positions"], payload.positions);
           }
           if (type === "executor_status") {
             queryClient.invalidateQueries({ queryKey: ["health"] });

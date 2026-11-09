@@ -25,6 +25,15 @@ function formatAnnualized(value: number): string {
   return `${value > 0 ? "+" : ""}${value.toFixed(2)}%`;
 }
 
+/** 结算间隔展示：28800 秒 → 8h，3600 秒 → 1h。 */
+function formatInterval(seconds: number): string {
+  const hours = seconds / 3_600;
+  if (hours < 1) {
+    return `${Math.max(1, Math.round(seconds / 60))}m`;
+  }
+  return `${Number.isInteger(hours) ? hours : hours.toFixed(1)}h`;
+}
+
 function formatCountdown(target: number, now: number): string {
   const minutes = Math.ceil((target - now) / 60_000);
   if (minutes <= 0) return "—";
@@ -35,7 +44,13 @@ function formatCountdown(target: number, now: number): string {
 
 type Flash = "up" | "down";
 
-type Cell = { rate: number | null; annualized: number | null; next: number | null };
+type Cell = {
+  rate: number | null;
+  annualized: number | null;
+  next: number | null;
+  /** 该交易所这个合约的实际结算间隔（秒）。 */
+  interval: number;
+};
 
 type Row = {
   symbol: string;
@@ -156,6 +171,7 @@ export default function FundingPage() {
           rate,
           annualized,
           next: next !== null && Number.isFinite(next) ? next : null,
+          interval: item.funding_interval_secs,
         };
         if (annualized !== null) {
           row.maxAnnualized =
@@ -314,7 +330,7 @@ export default function FundingPage() {
                               ? formatAnnualized(cell.annualized)
                               : undefined
                           }
-                          className={`px-3 py-2.5 text-right font-mono text-[11.5px] ${
+                          className={`px-3 py-2.5 text-right align-top font-mono text-[11.5px] ${
                             rate === null
                               ? "text-subtle"
                               : rate > 0
@@ -324,14 +340,35 @@ export default function FundingPage() {
                                   : "text-body"
                           } ${flash === "up" ? "funding-flash-up" : flash === "down" ? "funding-flash-down" : ""}`}
                         >
-                          {rate === null ? "—" : formatRate(rate)}
+                          <div>{rate === null ? "—" : formatRate(rate)}</div>
+                          {cell && (
+                            <div className="mt-0.5 text-[10px] font-normal text-subtle">
+                              {formatInterval(cell.interval)}
+                            </div>
+                          )}
                         </td>
                       );
                     })}
                     <td className="px-3 py-2.5 text-right font-mono text-[11.5px] text-body">
                       {row.maxAnnualized === null ? "—" : formatAnnualized(row.maxAnnualized)}
                     </td>
-                    <td className="px-4 py-2.5 text-right font-mono text-[11px] text-muted">
+                    <td
+                      className="px-4 py-2.5 text-right font-mono text-[11px] text-muted"
+                      title={
+                        activeVenues
+                          .map((venue) => {
+                            const next = row.cells[venue.venue]?.next;
+                            return next
+                              ? `${venue.venue} ${new Date(next).toLocaleString(
+                                  locale === "zh" ? "zh-CN" : "en-US",
+                                  { hour12: false },
+                                )}`
+                              : null;
+                          })
+                          .filter((label): label is string => label !== null)
+                          .join(" · ") || undefined
+                      }
+                    >
                       {row.next === null || updatedAt === null
                         ? "—"
                         : formatCountdown(row.next, updatedAt)}

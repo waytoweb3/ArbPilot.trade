@@ -579,13 +579,15 @@ export default function FundingPage() {
                               <span className="text-[11px] text-subtle">/{row.quote}</span>
                             </div>
                             <div className="mt-0.5 flex items-center gap-1.5 font-mono text-[10px] text-subtle">
-                              <span>{formatInterval(row.intervalSecs)}</span>
-                              <span>·</span>
                               <span
                                 title={
-                                  row.nextAt === null
-                                    ? undefined
-                                    : formatDateTime(new Date(row.nextAt).toISOString())
+                                  [...row.byVenue.entries()]
+                                    .filter(([, entry]) => entry.next_funding_at !== null)
+                                    .map(
+                                      ([venue, entry]) =>
+                                        `${venue} ${formatDateTime(entry.next_funding_at)}`,
+                                    )
+                                    .join(" · ") || undefined
                                 }
                               >
                                 {formatCountdown(row.nextAt, now)}
@@ -603,6 +605,8 @@ export default function FundingPage() {
                         const value = rateFor(row, venue);
                         const entry = row.byVenue.get(venue);
                         const flash = flashes.get(`${venue}:${row.symbol}`);
+                        // 各交易所结算间隔不同，单元格只用它自己的间隔折算年化。
+                        const intervalSecs = entry?.funding_interval_secs ?? row.intervalSecs;
                         const predicted =
                           period === "current" &&
                           entry !== undefined &&
@@ -629,20 +633,26 @@ export default function FundingPage() {
                                     "font-mono text-[13px] font-medium",
                                     value.rate >= 0 ? "text-accent" : "text-danger",
                                   )}
-                                  title={
+                                  title={[
+                                    fmt(t.funding.settleInterval, {
+                                      value: formatInterval(intervalSecs),
+                                    }),
                                     period === "current"
-                                      ? [
-                                          predicted ? t.funding.predicted : t.funding.settledTag,
-                                          flash === "up"
-                                            ? t.funding.flashUp
-                                            : flash === "down"
-                                              ? t.funding.flashDown
-                                              : null,
-                                        ]
-                                          .filter(Boolean)
-                                          .join(" · ")
-                                      : undefined
-                                  }
+                                      ? predicted
+                                        ? t.funding.predicted
+                                        : t.funding.settledTag
+                                      : null,
+                                    entry?.next_funding_at
+                                      ? `${t.funding.nextFunding} ${formatDateTime(entry.next_funding_at)}`
+                                      : null,
+                                    flash === "up"
+                                      ? t.funding.flashUp
+                                      : flash === "down"
+                                        ? t.funding.flashDown
+                                        : null,
+                                  ]
+                                    .filter(Boolean)
+                                    .join(" · ")}
                                 >
                                   {formatFundingRate(value.rate)}
                                   {predicted && (
@@ -657,12 +667,11 @@ export default function FundingPage() {
                                   )}
                                 </div>
                                 <div className="mt-0.5 font-mono text-[10px] text-subtle">
+                                  <span>{formatInterval(intervalSecs)}</span>
+                                  <span className="mx-1">·</span>
                                   {period === "current"
                                     ? fmt(t.funding.annualizedShort, {
-                                        value: formatAnnualizedFunding(
-                                          value.rate,
-                                          entry?.funding_interval_secs ?? row.intervalSecs,
-                                        ),
+                                        value: formatAnnualizedFunding(value.rate, intervalSecs),
                                       })
                                     : fmt(t.funding.settlements, { count: value.count })}
                                 </div>

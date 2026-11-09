@@ -625,6 +625,14 @@ export const api = {
       [422],
     ),
 
+  /** 一键平仓：按最新盘口反向提交只减仓市价单。 */
+  closePosition: (id: string) =>
+    request<CreateOrderResponse>(
+      `/api/v1/positions/${encodeURIComponent(id)}/close`,
+      { method: "POST" },
+      [422],
+    ),
+
   eventsUrl: () => {
     const params = new URLSearchParams({ token: getApiToken() });
     // 与 request 保持一致：内置执行器不需要用户授权令牌。

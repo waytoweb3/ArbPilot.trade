@@ -1,6 +1,10 @@
+import { useState } from "react";
+
 import { Badge } from "../components/ui/badge";
+import { Button } from "../components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "../components/ui/card";
-import { useOrders, usePositions } from "../hooks/useApi";
+import { ConfirmDialog } from "../components/ui/confirm-dialog";
+import { useClosePosition, useOrders, usePositions } from "../hooks/useApi";
 import { toNumber } from "../lib/api";
 import {
   formatNumber,
@@ -10,16 +14,36 @@ import {
   orderStatusTone,
 } from "../lib/format";
 import { fmt, useI18n } from "../lib/i18n";
+import type { Decimal, Position } from "../lib/types";
 
 export default function PositionsPage() {
   const positions = usePositions();
   const orders = useOrders();
+  const closePosition = useClosePosition();
   const { t } = useI18n();
+  /** 待确认平仓的仓位；不为空时展示确认弹窗。 */
+  const [closing, setClosing] = useState<Position | null>(null);
 
   const totalNotional = (positions.data ?? []).reduce(
     (sum, position) => sum + toNumber(position.quantity) * toNumber(position.mark_price),
     0,
   );
+  const totalPnl = (positions.data ?? []).reduce(
+    (sum, position) => sum + toNumber(position.unrealized_pnl),
+    0,
+  );
+  const closeError = closePosition.error
+    ? closePosition.error instanceof Error
+      ? closePosition.error.message
+      : String(closePosition.error)
+    : null;
+
+  const confirmClose = () => {
+    if (!closing) {
+      return;
+    }
+    closePosition.mutate(closing.id, { onSuccess: () => setClosing(null) });
+  };
 
   return (
     <div className="space-y-6">
@@ -36,6 +60,7 @@ export default function PositionsPage() {
               {fmt(t.positions.summary, {
                 count: positions.data?.length ?? 0,
                 value: formatUsd(totalNotional),
+                pnl: formatSignedPnl(totalPnl),
               })}
             </CardDescription>
           </div>
@@ -45,7 +70,7 @@ export default function PositionsPage() {
             <EmptyState text={t.positions.empty} />
           ) : (
             <div className="overflow-x-auto">
-              <table className="w-full min-w-[820px] border-collapse text-sm">
+              <table className="w-full min-w-[900px] border-collapse text-sm">
                 <thead>
                   <tr className="text-left text-[11px] tracking-wide text-muted uppercase">
                     <th className="px-4 py-2 font-medium">{t.positions.venue}</th>
@@ -56,6 +81,8 @@ export default function PositionsPage() {
                     <th className="px-4 py-2 text-right font-medium">{t.positions.mark}</th>
                     <th className="px-4 py-2 text-right font-medium">{t.positions.leverage}</th>
                     <th className="px-4 py-2 text-right font-medium">{t.positions.notional}</th>
+                    <th className="px-4 py-2 text-right font-medium">{t.positions.pnl}</th>
+                    <th className="px-4 py-2 text-right font-medium">{t.positions.action}</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -82,6 +109,24 @@ export default function PositionsPage() {
                       </td>
                       <td className="px-4 py-2.5 text-right font-mono text-xs text-body">
                         {formatUsd(toNumber(position.quantity) * toNumber(position.mark_price))}
+                      </td>
+                      <td
+                        className={`px-4 py-2.5 text-right font-mono text-xs ${pnlTone(position.unrealized_pnl)}`}
+                      >
+                        {formatSignedPnl(position.unrealized_pnl)}
+                      </td>
+                      <td className="px-4 py-2.5 text-right">
+                        <Button
+                          size="sm"
+                          variant="secondary"
+                          disabled={closePosition.isPending}
+                          onClick={() => {
+                            closePosition.reset();
+                            setClosing(position);
+                          }}
+                        >
+                          {t.positions.close}
+                        </Button>
                       </td>
                     </tr>
                   ))}
@@ -158,10 +203,47 @@ export default function PositionsPage() {
           )}
         </CardContent>
       </Card>
+
+      <ConfirmDialog
+        open={closing !== null}
+        title={t.positions.closeTitle}
+        message={
+          closing
+            ? fmt(t.positions.closeMessage, {
+                venue: closing.venue,
+                symbol: closing.symbol,
+                quantity: formatNumber(closing.quantity, 6),
+              })
+            : ""
+        }
+        confirmLabel={t.positions.closeConfirm}
+        cancelLabel={t.positions.closeCancel}
+        pending={closePosition.isPending}
+        error={closeError}
+        onConfirm={confirmClose}
+        onCancel={() => {
+          closePosition.reset();
+          setClosing(null);
+        }}
+      />
     </div>
   );
 }
 
 function EmptyState({ text }: { text: string }) {
   return <p className="px-4 py-10 text-center text-sm text-muted">{text}</p>;
+}
+
+// 浮动盈亏：盈利显示正号并用强调色，亏损显示负号并用危险色。
+function formatSignedPnl(value: Decimal): string {
+  const amount = toNumber(value);
+  const sign = amount > 0 ? "+" : amount < 0 ? "-" : "";
+  return `${sign}${formatUsd(Math.abs(amount))}`;
+}
+
+function pnlTone(value: Decimal): string {
+  const amount = toNumber(value);
+  if (amount > 0) return "text-accent";
+  if (amount < 0) return "text-danger";
+  return "text-muted";
 }

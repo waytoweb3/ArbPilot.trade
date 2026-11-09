@@ -147,6 +147,7 @@ const zh = {
     passphraseHint: "OKX 与 Bitget 需要填写创建 Key 时设置的 Passphrase",
     walletAddress: "钱包地址",
     lighterAddress: "L1 地址或账户索引",
+    asterAddress: "主账户钱包地址",
     walletHint: "钱包地址用于查询余额，签名私钥用于本机签名下单，两者都必须填写。",
     signerKey: "签名私钥",
     signerKeyPlaceholder: "0x…",
@@ -154,8 +155,10 @@ const zh = {
       "Hyperliquid 填 API Wallet（Agent）私钥：只能签名下单、不能提现。",
     signerKeyLighterHint:
       "Lighter 填 API Key 私钥（80 位十六进制）：只能签名下单、可随时在 Lighter 撤销。",
+    signerKeyAsterHint:
+      "Aster 填 API 钱包私钥（64 位十六进制）：需先在 Aster 的 API Wallet 页面授权，只能签名下单、不能提现。",
     signerKeyInvalid:
-      "私钥格式不正确：Hyperliquid 为 64 位十六进制，Lighter 为 80 位十六进制。",
+      "私钥格式不正确：Hyperliquid 与 Aster 为 64 位十六进制，Lighter 为 80 位十六进制。",
     signerSecurity:
       "私钥只写入本机执行器，请勿填写主钱包私钥或助记词；一旦泄露，资产可能被立即转走。建议使用交易所生成的 Agent / API 专用私钥，并可随时撤销。",
     lighterKeyIndex: "API Key 序号",
@@ -169,6 +172,7 @@ const zh = {
     cancel: "取消",
     remove: "移除",
     removeConfirm: "移除后将停止采集该账户，并删除它的历史权益记录。确定继续？",
+    removeFailed: "移除失败：{message}",
     refresh: "刷新",
     refreshFailed: "刷新失败：{message}",
     importFailed: "导入失败：{message}",
@@ -262,7 +266,7 @@ const zh = {
     title: "仓位与订单",
     subtitle: "订阅过期或执行器暂停时，查看仓位与撤单能力始终保留。",
     current: "当前仓位",
-    summary: "{count} 条 · 名义价值合计 {value}",
+    summary: "{count} 条 · 名义价值合计 {value} · 浮动盈亏 {pnl}",
     empty: "暂无仓位。开仓成交后会出现在这里。",
     venue: "交易所",
     symbol: "交易对",
@@ -272,6 +276,13 @@ const zh = {
     mark: "标记价",
     leverage: "杠杆",
     notional: "名义价值",
+    pnl: "浮动盈亏",
+    action: "操作",
+    close: "平仓",
+    closeTitle: "确认平仓",
+    closeMessage: "将按市价反向平掉 {venue} {symbol} 的 {quantity} 仓位，成交后不可撤销。",
+    closeConfirm: "确认平仓",
+    closeCancel: "取消",
     history: "订单历史",
     historyDesc: "包含风控拒绝与补偿中的订单",
     ordersEmpty: "暂无订单记录。",
@@ -1141,6 +1152,7 @@ const en: typeof zh = {
     passphraseHint: "OKX and Bitget require the passphrase set when creating the key",
     walletAddress: "Wallet address",
     lighterAddress: "L1 address or account index",
+    asterAddress: "Master account wallet address",
     walletHint:
       "The wallet address is used for balance queries and the signing key signs orders locally. Both are required.",
     signerKey: "Signing key",
@@ -1149,8 +1161,10 @@ const en: typeof zh = {
       "Hyperliquid: paste the API Wallet (agent) private key. It can sign orders but cannot withdraw.",
     signerKeyLighterHint:
       "Lighter: paste the API key private key (80 hex chars). It can sign orders and can be revoked in Lighter at any time.",
+    signerKeyAsterHint:
+      "Aster: paste the API wallet private key (64 hex chars). Authorize it on the API Wallet page first; it can sign orders but cannot withdraw.",
     signerKeyInvalid:
-      "Invalid key format: 64 hex chars for Hyperliquid, 80 hex chars for Lighter.",
+      "Invalid key format: 64 hex chars for Hyperliquid and Aster, 80 hex chars for Lighter.",
     signerSecurity:
       "The key is written only to the local executor. Never paste your main wallet private key or seed phrase — a leaked key can drain funds instantly. Use an exchange-generated agent/API key instead, and revoke it when you no longer need it.",
     lighterKeyIndex: "API key index",
@@ -1165,6 +1179,7 @@ const en: typeof zh = {
     remove: "Remove",
     removeConfirm:
       "Removing stops collection and deletes this account's saved equity history. Continue?",
+    removeFailed: "Remove failed: {message}",
     refresh: "Refresh",
     refreshFailed: "Refresh failed: {message}",
     importFailed: "Import failed: {message}",
@@ -1263,7 +1278,7 @@ const en: typeof zh = {
     subtitle:
       "Viewing positions and cancelling orders stay available even when a subscription expires or the executor is paused.",
     current: "Open positions",
-    summary: "{count} items · total notional {value}",
+    summary: "{count} items · total notional {value} · unrealized PnL {pnl}",
     empty: "No positions yet. Filled entries will appear here.",
     venue: "Venue",
     symbol: "Symbol",
@@ -1273,6 +1288,14 @@ const en: typeof zh = {
     mark: "Mark",
     leverage: "Leverage",
     notional: "Notional",
+    pnl: "Unrealized PnL",
+    action: "Action",
+    close: "Close",
+    closeTitle: "Close position",
+    closeMessage:
+      "Close the entire {venue} {symbol} position of {quantity} at market? This cannot be undone once filled.",
+    closeConfirm: "Close position",
+    closeCancel: "Cancel",
     history: "Order history",
     historyDesc: "Includes risk-rejected and unwinding orders",
     ordersEmpty: "No order history yet.",
