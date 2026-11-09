@@ -2,6 +2,7 @@ import {
   ColorType,
   createChart,
   createSeriesMarkers,
+  HistogramSeries,
   LineSeries,
   LineStyle,
   type LineData,
@@ -15,14 +16,38 @@ import type { FundingRate } from "../lib/types";
 
 interface FundingChartProps {
   rates: FundingRate[];
+  /** 对比腿的费率曲线，用于双腿套利页面。 */
+  compare?: FundingRate[];
+  /** 净费率柱状数据，`value` 已是百分数。 */
+  net?: { time: number; value: number }[];
+  /** 图表高度，默认 240px。 */
+  heightClass?: string;
   /** 当前高亮的数据点时间（Unix 秒）。 */
   selectedTime?: number | null;
   /** 点击数据点时回调对应时间；点空白处回调 `null`。 */
   onSelectTime?: (time: number | null) => void;
 }
 
+/** 同一时间戳只保留最后一个点，避免 lightweight-charts 因时间乱序报错。 */
+function toLineData(rates: FundingRate[]): LineData<UTCTimestamp>[] {
+  const byTime = new Map<number, number>();
+  for (const rate of rates) {
+    byTime.set(Math.floor(new Date(rate.funding_time).getTime() / 1000), toNumber(rate.funding_rate) * 100);
+  }
+  return [...byTime.entries()]
+    .sort((left, right) => left[0] - right[0])
+    .map(([time, value]) => ({ time: time as UTCTimestamp, value }));
+}
+
 /** 资金费率走势折线（通常按日聚合），负值表示空头向多头收取。 */
-export function FundingChart({ rates, selectedTime, onSelectTime }: FundingChartProps) {
+export function FundingChart({
+  rates,
+  compare,
+  net,
+  heightClass = "h-[240px] w-full",
+  selectedTime,
+  onSelectTime,
+}: FundingChartProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const { resolved } = useTheme();
 
@@ -37,6 +62,9 @@ export function FundingChart({ rates, selectedTime, onSelectTime }: FundingChart
     const grid = dark ? "rgba(39, 54, 74, 0.45)" : "rgba(203, 213, 225, 0.55)";
     const border = dark ? "#1b2532" : "#e2e8f0";
     const accent = dark ? "#60a5fa" : "#2563eb";
+    const compareColor = dark ? "#fbbf24" : "#d97706";
+    const netUp = dark ? "#34d399" : "#059669";
+    const netDown = dark ? "#fb7185" : "#e11d48";
 
     const chart = createChart(container, {
       autoSize: true,
@@ -53,24 +81,50 @@ export function FundingChart({ rates, selectedTime, onSelectTime }: FundingChart
       timeScale: { borderColor: border, timeVisible: false, secondsVisible: false },
     });
 
+    const priceFormat = { type: "price" as const, precision: 4, minMove: 0.0001 };
+
+    // 柱状放在底层，折线压在上面，避免遮挡。
+    if (net && net.length > 0) {
+      const histogram = chart.addSeries(HistogramSeries, {
+        priceFormat,
+        priceLineVisible: false,
+        lastValueVisible: false,
+        base: 0,
+      });
+      histogram.setData(
+        [...net]
+          .sort((left, right) => left.time - right.time)
+          .map((point) => ({
+            time: point.time as UTCTimestamp,
+            value: point.value,
+            color: point.value >= 0 ? netUp : netDown,
+          })),
+      );
+    }
+
     const series = chart.addSeries(LineSeries, {
       color: accent,
       lineWidth: 2,
-      priceFormat: { type: "price", precision: 4, minMove: 0.0001 },
+      priceFormat,
       priceLineVisible: false,
       lastValueVisible: true,
       crosshairMarkerVisible: true,
     });
-
-    // 无论入参顺序如何，图表都要求时间升序。
-    const data: LineData<UTCTimestamp>[] = rates
-      .map((rate) => ({
-        time: Math.floor(new Date(rate.funding_time).getTime() / 1000) as UTCTimestamp,
-        value: toNumber(rate.funding_rate) * 100,
-      }))
-      .sort((left, right) => Number(left.time) - Number(right.time));
-
+    const data = toLineData(rates);
     series.setData(data);
+
+    if (compare && compare.length > 0) {
+      const compareSeries = chart.addSeries(LineSeries, {
+        color: compareColor,
+        lineWidth: 2,
+        priceFormat,
+        priceLineVisible: false,
+        lastValueVisible: true,
+        crosshairMarkerVisible: true,
+      });
+      compareSeries.setData(toLineData(compare));
+    }
+
     if (data.length > 0) {
       series.createPriceLine({
         price: 0,
@@ -109,7 +163,7 @@ export function FundingChart({ rates, selectedTime, onSelectTime }: FundingChart
     }
 
     return () => chart.remove();
-  }, [rates, resolved, selectedTime, onSelectTime]);
+  }, [rates, compare, net, resolved, selectedTime, onSelectTime]);
 
-  return <div ref={containerRef} className="h-[240px] w-full" />;
+  return <div ref={containerRef} className={heightClass} />;
 }

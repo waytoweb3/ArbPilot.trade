@@ -6,8 +6,8 @@ use rust_decimal::Decimal;
 use serde_json::Value;
 
 use super::{
-    make_book, millis_to_time, parse_json_decimal, value_to_millis, BookSnapshot, FundingRate,
-    FundingSnapshot, FundingVenueClient,
+    depth_rows, make_book, make_depth, millis_to_time, parse_json_decimal, value_to_millis,
+    BookSnapshot, DepthSnapshot, FundingRate, FundingSnapshot, FundingVenueClient,
 };
 use crate::http_client::HttpClient;
 
@@ -123,6 +123,34 @@ impl BingxFundingClient {
         }
         let data = value.get("data").unwrap_or(&value);
         book_from_depth(data)
+    }
+
+    /// USDT 本位永续的多档盘口；数量单位是币。
+    pub fn depth(&self, symbol: &str, limit: u32) -> anyhow::Result<DepthSnapshot> {
+        let contract = bingx_contract(symbol)?;
+        let url = format!(
+            "{}/openApi/swap/v2/quote/depth?symbol={contract}&limit={}",
+            self.base_url,
+            limit.clamp(1, 1_000)
+        );
+        let value = self.http.get_json(&url)?;
+        if let Some(code) = value.get("code").and_then(Value::as_i64) {
+            if code != 0 {
+                let message = value
+                    .get("msg")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                bail!("BingX depth 返回错误 {code}: {message}");
+            }
+        }
+        let data = value.get("data").unwrap_or(&value);
+        make_depth(
+            VENUE,
+            symbol,
+            depth_rows(data, "bids")?,
+            depth_rows(data, "asks")?,
+            Decimal::ONE,
+        )
     }
 
     /// 一次请求返回全部 USDT 本位永续的当期费率、标记价与下次结算时间。

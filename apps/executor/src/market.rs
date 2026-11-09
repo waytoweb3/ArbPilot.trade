@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, RwLock},
     time::Duration,
 };
@@ -16,10 +16,11 @@ use crate::{
     events::ExecutorEvent,
     exchange::{
         BinanceMarketClient, BingxFundingClient, BitgetFundingClient, BookSnapshot,
-        BybitFundingClient, Candle, DeliveryContract, FundingRate, GateFundingClient,
-        HtxFundingClient, HyperliquidFundingClient, LighterFundingClient, MexcFundingClient,
-        OkxMarketClient, Segment, ASTER_VENUE, BINGX_VENUE, BITGET_VENUE, BYBIT_VENUE, GATE_VENUE,
-        HTX_VENUE, HYPERLIQUID_VENUE, LIGHTER_VENUE, MEXC_VENUE, OKX_VENUE, VENUE,
+        BybitFundingClient, Candle, DeliveryContract, DepthSnapshot, FundingRate,
+        GateFundingClient, HtxFundingClient, HyperliquidFundingClient, LighterFundingClient,
+        MexcFundingClient, OkxMarketClient, Segment, ASTER_VENUE, BINGX_VENUE, BITGET_VENUE,
+        BYBIT_VENUE, GATE_VENUE, HTX_VENUE, HYPERLIQUID_VENUE, LIGHTER_VENUE, MEXC_VENUE,
+        OKX_VENUE, VENUE,
     },
     funding::{annualize, FundingFeed},
     http_client::HttpClient,
@@ -46,7 +47,92 @@ const DELIVERY_REFRESH_SECS: i64 = 3_600;
 /// 跨所比较以 `funding_annualized_pct`（年化）为准；bps 字段仍按 8 小时一期展示，
 /// 未能确认结算间隔时也回退到该值。
 const FUNDING_TARGET_INTERVAL_SECS: i64 = 8 * 3600;
-const KLINE_INTERVALS: [&str; 8] = ["1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w"];
+const KLINE_INTERVALS: [&str; 9] = ["1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w", "10m"];
+/// 30 秒 K 线由 WebSocket 盘口逐秒采样聚合，REST 只提供分钟级历史。
+const TICK_BAR_SECONDS: i64 = 30;
+/// 单个交易对保留的 30 秒 K 线上限（30s × 480 = 4 小时）。
+const TICK_BAR_CAPACITY: usize = 480;
+
+/// 秒级 K 线内存聚合器。
+///
+/// 交易所 REST 基本不提供 30 秒历史（Binance 永续最低 1 分钟），
+/// 这里对 WebSocket 盘口中间价逐秒采样，跨周期边界时开新的一根。
+#[derive(Default)]
+struct TickBars {
+    inner: RwLock<TickBarsState>,
+}
+
+#[derive(Default)]
+struct TickBarsState {
+    watched: HashSet<(String, String)>,
+    bars: HashMap<(String, String), Vec<Candle>>,
+}
+
+impl TickBars {
+    /// 标记需要采样的交易对；采样器会持续为它维护 30 秒 K 线。
+    fn watch(&self, venue: &str, symbol: &str) {
+        self.inner
+            .write()
+            .expect("秒级 K 线锁不可用")
+            .watched
+            .insert((venue.to_string(), symbol.to_string()));
+    }
+
+    fn watched(&self) -> Vec<(String, String)> {
+        self.inner
+            .read()
+            .expect("秒级 K 线锁不可用")
+            .watched
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    /// 用一次盘口中间价采样更新当前 K 线。
+    fn record(&self, venue: &str, symbol: &str, price: Decimal, at: DateTime<Utc>) {
+        let bucket = at.timestamp() - at.timestamp().rem_euclid(TICK_BAR_SECONDS);
+        let Some(open_time) = DateTime::from_timestamp(bucket, 0) else {
+            return;
+        };
+        let key = (venue.to_string(), symbol.to_string());
+        let mut inner = self.inner.write().expect("秒级 K 线锁不可用");
+        let bars = inner.bars.entry(key).or_default();
+        if let Some(last) = bars.last_mut() {
+            let last_at = last.open_time.timestamp();
+            if last_at == bucket {
+                last.high = last.high.max(price);
+                last.low = last.low.min(price);
+                last.close = price;
+                return;
+            }
+            // 采样时间回退（时钟漂移）时忽略这一笔。
+            if last_at > bucket {
+                return;
+            }
+        }
+        bars.push(Candle {
+            open_time,
+            open: price,
+            high: price,
+            low: price,
+            close: price,
+            volume: Decimal::ZERO,
+        });
+        if bars.len() > TICK_BAR_CAPACITY {
+            let excess = bars.len() - TICK_BAR_CAPACITY;
+            bars.drain(..excess);
+        }
+    }
+
+    fn series(&self, venue: &str, symbol: &str, limit: usize) -> Vec<Candle> {
+        let inner = self.inner.read().expect("秒级 K 线锁不可用");
+        let Some(bars) = inner.bars.get(&(venue.to_string(), symbol.to_string())) else {
+            return Vec::new();
+        };
+        let start = bars.len().saturating_sub(limit);
+        bars[start..].to_vec()
+    }
+}
 
 /// 盘口快照，同时保留买一/卖一档的名义价值用于估算可成交额度。
 #[derive(Debug, Clone)]
@@ -154,6 +240,79 @@ impl BookClients {
             other => bail!("不支持的行情来源: {other}"),
         }
     }
+
+    /// 多档盘口；按 venue 分派到对应交易所的 depth 端点。
+    fn depth(
+        &self,
+        venue: &str,
+        symbol: &str,
+        segment: Segment,
+        limit: u32,
+    ) -> anyhow::Result<DepthSnapshot> {
+        match venue {
+            SPOT_VENUE | VENUE => self
+                .binance
+                .as_ref()
+                .ok_or_else(|| anyhow!("Binance 行情客户端未初始化"))?
+                .depth(symbol, segment, limit),
+            OKX_SPOT_VENUE | OKX_VENUE => self
+                .okx
+                .as_ref()
+                .ok_or_else(|| anyhow!("OKX 行情客户端未启用"))?
+                .depth(symbol, segment, limit),
+            BYBIT_SPOT_VENUE => self
+                .bybit
+                .as_ref()
+                .ok_or_else(|| anyhow!("Bybit 行情客户端未启用"))?
+                .depth(symbol, true, limit),
+            BYBIT_VENUE => self
+                .bybit
+                .as_ref()
+                .ok_or_else(|| anyhow!("Bybit 行情客户端未启用"))?
+                .depth(symbol, false, limit),
+            BITGET_VENUE => self
+                .bitget
+                .as_ref()
+                .ok_or_else(|| anyhow!("Bitget 行情客户端未启用"))?
+                .depth(symbol, limit),
+            GATE_VENUE => self
+                .gate
+                .as_ref()
+                .ok_or_else(|| anyhow!("Gate 行情客户端未启用"))?
+                .depth(symbol, limit),
+            ASTER_VENUE => self
+                .aster
+                .as_ref()
+                .ok_or_else(|| anyhow!("Aster 行情客户端未启用"))?
+                .depth(symbol, Segment::Swap, limit),
+            HYPERLIQUID_VENUE => self
+                .hyperliquid
+                .as_ref()
+                .ok_or_else(|| anyhow!("Hyperliquid 行情客户端未启用"))?
+                .depth(symbol, limit),
+            LIGHTER_VENUE => self
+                .lighter
+                .as_ref()
+                .ok_or_else(|| anyhow!("Lighter 行情客户端未启用"))?
+                .depth(symbol, limit),
+            HTX_VENUE => self
+                .htx
+                .as_ref()
+                .ok_or_else(|| anyhow!("HTX 行情客户端未启用"))?
+                .depth(symbol),
+            MEXC_VENUE => self
+                .mexc
+                .as_ref()
+                .ok_or_else(|| anyhow!("MEXC 行情客户端未启用"))?
+                .depth(symbol, limit),
+            BINGX_VENUE => self
+                .bingx
+                .as_ref()
+                .ok_or_else(|| anyhow!("BingX 行情客户端未启用"))?
+                .depth(symbol, limit),
+            other => bail!("不支持的行情来源: {other}"),
+        }
+    }
 }
 
 /// 真实行情源：WebSocket 推送优先，REST 只在推送缺失或过期时兜底。
@@ -182,6 +341,8 @@ pub struct MarketFeed {
     realtime: Option<Arc<RealtimeFeed>>,
     store: Arc<Store>,
     state: RwLock<MarketState>,
+    /// 30 秒 K 线由 WebSocket 盘口采样聚合。
+    tick_bars: TickBars,
     /// 交割合约清单缓存（Binance / OKX / Bybit）。
     delivery: RwLock<DeliveryCache>,
     events: broadcast::Sender<ExecutorEvent>,
@@ -318,6 +479,7 @@ impl MarketFeed {
             realtime,
             store,
             state: RwLock::new(MarketState::default()),
+            tick_bars: TickBars::default(),
             delivery: RwLock::new(DeliveryCache::default()),
             events,
             notifier: RwLock::new(None),
@@ -359,6 +521,22 @@ impl MarketFeed {
             loop {
                 ticker.tick().await;
                 worker.refresh().await;
+            }
+        });
+
+        // 秒级 K 线采样：每秒把已订阅交易对的盘口中间价写进 30s 聚合器。
+        let sampler = feed.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(1));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                for (venue, symbol) in sampler.tick_bars.watched() {
+                    let Some((price, at)) = sampler.realtime_quote(&venue, &symbol) else {
+                        continue;
+                    };
+                    sampler.tick_bars.record(&venue, &symbol, price, at);
+                }
             }
         });
 
@@ -426,6 +604,11 @@ impl MarketFeed {
     /// 仓位与浮动盈亏用它实时定价；推送过期（断线）时返回 `None`，由调用方
     /// 保留交易所返回的标记价。
     pub fn realtime_price(&self, venue: &str, symbol: &str) -> Option<Decimal> {
+        self.realtime_quote(venue, symbol).map(|(mid, _)| mid)
+    }
+
+    /// WebSocket 盘口的最新中间价与推送时间，供实时 K 线与前端价格推送使用。
+    pub fn realtime_quote(&self, venue: &str, symbol: &str) -> Option<(Decimal, DateTime<Utc>)> {
         let update = self.realtime.as_ref()?.book(venue, symbol)?;
         let age_ms = Utc::now()
             .signed_duration_since(update.observed_at)
@@ -434,20 +617,35 @@ impl MarketFeed {
             return None;
         }
         let mid = (update.snapshot.bid + update.snapshot.ask) / Decimal::from(2);
-        (mid > Decimal::ZERO).then_some(mid)
+        (mid > Decimal::ZERO).then_some((mid, update.observed_at))
     }
 
-    /// 把持仓涉及的交易对加入 WebSocket 订阅，价格变化即可实时反映到仓位。
-    pub fn watch_position_symbols(&self, venue: &str, symbols: &[String]) {
+    /// 把交易对加入 WebSocket 订阅，价格变化即可实时反映到仓位与图表。
+    pub fn watch_symbols(&self, venue: &str, symbols: &[String]) {
         if let Some(feed) = &self.realtime {
             feed.book_symbols().extend_venue(venue, symbols.to_vec());
         }
     }
 
+    /// 订阅某交易对的实时价格，并让采样器维护它的 30 秒 K 线。
+    pub fn watch_tick_bars(&self, venue: &str, symbol: &str) {
+        let Ok(symbol) = normalize_symbol(symbol) else {
+            return;
+        };
+        let venue = venue.trim().to_ascii_lowercase();
+        self.tick_bars.watch(&venue, &symbol);
+        self.watch_symbols(&venue, &[symbol]);
+    }
+
+    /// 把持仓涉及的交易对加入 WebSocket 订阅，价格变化即可实时反映到仓位。
+    pub fn watch_position_symbols(&self, venue: &str, symbols: &[String]) {
+        self.watch_symbols(venue, symbols);
+    }
+
     /// K 线，供桌面端图表与策略指标使用。
     ///
     /// `venue` 为 `binance-spot` / `okx-spot` 等标识；以 `-spot` 结尾走现货，
-    /// 其余走永续合约。
+    /// 其余走永续合约。`30s` 由 WebSocket 盘口采样聚合，`10m` 由 5m 聚合。
     pub async fn candles(
         &self,
         venue: &str,
@@ -456,10 +654,7 @@ impl MarketFeed {
         limit: u32,
     ) -> anyhow::Result<Vec<Candle>> {
         let symbol = normalize_symbol(symbol)?;
-        let interval = interval.trim().to_string();
-        if !KLINE_INTERVALS.contains(&interval.as_str()) {
-            bail!("不支持的 K 线周期: {interval}");
-        }
+        let interval = interval.trim().to_ascii_lowercase();
         let limit = limit.clamp(1, 1_000);
         let lower = venue.trim().to_ascii_lowercase();
         let segment = if lower.ends_with("-spot") {
@@ -468,30 +663,156 @@ impl MarketFeed {
             Segment::Swap
         };
 
-        match lower.as_str() {
+        // 30 秒没有可用的 REST 历史，只能读取 WebSocket 采样聚合的结果。
+        if interval == "30s" {
+            self.watch_tick_bars(&lower, &symbol);
+            return Ok(self.tick_bars.series(&lower, &symbol, limit as usize));
+        }
+        if !KLINE_INTERVALS.contains(&interval.as_str()) {
+            bail!("不支持的 K 线周期: {interval}");
+        }
+        // 交易所普遍没有 10 分钟周期，用 5 分钟聚合。
+        let (native, bucket_secs, aggregate) = if interval == "10m" {
+            ("5m".to_string(), 600, true)
+        } else {
+            (interval.clone(), interval_seconds(&interval)?, false)
+        };
+        let fetch_limit = if aggregate {
+            ((limit as i64) * bucket_secs / interval_seconds(&native)?).clamp(1, 1_000) as u32
+        } else {
+            limit
+        };
+
+        let raw = match lower.as_str() {
+            SPOT_VENUE | VENUE => {
+                let client = self
+                    .binance
+                    .clone()
+                    .ok_or_else(|| anyhow!("Binance 行情客户端未初始化"))?;
+                tokio::task::spawn_blocking(move || {
+                    client.candles(&symbol, &native, fetch_limit, segment)
+                })
+                .await
+                .map_err(|error| anyhow!("K 线任务异常退出: {error}"))?
+            }
             OKX_VENUE | OKX_SPOT_VENUE => {
                 let client = self
                     .okx
                     .clone()
                     .ok_or_else(|| anyhow!("OKX 行情客户端未启用"))?;
                 tokio::task::spawn_blocking(move || {
-                    client.candles(&symbol, &interval, limit, segment)
+                    client.candles(&symbol, &native, fetch_limit, segment)
                 })
                 .await
                 .map_err(|error| anyhow!("K 线任务异常退出: {error}"))?
             }
-            _ => {
+            ASTER_VENUE => {
                 let client = self
-                    .binance
+                    .aster
                     .clone()
-                    .ok_or_else(|| anyhow!("Binance 行情客户端未初始化"))?;
+                    .ok_or_else(|| anyhow!("Aster 行情客户端未启用"))?;
                 tokio::task::spawn_blocking(move || {
-                    client.candles(&symbol, &interval, limit, segment)
+                    client.candles(&symbol, &native, fetch_limit, Segment::Swap)
                 })
                 .await
                 .map_err(|error| anyhow!("K 线任务异常退出: {error}"))?
             }
+            BYBIT_VENUE => {
+                let client = self
+                    .bybit
+                    .clone()
+                    .ok_or_else(|| anyhow!("Bybit 行情客户端未启用"))?;
+                tokio::task::spawn_blocking(move || client.candles(&symbol, &native, fetch_limit))
+                    .await
+                    .map_err(|error| anyhow!("K 线任务异常退出: {error}"))?
+            }
+            BITGET_VENUE => {
+                let client = self
+                    .bitget
+                    .clone()
+                    .ok_or_else(|| anyhow!("Bitget 行情客户端未启用"))?;
+                tokio::task::spawn_blocking(move || client.candles(&symbol, &native, fetch_limit))
+                    .await
+                    .map_err(|error| anyhow!("K 线任务异常退出: {error}"))?
+            }
+            GATE_VENUE => {
+                let client = self
+                    .gate
+                    .clone()
+                    .ok_or_else(|| anyhow!("Gate 行情客户端未启用"))?;
+                tokio::task::spawn_blocking(move || client.candles(&symbol, &native, fetch_limit))
+                    .await
+                    .map_err(|error| anyhow!("K 线任务异常退出: {error}"))?
+            }
+            HYPERLIQUID_VENUE => {
+                let client = self
+                    .hyperliquid
+                    .clone()
+                    .ok_or_else(|| anyhow!("Hyperliquid 行情客户端未启用"))?;
+                tokio::task::spawn_blocking(move || client.candles(&symbol, &native, fetch_limit))
+                    .await
+                    .map_err(|error| anyhow!("K 线任务异常退出: {error}"))?
+            }
+            LIGHTER_VENUE => {
+                let client = self
+                    .lighter
+                    .clone()
+                    .ok_or_else(|| anyhow!("Lighter 行情客户端未启用"))?;
+                tokio::task::spawn_blocking(move || client.candles(&symbol, &native, fetch_limit))
+                    .await
+                    .map_err(|error| anyhow!("K 线任务异常退出: {error}"))?
+            }
+            other => bail!("{other} 暂不支持 K 线"),
+        }?;
+
+        if aggregate {
+            Ok(aggregate_candles(raw, bucket_secs, limit as usize))
+        } else {
+            Ok(raw)
         }
+    }
+
+    /// 多档盘口，供桌面端展示盘口深度。
+    ///
+    /// `venue` 规则与 [`MarketFeed::candles`] 一致：`-spot` 结尾走现货，其余走永续。
+    pub async fn depth(
+        &self,
+        venue: &str,
+        symbol: &str,
+        limit: u32,
+    ) -> anyhow::Result<DepthSnapshot> {
+        let symbol = normalize_symbol(symbol)?;
+        let limit = limit.clamp(1, 200);
+        let requested = venue.trim().to_ascii_lowercase();
+        let segment = if requested.ends_with("-spot") {
+            Segment::Spot
+        } else {
+            Segment::Swap
+        };
+        let clients = BookClients {
+            binance: self.binance.clone(),
+            okx: self.okx.clone(),
+            bybit: self.bybit.clone(),
+            bitget: self.bitget.clone(),
+            gate: self.gate.clone(),
+            aster: self.aster.clone(),
+            hyperliquid: self.hyperliquid.clone(),
+            lighter: self.lighter.clone(),
+            htx: self.htx.clone(),
+            mexc: self.mexc.clone(),
+            bingx: self.bingx.clone(),
+        };
+        let target = requested.clone();
+        let mut snapshot = tokio::task::spawn_blocking(move || {
+            clients.depth(&target, &symbol, segment, limit)
+        })
+        .await
+        .map_err(|error| anyhow!("盘口深度任务异常退出: {error}"))??;
+        // Aster 复用 Binance 客户端，这里统一改用请求方传入的 venue。
+        snapshot.venue = requested;
+        snapshot.bids.truncate(limit as usize);
+        snapshot.asks.truncate(limit as usize);
+        Ok(snapshot)
     }
 
     /// 交割合约清单：缓存一小时内有效，避免每轮行情都拉取各所合约信息。
@@ -905,6 +1226,54 @@ fn normalize_symbol(symbol: &str) -> anyhow::Result<String> {
         bail!("交易对名称不合法: {symbol}");
     }
     Ok(symbol)
+}
+
+/// K 线周期对应的秒数，仅用于聚合计算。
+fn interval_seconds(interval: &str) -> anyhow::Result<i64> {
+    Ok(match interval {
+        "1m" => 60,
+        "5m" => 300,
+        "15m" => 900,
+        "30m" => 1_800,
+        "1h" => 3_600,
+        "4h" => 14_400,
+        "1d" => 86_400,
+        "1w" => 604_800,
+        other => bail!("不支持的 K 线周期: {other}"),
+    })
+}
+
+/// 把更细粒度的 K 线按周期边界合并成目标周期（如 5m → 10m）。
+fn aggregate_candles(candles: Vec<Candle>, bucket_secs: i64, limit: usize) -> Vec<Candle> {
+    if bucket_secs <= 0 {
+        return candles;
+    }
+    let mut out: Vec<Candle> = Vec::with_capacity(candles.len());
+    for candle in candles {
+        let ts = candle.open_time.timestamp();
+        let bucket = ts - ts.rem_euclid(bucket_secs);
+        match out.last_mut() {
+            Some(last) if last.open_time.timestamp() == bucket => {
+                last.high = last.high.max(candle.high);
+                last.low = last.low.min(candle.low);
+                last.close = candle.close;
+                last.volume += candle.volume;
+            }
+            _ => {
+                let Some(open_time) = DateTime::from_timestamp(bucket, 0) else {
+                    continue;
+                };
+                out.push(Candle {
+                    open_time,
+                    ..candle
+                });
+            }
+        }
+    }
+    if out.len() > limit {
+        out.drain(..out.len() - limit);
+    }
+    out
 }
 
 #[cfg(test)]

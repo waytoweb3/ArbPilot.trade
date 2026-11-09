@@ -12,7 +12,10 @@ use serde::{de::DeserializeOwned, Serialize};
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 use uuid::Uuid;
 
-use crate::{exchange::FundingRate, sqlite_store::SqliteStore, templates::StrategyTemplate};
+use crate::{
+    conditional::ConditionalOrder, exchange::FundingRate, sqlite_store::SqliteStore,
+    templates::StrategyTemplate,
+};
 
 /// 有本地 SQLite 时优先走本地库，其余分支保持 PostgreSQL / 内存逻辑不变。
 macro_rules! sqlite_branch {
@@ -216,6 +219,8 @@ pub struct Store {
     sandbox_modules: RwLock<HashMap<Uuid, Vec<u8>>>,
     /// 内置策略模板（源码 + 默认定义），重启后从数据库恢复。
     strategy_templates: RwLock<Vec<StrategyTemplate>>,
+    /// 内存降级时的条件单，重启即丢。
+    conditional_orders: RwLock<Vec<ConditionalOrder>>,
 }
 
 impl Store {
@@ -301,6 +306,7 @@ impl Store {
             sandbox_artifacts: RwLock::new(Vec::new()),
             sandbox_modules: RwLock::new(HashMap::new()),
             strategy_templates: RwLock::new(Vec::new()),
+            conditional_orders: RwLock::new(Vec::new()),
         }
     }
 
@@ -1766,6 +1772,57 @@ impl Store {
         .await
         {
             tracing::error!(%error, key = %template.key, "写入策略模板失败");
+        }
+    }
+
+    /// 读取全部条件单，按创建时间倒序由调用方排序。
+    pub async fn conditional_orders(&self) -> Vec<ConditionalOrder> {
+        sqlite_branch!(self, db => db.conditional_orders().await);
+        let Some(pool) = &self.pool else {
+            return self
+                .conditional_orders
+                .read()
+                .expect("条件单锁不可用")
+                .clone();
+        };
+        load_payloads(pool, "conditional_orders").await
+    }
+
+    /// 写入条件单，按 `id` 幂等。
+    pub async fn save_conditional_order(&self, order: &ConditionalOrder) {
+        sqlite_branch!(self, db => db.save_conditional_order(order).await);
+        let id = order.id;
+        let Some(pool) = &self.pool else {
+            let mut rows = self.conditional_orders.write().expect("条件单锁不可用");
+            match rows.iter_mut().find(|existing| existing.id == id) {
+                Some(existing) => *existing = order.clone(),
+                None => rows.push(order.clone()),
+            }
+            return;
+        };
+
+        let payload = match serde_json::to_value(order) {
+            Ok(payload) => payload,
+            Err(error) => {
+                tracing::error!(%error, %id, "条件单序列化失败");
+                return;
+            }
+        };
+        if let Err(error) = sqlx::query(
+            r#"
+            insert into conditional_orders (id, payload)
+            values ($1, $2)
+            on conflict (id) do update
+                set payload = excluded.payload,
+                    updated_at = now()
+            "#,
+        )
+        .bind(order.id)
+        .bind(payload)
+        .execute(pool)
+        .await
+        {
+            tracing::error!(%error, %id, "写入条件单失败");
         }
     }
 

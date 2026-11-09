@@ -9,7 +9,7 @@ import { ThemeProvider } from "./lib/theme";
 export { SITE_URL } from "./lib/seo";
 
 /** 构建期要落成静态 HTML 的公开页面；工具页与 /pricing 只保留客户端渲染。 */
-export const PRERENDER_ROUTES = ["/", "/funding", "/privacy", "/terms"] as const;
+export const PRERENDER_ROUTES = ["/", "/funding", "/privacy", "/terms", "/404"] as const;
 
 export type PrerenderPage = { meta: PageMeta; html: string };
 

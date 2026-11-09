@@ -261,6 +261,12 @@ const zh = {
       "数字资产与衍生品交易存在亏损风险。ArbPilot 提供的行情、机会与自动化执行不构成投资建议，也不承诺套利无风险或保证盈利。请根据自身情况评估风险并控制仓位。",
     copyright: "© 2026 ArbPilot · 自托管 · 资金与密钥始终由你掌控",
   },
+  notFound: {
+    eyebrow: "404",
+    title: "这个页面不存在",
+    body: "链接可能已经失效，或者地址拼错了。回到首页可以继续查看资金费率、新闻采集与自定义策略。",
+    back: "返回首页",
+  },
 };
 
 const en: typeof zh = {
@@ -511,6 +517,12 @@ const en: typeof zh = {
     disclaimer:
       "Digital asset and derivatives trading carries the risk of loss. Market data, opportunities and automated execution from ArbPilot are not investment advice and do not promise risk-free arbitrage or profits. Assess your own situation and control position size.",
     copyright: "© 2026 ArbPilot · Self-hosted · Funds and keys always stay in your hands",
+  },
+  notFound: {
+    eyebrow: "404",
+    title: "This page does not exist",
+    body: "The link may be out of date, or the address was mistyped. Head back to the homepage to see funding rates, news coverage and custom strategies.",
+    back: "Back to home",
   },
 };
 

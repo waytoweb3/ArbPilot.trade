@@ -1,8 +1,10 @@
 mod accounts;
 mod candles;
 mod chain;
+mod conditional;
 mod config;
 mod control;
+mod depth;
 mod funding;
 mod health;
 mod license;
@@ -11,6 +13,7 @@ mod news;
 mod opportunities;
 mod orders;
 mod portfolio;
+mod prices;
 mod sandbox;
 mod strategies;
 mod strategy_code;
@@ -35,9 +38,22 @@ pub fn build(state: AppState) -> Router {
         .route("/opportunities", get(opportunities::list))
         .route("/opportunities/basis", get(opportunities::basis))
         .route("/candles", get(candles::list))
+        .route("/depth", get(depth::get))
         .route("/orders", get(orders::list).post(orders::create))
+        .route(
+            "/conditional-orders",
+            get(conditional::list).post(conditional::create),
+        )
+        .route(
+            "/conditional-orders/{id}/cancel",
+            post(conditional::cancel),
+        )
         .route("/positions", get(portfolio::positions))
         .route("/positions/{id}/close", post(portfolio::close))
+        .route(
+            "/positions/groups/{group_id}/close",
+            post(portfolio::close_group),
+        )
         .route("/accounts", get(accounts::list).post(accounts::import))
         .route("/accounts/history", get(accounts::history))
         .route("/accounts/{id}", delete(accounts::remove))
@@ -168,6 +184,7 @@ pub fn build(state: AppState) -> Router {
         .route("/control/pause", post(control::pause))
         .route("/control/resume", post(control::resume))
         .route("/events", get(ws::handler))
+        .route("/prices/stream", get(prices::stream))
         // 先鉴权再校验套餐：内层先执行，因此授权中间件放在鉴权层之前声明。
         .layer(middleware::from_fn_with_state(
             state.clone(),

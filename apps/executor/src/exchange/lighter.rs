@@ -11,8 +11,8 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::{
-    make_book, parse_decimal, parse_json_decimal, BookSnapshot, FundingRate, FundingSnapshot,
-    FundingVenueClient,
+    make_book, make_depth, parse_decimal, parse_json_decimal, BookSnapshot, Candle, DepthSnapshot,
+    FundingRate, FundingSnapshot, FundingVenueClient,
 };
 use crate::http_client::HttpClient;
 
@@ -173,6 +173,48 @@ struct HistoryRow {
     rate: Option<Value>,
 }
 
+#[derive(Debug, Deserialize)]
+struct CandlesEnvelope {
+    #[serde(default)]
+    code: i64,
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    c: Vec<CandleRow>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CandleRow {
+    /// 开盘时间（毫秒）。
+    #[serde(default)]
+    t: i64,
+    /// 价格与成交量在响应里是数字，且为 0 时会被省略。
+    #[serde(default)]
+    o: Option<Value>,
+    #[serde(default)]
+    h: Option<Value>,
+    #[serde(default)]
+    l: Option<Value>,
+    #[serde(default)]
+    c: Option<Value>,
+    #[serde(default)]
+    v: Option<Value>,
+}
+
+/// Lighter 支持的 K 线周期（没有 10m 与 1w，10m 由上层用 5m 聚合）。
+fn lighter_resolution(interval: &str) -> anyhow::Result<(&'static str, i64)> {
+    Ok(match interval {
+        "1m" => ("1m", 60),
+        "5m" => ("5m", 300),
+        "15m" => ("15m", 900),
+        "30m" => ("30m", 1_800),
+        "1h" => ("1h", 3_600),
+        "4h" => ("4h", 14_400),
+        "1d" => ("1d", 86_400),
+        other => bail!("Lighter 不支持的 K 线周期: {other}"),
+    })
+}
+
 /// Lighter 永续公开资金费率客户端。
 pub struct LighterFundingClient {
     base_url: String,
@@ -268,6 +310,120 @@ impl LighterFundingClient {
             self.base_url
         );
         book_from_orders(&self.fetch(&url)?, market_id)
+    }
+
+    /// 永续的多档盘口；订单簿按价格聚合成档位，数量单位是币。
+    pub fn depth(&self, symbol: &str, limit: u32) -> anyhow::Result<DepthSnapshot> {
+        let mut market_id = self.market_ids(false)?.get(symbol).copied();
+        if market_id.is_none() {
+            market_id = self.market_ids(true)?.get(symbol).copied();
+        }
+        let market_id = market_id.ok_or_else(|| anyhow!("Lighter 未找到交易对: {symbol}"))?;
+        let cap = limit.clamp(1, 100);
+        let url = format!(
+            "{}/api/v1/orderBookOrders?market_id={market_id}&limit={cap}",
+            self.base_url
+        );
+        let value = self.fetch(&url)?;
+        let code = value.get("code").and_then(Value::as_i64).unwrap_or(200);
+        if code != 200 {
+            let message = value
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            bail!("Lighter orderBookOrders 返回错误 {code}: {message}");
+        }
+        let side = |key: &str| -> anyhow::Result<Vec<(Decimal, Decimal)>> {
+            let rows = value
+                .get(key)
+                .and_then(Value::as_array)
+                .ok_or_else(|| anyhow!("Lighter 盘口缺少 {key}: market_id={market_id}"))?;
+            let mut merged: Vec<(Decimal, Decimal)> = Vec::new();
+            for row in rows {
+                let price = row
+                    .get("price")
+                    .ok_or_else(|| anyhow!("Lighter 盘口缺少 price"))?;
+                let size = row
+                    .get("remaining_base_amount")
+                    .ok_or_else(|| anyhow!("Lighter 盘口缺少 remaining_base_amount"))?;
+                let price = parse_json_decimal(price)?;
+                let size = parse_json_decimal(size)?;
+                match merged.iter_mut().find(|(level, _)| *level == price) {
+                    Some(existing) => existing.1 += size,
+                    None => merged.push((price, size)),
+                }
+            }
+            Ok(merged)
+        };
+        let mut bids = side("bids")?;
+        let mut asks = side("asks")?;
+        bids.sort_by(|a, b| b.0.cmp(&a.0));
+        asks.sort_by(|a, b| a.0.cmp(&b.0));
+        bids.truncate(cap as usize);
+        asks.truncate(cap as usize);
+        make_depth(VENUE, symbol, bids, asks, Decimal::ONE)
+    }
+
+    /// 永续 K 线；`/api/v1/candles` 单次最多返回 500 根。
+    pub fn candles(
+        &self,
+        symbol: &str,
+        interval: &str,
+        limit: u32,
+    ) -> anyhow::Result<Vec<Candle>> {
+        let (resolution, step) = lighter_resolution(interval)?;
+        let mut market_id = self.market_ids(false)?.get(symbol).copied();
+        if market_id.is_none() {
+            market_id = self.market_ids(true)?.get(symbol).copied();
+        }
+        let market_id = market_id.ok_or_else(|| anyhow!("Lighter 未找到交易对: {symbol}"))?;
+
+        let limit = limit.clamp(1, 500);
+        let end = Utc::now();
+        let start = end - chrono::Duration::seconds(step * i64::from(limit));
+        let url = format!(
+            "{}/api/v1/candles?market_id={market_id}&resolution={resolution}&start_timestamp={}&end_timestamp={}&count_back={limit}",
+            self.base_url,
+            start.timestamp_millis(),
+            end.timestamp_millis()
+        );
+        let envelope: CandlesEnvelope =
+            serde_json::from_value(self.fetch(&url)?).context("解析 Lighter candles 失败")?;
+        if envelope.code != 200 {
+            bail!(
+                "Lighter candles 返回错误 {}: {}",
+                envelope.code,
+                envelope.message.unwrap_or_default()
+            );
+        }
+
+        let mut candles = Vec::with_capacity(envelope.c.len());
+        for row in envelope.c {
+            let Some(open_time) = Utc.timestamp_millis_opt(row.t).single() else {
+                continue;
+            };
+            // 价格为 0 的字段会被省略，这里统一按 0 处理。
+            let parse = |value: &Option<Value>| -> anyhow::Result<Decimal> {
+                value
+                    .as_ref()
+                    .map(parse_json_decimal)
+                    .transpose()
+                    .map(Option::unwrap_or_default)
+            };
+            candles.push(Candle {
+                open_time,
+                open: parse(&row.o)?,
+                high: parse(&row.h)?,
+                low: parse(&row.l)?,
+                close: parse(&row.c)?,
+                volume: parse(&row.v)?,
+            });
+        }
+        candles.sort_by_key(|candle| candle.open_time);
+        if candles.len() > limit as usize {
+            candles.drain(..candles.len() - limit as usize);
+        }
+        Ok(candles)
     }
 
     fn current_rates(&self) -> anyhow::Result<HashMap<i64, Decimal>> {

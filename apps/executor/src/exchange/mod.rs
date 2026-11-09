@@ -94,6 +94,25 @@ pub struct BookSnapshot {
     pub ask_notional_usd: Decimal,
 }
 
+/// 盘口单档：价格与数量，数量统一为币本位。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DepthLevel {
+    pub price: Decimal,
+    pub quantity: Decimal,
+}
+
+/// 多档盘口快照，供桌面端展示盘口深度。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DepthSnapshot {
+    pub venue: String,
+    pub symbol: String,
+    /// 买盘，价格由高到低。
+    pub bids: Vec<DepthLevel>,
+    /// 卖盘，价格由低到高。
+    pub asks: Vec<DepthLevel>,
+    pub observed_at: DateTime<Utc>,
+}
+
 /// 一根 K 线，两个交易所统一为同一结构。
 #[derive(Debug, Clone, Serialize)]
 pub struct Candle {
@@ -171,6 +190,58 @@ pub(crate) fn make_book(
         ask,
         bid_notional_usd: bid * bid_qty,
         ask_notional_usd: ask * ask_qty,
+    })
+}
+
+/// 解析 `[[价格, 数量], ...]` 形式的盘口数组。
+pub(crate) fn depth_rows(value: &Value, key: &str) -> anyhow::Result<Vec<(Decimal, Decimal)>> {
+    let rows = value
+        .get(key)
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("盘口缺少 {key}"))?;
+    let mut levels = Vec::with_capacity(rows.len());
+    for row in rows {
+        let row = row
+            .as_array()
+            .ok_or_else(|| anyhow!("盘口 {key} 档位格式不合法: {row:?}"))?;
+        if row.len() < 2 {
+            bail!("盘口 {key} 档位字段不足: {row:?}");
+        }
+        levels.push((parse_json_decimal(&row[0])?, parse_json_decimal(&row[1])?));
+    }
+    Ok(levels)
+}
+
+/// 组装多档盘口：数量按 `multiplier` 折算成币本位，并校验价格与数量合法。
+pub(crate) fn make_depth(
+    venue: &str,
+    symbol: &str,
+    bids: Vec<(Decimal, Decimal)>,
+    asks: Vec<(Decimal, Decimal)>,
+    multiplier: Decimal,
+) -> anyhow::Result<DepthSnapshot> {
+    if bids.is_empty() || asks.is_empty() {
+        bail!("盘口档位为空: {venue} {symbol}");
+    }
+    let levels = |rows: Vec<(Decimal, Decimal)>| -> anyhow::Result<Vec<DepthLevel>> {
+        rows.into_iter()
+            .map(|(price, quantity)| {
+                if price <= Decimal::ZERO || quantity < Decimal::ZERO {
+                    bail!("盘口价格或数量异常: price={price} quantity={quantity}");
+                }
+                Ok(DepthLevel {
+                    price,
+                    quantity: quantity * multiplier,
+                })
+            })
+            .collect()
+    };
+    Ok(DepthSnapshot {
+        venue: venue.to_string(),
+        symbol: symbol.to_string(),
+        bids: levels(bids)?,
+        asks: levels(asks)?,
+        observed_at: Utc::now(),
     })
 }
 

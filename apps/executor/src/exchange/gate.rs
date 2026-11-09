@@ -7,8 +7,8 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::{
-    make_book, parse_decimal, parse_json_decimal, BookSnapshot, FundingRate, FundingSnapshot,
-    FundingVenueClient,
+    make_book, make_depth, parse_decimal, parse_json_decimal, BookSnapshot, Candle, DepthSnapshot,
+    FundingRate, FundingSnapshot, FundingVenueClient,
 };
 use crate::http_client::HttpClient;
 
@@ -208,6 +208,52 @@ impl GateFundingClient {
         make_book(bid, bid_size * multiplier, ask, ask_size * multiplier)
     }
 
+    /// USDT 本位永续的多档盘口；张数按合约乘数折算成币。
+    pub fn depth(&self, symbol: &str, limit: u32) -> anyhow::Result<DepthSnapshot> {
+        let contract = gate_contract(symbol)?;
+        let multiplier = self.quanto_multiplier(&contract)?;
+        let limit = limit.clamp(1, 100);
+        let url = format!(
+            "{}/api/v4/futures/usdt/order_book?contract={contract}&limit={limit}",
+            self.base_url
+        );
+        let row: OrderBookRow = serde_json::from_value(self.http.get_json(&url)?)
+            .context("解析 Gate order_book 失败")?;
+        let levels = |rows: Vec<OrderBookLevel>| -> anyhow::Result<Vec<(Decimal, Decimal)>> {
+            rows.into_iter()
+                .map(|level| Ok((parse_json_decimal(&level.p)?, parse_json_decimal(&level.s)?)))
+                .collect()
+        };
+        make_depth(
+            VENUE,
+            symbol,
+            levels(row.bids)?,
+            levels(row.asks)?,
+            multiplier,
+        )
+    }
+
+    /// USDT 本位永续 K 线。
+    ///
+    /// Gate v4 的 K 线行是 `{t, o, h, l, c, v}` 对象（`t` 为 Unix 秒），
+    /// 与其它交易所的数组行不同，这里单独解析。
+    pub fn candles(
+        &self,
+        symbol: &str,
+        interval: &str,
+        limit: u32,
+    ) -> anyhow::Result<Vec<Candle>> {
+        let contract = gate_contract(symbol)?;
+        let interval = gate_interval(interval)?;
+        let url = format!(
+            "{}/api/v4/futures/usdt/candlesticks?contract={contract}&interval={interval}&limit={}",
+            self.base_url,
+            limit.clamp(1, 1_000)
+        );
+        let value = self.http.get_json(&url)?;
+        gate_candles(&value)
+    }
+
     /// 一张合约对应的标的数量，供 WebSocket 盘口把张数折算成币。
     pub fn symbol_multiplier(&self, symbol: &str) -> anyhow::Result<Decimal> {
         let contract = gate_contract(symbol)?;
@@ -273,6 +319,59 @@ impl GateFundingClient {
         rates.sort_by_key(|row| row.funding_time);
         Ok(rates)
     }
+}
+
+/// Gate v4 的 K 线周期；小时/天/周用小写后缀。
+fn gate_interval(interval: &str) -> anyhow::Result<&'static str> {
+    Ok(match interval {
+        "1m" => "1m",
+        "5m" => "5m",
+        "15m" => "15m",
+        "30m" => "30m",
+        "1h" => "1h",
+        "4h" => "4h",
+        "1d" => "1d",
+        "1w" => "1w",
+        other => bail!("Gate 不支持的 K 线周期: {other}"),
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct CandleRow {
+    /// 开盘时间（Unix 秒）。
+    t: i64,
+    o: String,
+    c: String,
+    h: String,
+    l: String,
+    #[serde(default)]
+    v: Option<Value>,
+}
+
+fn gate_candles(value: &Value) -> anyhow::Result<Vec<Candle>> {
+    let rows: Vec<CandleRow> =
+        serde_json::from_value(value.clone()).context("解析 Gate K 线失败")?;
+    let mut candles = Vec::with_capacity(rows.len());
+    for row in rows {
+        let Some(open_time) = Utc.timestamp_opt(row.t, 0).single() else {
+            continue;
+        };
+        candles.push(Candle {
+            open_time,
+            open: parse_decimal(&row.o)?,
+            high: parse_decimal(&row.h)?,
+            low: parse_decimal(&row.l)?,
+            close: parse_decimal(&row.c)?,
+            volume: row
+                .v
+                .as_ref()
+                .map(parse_json_decimal)
+                .transpose()?
+                .unwrap_or_default(),
+        });
+    }
+    candles.sort_by_key(|candle| candle.open_time);
+    Ok(candles)
 }
 
 impl FundingVenueClient for GateFundingClient {

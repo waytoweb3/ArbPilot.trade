@@ -80,7 +80,14 @@ export function metaForPath(pathname: string, locale: Locale): PageMeta {
     });
   }
 
-  return build("/", copy.meta.title, copy.meta.description, {});
+  if (path === "/") {
+    return build("/", copy.meta.title, copy.meta.description, {});
+  }
+
+  // 其它路径都是 404：不收录，也不进 sitemap。
+  return build("/404", `${copy.notFound.title} · ArbPilot`, copy.notFound.body, {
+    noindex: true,
+  });
 }
 
 /** 客户端路由切换时同步 head，避免每个页面各写一遍 effect。 */

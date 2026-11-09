@@ -3,12 +3,15 @@ import type {
   BacktestReport,
   Candle,
   CompileStrategyCodeResponse,
+  ConditionalOrder,
   ControlResponse,
+  CreateConditionalRequest,
   CreateOrderRequest,
   CreateOrderResponse,
   CreatePerformanceRequest,
   CreatePublicationRequest,
   Decimal,
+  DepthSnapshot,
   DeployStrategyCodeResponse,
   EquityHistoryResponse,
   ExecutorLicense,
@@ -332,6 +335,30 @@ export const api = {
   },
 
   positions: () => request<Position[]>("/api/v1/positions"),
+
+  /** 多档盘口深度，用于交易页展示买卖盘挂单分布。 */
+  depth: (venue: string, symbol: string, limit: number) => {
+    const params = new URLSearchParams({
+      venue,
+      symbol,
+      limit: String(limit),
+    });
+    return request<DepthSnapshot>(`/api/v1/depth?${params.toString()}`);
+  },
+
+  conditionalOrders: () => request<ConditionalOrder[]>("/api/v1/conditional-orders"),
+
+  createConditionalOrder: (body: CreateConditionalRequest) =>
+    request<ConditionalOrder>("/api/v1/conditional-orders", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+
+  cancelConditionalOrder: (id: string) =>
+    request<ConditionalOrder>(
+      `/api/v1/conditional-orders/${encodeURIComponent(id)}/cancel`,
+      { method: "POST" },
+    ),
 
   orders: () => request<Order[]>("/api/v1/orders"),
 
@@ -674,6 +701,14 @@ export const api = {
       [422],
     ),
 
+  /** 整组平仓：把同一双腿订单产生的仓位一次性平掉。 */
+  closePositionGroup: (groupId: string) =>
+    request<CreateOrderResponse>(
+      `/api/v1/positions/groups/${encodeURIComponent(groupId)}/close`,
+      { method: "POST" },
+      [422],
+    ),
+
   eventsUrl: () => {
     const params = new URLSearchParams({ token: getApiToken() });
     // 与 request 保持一致：内置执行器不需要用户授权令牌。
@@ -682,6 +717,23 @@ export const api = {
       params.set("license", license);
     }
     return `${getExecutorUrl().replace(/^http/, "ws")}/api/v1/events?${params.toString()}`;
+  },
+
+  /** 实时价格 WebSocket：与 K 线请求走同一数据源。 */
+  pricesUrl: (venue: string, symbol: string) => {
+    const hosted =
+      getExecutorMode() === "local" && Boolean(DATA_URL) && DATA_URL !== getExecutorUrl("local");
+    const base = hosted ? DATA_URL : getExecutorUrl();
+    const params = new URLSearchParams({
+      venue,
+      symbol,
+      token: hosted ? DEFAULT_TOKEN : getApiToken(),
+    });
+    const license = hosted ? getLicenseToken() : "";
+    if (license) {
+      params.set("license", license);
+    }
+    return `${base.replace(/^http/, "ws")}/api/v1/prices/stream?${params.toString()}`;
   },
 };
 

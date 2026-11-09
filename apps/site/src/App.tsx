@@ -7,6 +7,7 @@ import DevicePage from "./pages/DevicePage";
 import FundingPage from "./pages/FundingPage";
 import HomePage from "./pages/HomePage";
 import LegalPage from "./pages/LegalPage";
+import NotFoundPage from "./pages/NotFoundPage";
 
 export default function App() {
   return (
@@ -21,6 +22,7 @@ export default function App() {
         <Route path="terms" element={<LegalPage slug="terms" />} />
         <Route path="checkout/success" element={<CheckoutSuccessPage />} />
         <Route path="device" element={<DevicePage />} />
+        <Route path="*" element={<NotFoundPage />} />
       </Route>
     </Routes>
   );

@@ -61,7 +61,9 @@ export function formatPercentValue(value: Decimal | null | undefined, digits = 2
 
 /** 结算间隔展示，如 28800 秒 → 8h。 */
 export function formatInterval(seconds: number): string {
-  const hours = seconds / 3_600;
+  // 交易所常返回相差 1 秒的间隔（如 14399），先就近取整到分钟再展示。
+  const secs = Math.round(seconds / 60) * 60;
+  const hours = secs / 3_600;
   return `${Number.isInteger(hours) ? hours : hours.toFixed(1)}h`;
 }
 

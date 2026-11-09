@@ -18,15 +18,21 @@ const { renderPages, SITE_URL } = await import(pathToFileURL(serverEntry).href);
 const pages = renderPages("en");
 
 for (const page of pages) {
-  const targetDir = page.meta.path === "/" ? distDir : join(distDir, page.meta.path.slice(1));
-  await mkdir(targetDir, { recursive: true });
+  // 404 页面落到 dist/404.html，由 nginx 的 error_page 直接返回。
+  const target =
+    page.meta.path === "/"
+      ? join(distDir, "index.html")
+      : page.meta.path === "/404"
+        ? join(distDir, "404.html")
+        : join(distDir, page.meta.path.slice(1), "index.html");
+  await mkdir(dirname(target), { recursive: true });
 
   const html = applyMeta(template, page.meta).replace(
     rootPlaceholder,
     `<div id="root">${page.html}</div>`,
   );
-  await writeFile(join(targetDir, "index.html"), html);
-  console.log(`[prerender] ${page.meta.path} → ${join(targetDir, "index.html")}`);
+  await writeFile(target, html);
+  console.log(`[prerender] ${page.meta.path} → ${target}`);
 }
 
 const today = new Date().toISOString().slice(0, 10);

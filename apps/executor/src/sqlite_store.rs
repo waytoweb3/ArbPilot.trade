@@ -14,6 +14,7 @@ use sqlx::{
 use uuid::Uuid;
 
 use crate::{
+    conditional::ConditionalOrder,
     exchange::FundingRate,
     store::{
         EquityPoint, ExchangeVenueConfig, FundingSummary, MarketSnapshot, NotificationSettings,
@@ -714,6 +715,20 @@ impl SqliteStore {
             .await
         {
             tracing::error!(%error, key = %template.key, "写入策略模板失败");
+        }
+    }
+
+    pub async fn conditional_orders(&self) -> Vec<ConditionalOrder> {
+        self.docs("conditional_orders").await
+    }
+
+    pub async fn save_conditional_order(&self, order: &ConditionalOrder) {
+        let id = order.id;
+        if let Err(error) = self
+            .put_doc("conditional_orders", &id.to_string(), order)
+            .await
+        {
+            tracing::error!(%error, %id, "写入条件单失败");
         }
     }
 

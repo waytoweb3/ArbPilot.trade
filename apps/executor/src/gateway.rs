@@ -535,6 +535,8 @@ pub async fn submit_legs(
             positions.push(Position {
                 id: Uuid::new_v4(),
                 strategy_id: intent.strategy_id,
+                // 双腿订单产生的仓位共享订单 ID，便于整组查看与平仓。
+                group_id: (order.intent.legs.len() > 1).then_some(order.id),
                 venue: leg.intent.venue.clone(),
                 symbol: leg.intent.symbol.clone(),
                 side: leg.intent.side,

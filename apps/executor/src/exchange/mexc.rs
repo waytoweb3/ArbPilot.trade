@@ -11,8 +11,8 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::{
-    make_book, millis_to_time, parse_json_decimal, value_to_millis, BookSnapshot, FundingRate,
-    FundingSnapshot, FundingVenueClient,
+    depth_rows, make_book, make_depth, millis_to_time, parse_json_decimal, value_to_millis,
+    BookSnapshot, DepthSnapshot, FundingRate, FundingSnapshot, FundingVenueClient,
 };
 use crate::http_client::HttpClient;
 
@@ -152,6 +152,22 @@ impl MexcFundingClient {
             serde_json::from_value(self.fetch(&url)?).context("解析 MEXC depth 失败")?;
         let data = into_data(envelope, "contract/depth")?;
         book_from_depth(&data, contract_size)
+    }
+
+    /// USDT 本位永续的多档盘口；张数按合约面值折算成币。
+    pub fn depth(&self, symbol: &str, limit: u32) -> anyhow::Result<DepthSnapshot> {
+        let contract = mexc_contract(symbol)?;
+        let contract_size = self.contract_size(&contract)?;
+        let url = format!("{}/api/v1/contract/depth/{contract}", self.base_url);
+        let envelope: Envelope =
+            serde_json::from_value(self.fetch(&url)?).context("解析 MEXC depth 失败")?;
+        let data = into_data(envelope, "contract/depth")?;
+        let cap = limit.clamp(1, 50) as usize;
+        let mut bids = depth_rows(&data, "bids")?;
+        let mut asks = depth_rows(&data, "asks")?;
+        bids.truncate(cap);
+        asks.truncate(cap);
+        make_depth(VENUE, symbol, bids, asks, contract_size)
     }
 
     /// 一张合约对应的标的数量，供 WebSocket 盘口把张数折算成币。

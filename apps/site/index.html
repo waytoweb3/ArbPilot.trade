@@ -17,13 +17,17 @@
     <meta property="og:title" content="ArbPilot · Self-hosted cross-venue arbitrage terminal" />
     <meta property="og:description" content="ArbPilot is a self-hosted quantitative arbitrage terminal: the desktop configures and monitors while a Rust executor on your machine or server connects to exchanges. Market-wide funding rates, news events and custom strategies all pass the same risk checks, and keys never leave your device." />
     <meta property="og:url" content="https://arbpilot.trade/" />
-    <meta property="og:image" content="https://arbpilot.trade/icon-512.png" />
+    <meta property="og:image" content="https://arbpilot.trade/og.png" />
+    <meta property="og:image:type" content="image/png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="ArbPilot — self-hosted cross-venue arbitrage terminal" />
     <meta property="og:locale" content="en_US" />
     <meta property="og:locale:alternate" content="zh_CN" />
     <meta name="twitter:card" content="summary_large_image" />
     <meta name="twitter:title" content="ArbPilot · Self-hosted cross-venue arbitrage terminal" />
     <meta name="twitter:description" content="ArbPilot is a self-hosted quantitative arbitrage terminal: the desktop configures and monitors while a Rust executor on your machine or server connects to exchanges. Market-wide funding rates, news events and custom strategies all pass the same risk checks, and keys never leave your device." />
-    <meta name="twitter:image" content="https://arbpilot.trade/icon-512.png" />
+    <meta name="twitter:image" content="https://arbpilot.trade/og.png" />
     <script type="application/ld+json">
       {
         "@context": "https://schema.org",
@@ -36,8 +40,10 @@
         "inLanguage": ["en", "zh-CN"],
         "description": "Self-hosted cross-venue arbitrage terminal: configure and monitor from the desktop while a Rust executor connects to 11 exchanges locally with unified risk checks, keeping API keys on your device.",
         "offers": {
-          "@type": "Offer",
-          "price": "0",
+          "@type": "AggregateOffer",
+          "lowPrice": "0",
+          "highPrice": "19",
+          "offerCount": "2",
           "priceCurrency": "USD"
         }
       }

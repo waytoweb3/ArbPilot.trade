@@ -27,9 +27,11 @@ function formatAnnualized(value: number): string {
 
 /** 结算间隔展示：28800 秒 → 8h，3600 秒 → 1h。 */
 function formatInterval(seconds: number): string {
-  const hours = seconds / 3_600;
+  // 交易所常返回相差 1 秒的间隔（如 14399），先就近取整到分钟再展示。
+  const secs = Math.round(seconds / 60) * 60;
+  const hours = secs / 3_600;
   if (hours < 1) {
-    return `${Math.max(1, Math.round(seconds / 60))}m`;
+    return `${Math.max(1, Math.round(secs / 60))}m`;
   }
   return `${Number.isInteger(hours) ? hours : hours.toFixed(1)}h`;
 }

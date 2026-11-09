@@ -1,13 +1,14 @@
 use std::{collections::HashMap, sync::Arc};
 
-use anyhow::{anyhow, Context};
+use anyhow::{anyhow, bail, Context};
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::Deserialize;
+use serde_json::Value;
 
 use super::{
-    make_book, millis_to_time, parse_decimal, BookSnapshot, FundingRate, FundingSnapshot,
-    FundingVenueClient,
+    candles_from_rows, depth_rows, make_book, make_depth, millis_to_time, parse_decimal,
+    BookSnapshot, Candle, DepthSnapshot, FundingRate, FundingSnapshot, FundingVenueClient,
 };
 use crate::http_client::HttpClient;
 
@@ -249,6 +250,35 @@ impl BitgetFundingClient {
         )
     }
 
+    /// USDT 本位永续的多档盘口；数量单位是币。
+    pub fn depth(&self, symbol: &str, limit: u32) -> anyhow::Result<DepthSnapshot> {
+        let wanted = symbol.trim().to_ascii_uppercase();
+        let limit = limit.clamp(1, 200);
+        let url = format!(
+            "{}/api/v2/mix/market/merge-depth?symbol={wanted}&productType=usdt-futures&limit={limit}",
+            self.base_url
+        );
+        let value = self.http.get_json(&url)?;
+        let code = value.get("code").and_then(Value::as_str).unwrap_or("00000");
+        if code != "00000" {
+            let message = value
+                .get("msg")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            bail!("Bitget merge-depth 返回错误 {code}: {message}");
+        }
+        let data = value
+            .get("data")
+            .ok_or_else(|| anyhow!("Bitget merge-depth 响应缺少 data"))?;
+        make_depth(
+            VENUE,
+            symbol,
+            depth_rows(data, "bids")?,
+            depth_rows(data, "asks")?,
+            Decimal::ONE,
+        )
+    }
+
     /// 当前正在交易的 USDT 本位永续合约清单。
     pub fn perpetual_symbols(&self) -> anyhow::Result<Vec<String>> {
         let url = format!(
@@ -318,6 +348,40 @@ impl BitgetFundingClient {
         rates.sort_by_key(|row| row.funding_time);
         Ok(rates)
     }
+
+    /// USDT 本位永续 K 线；Bitget 返回按时间倒序的数组行，单次最多 200 条。
+    pub fn candles(
+        &self,
+        symbol: &str,
+        interval: &str,
+        limit: u32,
+    ) -> anyhow::Result<Vec<Candle>> {
+        let granularity = bitget_interval(interval)?;
+        let url = format!(
+            "{}/api/v2/mix/market/candles?symbol={symbol}&productType=usdt-futures&granularity={granularity}&limit={}",
+            self.base_url,
+            limit.clamp(1, 200)
+        );
+        let envelope: Envelope<Vec<Value>> =
+            serde_json::from_value(self.http.get_json(&url)?).context("解析 Bitget K 线失败")?;
+        let rows = into_data(envelope, "market/candles")?;
+        candles_from_rows(rows, true)
+    }
+}
+
+/// Bitget 的 K 线周期格式：分钟用小写 m，小时/天/周用大写。
+fn bitget_interval(interval: &str) -> anyhow::Result<&'static str> {
+    Ok(match interval {
+        "1m" => "1m",
+        "5m" => "5m",
+        "15m" => "15m",
+        "30m" => "30m",
+        "1h" => "1H",
+        "4h" => "4H",
+        "1d" => "1D",
+        "1w" => "1W",
+        other => bail!("Bitget 不支持的 K 线周期: {other}"),
+    })
 }
 
 impl FundingVenueClient for BitgetFundingClient {

@@ -21,6 +21,8 @@ pub struct LocalExecutorConfig {
 pub struct LocalExecutor {
     config: LocalExecutorConfig,
     child: Mutex<Option<Child>>,
+    /// 记录执行器进程号，退出异常时供下次启动清理孤儿进程。
+    pid_file: PathBuf,
 }
 
 impl LocalExecutor {
@@ -33,6 +35,7 @@ impl LocalExecutor {
             let _ = child.kill();
             let _ = child.wait();
         }
+        let _ = std::fs::remove_file(&self.pid_file);
     }
 }
 
@@ -84,6 +87,9 @@ pub fn start(app: &AppHandle) -> ExecutorRuntime {
     };
     let token = random_token();
     let database = data_dir.join("executor.db");
+    let pid_file = data_dir.join("executor.pid");
+    // 上次会话若异常退出，旧执行器会残留在后台，先按 pid 文件清理再启动新的。
+    kill_previous(&pid_file, &binary);
 
     let mut command = Command::new(&binary);
     command
@@ -111,6 +117,7 @@ pub fn start(app: &AppHandle) -> ExecutorRuntime {
 
     match command.spawn() {
         Ok(child) => {
+            let _ = std::fs::write(&pid_file, child.id().to_string());
             // 等执行器开始监听再交给前端，避免首屏请求打到尚未就绪的端口。
             wait_until_ready(port, std::time::Duration::from_secs(3));
             eprintln!("内置执行器已启动：{}（端口 {port}）", binary.display());
@@ -122,6 +129,7 @@ pub fn start(app: &AppHandle) -> ExecutorRuntime {
                         database: database.display().to_string(),
                     },
                     child: Mutex::new(Some(child)),
+                    pid_file,
                 }),
             }
         }
@@ -130,6 +138,61 @@ pub fn start(app: &AppHandle) -> ExecutorRuntime {
             ExecutorRuntime { local: None }
         }
     }
+}
+
+/// 清理上一次会话遗留的执行器进程。
+///
+/// 桌面端被强制结束或崩溃时，子进程不会随父进程退出，重启后会造成端口与 CPU 占用；
+/// 启动前按 pid 文件结束它，并确认进程确实是本机的执行器二进制，避免 pid 复用误杀。
+fn kill_previous(pid_file: &Path, binary: &Path) {
+    if let Ok(text) = std::fs::read_to_string(pid_file) {
+        if let Ok(pid) = text.trim().parse::<u32>() {
+            if pid != std::process::id() && is_executor(pid, binary) {
+                terminate(pid);
+            }
+        }
+    }
+    let _ = std::fs::remove_file(pid_file);
+}
+
+#[cfg(unix)]
+fn is_executor(pid: u32, binary: &Path) -> bool {
+    Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "args="])
+        .output()
+        .map(|output| {
+            let args = String::from_utf8_lossy(&output.stdout);
+            args.trim().starts_with(binary.to_string_lossy().as_ref())
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn is_executor(pid: u32, binary: &Path) -> bool {
+    let Some(name) = binary.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+        .output()
+        .map(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .to_ascii_lowercase()
+                .contains(&name.to_ascii_lowercase())
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(unix)]
+fn terminate(pid: u32) {
+    let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+}
+
+#[cfg(windows)]
+fn terminate(pid: u32) {
+    let _ = Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/F"])
+        .status();
 }
 
 /// 依次尝试安装包内路径与开发态构建产物。

@@ -7,8 +7,8 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::{
-    candles_from_rows, make_book, BookSnapshot, Candle, DeliveryContract, FundingRate,
-    FundingSnapshot, FundingVenueClient, Segment,
+    candles_from_rows, depth_rows, make_book, make_depth, BookSnapshot, Candle, DeliveryContract,
+    DepthSnapshot, FundingRate, FundingSnapshot, FundingVenueClient, Segment,
 };
 use crate::http_client::HttpClient;
 
@@ -206,6 +206,38 @@ impl BinanceMarketClient {
             required_decimal(&payload.bid_qty, "bidQty")?,
             required_decimal(&payload.ask_price, "askPrice")?,
             required_decimal(&payload.ask_qty, "askQty")?,
+        )
+    }
+
+    /// 多档盘口；现货与合约分别走各自的 depth 端点，数量单位是币。
+    pub fn depth(
+        &self,
+        symbol: &str,
+        segment: Segment,
+        limit: u32,
+    ) -> anyhow::Result<DepthSnapshot> {
+        let (base, path) = match segment {
+            Segment::Spot => (&self.spot_base_url, "/api/v3/depth"),
+            Segment::Swap | Segment::Delivery => (&self.futures_base_url, "/fapi/v1/depth"),
+        };
+        // Binance 只接受固定的档位集合，向上取整到最近的合法值。
+        let limit = match limit {
+            0..=5 => 5,
+            6..=10 => 10,
+            11..=20 => 20,
+            21..=50 => 50,
+            51..=100 => 100,
+            101..=500 => 500,
+            _ => 1_000,
+        };
+        let url = format!("{base}{path}?symbol={symbol}&limit={limit}");
+        let value = self.http.get_json(&url)?;
+        make_depth(
+            VENUE,
+            symbol,
+            depth_rows(&value, "bids")?,
+            depth_rows(&value, "asks")?,
+            Decimal::ONE,
         )
     }
 

@@ -1,14 +1,14 @@
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context};
+use anyhow::{anyhow, bail, Context};
 use chrono::{DateTime, TimeZone, Utc};
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::{
-    make_book, parse_decimal, parse_json_decimal, BookSnapshot, FundingRate, FundingSnapshot,
-    FundingVenueClient,
+    make_book, make_depth, parse_decimal, parse_json_decimal, BookSnapshot, Candle, DepthSnapshot,
+    FundingRate, FundingSnapshot, FundingVenueClient,
 };
 use crate::http_client::HttpClient;
 
@@ -101,6 +101,33 @@ struct HistoryRow {
     time: i64,
 }
 
+#[derive(Debug, Deserialize)]
+struct CandleRow {
+    /// 开盘时间（毫秒）。
+    t: i64,
+    o: String,
+    h: String,
+    l: String,
+    c: String,
+    #[serde(default)]
+    v: Option<Value>,
+}
+
+/// Hyperliquid 的 K 线周期与对应秒数。
+fn hyperliquid_interval(interval: &str) -> anyhow::Result<(&'static str, i64)> {
+    Ok(match interval {
+        "1m" => ("1m", 60),
+        "5m" => ("5m", 300),
+        "15m" => ("15m", 900),
+        "30m" => ("30m", 1_800),
+        "1h" => ("1h", 3_600),
+        "4h" => ("4h", 14_400),
+        "1d" => ("1d", 86_400),
+        "1w" => ("1w", 604_800),
+        other => bail!("Hyperliquid 不支持的 K 线周期: {other}"),
+    })
+}
+
 /// Hyperliquid 永续公开资金费率客户端。
 pub struct HyperliquidFundingClient {
     base_url: String,
@@ -125,6 +152,85 @@ impl HyperliquidFundingClient {
         let coin = venue_coin(symbol)?;
         let value = self.info(json!({ "type": "l2Book", "coin": coin }))?;
         book_from_l2(&value)
+    }
+
+    /// 永续的多档盘口；`l2Book` 一次返回全部档位，数量单位是币。
+    pub fn depth(&self, symbol: &str, limit: u32) -> anyhow::Result<DepthSnapshot> {
+        let coin = venue_coin(symbol)?;
+        let value = self.info(json!({ "type": "l2Book", "coin": coin }))?;
+        let levels = value
+            .get("levels")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow!("Hyperliquid l2Book 响应缺少 levels"))?;
+        let cap = limit.clamp(1, 100) as usize;
+        let side = |index: usize| -> anyhow::Result<Vec<(Decimal, Decimal)>> {
+            let rows = levels
+                .get(index)
+                .and_then(Value::as_array)
+                .ok_or_else(|| anyhow!("Hyperliquid l2Book 缺少档位 {index}"))?;
+            rows.iter()
+                .take(cap)
+                .map(|row| {
+                    let price = row
+                        .get("px")
+                        .ok_or_else(|| anyhow!("Hyperliquid l2Book 档位缺少 px"))?;
+                    let size = row
+                        .get("sz")
+                        .ok_or_else(|| anyhow!("Hyperliquid l2Book 档位缺少 sz"))?;
+                    Ok((parse_json_decimal(price)?, parse_json_decimal(size)?))
+                })
+                .collect()
+        };
+        make_depth(VENUE, symbol, side(0)?, side(1)?, Decimal::ONE)
+    }
+
+    /// 永续 K 线；`candleSnapshot` 按毫秒时间窗返回 `{t, o, h, l, c, v}` 对象数组。
+    pub fn candles(
+        &self,
+        symbol: &str,
+        interval: &str,
+        limit: u32,
+    ) -> anyhow::Result<Vec<Candle>> {
+        let coin = venue_coin(symbol)?;
+        let (interval, step) = hyperliquid_interval(interval)?;
+        let limit = limit.clamp(1, 5_000);
+        let end = Utc::now();
+        let start = end - chrono::Duration::seconds(step * i64::from(limit));
+        let value = self.info(json!({
+            "type": "candleSnapshot",
+            "req": {
+                "coin": coin,
+                "interval": interval,
+                "startTime": start.timestamp_millis(),
+                "endTime": end.timestamp_millis(),
+            }
+        }))?;
+        let rows: Vec<CandleRow> =
+            serde_json::from_value(value).context("解析 Hyperliquid candleSnapshot 失败")?;
+        let mut candles = Vec::with_capacity(rows.len());
+        for row in rows {
+            let Some(open_time) = Utc.timestamp_millis_opt(row.t).single() else {
+                continue;
+            };
+            candles.push(Candle {
+                open_time,
+                open: parse_decimal(&row.o)?,
+                high: parse_decimal(&row.h)?,
+                low: parse_decimal(&row.l)?,
+                close: parse_decimal(&row.c)?,
+                volume: row
+                    .v
+                    .as_ref()
+                    .map(parse_json_decimal)
+                    .transpose()?
+                    .unwrap_or_default(),
+            });
+        }
+        candles.sort_by_key(|candle| candle.open_time);
+        if candles.len() > limit as usize {
+            candles.drain(..candles.len() - limit as usize);
+        }
+        Ok(candles)
     }
 
     /// 全部永续的当期费率、标记价与下次结算时间，一次 `metaAndAssetCtxs` 请求即可。

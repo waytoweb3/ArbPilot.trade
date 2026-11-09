@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 use crate::{
     accounts::{AccountEndpoints, Accounts, VenuePositions},
+    conditional::ConditionalOrders,
     config::Config,
     events::{AlertLevel, ExecutorEvent},
     exchange::{LiveEndpoints, LiveExchange, OkxMarketClient},
@@ -58,6 +59,8 @@ pub struct AppState {
     pub orders: Arc<RwLock<Vec<Order>>>,
     pub positions: Arc<RwLock<Vec<Position>>>,
     pub strategies: Arc<RwLock<Vec<StrategyRecord>>>,
+    /// 条件单：等待触发，由后台轮询判断有效期与阈值。
+    pub conditional: Arc<ConditionalOrders>,
     pub idempotency: Arc<RwLock<HashMap<String, Uuid>>>,
     pub events: broadcast::Sender<ExecutorEvent>,
     pub paused: Arc<AtomicBool>,
@@ -145,6 +148,8 @@ impl AppState {
 
         // 策略定义完全以数据库为准：没有保存过策略时列表就是空的，不再自动生成内置策略。
         let strategies = store.load_strategies().await;
+        // 条件单持久化在库里，重启后继续等待触发。
+        let conditional = ConditionalOrders::with_orders(store.conditional_orders().await);
 
         // 授权令牌在启动时从本地恢复，过期后仍需回桌面端重新登录换取。
         let license = Arc::new(LicenseManager::start(
@@ -171,6 +176,7 @@ impl AppState {
             orders: Arc::new(RwLock::new(Vec::new())),
             positions: Arc::new(RwLock::new(Vec::new())),
             strategies: Arc::new(RwLock::new(strategies)),
+            conditional: Arc::new(conditional),
             idempotency: Arc::new(RwLock::new(HashMap::new())),
             events,
             paused: Arc::new(AtomicBool::new(false)),
@@ -356,6 +362,7 @@ fn merge_exchange_positions(positions: &mut Vec<Position>, snapshots: Vec<VenueP
                 let existing = local.remove(index);
                 position.id = existing.id;
                 position.strategy_id = existing.strategy_id;
+                position.group_id = existing.group_id;
             }
             retained.push(position);
         }

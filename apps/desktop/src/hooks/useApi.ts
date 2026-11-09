@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { api } from "../lib/api";
 import type {
+  CreateConditionalRequest,
   CreateOrderRequest,
   CreatePerformanceRequest,
   CreatePublicationRequest,
@@ -38,12 +39,13 @@ export function useBasisOpportunities() {
   });
 }
 
-/** 现货 K 线：执行器按需拉取，桌面端定时刷新。 */
-export function useCandles(symbol: string, interval: string, limit: number, venue = "binance-spot") {
+/** 永续 K 线：执行器按需拉取，桌面端定时刷新；30 秒周期由实时盘口聚合，刷新更频繁。 */
+export function useCandles(symbol: string, interval: string, limit: number, venue = "binance") {
   return useQuery({
     queryKey: ["candles", venue, symbol, interval, limit],
     queryFn: () => api.candles(symbol, interval, limit, venue),
-    refetchInterval: 30_000,
+    refetchInterval: interval === "30s" ? 10_000 : 30_000,
+    enabled: Boolean(symbol) && Boolean(venue),
   });
 }
 
@@ -62,6 +64,59 @@ export function useOrders() {
     queryKey: ["orders"],
     queryFn: api.orders,
     refetchInterval: 5_000,
+  });
+}
+
+/** 多档盘口深度：跟随交易页刷新，用于展示买卖盘挂单分布。 */
+export function useDepth(venue: string, symbol: string, limit = 12) {
+  return useQuery({
+    queryKey: ["depth", venue, symbol, limit],
+    queryFn: () => api.depth(venue, symbol, limit),
+    refetchInterval: 3_000,
+    enabled: Boolean(venue) && Boolean(symbol),
+  });
+}
+
+/** 条件单列表：等待触发与已结束的记录都在这里。 */
+export function useConditionalOrders() {
+  return useQuery({
+    queryKey: ["conditional-orders"],
+    queryFn: api.conditionalOrders,
+    refetchInterval: 5_000,
+  });
+}
+
+export function useCreateConditionalOrder() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (body: CreateConditionalRequest) => api.createConditionalOrder(body),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["conditional-orders"] }),
+  });
+}
+
+export function useCancelConditionalOrder() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => api.cancelConditionalOrder(id),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["conditional-orders"] }),
+  });
+}
+
+/** 整组平仓：成交后刷新仓位与订单列表。 */
+export function useClosePositionGroup() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (groupId: string) => {
+      const result = await api.closePositionGroup(groupId);
+      if (result.order.status === "rejected") {
+        throw new Error(result.order.note ?? "整组平仓被风控拒绝");
+      }
+      return result;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["positions"] });
+      queryClient.invalidateQueries({ queryKey: ["orders"] });
+    },
   });
 }
 

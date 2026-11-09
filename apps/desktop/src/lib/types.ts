@@ -410,6 +410,8 @@ export interface Position {
   id: string;
   /** 来自策略的仓位记录来源策略，手动下单为 null。 */
   strategy_id?: string | null;
+  /** 同一次双腿下单产生的仓位共享该分组 ID，为空表示单腿仓位。 */
+  group_id?: string | null;
   venue: string;
   symbol: string;
   side: Side;
@@ -531,7 +533,7 @@ export interface CreateOrderRequest {
   long_venue: string;
   short_venue: string;
   notional_usd: number;
-  leverage: number;
+  leverage?: number;
   max_slippage_bps?: number;
   origin?: OrderOrigin;
 }
@@ -540,6 +542,64 @@ export interface CreateOrderResponse {
   order: Order;
   decision: RiskDecision | null;
   replayed: boolean;
+}
+
+/** 盘口单档：数量为币本位。 */
+export interface DepthLevel {
+  price: Decimal;
+  quantity: Decimal;
+}
+
+/** 多档盘口快照，买盘价格由高到低、卖盘由低到高。 */
+export interface DepthSnapshot {
+  venue: string;
+  symbol: string;
+  bids: DepthLevel[];
+  asks: DepthLevel[];
+  observed_at: string;
+}
+
+export type ConditionalStatus =
+  | "active"
+  | "triggered"
+  | "expired"
+  | "cancelled"
+  | "rejected";
+
+/** 触发条件来源：两腿净资金费率年化，或多腿中间价。 */
+export type TriggerKind = "funding" | "price";
+export type TriggerDirection = "above" | "below";
+
+/** 等待触发的双腿条件单。 */
+export interface ConditionalOrder {
+  id: string;
+  symbol: string;
+  long_venue: string;
+  short_venue: string;
+  notional_usd: Decimal;
+  leverage: Decimal;
+  trigger_kind: TriggerKind;
+  trigger_direction: TriggerDirection;
+  /** 资金费率触发时为年化百分比，价格触发时为报价。 */
+  trigger_value: Decimal;
+  expires_at: string | null;
+  status: ConditionalStatus;
+  note: string | null;
+  triggered_order_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CreateConditionalRequest {
+  symbol: string;
+  long_venue: string;
+  short_venue: string;
+  notional_usd: number;
+  leverage: number;
+  trigger_kind: TriggerKind;
+  trigger_direction: TriggerDirection;
+  trigger_value: number;
+  expires_at: string | null;
 }
 
 export interface ControlResponse {
@@ -598,6 +658,13 @@ export interface Candle {
   low: Decimal;
   close: Decimal;
   volume: Decimal;
+}
+
+/** 执行器 WebSocket 推送的实时中间价。 */
+export interface PriceTick {
+  price: number;
+  /** 推送时间（毫秒）。 */
+  ts: number;
 }
 
 export interface ExecutorEvent {

@@ -10,8 +10,9 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::{
-    candles_from_rows, make_book, millis_to_time, parse_decimal, BookSnapshot, Candle,
-    DeliveryContract, FundingRate, FundingSnapshot, FundingVenueClient, Segment,
+    candles_from_rows, depth_rows, make_book, make_depth, millis_to_time, parse_decimal,
+    BookSnapshot, Candle, DeliveryContract, DepthSnapshot, FundingRate, FundingSnapshot,
+    FundingVenueClient, Segment,
 };
 use crate::http_client::HttpClient;
 
@@ -376,6 +377,42 @@ impl OkxMarketClient {
         };
 
         make_book(bid, bid_qty, ask, ask_qty)
+    }
+
+    /// 多档盘口；永续与交割的数量单位是「张」，按 ctVal 折算成币。
+    pub fn depth(
+        &self,
+        symbol: &str,
+        segment: Segment,
+        limit: u32,
+    ) -> anyhow::Result<DepthSnapshot> {
+        let inst_id = match segment {
+            Segment::Spot => spot_inst_id(symbol)?,
+            Segment::Swap => swap_inst_id(symbol)?,
+            Segment::Delivery => symbol.trim().to_ascii_uppercase(),
+        };
+        let sz = limit.clamp(1, 400);
+        let url = format!(
+            "{}/api/v5/market/books?instId={inst_id}&sz={sz}",
+            self.base_url
+        );
+        let envelope: Envelope<Value> =
+            serde_json::from_value(self.http.get_json(&url)?).context("解析 OKX 盘口失败")?;
+        let book = into_data(envelope, "market/books")?
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("OKX 盘口返回空数据: {inst_id}"))?;
+        let multiplier = match segment {
+            Segment::Spot => Decimal::ONE,
+            Segment::Swap | Segment::Delivery => self.contract_value(&inst_id)?,
+        };
+        make_depth(
+            VENUE,
+            symbol,
+            depth_rows(&book, "bids")?,
+            depth_rows(&book, "asks")?,
+            multiplier,
+        )
     }
 
     pub fn candles(

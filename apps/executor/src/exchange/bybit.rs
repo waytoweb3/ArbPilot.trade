@@ -4,10 +4,12 @@ use anyhow::{anyhow, bail, Context};
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::Deserialize;
+use serde_json::Value;
 
 use super::{
-    make_book, millis_to_time, parse_decimal, BookSnapshot, DeliveryContract, FundingRate,
-    FundingSnapshot, FundingVenueClient,
+    candles_from_rows, depth_rows, make_book, make_depth, millis_to_time, parse_decimal,
+    BookSnapshot, Candle, DeliveryContract, DepthSnapshot, FundingRate, FundingSnapshot,
+    FundingVenueClient,
 };
 use crate::http_client::HttpClient;
 
@@ -190,6 +192,35 @@ impl BybitFundingClient {
         self.category_book("spot", symbol)
     }
 
+    /// 多档盘口；`spot` 为真取现货，否则取线性永续，数量单位是币。
+    pub fn depth(&self, symbol: &str, spot: bool, limit: u32) -> anyhow::Result<DepthSnapshot> {
+        let category = if spot { "spot" } else { "linear" };
+        let limit = limit.clamp(1, 200);
+        let url = format!(
+            "{}/v5/market/orderbook?category={category}&symbol={symbol}&limit={limit}",
+            self.base_url
+        );
+        let value = self.http.get_json(&url)?;
+        let ret_code = value.get("retCode").and_then(Value::as_i64).unwrap_or(0);
+        if ret_code != 0 {
+            let message = value
+                .get("retMsg")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            bail!("Bybit orderbook 返回错误 {ret_code}: {message}");
+        }
+        let result = value
+            .get("result")
+            .ok_or_else(|| anyhow!("Bybit orderbook 响应缺少 result"))?;
+        make_depth(
+            VENUE,
+            symbol,
+            depth_rows(result, "b")?,
+            depth_rows(result, "a")?,
+            Decimal::ONE,
+        )
+    }
+
     fn category_book(&self, category: &str, symbol: &str) -> anyhow::Result<BookSnapshot> {
         let url = format!(
             "{}/v5/market/tickers?category={category}&symbol={symbol}",
@@ -359,6 +390,47 @@ impl BybitFundingClient {
         rates.sort_by_key(|row| row.funding_time);
         Ok(rates)
     }
+
+    /// 线性永续 K 线；Bybit 返回按时间倒序的数组行。
+    pub fn candles(
+        &self,
+        symbol: &str,
+        interval: &str,
+        limit: u32,
+    ) -> anyhow::Result<Vec<Candle>> {
+        let interval = bybit_interval(interval)?;
+        let url = format!(
+            "{}/v5/market/kline?category=linear&symbol={symbol}&interval={interval}&limit={}",
+            self.base_url,
+            limit.clamp(1, 1_000)
+        );
+        let envelope: Envelope<Value> =
+            serde_json::from_value(self.http.get_json(&url)?).context("解析 Bybit K 线失败")?;
+        let result = into_result(envelope, "market/kline")?;
+        let rows: Vec<Vec<Value>> = serde_json::from_value(
+            result
+                .get("list")
+                .cloned()
+                .unwrap_or_else(|| Value::Array(Vec::new())),
+        )
+        .context("解析 Bybit K 线行失败")?;
+        candles_from_rows(rows, true)
+    }
+}
+
+/// Bybit 的 K 线周期用分钟数表示。
+fn bybit_interval(interval: &str) -> anyhow::Result<&'static str> {
+    Ok(match interval {
+        "1m" => "1",
+        "5m" => "5",
+        "15m" => "15",
+        "30m" => "30",
+        "1h" => "60",
+        "4h" => "240",
+        "1d" => "D",
+        "1w" => "W",
+        other => bail!("Bybit 不支持的 K 线周期: {other}"),
+    })
 }
 
 impl FundingVenueClient for BybitFundingClient {

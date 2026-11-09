@@ -10,8 +10,8 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::{
-    make_book, millis_to_time, parse_json_decimal, value_to_millis, BookSnapshot, FundingRate,
-    FundingSnapshot, FundingVenueClient,
+    depth_rows, make_book, make_depth, millis_to_time, parse_json_decimal, value_to_millis,
+    BookSnapshot, DepthSnapshot, FundingRate, FundingSnapshot, FundingVenueClient,
 };
 use crate::http_client::HttpClient;
 
@@ -154,6 +154,35 @@ impl HtxFundingClient {
             .get("tick")
             .ok_or_else(|| anyhow!("HTX merged 响应缺少 tick: {contract}"))?;
         book_from_tick(tick, contract_size)
+    }
+
+    /// USDT 本位永续的多档盘口；张数按合约面值折算成币。
+    pub fn depth(&self, symbol: &str) -> anyhow::Result<DepthSnapshot> {
+        let contract = htx_contract(symbol)?;
+        let contract_size = self.contract_size(&contract)?;
+        let url = format!(
+            "{}/linear-swap-ex/market/depth?contract_code={contract}&type=step0",
+            self.base_url
+        );
+        let value = self.http.get_json(&url)?;
+        let status = value.get("status").and_then(Value::as_str).unwrap_or("ok");
+        if !status.eq_ignore_ascii_case("ok") {
+            let message = value
+                .get("err-msg")
+                .and_then(Value::as_str)
+                .unwrap_or(status);
+            bail!("HTX depth 返回错误: {message}");
+        }
+        let tick = value
+            .get("tick")
+            .ok_or_else(|| anyhow!("HTX depth 响应缺少 tick: {contract}"))?;
+        make_depth(
+            VENUE,
+            symbol,
+            depth_rows(tick, "bids")?,
+            depth_rows(tick, "asks")?,
+            contract_size,
+        )
     }
 
     /// 一张合约对应的标的数量，供 WebSocket 盘口把张数折算成币。

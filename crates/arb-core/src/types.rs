@@ -249,6 +249,9 @@ pub struct Position {
     /// 来自策略的仓位记录来源策略，手动下单为 None。
     #[serde(default)]
     pub strategy_id: Option<Uuid>,
+    /// 同一次双腿下单产生的仓位共享同一个分组 ID，用于整组平仓。
+    #[serde(default)]
+    pub group_id: Option<Uuid>,
     pub venue: String,
     pub symbol: String,
     pub side: Side,

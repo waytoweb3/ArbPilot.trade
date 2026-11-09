@@ -1,5 +1,6 @@
 mod accounts;
 mod auth;
+mod conditional;
 mod config;
 mod error;
 mod events;
@@ -57,6 +58,8 @@ async fn main() -> anyhow::Result<()> {
     routes::market::seed_official(&state).await;
     // 策略只在「运行中」且执行器未暂停时产生订单意图，并通过统一风控网关下单。
     strategy_runner::spawn(state.clone());
+    // 条件单：按固定节拍检查有效期与触发条件，命中后走同一风控网关下单。
+    conditional::spawn(state.clone());
     let app = routes::build(state);
 
     let listener = TcpListener::bind(config.bind_addr)
