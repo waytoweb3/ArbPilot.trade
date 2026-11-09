@@ -128,6 +128,11 @@ pub trait FundingVenueClient: Send + Sync {
     fn funding_interval_secs(&self) -> Option<i64> {
         None
     }
+
+    /// 交易所公开的逐合约结算间隔（秒）；不支持时返回空，由历史结算时间推断。
+    fn funding_intervals(&self) -> anyhow::Result<std::collections::HashMap<String, i64>> {
+        Ok(std::collections::HashMap::new())
+    }
 }
 
 pub(crate) fn parse_decimal(value: &str) -> anyhow::Result<Decimal> {

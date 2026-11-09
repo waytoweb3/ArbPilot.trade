@@ -71,6 +71,25 @@ impl BinanceFundingClient {
         Ok(snapshots)
     }
 
+    /// 各合约的官方结算间隔（秒）；`fundingInfo` 是 Binance 唯一公开该字段的接口。
+    ///
+    /// Aster 的接口与 Binance 兼容，同一份实现可以直接复用。
+    pub fn funding_intervals(&self) -> anyhow::Result<HashMap<String, i64>> {
+        let url = format!("{}/fapi/v1/fundingInfo", self.base_url);
+        let rows: Vec<FundingInfoRow> = serde_json::from_value(self.http.get_json(&url)?)
+            .context("解析 fundingInfo 失败")?;
+
+        let mut intervals = HashMap::with_capacity(rows.len());
+        for row in rows {
+            let Some(hours) = row.funding_interval_hours.filter(|value| (1..=24).contains(value))
+            else {
+                continue;
+            };
+            intervals.insert(row.symbol.to_ascii_uppercase(), hours * 3600);
+        }
+        Ok(intervals)
+    }
+
     /// 当前正在交易的 USDT 本位永续合约清单。
     pub fn perpetual_symbols(&self) -> anyhow::Result<Vec<String>> {
         let url = format!("{}/fapi/v1/exchangeInfo", self.base_url);
@@ -146,6 +165,10 @@ impl FundingVenueClient for BinanceFundingClient {
 
     fn premium_index_all(&self) -> anyhow::Result<Vec<(String, FundingSnapshot)>> {
         Self::premium_index_all(self)
+    }
+
+    fn funding_intervals(&self) -> anyhow::Result<HashMap<String, i64>> {
+        Self::funding_intervals(self)
     }
 }
 
@@ -259,6 +282,15 @@ impl BinanceMarketClient {
         contracts.sort_by_key(|contract| contract.expiry);
         Ok(contracts)
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FundingInfoRow {
+    symbol: String,
+    /// 官方结算间隔（小时）；缺省表示沿用 8 小时。
+    #[serde(default)]
+    funding_interval_hours: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]

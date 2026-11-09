@@ -1,6 +1,9 @@
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, RwLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, RwLock,
+    },
     time::{Duration, Instant},
 };
 
@@ -54,12 +57,8 @@ pub(crate) fn annualize(rate: Decimal, interval_secs: i64) -> Decimal {
     rate * periods * Decimal::from(100)
 }
 
-/// 从历史结算时间推断该合约的结算间隔：取出现次数最多的相邻间隔。
-fn observed_interval_secs(previous: Option<DateTime<Utc>>, history: &[FundingRate]) -> Option<i64> {
-    let mut times: Vec<DateTime<Utc>> = Vec::with_capacity(history.len() + 1);
-    times.extend(previous);
-    times.extend(history.iter().map(|row| row.funding_time));
-
+/// 相邻结算时间中出现次数最多的间隔，用作该合约的实际结算周期。
+fn dominant_interval(times: &[DateTime<Utc>]) -> Option<i64> {
     let mut counts: HashMap<i64, usize> = HashMap::new();
     for pair in times.windows(2) {
         let diff = (pair[1] - pair[0]).num_seconds();
@@ -71,6 +70,14 @@ fn observed_interval_secs(previous: Option<DateTime<Utc>>, history: &[FundingRat
         .into_iter()
         .max_by_key(|(seconds, count)| (*count, *seconds))
         .map(|(seconds, _)| seconds)
+}
+
+/// 从历史结算时间推断该合约的结算间隔：取出现次数最多的相邻间隔。
+fn observed_interval_secs(previous: Option<DateTime<Utc>>, history: &[FundingRate]) -> Option<i64> {
+    let mut times: Vec<DateTime<Utc>> = Vec::with_capacity(history.len() + 1);
+    times.extend(previous);
+    times.extend(history.iter().map(|row| row.funding_time));
+    dominant_interval(&times)
 }
 
 /// 单个交易所的资金费率采集状态。
@@ -95,7 +102,7 @@ pub struct FundingSymbolStatus {
     pub last_funding_rate: Option<Decimal>,
     /// 该合约的实际结算间隔（秒），由历史结算时间推断。
     pub funding_interval_secs: i64,
-    /// 最近一次已结算费率按实际结算间隔折算的年化百分比。
+    /// 当期（未结算）费率按实际结算间隔折算的年化百分比；与 `predicted_rate` 同口径。
     pub annualized_pct: Option<Decimal>,
     /// 当期（未结算）预测费率。
     pub predicted_rate: Option<Decimal>,
@@ -144,6 +151,8 @@ pub struct FundingFeed {
     store: Arc<Store>,
     /// 上次清理超期历史的时间，避免每轮都执行删除。
     last_prune: RwLock<Option<Instant>>,
+    /// 是否已完成首轮的结算间隔恢复；顺序：交易所公开间隔 → 已入库历史推断。
+    hydrated: AtomicBool,
 }
 
 impl FundingFeed {
@@ -325,6 +334,7 @@ impl FundingFeed {
             realtime,
             store,
             last_prune: RwLock::new(None),
+            hydrated: AtomicBool::new(false),
         });
 
         if !enabled {
@@ -387,6 +397,7 @@ impl FundingFeed {
                     continue;
                 }
                 let rate = row.map(|row| row.funding_rate);
+                let predicted = snapshot.map(|snapshot| snapshot.funding_rate);
                 let interval_secs = state
                     .intervals
                     .get(symbol)
@@ -403,8 +414,11 @@ impl FundingFeed {
                     last_funding_time: row.map(|row| row.funding_time),
                     last_funding_rate: rate,
                     funding_interval_secs: interval_secs,
-                    annualized_pct: rate.map(|rate| annualize(rate, interval_secs)),
-                    predicted_rate: snapshot.map(|snapshot| snapshot.funding_rate),
+                    // 与展示的当期费率保持同一口径；没有当期费率时回退最近一次已结算费率。
+                    annualized_pct: predicted
+                        .or(rate)
+                        .map(|rate| annualize(rate, interval_secs)),
+                    predicted_rate: predicted,
                     mark_price: snapshot
                         .and_then(|snapshot| snapshot.mark_price)
                         .or_else(|| row.and_then(|row| row.mark_price)),
@@ -458,6 +472,14 @@ impl FundingFeed {
             if self.discovery_due(venue) {
                 self.discover_venue(venue).await;
             }
+        }
+
+        // 重启后先恢复结算间隔：交易所公开值优先，缺失的再用已入库历史推断。
+        if !self.hydrated.swap(true, Ordering::Relaxed) {
+            for venue in &self.venues {
+                self.seed_native_intervals(venue).await;
+            }
+            self.hydrate_intervals().await;
         }
 
         for venue in &self.venues {
@@ -618,6 +640,67 @@ impl FundingFeed {
         }
     }
 
+    /// 用交易所公开的逐合约结算间隔填充缓存；结果只用于启动时的初始值。
+    async fn seed_native_intervals(&self, venue: &VenueRuntime) {
+        let Some(client) = venue.client.clone() else {
+            return;
+        };
+        let result = tokio::task::spawn_blocking(move || client.funding_intervals()).await;
+        match result {
+            Ok(Ok(intervals)) if !intervals.is_empty() => {
+                let mut state = venue.state.write().expect("资金费率状态锁不可用");
+                let mut applied = 0;
+                for (symbol, secs) in intervals {
+                    if secs > 0 {
+                        state.intervals.insert(symbol, secs);
+                        applied += 1;
+                    }
+                }
+                tracing::info!(venue = venue.venue, applied, "已同步交易所公开的结算间隔");
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(venue = venue.venue, %error, "读取交易所结算间隔失败，改用历史推断")
+            }
+            Err(error) => tracing::warn!(venue = venue.venue, %error, "结算间隔任务异常退出"),
+        }
+    }
+
+    /// 从最近两天的已入库结算时间恢复结算间隔，覆盖交易所未公开间隔的合约。
+    async fn hydrate_intervals(&self) {
+        let since = Utc::now() - chrono::Duration::days(2);
+        for venue in &self.venues {
+            let rows = match self.store.funding_settlements(venue.venue, since).await {
+                Ok(rows) => rows,
+                Err(error) => {
+                    tracing::warn!(venue = venue.venue, %error, "读取历史结算时间失败");
+                    continue;
+                }
+            };
+            if rows.is_empty() {
+                continue;
+            }
+
+            let mut grouped: HashMap<String, Vec<DateTime<Utc>>> = HashMap::new();
+            for (symbol, time) in rows {
+                grouped.entry(symbol).or_default().push(time);
+            }
+
+            let mut restored = 0;
+            let mut state = venue.state.write().expect("资金费率状态锁不可用");
+            for (symbol, times) in grouped {
+                if state.intervals.contains_key(&symbol) {
+                    continue;
+                }
+                if let Some(secs) = dominant_interval(&times) {
+                    state.intervals.insert(symbol, secs);
+                    restored += 1;
+                }
+            }
+            tracing::info!(venue = venue.venue, restored, "已从历史恢复结算间隔");
+        }
+    }
+
     /// 当期（未结算）费率：批量接口优先，其次 WebSocket，最后按预算逐币 REST。
     async fn sync_snapshots(
         &self,
@@ -742,7 +825,16 @@ impl FundingFeed {
                     .unwrap_or(DEFAULT_INTERVAL_SECS);
                 let is_due = match row {
                     None => true,
-                    Some(row) => row.funding_time.timestamp() + interval <= now,
+                    Some(row) => {
+                        // 交易所已给出下次结算时间时以它为准，避免结算间隔偏大导致漏补。
+                        let settled = state
+                            .snapshots
+                            .get(symbol)
+                            .and_then(|snapshot| snapshot.next_funding_at)
+                            .map(|at| at.timestamp() <= now)
+                            .unwrap_or(false);
+                        settled || row.funding_time.timestamp() + interval <= now
+                    }
                 };
                 if is_due {
                     due.push((row.map(|row| row.funding_time), symbol.clone()));

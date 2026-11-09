@@ -436,7 +436,8 @@ fn parse_response(raw: &[u8]) -> anyhow::Result<Vec<u8>> {
         }
     }
 
-    if code != 200 {
+    // 不同交易所的成功码并不统一（Gate v4 下单返回 201），2xx 一律视为成功。
+    if !(200..300).contains(&code) {
         let snippet = String::from_utf8_lossy(&body[..body.len().min(200)]).replace('\n', " ");
         bail!("HTTP {code}: {snippet}");
     }
@@ -534,6 +535,13 @@ mod tests {
     fn decodes_chunked_body() {
         let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n[]\r\n0\r\n\r\n";
         assert_eq!(parse_response(raw).expect("应可解析"), b"[]".to_vec());
+    }
+
+    #[test]
+    fn accepts_non_200_success_status() {
+        // Gate v4 下单成功时返回 201，响应体是订单 JSON。
+        let raw = b"HTTP/1.1 201 Created\r\nContent-Length: 8\r\n\r\n{\"id\":1}";
+        assert_eq!(parse_response(raw).expect("2xx 应可解析"), b"{\"id\":1}".to_vec());
     }
 
     #[test]

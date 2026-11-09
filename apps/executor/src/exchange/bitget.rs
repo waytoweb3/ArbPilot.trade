@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use anyhow::{anyhow, Context};
 use chrono::{DateTime, Utc};
@@ -79,6 +79,36 @@ struct HistoryRow {
     funding_time: String,
 }
 
+/// `market/current-fund-rate` 的一行：tickers 里没有结算间隔与下次结算时间。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CurrentFundRateRow {
+    symbol: String,
+    /// 结算间隔，单位小时（字符串）。
+    #[serde(default)]
+    funding_rate_interval: Option<String>,
+    /// 下次结算时间（毫秒时间戳，字符串）。
+    #[serde(default)]
+    next_update: Option<String>,
+}
+
+impl CurrentFundRateRow {
+    fn interval_secs(&self) -> Option<i64> {
+        let hours = self
+            .funding_rate_interval
+            .as_deref()
+            .and_then(|value| value.trim().parse::<i64>().ok())?;
+        (1..=24).contains(&hours).then_some(hours * 3600)
+    }
+
+    fn next_funding_at(&self) -> Option<DateTime<Utc>> {
+        self.next_update
+            .as_deref()
+            .and_then(|value| value.trim().parse::<i64>().ok())
+            .and_then(millis_to_time)
+    }
+}
+
 /// Bitget 的 tickers 不含下次结算时间，展示时由其它交易所或结算间隔推断。
 fn snapshot_from(row: &TickerRow) -> Option<FundingSnapshot> {
     let funding_rate = row
@@ -125,17 +155,58 @@ impl BitgetFundingClient {
         let envelope: Envelope<TickerRow> = serde_json::from_value(self.http.get_json(&url)?)
             .context("解析 Bitget tickers 失败")?;
         let rows = into_data(envelope, "market/tickers")?;
+        // tickers 不带下次结算时间，合并另一张全量表补齐。
+        let fund_rates = match self.current_fund_rates() {
+            Ok(map) => map,
+            Err(error) => {
+                tracing::debug!(%error, "读取 Bitget 结算信息失败，下次结算时间暂缺");
+                HashMap::new()
+            }
+        };
 
         let mut snapshots = Vec::with_capacity(rows.len());
         for row in &rows {
             if !row.symbol.ends_with("USDT") {
                 continue;
             }
-            if let Some(snapshot) = snapshot_from(row) {
-                snapshots.push((row.symbol.to_ascii_uppercase(), snapshot));
+            let Some(mut snapshot) = snapshot_from(row) else {
+                continue;
+            };
+            if let Some(next) = fund_rates
+                .get(&row.symbol.to_ascii_uppercase())
+                .and_then(CurrentFundRateRow::next_funding_at)
+            {
+                snapshot.next_funding_at = Some(next);
             }
+            snapshots.push((row.symbol.to_ascii_uppercase(), snapshot));
         }
         Ok(snapshots)
+    }
+
+    /// 全部 USDT 本位永续的结算间隔与下次结算时间，按内部 symbol 索引。
+    fn current_fund_rates(&self) -> anyhow::Result<HashMap<String, CurrentFundRateRow>> {
+        let url = format!(
+            "{}/api/v2/mix/market/current-fund-rate?productType=usdt-futures",
+            self.base_url
+        );
+        let envelope: Envelope<CurrentFundRateRow> =
+            serde_json::from_value(self.http.get_json(&url)?)
+                .context("解析 Bitget current-fund-rate 失败")?;
+        Ok(into_data(envelope, "market/current-fund-rate")?
+            .into_iter()
+            .map(|row| (row.symbol.to_ascii_uppercase(), row))
+            .collect())
+    }
+
+    /// 各合约的官方结算间隔（秒）。
+    pub fn funding_intervals(&self) -> anyhow::Result<HashMap<String, i64>> {
+        let mut intervals = HashMap::new();
+        for (symbol, row) in self.current_fund_rates()? {
+            if let Some(secs) = row.interval_secs() {
+                intervals.insert(symbol, secs);
+            }
+        }
+        Ok(intervals)
     }
 
     pub fn premium_index(&self, symbol: &str) -> anyhow::Result<FundingSnapshot> {
@@ -269,6 +340,10 @@ impl FundingVenueClient for BitgetFundingClient {
     fn premium_index_all(&self) -> anyhow::Result<Vec<(String, FundingSnapshot)>> {
         Self::premium_index_all(self)
     }
+
+    fn funding_intervals(&self) -> anyhow::Result<HashMap<String, i64>> {
+        Self::funding_intervals(self)
+    }
 }
 
 #[cfg(test)]
@@ -292,6 +367,22 @@ mod tests {
         assert_eq!(snapshot.funding_rate, dec!(-0.000028));
         assert!(snapshot.mark_price.is_some());
         assert!(snapshot.next_funding_at.is_none());
+    }
+
+    #[test]
+    fn parses_current_fund_rate_metadata() {
+        let row: CurrentFundRateRow = serde_json::from_value(serde_json::json!({
+            "symbol": "BTCUSDT",
+            "fundingRate": "0.000086",
+            "fundingRateInterval": "4",
+            "nextUpdate": "1794211200000"
+        }))
+        .expect("应能解析 current-fund-rate");
+        assert_eq!(row.interval_secs(), Some(4 * 3600));
+        assert_eq!(
+            row.next_funding_at().map(|at| at.timestamp()),
+            Some(1_794_211_200)
+        );
     }
 
     #[test]

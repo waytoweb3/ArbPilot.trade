@@ -995,7 +995,8 @@ fn fetch_bitget(
         .ok_or_else(|| anyhow!("Bitget 需要 Passphrase"))?;
     let timestamp = Utc::now().timestamp_millis().to_string();
 
-    // 现货资产
+    // 现货资产：只开通合约权限的 Key 会返回 40014（缺少 spot 权限），
+    // 这类 Key 仍可用于永续套利，因此先记录错误并继续查询合约账户。
     let spot_path = "/api/v2/spot/account/assets";
     let spot_sign = hmac_sha256_base64(
         &credentials.api_secret,
@@ -1008,23 +1009,28 @@ fn fetch_bitget(
         ("ACCESS-PASSPHRASE", passphrase),
         ("locale", "zh-CN"),
     ];
-    let spot = http.get_json_with_headers(&format!("{base_url}{spot_path}"), &spot_headers)?;
-    if spot["code"].as_str().unwrap_or("00000") != "00000" {
-        bail!(
-            "Bitget 返回错误: {}",
-            spot["msg"].as_str().unwrap_or("未知错误")
-        );
-    }
-
     let mut balances = Vec::new();
-    if let Some(rows) = spot["data"].as_array() {
-        for row in rows {
-            let asset = row.get("coin").and_then(Value::as_str).unwrap_or_default();
-            let available =
-                decimal(row.get("available").unwrap_or(&Value::Null)).unwrap_or_default();
-            let frozen = decimal(row.get("frozen").unwrap_or(&Value::Null)).unwrap_or_default();
-            balances.push((asset.to_string(), available, frozen));
+    let mut spot_error = None;
+    match http.get_json_with_headers(&format!("{base_url}{spot_path}"), &spot_headers) {
+        Ok(spot) if spot["code"].as_str().unwrap_or("00000") == "00000" => {
+            if let Some(rows) = spot["data"].as_array() {
+                for row in rows {
+                    let asset = row.get("coin").and_then(Value::as_str).unwrap_or_default();
+                    let available =
+                        decimal(row.get("available").unwrap_or(&Value::Null)).unwrap_or_default();
+                    let frozen =
+                        decimal(row.get("frozen").unwrap_or(&Value::Null)).unwrap_or_default();
+                    balances.push((asset.to_string(), available, frozen));
+                }
+            }
         }
+        Ok(spot) => {
+            spot_error = Some(format!(
+                "Bitget 现货账户: {}",
+                spot["msg"].as_str().unwrap_or("未知错误")
+            ))
+        }
+        Err(error) => spot_error = Some(format!("Bitget 现货账户: {error}")),
     }
 
     // 合约账户：USDT 本位全仓账户各交易对返回相同权益，取最大值避免重复累加。
@@ -1041,29 +1047,42 @@ fn fetch_bitget(
         ("locale", "zh-CN"),
     ];
     let mut futures_equity = Decimal::ZERO;
-    if let Ok(futures) =
-        http.get_json_with_headers(&format!("{base_url}{futures_path}"), &futures_headers)
-    {
-        if let Some(rows) = futures["data"].as_array() {
-            for row in rows {
-                let equity =
-                    decimal(row.get("accountEquity").unwrap_or(&Value::Null)).unwrap_or_default();
-                if equity > futures_equity {
-                    futures_equity = equity;
+    let mut futures_error = None;
+    match http.get_json_with_headers(&format!("{base_url}{futures_path}"), &futures_headers) {
+        Ok(futures) if futures["code"].as_str().unwrap_or("00000") == "00000" => {
+            if let Some(rows) = futures["data"].as_array() {
+                for row in rows {
+                    let equity = decimal(row.get("accountEquity").unwrap_or(&Value::Null))
+                        .unwrap_or_default();
+                    if equity > futures_equity {
+                        futures_equity = equity;
+                    }
+                }
+                if futures_equity > Decimal::ZERO {
+                    let available = rows
+                        .first()
+                        .and_then(|row| decimal(row.get("available").unwrap_or(&Value::Null)))
+                        .unwrap_or_default();
+                    balances.push((
+                        "USDT".to_string(),
+                        available,
+                        (futures_equity - available).max(Decimal::ZERO),
+                    ));
                 }
             }
-            if futures_equity > Decimal::ZERO {
-                let available = rows
-                    .first()
-                    .and_then(|row| decimal(row.get("available").unwrap_or(&Value::Null)))
-                    .unwrap_or_default();
-                balances.push((
-                    "USDT".to_string(),
-                    available,
-                    (futures_equity - available).max(Decimal::ZERO),
-                ));
-            }
         }
+        Ok(futures) => {
+            futures_error = Some(format!(
+                "Bitget 合约账户: {}",
+                futures["msg"].as_str().unwrap_or("未知错误")
+            ))
+        }
+        Err(error) => futures_error = Some(format!("Bitget 合约账户: {error}")),
+    }
+
+    // 任一账户查询成功即可导入；两个都失败通常是 Key 权限不足或密钥错误。
+    if let (Some(spot), Some(futures)) = (spot_error, futures_error) {
+        bail!("{spot}；{futures}。请在 Bitget API Key 中开启现货或合约的读取权限");
     }
 
     Ok((balances, None))
@@ -1208,6 +1227,10 @@ fn fetch_hyperliquid(
 }
 
 /// Lighter 余额查询：按 L1 地址或数字账户索引查询全部子账户的资产。
+///
+/// `assets[].balance` 是现货钱包余额，永续保证金实际记在 `assets[].margin_balance`，
+/// 账户权益（含未实现盈亏）只能取 `total_asset_value`；直接对 `balance` 求和会让
+/// 有持仓的账户显示成 0 或接近 0，因此这里统一用权益覆盖。
 fn fetch_lighter(
     http: &HttpClient,
     base_url: &str,
@@ -1235,30 +1258,16 @@ fn fetch_lighter(
         bail!("Lighter 未找到该钱包的账户");
     }
 
-    let mut balances = Vec::new();
+    let mut equity = Decimal::ZERO;
     for account in accounts {
-        let Some(assets) = account["assets"].as_array() else {
-            continue;
-        };
-        for asset in assets {
-            let symbol = asset
-                .get("symbol")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let balance = decimal(asset.get("balance").unwrap_or(&Value::Null)).unwrap_or_default();
-            let locked =
-                decimal(asset.get("locked_balance").unwrap_or(&Value::Null)).unwrap_or_default();
-            if balance > Decimal::ZERO {
-                balances.push((
-                    symbol.to_string(),
-                    (balance - locked).max(Decimal::ZERO),
-                    locked,
-                ));
-            }
-        }
+        let value = decimal(account.get("total_asset_value").unwrap_or(&Value::Null))
+            .ok_or_else(|| anyhow!("Lighter 响应缺少 total_asset_value"))?;
+        equity += value;
     }
 
-    Ok((balances, None))
+    // Lighter 的权益本身就是 USDC 计价，按 1:1 计入。
+    let free = equity.max(Decimal::ZERO);
+    Ok((vec![("USDC".to_string(), free, Decimal::ZERO)], Some(equity)))
 }
 
 /// HTX（火币）U 本位永续：只读取全仓保证金账户的 USDT 权益。

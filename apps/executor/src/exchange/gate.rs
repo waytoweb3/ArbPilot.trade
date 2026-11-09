@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use anyhow::{anyhow, bail, Context};
 use chrono::{DateTime, TimeZone, Utc};
@@ -52,6 +52,9 @@ struct ContractRow {
     /// 下次结算时间（Unix 秒）。
     #[serde(default)]
     funding_next_apply: Option<i64>,
+    /// 该合约的结算间隔（秒）。
+    #[serde(default)]
+    funding_interval: Option<i64>,
     #[serde(default)]
     status: Option<String>,
     #[serde(default)]
@@ -151,6 +154,25 @@ impl GateFundingClient {
             }
         }
         Ok(snapshots)
+    }
+
+    /// 各合约的官方结算间隔（秒），与合约清单同一次请求返回。
+    pub fn funding_intervals(&self) -> anyhow::Result<HashMap<String, i64>> {
+        let mut intervals = HashMap::new();
+        for row in self.contracts()? {
+            if !row.is_tradable() {
+                continue;
+            }
+            let Some(symbol) = internal_symbol(&row.name) else {
+                continue;
+            };
+            let Some(secs) = row.funding_interval.filter(|secs| (60..=86_400).contains(secs))
+            else {
+                continue;
+            };
+            intervals.insert(symbol, secs);
+        }
+        Ok(intervals)
     }
 
     pub fn premium_index(&self, symbol: &str) -> anyhow::Result<FundingSnapshot> {
@@ -273,6 +295,10 @@ impl FundingVenueClient for GateFundingClient {
     fn premium_index_all(&self) -> anyhow::Result<Vec<(String, FundingSnapshot)>> {
         Self::premium_index_all(self)
     }
+
+    fn funding_intervals(&self) -> anyhow::Result<HashMap<String, i64>> {
+        Self::funding_intervals(self)
+    }
 }
 
 #[cfg(test)]
@@ -308,6 +334,7 @@ mod tests {
             funding_rate: Some("0.000042".to_string()),
             mark_price: Some("78351.95".to_string()),
             funding_next_apply: Some(1_793_808_000),
+            funding_interval: Some(8 * 3600),
             status: Some("trading".to_string()),
             in_delisting: Some(false),
             is_pre_market: Some(false),

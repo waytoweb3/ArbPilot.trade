@@ -464,13 +464,15 @@ fn gate_place(
         -contracts
     };
     let path = "/api/v4/futures/usdt/orders";
+    // Gate 要求 `text` 以 `t-` 开头，且自定义部分不超过 28 字节；client_id 可能长达 32 位。
+    let text: String = format!("t-{client_order_id}").chars().take(30).collect();
     let body = json!({
         "contract": contract,
         "size": size,
         "price": num(request.limit_price),
         "tif": "gtc",
         "reduce_only": request.reduce_only,
-        "text": format!("t-{client_order_id}"),
+        "text": text,
     })
     .to_string();
     let timestamp = Utc::now().timestamp().to_string();

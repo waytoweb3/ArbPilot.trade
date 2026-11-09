@@ -286,6 +286,35 @@ impl SqliteStore {
         Ok(latest.into_values().collect())
     }
 
+    pub async fn funding_settlements(
+        &self,
+        venue: &str,
+        since: DateTime<Utc>,
+    ) -> anyhow::Result<Vec<(String, DateTime<Utc>)>> {
+        let rows = sqlx::query(
+            r#"
+            select symbol, funding_time
+            from funding_rates
+            where venue = ? and funding_time >= ?
+            order by symbol, funding_time
+            "#,
+        )
+        .bind(venue)
+        .bind(since.timestamp_millis())
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .iter()
+            .map(|row| {
+                Ok((
+                    row.try_get("symbol")?,
+                    from_millis(row.try_get("funding_time")?),
+                ))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?)
+    }
+
     pub async fn funding_summary(
         &self,
         since: DateTime<Utc>,

@@ -558,6 +558,44 @@ impl Store {
         Ok(rates)
     }
 
+    /// 时间窗口内各交易对的结算时间，按 (symbol, funding_time) 升序返回。
+    ///
+    /// 启动时用最近几天的结算记录恢复各合约的结算间隔，避免重启后全部回退默认值。
+    pub async fn funding_settlements(
+        &self,
+        venue: &str,
+        since: DateTime<Utc>,
+    ) -> anyhow::Result<Vec<(String, DateTime<Utc>)>> {
+        sqlite_branch!(self, db => db.funding_settlements(venue, since).await);
+        let Some(pool) = &self.pool else {
+            let rows = self.funding.read().expect("资金费率锁不可用");
+            return Ok(rows
+                .iter()
+                .filter(|rate| rate.venue == venue && rate.funding_time >= since)
+                .map(|rate| (rate.symbol.clone(), rate.funding_time))
+                .collect());
+        };
+
+        let rows: Vec<sqlx::postgres::PgRow> = sqlx::query(
+            r#"
+            select symbol, funding_time
+            from funding_rates
+            where venue = $1 and funding_time >= $2
+            order by symbol, funding_time
+            "#,
+        )
+        .bind(venue)
+        .bind(since)
+        .fetch_all(pool)
+        .await?;
+
+        let mut settlements = Vec::with_capacity(rows.len());
+        for row in rows {
+            settlements.push((row.try_get("symbol")?, row.try_get("funding_time")?));
+        }
+        Ok(settlements)
+    }
+
     /// 时间窗口内的资金费率累计，按 (venue, symbol) 汇总。
     ///
     /// 币种很多时前端无法逐币拉历史，用一条聚合查询替代。
