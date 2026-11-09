@@ -109,6 +109,12 @@ struct MarketRow {
     /// 最小下单名义额（USDT）。
     #[serde(default)]
     min_quote_amount: Option<String>,
+    /// 数量精度；下单数量必须是 1e-`size_decimals` 的整数倍。
+    #[serde(default)]
+    size_decimals: Option<u32>,
+    /// 价格精度；下单价格按 1e-`price_decimals` 取整。
+    #[serde(default)]
+    price_decimals: Option<u32>,
 }
 
 impl MarketRow {
@@ -390,6 +396,16 @@ impl LighterFundingClient {
             .as_deref()
             .and_then(|value| parse_decimal(value).ok())
             .filter(|value| *value > Decimal::ZERO);
+        // 签名时数量与价格都会按精度取整，提前按同一精度对齐，避免取整后名义额
+        // 掉到最小下单额以下（如 BTC 5 位精度、10 USDC 门槛）。
+        spec.step_size = row
+            .size_decimals
+            .filter(|decimals| *decimals < 28)
+            .map(|decimals| Decimal::new(1, decimals));
+        spec.tick_size = row
+            .price_decimals
+            .filter(|decimals| *decimals < 28)
+            .map(|decimals| Decimal::new(1, decimals));
         Ok(Some(spec))
     }
 

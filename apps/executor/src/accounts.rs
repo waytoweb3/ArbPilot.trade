@@ -1197,16 +1197,12 @@ fn fetch_aster(
         .as_array()
         .ok_or_else(|| anyhow!(aster::error_of(&value)))?;
     let mut balances = Vec::with_capacity(rows.len());
-    let mut available_margin = Decimal::ZERO;
     for row in rows {
         let asset = row.get("asset").and_then(Value::as_str).unwrap_or_default();
         let wallet = decimal(row.get("walletBalance").unwrap_or(&Value::Null)).unwrap_or_default();
         let available =
             decimal(row.get("availableBalance").unwrap_or(&Value::Null)).unwrap_or_default();
         if wallet > Decimal::ZERO {
-            if asset == "USDT" {
-                available_margin += available;
-            }
             balances.push((
                 asset.to_string(),
                 available,
@@ -1215,8 +1211,31 @@ fn fetch_aster(
         }
     }
 
+    // 可用保证金取账户口径字段：USDT 的 walletBalance 会因手续费或浮亏为负，
+    // 逐资产按「持有」过滤后再累加会把 USDT 整行漏掉，导致显示为 0。
+    let available_margin = decimal(&value["availableBalance"]).or_else(|| {
+        rows.iter()
+            .find(|row| row.get("asset").and_then(Value::as_str) == Some("USDT"))
+            .and_then(|row| decimal(row.get("availableBalance").unwrap_or(&Value::Null)))
+    });
     let equity = decimal(&value["totalWalletBalance"]).filter(|value| *value > Decimal::ZERO);
-    Ok((balances, equity, Some(available_margin)))
+    Ok((balances, equity, available_margin))
+}
+
+/// Hyperliquid 是否处于统一账户模式（`unifiedAccount` / `portfolioMargin`）。
+///
+/// 统一账户下现货 USDC 本身就是永续保证金，官方文档说明 `clearinghouseState`
+/// 返回的权益对用户没有参考意义；此时若把永续权益与现货余额相加，同一笔 USDC
+/// 会被计算两次，余额会明显偏大。读取失败时按非统一账户处理，保持原有口径。
+fn hyperliquid_unified_account(http: &HttpClient, base_url: &str, address: &str) -> bool {
+    http.post_json(
+        &format!("{base_url}/info"),
+        &json!({ "type": "userAbstraction", "user": address }),
+    )
+    .ok()
+    .and_then(|value| value.as_str().map(str::to_string))
+    .map(|mode| matches!(mode.as_str(), "unifiedAccount" | "portfolioMargin"))
+    .unwrap_or(false)
 }
 
 /// Hyperliquid 余额查询：永续账户权益走 `clearinghouseState`，现货余额走 `spotClearinghouseState`。
@@ -1230,18 +1249,23 @@ fn fetch_hyperliquid(
         .wallet_address
         .as_deref()
         .ok_or_else(|| anyhow!("Hyperliquid 需要钱包地址"))?;
+    let unified = hyperliquid_unified_account(http, base_url, address);
 
-    let perp = http.post_json(
-        &format!("{base_url}/info"),
-        &json!({ "type": "clearinghouseState", "user": address }),
-    )?;
-    // 永续账户的 withdrawable 才是当前可动用的保证金。
-    let available_margin = decimal(&perp["withdrawable"]);
+    let mut available_margin = None;
     let mut balances = Vec::new();
-    if let Some(account_value) = decimal(&perp["marginSummary"]["accountValue"]) {
-        if account_value > Decimal::ZERO {
-            // 永续账户权益本身就是 USDC，按 1:1 计入。
-            balances.push(("USDC".to_string(), account_value, Decimal::ZERO));
+    if !unified {
+        let perp = http.post_json(
+            &format!("{base_url}/info"),
+            &json!({ "type": "clearinghouseState", "user": address }),
+        )?;
+        // 永续账户的 withdrawable 才是当前可动用的保证金；从未开过永续时它恒为 0，
+        // 此时不能当作「可用额度为 0」，可动用额度要看现货 USDC。
+        let perp_account_value =
+            decimal(&perp["marginSummary"]["accountValue"]).unwrap_or_default();
+        if perp_account_value > Decimal::ZERO {
+            available_margin = decimal(&perp["withdrawable"]);
+            // 永续账户权益本身就是 USDC，按 1:1 计入；标准账户下与现货是两个账本，需要相加。
+            balances.push(("USDC".to_string(), perp_account_value, Decimal::ZERO));
         }
     }
 
@@ -1256,7 +1280,12 @@ fn fetch_hyperliquid(
                 let total = decimal(row.get("total").unwrap_or(&Value::Null)).unwrap_or_default();
                 let hold = decimal(row.get("hold").unwrap_or(&Value::Null)).unwrap_or_default();
                 if total > Decimal::ZERO {
-                    balances.push((coin.to_string(), (total - hold).max(Decimal::ZERO), hold));
+                    let free = (total - hold).max(Decimal::ZERO);
+                    // 统一账户或没有永续权益时，现货可用额就是能立即动用的保证金。
+                    if coin == "USDC" && available_margin.is_none() {
+                        available_margin = Some(free);
+                    }
+                    balances.push((coin.to_string(), free, hold));
                 }
             }
         }
@@ -1604,17 +1633,26 @@ fn positions_okx(
 
     let mut positions = Vec::new();
     if let Some(rows) = value["data"].as_array() {
+        // OKX 的 pos 单位是「张」，必须乘以合约面值 ctVal 才能还原成币数量；
+        // 用 notionalUsd / markPx 推导会因名义价值被交易所四舍五入而产生误差（如 0.001 变成 0.000999）。
+        let contract_values = okx_swap_contract_values(http, base_url);
         for row in rows {
             let Some(pos) = decimal(&row["pos"]) else {
                 continue;
             };
             let mark = decimal(&row["markPx"]).unwrap_or_default();
-            let notional = decimal(&row["notionalUsd"]).unwrap_or_default().abs();
-            // OKX 的 pos 单位是张数，用名义价值除以标记价格换算成币数量。
-            let quantity = if mark > Decimal::ZERO && notional > Decimal::ZERO {
-                notional / mark
-            } else {
-                pos.abs()
+            let inst_id = row["instId"].as_str().unwrap_or_default();
+            let quantity = match contract_values.get(inst_id).copied() {
+                Some(ct_val) if ct_val > Decimal::ZERO => pos.abs() * ct_val,
+                // 兜底：拿不到合约面值时退回名义价值推导。
+                _ => {
+                    let notional = decimal(&row["notionalUsd"]).unwrap_or_default().abs();
+                    if mark > Decimal::ZERO && notional > Decimal::ZERO {
+                        notional / mark
+                    } else {
+                        pos.abs()
+                    }
+                }
             };
             let is_long = match row["posSide"].as_str().unwrap_or("net") {
                 "long" => true,
@@ -1622,7 +1660,7 @@ fn positions_okx(
                 _ => pos > Decimal::ZERO,
             };
             positions.push(RawPosition {
-                symbol: normalized_symbol(row["instId"].as_str().unwrap_or_default()),
+                symbol: normalized_symbol(inst_id),
                 side: if is_long { Side::Buy } else { Side::Sell },
                 quantity,
                 entry_price: decimal(&row["avgPx"]).unwrap_or_default(),
@@ -1633,6 +1671,30 @@ fn positions_okx(
         }
     }
     Ok(positions)
+}
+
+/// 拉取 OKX 全部永续合约面值（instId -> ctVal），供持仓数量换算使用；
+/// 请求失败时返回空表，由调用方退回名义价值推导。
+fn okx_swap_contract_values(http: &HttpClient, base_url: &str) -> HashMap<String, Decimal> {
+    let mut values = HashMap::new();
+    let url = format!("{base_url}/api/v5/public/instruments?instType=SWAP");
+    let Ok(value) = http.get_json(&url) else {
+        return values;
+    };
+    if value["code"].as_str().unwrap_or("0") != "0" {
+        return values;
+    }
+    if let Some(rows) = value["data"].as_array() {
+        for row in rows {
+            let Some(inst_id) = row["instId"].as_str() else {
+                continue;
+            };
+            if let Some(ct_val) = decimal(&row["ctVal"]).filter(|value| *value > Decimal::ZERO) {
+                values.insert(inst_id.to_string(), ct_val);
+            }
+        }
+    }
+    values
 }
 
 fn positions_bybit(

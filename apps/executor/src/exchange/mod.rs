@@ -113,7 +113,7 @@ pub struct DepthSnapshot {
     pub observed_at: DateTime<Utc>,
 }
 
-/// 交易所对单个交易对的最小下单限制。
+/// 交易所对单个交易对的下单限制：最小数量 / 最小名义额，以及数量与价格的步长。
 ///
 /// 多数交易所同时限制最小数量与最小名义额，二者取较大值才是实际门槛；
 /// 字段缺失表示交易所未公开该限制，由下单接口做最终校验。
@@ -127,6 +127,12 @@ pub struct MinOrderSpec {
     /// 最小下单名义额（USDT）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub min_notional_usd: Option<Decimal>,
+    /// 下单数量的步长（基础币），数量必须是该值的整数倍。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub step_size: Option<Decimal>,
+    /// 下单价格的步长（报价币），价格必须是该值的整数倍。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tick_size: Option<Decimal>,
 }
 
 impl MinOrderSpec {
@@ -136,6 +142,8 @@ impl MinOrderSpec {
             symbol: symbol.trim().to_ascii_uppercase(),
             min_quantity: None,
             min_notional_usd: None,
+            step_size: None,
+            tick_size: None,
         }
     }
 }

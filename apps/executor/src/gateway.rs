@@ -9,9 +9,15 @@ use rust_decimal::Decimal;
 use serde_json::json;
 use uuid::Uuid;
 
-use crate::{error::ApiError, events::ExecutorEvent, state::AppState};
+use crate::{
+    error::ApiError,
+    events::ExecutorEvent,
+    state::AppState,
+    store::PositionGroupMember,
+};
 
-const MAX_IN_MEMORY_ORDERS: usize = 500;
+/// 内存里保留的订单条数上限；重启时从库里恢复的历史订单同样按此截断。
+pub(crate) const MAX_IN_MEMORY_ORDERS: usize = 500;
 
 /// 单腿下单请求。方向由 `side` 决定，价格为空时按当前对手价成交。
 #[derive(Debug, Clone)]
@@ -87,6 +93,35 @@ fn is_quote_fresh(quote: &Quote, max_age_secs: i64) -> bool {
         .signed_duration_since(quote.observed_at)
         .num_seconds();
     (0..=max_age_secs).contains(&age)
+}
+
+/// 交易所最小下单限制对应的最小可下单数量：取「最小名义额 ÷ 价格」按数量精
+/// 度向上对齐后的值与「最小数量」中的较大者。
+///
+/// 数量按精度向下对齐后名义额可能略低于交易所门槛（例如 10 USDC 的请求在 5
+/// 位精度的 BTC 上只剩 9.74 USDC），提交前用它判断这一腿是否根本无法下单。
+fn venue_minimum_quantity(
+    minimum_notional: Option<Decimal>,
+    minimum_quantity: Option<Decimal>,
+    price: Decimal,
+    step: Option<Decimal>,
+) -> Option<Decimal> {
+    let from_notional = minimum_notional
+        .filter(|value| *value > Decimal::ZERO)
+        .filter(|_| price > Decimal::ZERO)
+        .map(|minimum| {
+            let step = step
+                .filter(|value| *value > Decimal::ZERO)
+                .unwrap_or_else(|| Decimal::new(1, 8));
+            (minimum / price / step).ceil() * step
+        });
+    match (
+        from_notional,
+        minimum_quantity.filter(|value| *value > Decimal::ZERO),
+    ) {
+        (Some(from_notional), Some(minimum_quantity)) => Some(from_notional.max(minimum_quantity)),
+        (from_notional, minimum_quantity) => from_notional.or(minimum_quantity),
+    }
 }
 
 /// 订单动作统一落库到 `order_events`；数据库不可用时 Store 内部退化为本地日志。
@@ -278,7 +313,7 @@ pub async fn submit_legs(
             },
         };
         // 市价腿按对手价成交：买入看卖一，卖出看买一。
-        let price = leg.limit_price.unwrap_or(if leg.side == Side::Buy {
+        let mut price = leg.limit_price.unwrap_or(if leg.side == Side::Buy {
             quote.ask
         } else {
             quote.bid
@@ -315,6 +350,60 @@ pub async fn submit_legs(
                 }
                 quantity = contracts * spec.ct_val;
             }
+        }
+        // Binance / Aster / Bybit 永续要求数量是步长（stepSize / qtyStep）的整数倍、
+        // 价格是价格步长（tickSize）的整数倍，否则会以「精度超限」或「Qty invalid」
+        // 拒单；Lighter / Hyperliquid 的签名接口同样按各自精度取整。数量向下对齐到
+        // 步长；价格按盘口方向对齐（市价腿买单向上、卖单向下，保证对齐后仍可立即
+        // 成交；指定限价则就近对齐）。对齐后的数量与价格写回订单腿。
+        if let Some(spec) = state.market.order_step_spec(&leg.venue, &leg.symbol).await {
+            if let Some(step) = spec.step_size.filter(|step| *step > Decimal::ZERO) {
+                quantity = (quantity / step).floor() * step;
+            }
+            if let Some(tick) = spec.tick_size.filter(|tick| *tick > Decimal::ZERO) {
+                let ticks = if leg.limit_price.is_none() {
+                    if leg.side == Side::Buy {
+                        (price / tick).ceil()
+                    } else {
+                        (price / tick).floor()
+                    }
+                } else {
+                    (price / tick).round()
+                };
+                price = ticks * tick;
+            }
+            // 数量按精度向下对齐后名义额可能略低于交易所门槛（如 10 USDC 的请求
+            // 在 5 位精度的 BTC 上只剩 9.74 USDC）。在提交任何一腿之前就拦下来，
+            // 给出满足门槛的最小数量，避免第一腿成交后其余腿被拒导致敞口失衡。
+            if !request.closing {
+                if let Some(minimum_quantity) = venue_minimum_quantity(
+                    spec.min_notional_usd,
+                    spec.min_quantity,
+                    price,
+                    spec.step_size,
+                ) {
+                    if quantity < minimum_quantity {
+                        let reason = format!(
+                            "{} {} 单腿名义价值 {} USDC 低于交易所最小下单额，最小可下单 {} ≈ {} USDC；请提高单腿名义价值",
+                            leg.venue.to_ascii_uppercase(),
+                            leg.symbol,
+                            (quantity * price).round_dp(2),
+                            minimum_quantity,
+                            (minimum_quantity * price).round_dp(2),
+                        );
+                        return Err(reject_request(state, &request, reason).await);
+                    }
+                }
+            }
+        }
+        if quantity <= Decimal::ZERO {
+            let reason = format!(
+                "{} {} 的下单数量 {} 小于交易所最小步长，无法下单",
+                leg.venue.to_ascii_uppercase(),
+                leg.symbol,
+                (leg.notional_usd / price).round_dp(8),
+            );
+            return Err(reject_request(state, &request, reason).await);
         }
         observed_at = observed_at.min(quote.observed_at);
         legs.push(OrderLegIntent {
@@ -640,6 +729,23 @@ pub async fn submit_legs(
         }
     }
 
+    // 双腿开仓把成员登记到持久化的仓位组，重启后仍能把交易所持仓还原回同一组。
+    if !request.closing && order.intent.legs.len() > 1 {
+        let members = order
+            .legs
+            .iter()
+            .filter(|leg| leg.is_filled())
+            .map(|leg| PositionGroupMember {
+                venue: leg.intent.venue.clone(),
+                symbol: leg.intent.symbol.clone(),
+                side: leg.intent.side,
+            })
+            .collect::<Vec<_>>();
+        if !members.is_empty() {
+            state.store.save_position_group(order.id, &members).await;
+        }
+    }
+
     state.store.save_order(&order).await;
     log_event(
         state,
@@ -715,4 +821,34 @@ fn remember(state: &AppState, key: &str, order: &Order) {
     let mut orders = state.orders.write().expect("订单锁不可用");
     orders.insert(0, order.clone());
     orders.truncate(MAX_IN_MEMORY_ORDERS);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::venue_minimum_quantity;
+    use rust_decimal_macros::dec;
+
+    #[test]
+    fn minimum_quantity_rounds_up_to_step() {
+        // Lighter BTC：最小 10 USDC、数量精度 1e-5，10 USDC 只够 0.00013 → 需向上取到 0.00014。
+        let minimum = venue_minimum_quantity(
+            Some(dec!(10)),
+            Some(dec!(0.00007)),
+            dec!(74936.1),
+            Some(dec!(0.00001)),
+        );
+        assert_eq!(minimum, Some(dec!(0.00014)));
+    }
+
+    #[test]
+    fn minimum_quantity_takes_larger_of_notional_and_quantity() {
+        // 最小数量换算出的名义额更大时以数量为准。
+        let minimum = venue_minimum_quantity(Some(dec!(10)), Some(dec!(0.001)), dec!(60000), None);
+        assert_eq!(minimum, Some(dec!(0.001)));
+    }
+
+    #[test]
+    fn minimum_quantity_is_none_without_venue_limits() {
+        assert_eq!(venue_minimum_quantity(None, None, dec!(60000), None), None);
+    }
 }

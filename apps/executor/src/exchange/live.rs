@@ -494,9 +494,18 @@ fn gate_current_leverage(
         ("SIGN", signature.as_str()),
         ("TIMESTAMP", timestamp.as_str()),
     ];
-    let value = http
-        .get_json_with_headers(&format!("{base_url}{path}"), &headers)
-        .map_err(transport)?;
+    let value = match http.get_json_with_headers(&format!("{base_url}{path}"), &headers) {
+        Ok(value) => value,
+        // 该合约没有持仓时 Gate 返回 404 POSITION_NOT_FOUND：只代表查不到杠杆，不是故障。
+        Err(error) => {
+            if let Some(status) = error.downcast_ref::<HttpStatusError>() {
+                if status.status == 404 {
+                    return Ok(None);
+                }
+            }
+            return Err(transport(error));
+        }
+    };
     if value["label"].is_string() || value["message"].is_string() {
         return Ok(None);
     }
@@ -1834,7 +1843,7 @@ fn hyperliquid_place(
     let base_url = base_url.trim_end_matches('/');
     let coin = base_asset(request)?;
 
-    // 现货与永续是独立账本：开仓前先确认永续账户有足够保证金。
+    // 开仓前先确认可用保证金：统一账户看现货余额，标准账户看永续余额。
     if !request.reduce_only {
         hyperliquid_ensure_perp_margin(http, base_url, credentials, request)?;
     }
@@ -1935,49 +1944,60 @@ fn hyperliquid_ensure_perp_margin(
     let required =
         (notional / leverage).round_dp_with_strategy(2, RoundingStrategy::ToPositiveInfinity);
 
-    let mode = http
+    // 账户抽象模式决定现货与永续是否共用保证金，读不到时跳过预检交给交易所判定，
+    // 避免把统一账户误判成标准账户而拦掉正常下单。
+    let Some(mode) = hyperliquid_abstraction_mode(http, base_url, &address) else {
+        return Ok(());
+    };
+
+    if matches!(mode.as_str(), "unifiedAccount" | "portfolioMargin") {
+        // 统一账户的永续状态对 API 用户没有意义，余额只看现货清算状态。
+        let spot_available = hyperliquid_spot_usdc(http, base_url, &address)?;
+        if spot_available >= required {
+            return Ok(());
+        }
+        return Err(ExchangeError::Rejected(format!(
+            "Hyperliquid 可用保证金 {spot_available} USDC，本次下单需要 {required} USDC\
+             （账户模式 {mode}）。统一账户的现货余额就是永续保证金，请确认这笔 USDC 是否被挂单占用"
+        )));
+    }
+
+    let perp = http
         .post_json(
             &format!("{base_url}/info"),
-            &json!({ "type": "userAbstraction", "user": address }),
+            &json!({ "type": "clearinghouseState", "user": address }),
         )
-        .map(|value| value.as_str().unwrap_or("standard").to_string())
-        .unwrap_or_else(|_| "standard".to_string());
-    let unified = matches!(mode.as_str(), "unifiedAccount" | "portfolioMargin");
-
-    // 统一账户的永续状态对 API 用户没有意义，直接用现货余额判断。
-    let perp_available = if unified {
-        Decimal::ZERO
-    } else {
-        let perp = http
-            .post_json(
-                &format!("{base_url}/info"),
-                &json!({ "type": "clearinghouseState", "user": address }),
-            )
-            .map_err(transport)?;
-        let account_value = decimal(&perp["crossMarginSummary"]["accountValue"]).unwrap_or_default();
-        let margin_used = decimal(&perp["crossMarginSummary"]["totalMarginUsed"]).unwrap_or_default();
-        (account_value - margin_used).max(Decimal::ZERO)
-    };
+        .map_err(transport)?;
+    let account_value = decimal(&perp["crossMarginSummary"]["accountValue"]).unwrap_or_default();
+    let margin_used = decimal(&perp["crossMarginSummary"]["totalMarginUsed"]).unwrap_or_default();
+    let perp_available = (account_value - margin_used).max(Decimal::ZERO);
     if perp_available >= required {
         return Ok(());
     }
 
+    // 标准账户的现货与永续是独立账本且只有主钱包能划转；API Wallet（Agent）签名的
+    // 划转会被服务端当成 Agent 自己的账户而报 "Must deposit before performing actions"。
     let spot_available = hyperliquid_spot_usdc(http, base_url, &address)?;
-    if unified && spot_available >= required {
-        return Ok(());
-    }
-
-    // 现货与永续是独立账本且只有主钱包能划转；API Wallet（Agent）签名的划转会被
-    // 服务端当成 Agent 自己的账户而报 "Must deposit before performing actions"。
-    let hint = if unified {
-        "统一账户的现货余额就是永续保证金，请确认这笔 USDC 是否被挂单占用"
-    } else {
-        "API Wallet 无法在现货与永续之间划转，请先在 Hyperliquid 网页端把 USDC 划转到永续账户"
-    };
     Err(ExchangeError::Rejected(format!(
-        "Hyperliquid 可用保证金 {perp_available} USDC，本次下单需要 {required} USDC\
-         （现货可用 {spot_available} USDC，账户模式 {mode}）。{hint}"
+        "Hyperliquid 永续可用保证金 {perp_available} USDC，本次下单需要 {required} USDC\
+         （现货可用 {spot_available} USDC，账户模式 {mode}）。\
+         API Wallet 无法在现货与永续之间划转，请先在 Hyperliquid 网页端把 USDC 划转到永续账户"
     )))
+}
+
+/// 读取账户抽象模式；代理偶发 RST，重试几次，仍失败则返回 `None` 交给调用方跳过预检。
+fn hyperliquid_abstraction_mode(
+    http: &HttpClient,
+    base_url: &str,
+    address: &str,
+) -> Option<String> {
+    let body = json!({ "type": "userAbstraction", "user": address });
+    for _ in 0..3 {
+        if let Ok(value) = http.post_json(&format!("{base_url}/info"), &body) {
+            return Some(value.as_str().unwrap_or("unknown").to_string());
+        }
+    }
+    None
 }
 
 /// 现货清算状态里的 USDC 可用余额（总额减去挂单占用）。

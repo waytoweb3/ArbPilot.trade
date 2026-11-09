@@ -1014,6 +1014,37 @@ impl MarketFeed {
         }
     }
 
+    /// 下单数量与价格的步长约束。
+    ///
+    /// Binance / Aster / Bybit 永续要求数量是步长的整数倍、价格是价格步长的整数倍，
+    /// 否则会以「精度超限」或「Qty invalid」拒单；Lighter 与 Hyperliquid 的签名接口
+    /// 也会按各自精度取整，取整后可能掉到最小下单额以下。其他交易所返回 `None` 且
+    /// 不下发请求。查询失败同样返回 `None`，由交易所下单接口做最终校验，避免因合约
+    /// 信息接口抖动阻断正常下单。
+    pub async fn order_step_spec(&self, venue: &str, symbol: &str) -> Option<MinOrderSpec> {
+        let target = venue.trim().to_ascii_lowercase();
+        if target != VENUE
+            && target != ASTER_VENUE
+            && target != BYBIT_VENUE
+            && target != LIGHTER_VENUE
+            && target != HYPERLIQUID_VENUE
+        {
+            return None;
+        }
+        match self.min_order(&target, symbol).await {
+            Ok(spec) => spec,
+            Err(error) => {
+                tracing::warn!(
+                    venue = %target,
+                    symbol = %symbol,
+                    %error,
+                    "查询下单步长失败，跳过数量/价格精度对齐"
+                );
+                None
+            }
+        }
+    }
+
     /// 交割合约清单：缓存一小时内有效，避免每轮行情都拉取各所合约信息。
     async fn delivery_contracts(&self, now: DateTime<Utc>) -> Vec<DeliveryContract> {
         let cached = {

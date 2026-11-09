@@ -102,9 +102,12 @@ struct InstrumentRow {
     /// 交割合约到期时间（毫秒）。
     #[serde(default)]
     delivery_time: Option<String>,
-    /// 下单限制：最小数量与最小名义额。
+    /// 下单限制：最小数量、数量步长与最小名义额。
     #[serde(default)]
     lot_size_filter: Option<LotSizeFilter>,
+    /// 价格限制：价格步长（tickSize）。
+    #[serde(default)]
+    price_filter: Option<PriceFilter>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -114,6 +117,17 @@ struct LotSizeFilter {
     min_order_qty: Option<String>,
     #[serde(default)]
     min_notional_value: Option<String>,
+    /// 数量步长（基础币），下单数量必须是该值的整数倍。
+    #[serde(default)]
+    qty_step: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PriceFilter {
+    /// 价格步长（报价币），下单价格必须是该值的整数倍。
+    #[serde(default)]
+    tick_size: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -297,6 +311,19 @@ impl BybitFundingClient {
                 .and_then(|value| parse_decimal(value).ok());
             spec.min_notional_usd = filter
                 .min_notional_value
+                .as_deref()
+                .and_then(|value| parse_decimal(value).ok())
+                .filter(|value| *value > Decimal::ZERO);
+            // 下单数量必须是 qtyStep 的整数倍，否则 Bybit 以 10001「Qty invalid」拒单。
+            spec.step_size = filter
+                .qty_step
+                .as_deref()
+                .and_then(|value| parse_decimal(value).ok())
+                .filter(|value| *value > Decimal::ZERO);
+        }
+        if let Some(filter) = row.price_filter {
+            spec.tick_size = filter
+                .tick_size
                 .as_deref()
                 .and_then(|value| parse_decimal(value).ok())
                 .filter(|value| *value > Decimal::ZERO);
@@ -501,6 +528,7 @@ impl FundingVenueClient for BybitFundingClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rust_decimal_macros::dec;
 
     #[test]
     fn parses_ticker_snapshot() {
@@ -533,5 +561,28 @@ mod tests {
             ask_size: None,
         };
         assert!(snapshot_from(&row).is_none());
+    }
+
+    #[test]
+    fn parses_lot_size_qty_step_and_tick_size() {
+        let payload: InstrumentResult = serde_json::from_str(
+            r#"{"list":[{"symbol":"BTCUSDT","contractType":"LinearPerpetual","status":"Trading",
+                "baseCoin":"BTC","quoteCoin":"USDT",
+                "lotSizeFilter":{"minOrderQty":"0.001","minNotionalValue":"5","qtyStep":"0.001"},
+                "priceFilter":{"tickSize":"0.1"}}]}"#,
+        )
+        .expect("fixture 应可解析");
+
+        let row = payload.list.into_iter().next().expect("应含一条合约");
+        let lot = row.lot_size_filter.expect("应含 lotSizeFilter");
+        assert_eq!(
+            lot.qty_step.as_deref().and_then(|value| parse_decimal(value).ok()),
+            Some(dec!(0.001))
+        );
+        let price = row.price_filter.expect("应含 priceFilter");
+        assert_eq!(
+            price.tick_size.as_deref().and_then(|value| parse_decimal(value).ok()),
+            Some(dec!(0.1))
+        );
     }
 }

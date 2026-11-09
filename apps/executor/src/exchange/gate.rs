@@ -286,8 +286,10 @@ impl GateFundingClient {
             .as_deref()
             .and_then(|value| parse_decimal(value).ok())
             .unwrap_or(Decimal::ZERO);
-        let min_contracts = row.order_size_min.unwrap_or(0);
-        if multiplier > Decimal::ZERO && min_contracts > 0 {
+        // Gate 用 order_size_min = 0 表示「不限制」（多数合约都是 0），这里回退到最小可下单的 1 张，
+        // 否则面板拿不到数量，只能显示 `—`。
+        let min_contracts = row.order_size_min.unwrap_or(0).max(1);
+        if multiplier > Decimal::ZERO {
             spec.min_quantity = Some(multiplier * Decimal::from(min_contracts));
         }
         Ok(Some(spec))
@@ -460,6 +462,7 @@ mod tests {
             in_delisting: Some(false),
             is_pre_market: Some(false),
             quanto_multiplier: Some("0.0001".to_string()),
+            order_size_min: Some(1),
         };
         let snapshot = row.snapshot().expect("应能解析");
         assert_eq!(snapshot.funding_rate, dec!(0.000042));

@@ -1,6 +1,6 @@
 import { useState } from "react";
 
-import { useAccountLeverage, useAccounts, useCreateOrder, useMinOrder, useRiskLimits } from "../hooks/useApi";
+import { useAccounts, useCreateOrder, useMinOrder, useRiskLimits } from "../hooks/useApi";
 import { toNumber } from "../lib/api";
 import {
   formatFundingRate,
@@ -73,11 +73,10 @@ export function TradePanel({
   const mutation = useCreateOrder();
   const accounts = useAccounts();
   const limits = useRiskLimits();
-  const longLeverageQuery = useAccountLeverage(longVenue, symbol);
-  const shortLeverageQuery = useAccountLeverage(shortVenue, symbol);
   const longMinOrder = useMinOrder(longVenue, symbol);
   const shortMinOrder = useMinOrder(shortVenue, symbol);
   const [notional, setNotional] = useState("500");
+  const [leverageDraft, setLeverageDraft] = useState<string | null>(null);
   const [confirmed, setConfirmed] = useState(false);
   const [result, setResult] = useState<CreateOrderResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -106,23 +105,32 @@ export function TradePanel({
     const equity = account?.snapshot?.equity_usd;
     return equity === undefined || equity === null ? null : toNumber(equity);
   };
-  const leverageOf = (data?: { leverage: string | number | null }): number | null => {
-    if (!data || data.leverage === null || data.leverage === undefined) {
-      return null;
-    }
-    const value = toNumber(data.leverage);
-    return Number.isFinite(value) && value > 0 ? value : null;
-  };
   const longAvailable = availableOf(longAccount);
   const shortAvailable = availableOf(shortAccount);
-  const longLeverage = leverageOf(longLeverageQuery.data);
-  const shortLeverage = leverageOf(shortLeverageQuery.data);
 
-  // 杠杆未知时按 1x 估算保证金，避免低估占用。
-  const marginAt = (leverage: number | null): number | null =>
-    validSize ? notionalValue / (leverage ?? 1) : null;
-  const longMargin = marginAt(longLeverage);
-  const shortMargin = marginAt(shortLeverage);
+  // 风控配置的杠杆上限：全局上限与两腿的交易所覆盖取最严格值，口径与执行器风控一致。
+  const maxLeverage = (() => {
+    const global = toNumber(limits.data?.max_leverage);
+    if (!(global > 0)) {
+      return 1;
+    }
+    const overrides = [longVenue, shortVenue]
+      .map((venue) => toNumber(limits.data?.venue_overrides?.[venue.toLowerCase()]?.max_leverage))
+      .filter((value) => value > 0);
+    return overrides.length > 0 ? Math.min(global, ...overrides) : global;
+  })();
+  // 杠杆可手动输入，未填写时用风控值。下单会带上该值，执行器开仓前会把交易所杠杆
+  // 写为该值，因此保证金预览与两腿显示都统一按这个值估算，避免与交易所当前的旧杠杆
+  // （如 3x）不一致。
+  const draftLeverage = leverageDraft === null ? maxLeverage : Number(leverageDraft);
+  const leverageValue = Number.isFinite(draftLeverage) && draftLeverage > 0 ? draftLeverage : maxLeverage;
+  const leverageText = leverageDraft ?? String(maxLeverage);
+  const leverageOverLimit = leverageValue > maxLeverage;
+
+  const marginAt = (leverage: number): number | null =>
+    validSize ? notionalValue / leverage : null;
+  const longMargin = marginAt(leverageValue);
+  const shortMargin = marginAt(leverageValue);
   const totalMargin =
     longMargin === null || shortMargin === null ? null : longMargin + shortMargin;
   const perSettle = netRate !== null && validSize ? notionalValue * netRate : null;
@@ -153,6 +161,7 @@ export function TradePanel({
           long_venue: longVenue,
           short_venue: shortVenue,
           notional_usd: Number(notional),
+          leverage: leverageValue,
         },
         idempotencyKey: newIdempotencyKey(),
       },
@@ -218,7 +227,7 @@ export function TradePanel({
               venue: longVenue,
               account: longAccount,
               available: longAvailable,
-              leverage: longLeverage,
+              leverage: leverageValue,
               minNotional: longMinNotional,
             },
             {
@@ -226,7 +235,7 @@ export function TradePanel({
               venue: shortVenue,
               account: shortAccount,
               available: shortAvailable,
-              leverage: shortLeverage,
+              leverage: leverageValue,
               minNotional: shortMinNotional,
             },
           ].map((leg) => (
@@ -241,7 +250,7 @@ export function TradePanel({
                   <span className="flex items-center gap-2 font-mono text-body">
                     <span>{leg.available === null ? "—" : formatUsd(leg.available)}</span>
                     <span className="text-subtle">
-                      {t.trade.leverage} {leg.leverage === null ? "—" : `${leg.leverage}x`}
+                      {t.trade.leverage} {leg.leverage}x
                     </span>
                   </span>
                 )}
@@ -286,6 +295,23 @@ export function TradePanel({
               </button>
             ))}
           </div>
+        </div>
+
+        <div className="space-y-2">
+          <div className="flex items-baseline justify-between">
+            <span className="text-xs text-muted">{t.trade.leverage}</span>
+            <span className="text-[10px] text-subtle">
+              {fmt(t.trade.leverageHint, { value: `${maxLeverage}x` })}
+            </span>
+          </div>
+          <input
+            className={inputClass}
+            type="number"
+            min={1}
+            step={1}
+            value={leverageText}
+            onChange={(event) => setLeverageDraft(event.target.value)}
+          />
         </div>
 
         <div className="rounded-lg border border-line bg-panel-soft">
@@ -337,6 +363,11 @@ export function TradePanel({
         {belowMinimum && (
           <p className="rounded-lg border border-warning/30 bg-warning/10 px-3 py-2 text-xs text-warning">
             {fmt(t.trade.minNotional, { value: formatUsd(legMinNotional) })}
+          </p>
+        )}
+        {leverageOverLimit && (
+          <p className="rounded-lg border border-warning/30 bg-warning/10 px-3 py-2 text-xs text-warning">
+            {fmt(t.trade.leverageLimit, { value: `${maxLeverage}x` })}
           </p>
         )}
 

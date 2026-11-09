@@ -1,4 +1,4 @@
-import { ArrowLeft, ArrowLeftRight } from "lucide-react";
+import { ArrowLeft, ArrowLeftRight, ChevronLeft, ChevronRight } from "lucide-react";
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 
@@ -11,7 +11,8 @@ import { Badge } from "../components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "../components/ui/card";
 import {
   useCandles,
-  useClosePositionGroup,
+  useCloseAllPositions,
+  useClosePosition,
   useFundingHistory,
   useFundingStatus,
   useOrders,
@@ -39,7 +40,8 @@ import { cn } from "../lib/utils";
 
 type Direction = "long1_short2" | "short1_long2";
 type ChartMode = "price" | "funding";
-type FundingRange = 30 | 90 | 180 | "all";
+/** 资金费率图表的展示窗口，单位为小时。 */
+type FundingRange = 1 | 4 | 8 | 24;
 type BottomTab = "positions" | "openOrders" | "history" | "trades";
 
 /** 仍在执行中的订单状态：与仓位页的历史订单口径相反。 */
@@ -51,7 +53,11 @@ const OPEN_ORDER_STATUSES = new Set([
 ]);
 
 const PRICE_INTERVALS = ["30s", "1m", "5m", "10m", "30m", "1h", "4h"] as const;
-const FUNDING_RANGES: FundingRange[] = [30, 90, 180, "all"];
+
+const FUNDING_RANGES: FundingRange[] = [1, 4, 8, 24];
+
+/** 底部面板每页条数。 */
+const BOTTOM_PAGE_SIZE = 10;
 
 /** 盘口与图表共用同一高度，宽屏下底边对齐。 */
 const WORKSPACE_CARD_HEIGHT =
@@ -74,41 +80,6 @@ function priceDigits(value: number): number {
   if (value >= 1) return 3;
   if (value >= 0.01) return 5;
   return 8;
-}
-
-/** 每期费率按本地自然日汇总，折线图只画每天的总费率。 */
-function dailyRates(rates: FundingRate[], symbol: string, venue: string): FundingRate[] {
-  const buckets = new Map<string, { time: number; total: number }>();
-  for (const rate of rates) {
-    const date = new Date(rate.funding_time);
-    const key = `${date.getFullYear()}-${date.getMonth()}-${date.getDate()}`;
-    const value = toNumber(rate.funding_rate);
-    const bucket = buckets.get(key);
-    if (bucket) {
-      bucket.total += value;
-    } else {
-      buckets.set(key, {
-        time: Math.floor(
-          new Date(date.getFullYear(), date.getMonth(), date.getDate(), 12).getTime() / 1000,
-        ),
-        total: value,
-      });
-    }
-  }
-  return [...buckets.values()]
-    .sort((left, right) => left.time - right.time)
-    .map((day) => ({
-      venue,
-      symbol,
-      funding_time: new Date(day.time * 1000).toISOString(),
-      funding_rate: String(day.total),
-      mark_price: null,
-    }));
-}
-
-function dayKey(rate: FundingRate): string {
-  const date = new Date(rate.funding_time);
-  return `${date.getFullYear()}-${date.getMonth()}-${date.getDate()}`;
 }
 
 function annualizedPct(rate: number, intervalSecs: number): number {
@@ -240,18 +211,34 @@ export default function TradePage() {
     shortVenue || "binance",
   );
 
-  const longPoints = useMemo(
-    () => dailyRates(longHistory.data ?? [], symbol, longVenue),
-    [longHistory.data, symbol, longVenue],
-  );
-  const shortPoints = useMemo(
-    () => dailyRates(shortHistory.data ?? [], symbol, shortVenue),
-    [shortHistory.data, symbol, shortVenue],
-  );
+  const longPoints = longHistory.data ?? [];
+  const shortPoints = shortHistory.data ?? [];
 
   const [chartMode, setChartMode] = useState<ChartMode>("price");
   const [priceInterval, setPriceInterval] = useState<(typeof PRICE_INTERVALS)[number]>("1m");
-  const [fundingRange, setFundingRange] = useState<FundingRange>(90);
+  const [fundingRange, setFundingRange] = useState<FundingRange>(24);
+  // 交易对支持手输：本地草稿 + 联想列表，回车或点选后才提交到 URL 参数。
+  const [symbolDraft, setSymbolDraft] = useState(symbol);
+  const [symbolListOpen, setSymbolListOpen] = useState(false);
+
+  useEffect(() => {
+    setSymbolDraft(symbol);
+  }, [symbol]);
+
+  const symbolMatches = useMemo(() => {
+    const query = symbolDraft.trim().toUpperCase();
+    const options = query ? symbolOptions.filter((item) => item.includes(query)) : symbolOptions;
+    return options.slice(0, 50);
+  }, [symbolDraft, symbolOptions]);
+
+  const commitSymbol = (value: string) => {
+    const next = value.trim().toUpperCase();
+    setSymbolDraft(next);
+    setSymbolListOpen(false);
+    if (next && next !== symbol) {
+      setParam("symbol", next);
+    }
+  };
 
   const longCandles = useCandles(symbol, priceInterval, 240, longVenue);
   const shortCandles = useCandles(symbol, priceInterval, 240, shortVenue);
@@ -282,32 +269,30 @@ export default function TradePage() {
       : null;
 
   const longView = useMemo(() => {
-    if (fundingRange === "all") {
-      return longPoints;
-    }
-    const since = Date.now() - fundingRange * 86_400_000;
+    const since = Date.now() - fundingRange * 3_600_000;
     return longPoints.filter((point) => Date.parse(point.funding_time) >= since);
   }, [longPoints, fundingRange]);
 
   const shortView = useMemo(() => {
-    if (fundingRange === "all") {
-      return shortPoints;
-    }
-    const since = Date.now() - fundingRange * 86_400_000;
+    const since = Date.now() - fundingRange * 3_600_000;
     return shortPoints.filter((point) => Date.parse(point.funding_time) >= since);
   }, [shortPoints, fundingRange]);
 
-  // 净费率柱：按自然日对齐两腿，空腿减多腿。
+  // 净费率柱：按结算时刻对齐两腿，空腿减多腿。
   const netBars = useMemo(() => {
-    const shortByDay = new Map(shortView.map((point) => [dayKey(point), toNumber(point.funding_rate)]));
+    const settlementKey = (point: FundingRate) =>
+      Math.floor(new Date(point.funding_time).getTime() / 1000);
+    const shortByTime = new Map(
+      shortView.map((point) => [settlementKey(point), toNumber(point.funding_rate)]),
+    );
     return longView.flatMap((point) => {
-      const shortValue = shortByDay.get(dayKey(point));
+      const shortValue = shortByTime.get(settlementKey(point));
       if (shortValue === undefined) {
         return [];
       }
       return [
         {
-          time: Math.floor(new Date(point.funding_time).getTime() / 1000),
+          time: settlementKey(point),
           value: (shortValue - toNumber(point.funding_rate)) * 100,
         },
       ];
@@ -343,7 +328,10 @@ export default function TradePage() {
   }, [available, statuses, symbol]);
 
   const positions = usePositions();
-  const closeGroup = useClosePositionGroup();
+  const closePosition = useClosePosition();
+  const closeAll = useCloseAllPositions();
+  // 平仓相关的错误（单腿 / 一键）统一展示在持仓面板顶部。
+  const positionCloseError = closeAll.error ?? closePosition.error;
 
   const symbolPositions = useMemo(
     () => (positions.data ?? []).filter((position) => position.symbol === symbol),
@@ -369,6 +357,19 @@ export default function TradePage() {
 
   // 底部面板：持仓 / 当前委托 / 历史委托 / 成交记录，统一按当前交易对过滤。
   const [bottomTab, setBottomTab] = useState<BottomTab>("positions");
+  // 仓位组筛选：下拉选择后只看该组仓位；分组消失（已平仓）时自动回落到全部。
+  const [groupFilter, setGroupFilter] = useState("");
+  const [bottomPage, setBottomPage] = useState(0);
+  const activeGroupFilter = positionGroups.some(([groupId]) => groupId === groupFilter)
+    ? groupFilter
+    : "";
+  const filteredPositions = useMemo(
+    () =>
+      activeGroupFilter
+        ? symbolPositions.filter((position) => position.group_id === activeGroupFilter)
+        : symbolPositions,
+    [symbolPositions, activeGroupFilter],
+  );
   const orders = useOrders();
   const symbolOrders = useMemo(
     () =>
@@ -402,6 +403,21 @@ export default function TradePage() {
     { id: "history" as const, label: t.trade.bottomHistory, count: closedOrders.length },
     { id: "trades" as const, label: t.trade.bottomTrades, count: fills.length },
   ];
+
+  // 当前标签页的总条数决定分页；页码越界时自动收敛到最后一页。
+  const bottomCount =
+    bottomTab === "positions"
+      ? filteredPositions.length
+      : bottomTab === "trades"
+        ? fills.length
+        : bottomOrderList.length;
+  const bottomPageCount = Math.max(1, Math.ceil(bottomCount / BOTTOM_PAGE_SIZE));
+  const currentBottomPage = Math.min(bottomPage, bottomPageCount - 1);
+  const pageRows = <T,>(rows: T[]) =>
+    rows.slice(
+      currentBottomPage * BOTTOM_PAGE_SIZE,
+      currentBottomPage * BOTTOM_PAGE_SIZE + BOTTOM_PAGE_SIZE,
+    );
 
   const setParam = (key: string, value: string) => {
     const next = new URLSearchParams(params);
@@ -500,21 +516,53 @@ export default function TradePage() {
         </div>
         <div className="flex items-center gap-2">
           <span className="text-[11px] text-muted">{t.trade.symbolLabel}</span>
-          <select
-            value={symbol}
-            aria-label={t.trade.symbolLabel}
-            onChange={(event) => setParam("symbol", event.target.value)}
-            className="max-w-[180px] rounded-md border border-line bg-panel-soft px-2 py-1.5 font-mono text-xs text-fg uppercase outline-none focus:border-accent/60"
-          >
-            {symbol && !symbolOptions.includes(symbol) && (
-              <option value={symbol}>{symbol}</option>
+          <div className="relative">
+            <input
+              value={symbolDraft}
+              aria-label={t.trade.symbolLabel}
+              autoComplete="off"
+              spellCheck={false}
+              placeholder="BTCUSDT"
+              onChange={(event) => {
+                setSymbolDraft(event.target.value.toUpperCase());
+                setSymbolListOpen(true);
+              }}
+              onFocus={() => setSymbolListOpen(true)}
+              onBlur={() => setSymbolListOpen(false)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  event.preventDefault();
+                  commitSymbol(symbolDraft);
+                } else if (event.key === "Escape") {
+                  setSymbolDraft(symbol);
+                  setSymbolListOpen(false);
+                }
+              }}
+              className="w-[180px] rounded-md border border-line bg-panel-soft px-2 py-1.5 font-mono text-xs text-fg uppercase outline-none focus:border-accent/60"
+            />
+            {symbolListOpen && symbolMatches.length > 0 && (
+              <ul className="absolute top-full left-0 z-20 mt-1 max-h-60 w-[180px] overflow-auto rounded-md border border-line bg-panel py-1 shadow-lg">
+                {symbolMatches.map((item) => (
+                  <li key={item}>
+                    <button
+                      type="button"
+                      // mousedown 先于 input 的 blur 触发，避免点击被关闭联想列表吞掉。
+                      onMouseDown={(event) => {
+                        event.preventDefault();
+                        commitSymbol(item);
+                      }}
+                      className={cn(
+                        "w-full px-2 py-1 text-left font-mono text-xs uppercase text-body transition-colors hover:bg-hover",
+                        item === symbol && "text-accent",
+                      )}
+                    >
+                      {item}
+                    </button>
+                  </li>
+                ))}
+              </ul>
             )}
-            {symbolOptions.map((item) => (
-              <option key={item} value={item}>
-                {item}
-              </option>
-            ))}
-          </select>
+          </div>
         </div>
       </header>
 
@@ -589,10 +637,7 @@ export default function TradePage() {
               {legs.map((leg) => {
                 const long = leg.role === "long";
                 const intervalSecs = leg.entry?.funding_interval_secs ?? 8 * 3_600;
-                const markPrice =
-                  leg.entry?.mark_price === null || leg.entry?.mark_price === undefined
-                    ? null
-                    : toNumber(leg.entry.mark_price);
+                const markPrice = priceOf(leg.venue, leg.entry);
                 return (
                   <div key={leg.index} className="bg-panel px-4 py-3">
                     <div className="flex items-center justify-between gap-2">
@@ -785,13 +830,13 @@ export default function TradePage() {
                                   : "text-muted hover:text-body",
                               )}
                             >
-                              {range === "all"
-                                ? t.trade.rangeAll
-                                : range === 30
-                                  ? t.trade.range30d
-                                  : range === 90
-                                    ? t.trade.range90d
-                                    : t.trade.range180d}
+                              {range === 1
+                                ? t.trade.range1h
+                                : range === 4
+                                  ? t.trade.range4h
+                                  : range === 8
+                                    ? t.trade.range8h
+                                    : t.trade.range1d}
                             </button>
                           ))}
                     </div>
@@ -876,7 +921,10 @@ export default function TradePage() {
                   <button
                     key={tab.id}
                     type="button"
-                    onClick={() => setBottomTab(tab.id)}
+                    onClick={() => {
+                      setBottomTab(tab.id);
+                      setBottomPage(0);
+                    }}
                     className={cn(
                       "flex shrink-0 items-center gap-1.5 rounded-md px-2.5 py-1 text-xs transition-colors",
                       bottomTab === tab.id
@@ -907,42 +955,46 @@ export default function TradePage() {
             <CardContent className="p-0">
               {bottomTab === "positions" && (
                 <>
-                  {positionGroups.length > 0 && (
+                  {symbolPositions.length > 0 && (
                     <div className="flex flex-wrap items-center gap-2 border-b border-line px-4 py-2">
-                      {positionGroups.map(([groupId, members]) => (
-                        <div
-                          key={groupId}
-                          className="flex items-center gap-2 rounded-md border border-line bg-panel-soft px-2 py-1 text-[11px]"
-                        >
-                          <span className="text-muted">{t.trade.groupLabel}</span>
-                          <span className="font-mono text-body">{groupId.slice(0, 8)}</span>
-                          <span className="text-subtle">
-                            {members.length} {t.trade.groupLegs}
-                          </span>
-                          <button
-                            type="button"
-                            disabled={closeGroup.isPending}
-                            onClick={() => closeGroup.mutate(groupId)}
-                            className="text-danger transition-opacity hover:opacity-80 disabled:opacity-50"
-                          >
-                            {closeGroup.isPending ? t.trade.groupClosing : t.trade.closeGroup}
-                          </button>
-                        </div>
-                      ))}
+                      <select
+                        value={activeGroupFilter}
+                        onChange={(event) => {
+                          setGroupFilter(event.target.value);
+                          setBottomPage(0);
+                        }}
+                        aria-label={t.trade.groupLabel}
+                        className="rounded-md border border-line bg-panel-soft px-2 py-1 text-[11px] text-body outline-none focus:border-accent/60"
+                      >
+                        <option value="">{t.trade.groupFilterAll}</option>
+                        {positionGroups.map(([groupId, members]) => (
+                          <option key={groupId} value={groupId}>
+                            {groupId.slice(0, 8)} · {members.length} {t.trade.groupLegs}
+                          </option>
+                        ))}
+                      </select>
+                      <button
+                        type="button"
+                        disabled={closeAll.isPending}
+                        onClick={() => closeAll.mutate(symbolPositions)}
+                        className="ml-auto rounded-md border border-danger/40 px-2 py-1 text-[11px] text-danger transition-colors hover:bg-danger/10 disabled:opacity-50"
+                      >
+                        {closeAll.isPending ? t.trade.closeAllClosing : t.trade.closeAll}
+                      </button>
                     </div>
                   )}
-                  {closeGroup.error && (
+                  {positionCloseError && (
                     <p className="border-b border-line px-4 py-1.5 text-[11px] text-danger">
-                      {closeGroup.error instanceof Error
-                        ? closeGroup.error.message
+                      {positionCloseError instanceof Error
+                        ? positionCloseError.message
                         : t.errors.unknown}
                     </p>
                   )}
-                  {symbolPositions.length === 0 ? (
+                  {filteredPositions.length === 0 ? (
                     <p className="px-4 py-8 text-center text-xs text-muted">{t.trade.positionsEmpty}</p>
                   ) : (
                     <div className="overflow-x-auto">
-                      <table className="w-full min-w-[620px] border-collapse text-xs">
+                      <table className="w-full min-w-[720px] border-collapse text-xs">
                         <thead>
                           <tr className="border-b border-line text-[10px] tracking-wide text-muted uppercase">
                             <th className="px-4 py-2 text-left font-medium">{t.positions.venue}</th>
@@ -952,10 +1004,11 @@ export default function TradePage() {
                             <th className="px-4 py-2 text-right font-medium">{t.positions.entry}</th>
                             <th className="px-4 py-2 text-right font-medium">{t.positions.mark}</th>
                             <th className="px-4 py-2 text-right font-medium">{t.positions.pnl}</th>
+                            <th className="px-4 py-2 text-right font-medium">{t.positions.action}</th>
                           </tr>
                         </thead>
                         <tbody>
-                          {symbolPositions.map((position: Position) => (
+                          {pageRows(filteredPositions).map((position: Position) => (
                             <tr key={position.id} className="border-b border-line/70 last:border-0">
                               <td className="px-4 py-2 font-mono text-body uppercase">{position.venue}</td>
                               <td className="px-4 py-2 font-mono text-[10px] text-muted">
@@ -982,6 +1035,16 @@ export default function TradePage() {
                                 )}
                               >
                                 {formatUsd(position.unrealized_pnl)}
+                              </td>
+                              <td className="px-4 py-2 text-right">
+                                <button
+                                  type="button"
+                                  disabled={closePosition.isPending}
+                                  onClick={() => closePosition.mutate(position.id)}
+                                  className="text-danger transition-opacity hover:opacity-80 disabled:opacity-50"
+                                >
+                                  {t.positions.close}
+                                </button>
                               </td>
                             </tr>
                           ))}
@@ -1011,7 +1074,7 @@ export default function TradePage() {
                         </tr>
                       </thead>
                       <tbody>
-                        {bottomOrderList.map((order) => (
+                        {pageRows(bottomOrderList).map((order) => (
                           <tr key={order.id} className="border-b border-line/70 last:border-0">
                             <td className="px-4 py-2 font-mono text-[11px] text-muted">
                               {order.id.slice(0, 8)}
@@ -1068,7 +1131,7 @@ export default function TradePage() {
                         </tr>
                       </thead>
                       <tbody>
-                        {fills.map(({ order, leg }) => (
+                        {pageRows(fills).map(({ order, leg }) => (
                           <tr
                             key={`${order.id}-${leg.intent.venue}`}
                             className="border-b border-line/70 last:border-0"
@@ -1106,6 +1169,38 @@ export default function TradePage() {
                     </table>
                   </div>
                 ))}
+
+              {bottomCount > BOTTOM_PAGE_SIZE && (
+                <div className="flex flex-wrap items-center justify-between gap-2 border-t border-line px-4 py-1.5 text-[11px] text-muted">
+                  <span>{fmt(t.trade.pagerCount, { count: bottomCount })}</span>
+                  <div className="flex items-center gap-1">
+                    <button
+                      type="button"
+                      aria-label={t.trade.prevPage}
+                      disabled={currentBottomPage === 0}
+                      onClick={() => setBottomPage(currentBottomPage - 1)}
+                      className="rounded-md border border-line p-1 transition-colors enabled:hover:bg-hover disabled:opacity-40"
+                    >
+                      <ChevronLeft size={13} />
+                    </button>
+                    <span className="px-1 font-mono text-[11px]">
+                      {fmt(t.trade.pageInfo, {
+                        page: currentBottomPage + 1,
+                        pages: bottomPageCount,
+                      })}
+                    </span>
+                    <button
+                      type="button"
+                      aria-label={t.trade.nextPage}
+                      disabled={currentBottomPage >= bottomPageCount - 1}
+                      onClick={() => setBottomPage(currentBottomPage + 1)}
+                      className="rounded-md border border-line p-1 transition-colors enabled:hover:bg-hover disabled:opacity-40"
+                    >
+                      <ChevronRight size={13} />
+                    </button>
+                  </div>
+                </div>
+              )}
             </CardContent>
           </Card>
             </div>
@@ -1119,15 +1214,15 @@ export default function TradePage() {
                 shortRate={shortRate}
                 netRate={netRate}
                 netAnnualizedPct={netAnn}
-                longPrice={longEntry?.mark_price == null ? null : toNumber(longEntry.mark_price)}
-                shortPrice={shortEntry?.mark_price == null ? null : toNumber(shortEntry.mark_price)}
+                longPrice={longPrice}
+                shortPrice={shortPrice}
               />
               <ConditionalOrderPanel
                 symbol={symbol}
                 longVenue={longVenue}
                 shortVenue={shortVenue}
                 netAnnualizedPct={netAnn}
-                longPrice={longEntry?.mark_price == null ? null : toNumber(longEntry.mark_price)}
+                longPrice={longPrice}
               />
             </div>
 

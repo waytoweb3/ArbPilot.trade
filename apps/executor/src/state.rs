@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, RwLock,
@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use arb_core::{Order, Position, RiskLimits, Side, StrategyRecord};
+use arb_core::{Order, OrderStatus, Position, RiskLimits, Side, StrategyRecord};
 use chrono::Utc;
 use rust_decimal::Decimal;
 use tokio::sync::broadcast;
@@ -20,6 +20,7 @@ use crate::{
     events::{AlertLevel, ExecutorEvent},
     exchange::{LiveEndpoints, LiveExchange, OkxMarketClient},
     funding::FundingFeed,
+    gateway::MAX_IN_MEMORY_ORDERS,
     http_client::HttpClient,
     license::LicenseManager,
     market::MarketFeed,
@@ -27,7 +28,7 @@ use crate::{
     notifier::Notifier,
     onchain::ChainFeed,
     realtime::RealtimeFeed,
-    store::Store,
+    store::{PositionGroupMember, Store},
     telegram::TelegramBot,
 };
 
@@ -150,6 +151,10 @@ impl AppState {
         let strategies = store.load_strategies().await;
         // 条件单持久化在库里，重启后继续等待触发。
         let conditional = ConditionalOrders::with_orders(store.conditional_orders().await);
+        // 历史委托与成交记录来自订单表，重启后底部面板仍能看到历史。
+        let mut orders = store.orders().await;
+        orders.sort_by_key(|order| std::cmp::Reverse(order.created_at));
+        orders.truncate(MAX_IN_MEMORY_ORDERS);
 
         // 授权令牌在启动时从本地恢复，过期后仍需回桌面端重新登录换取。
         let license = Arc::new(LicenseManager::start(
@@ -173,7 +178,7 @@ impl AppState {
             accounts,
             exchange,
             license,
-            orders: Arc::new(RwLock::new(Vec::new())),
+            orders: Arc::new(RwLock::new(orders)),
             positions: Arc::new(RwLock::new(Vec::new())),
             strategies: Arc::new(RwLock::new(strategies)),
             conditional: Arc::new(conditional),
@@ -203,6 +208,8 @@ impl AppState {
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(POSITION_SYNC_INTERVAL);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // 历史仓位组只回填一次，之后完全依赖持久化映射。
+            let mut backfilled = false;
             loop {
                 ticker.tick().await;
                 let snapshots = state.accounts.sync_open_positions().await;
@@ -220,12 +227,108 @@ impl AppState {
                         .market
                         .watch_position_symbols(&snapshot.venue, &symbols);
                 }
-                merge_exchange_positions(
-                    &mut state.positions.write().expect("仓位锁不可用"),
-                    snapshots,
-                );
+                // 读取持久化的仓位组，把重启后只剩交易所持仓的分组还原回来。
+                let mut groups = state.store.load_position_groups().await;
+                if !backfilled {
+                    backfilled = true;
+                    // 兼容本次修复上线前成交的历史双腿仓位：库里没有映射时从订单库重建一次。
+                    if groups.is_empty() {
+                        groups = state.backfill_position_groups(&snapshots).await;
+                    }
+                }
+                let lookup: HashMap<(String, String, Side), Uuid> = groups
+                    .iter()
+                    .flat_map(|(group_id, members)| {
+                        members.iter().map(move |member| {
+                            (
+                                (member.venue.clone(), member.symbol.clone(), member.side),
+                                *group_id,
+                            )
+                        })
+                    })
+                    .collect();
+
+                let stale = {
+                    let mut positions = state.positions.write().expect("仓位锁不可用");
+                    merge_exchange_positions(&mut positions, snapshots, &lookup);
+                    // 组内成员全部不在持仓里，说明该组已平仓，删除映射避免同键位被误归组。
+                    let live: HashSet<(String, String, Side)> = positions
+                        .iter()
+                        .map(|position| {
+                            (position.venue.clone(), position.symbol.clone(), position.side)
+                        })
+                        .collect();
+                    groups
+                        .iter()
+                        .filter(|(_, members)| {
+                            members.iter().all(|member| {
+                                !live.contains(&(
+                                    member.venue.clone(),
+                                    member.symbol.clone(),
+                                    member.side,
+                                ))
+                            })
+                        })
+                        .map(|(group_id, _)| *group_id)
+                        .collect::<Vec<_>>()
+                };
+                if !stale.is_empty() {
+                    state.store.delete_position_groups(&stale).await;
+                }
             }
         });
+    }
+
+    /// 兼容本次修复上线前成交的双腿仓位：本地还没有映射时，从持久化订单里重建一次。
+    ///
+    /// 只登记当前仍在交易所持仓中的腿，避免把已经平掉的旧组合带回来。
+    async fn backfill_position_groups(
+        &self,
+        snapshots: &[VenuePositions],
+    ) -> Vec<(Uuid, Vec<PositionGroupMember>)> {
+        let live: HashSet<(String, String, Side)> = snapshots
+            .iter()
+            .flat_map(|snapshot| {
+                snapshot
+                    .positions
+                    .iter()
+                    .map(|position| (position.venue.clone(), position.symbol.clone(), position.side))
+            })
+            .collect();
+        if live.is_empty() {
+            return Vec::new();
+        }
+
+        let mut restored = Vec::new();
+        for order in self.store.orders().await {
+            // 只认开仓双腿单，且必须两条腿都还在持仓里。
+            if order.status != OrderStatus::Filled
+                || order.intent.legs.len() < 2
+                || order.intent.legs.iter().any(|leg| leg.reduce_only)
+            {
+                continue;
+            }
+            let members = order
+                .intent
+                .legs
+                .iter()
+                .filter(|leg| live.contains(&(leg.venue.clone(), leg.symbol.clone(), leg.side)))
+                .map(|leg| PositionGroupMember {
+                    venue: leg.venue.clone(),
+                    symbol: leg.symbol.clone(),
+                    side: leg.side,
+                })
+                .collect::<Vec<_>>();
+            if members.len() < 2 {
+                continue;
+            }
+            self.store.save_position_group(order.id, &members).await;
+            restored.push((order.id, members));
+        }
+        if !restored.is_empty() {
+            tracing::info!(groups = restored.len(), "已从历史订单回填仓位组映射");
+        }
+        restored
     }
 
     /// 用 WebSocket 最新盘口刷新标记价与浮动盈亏，变化时推送给桌面端。
@@ -348,13 +451,23 @@ impl AppState {
 ///
 /// 同一 (交易所, 交易对, 方向) 若已有本机订单产生的记录，保留其策略归属与
 /// UUID；交易所已不存在的仓位直接移除，保证展示与真实敞口一致。
-fn merge_exchange_positions(positions: &mut Vec<Position>, snapshots: Vec<VenuePositions>) {
+/// 本地记录已丢失（如执行器重启）时，用持久化的仓位组把分组还原回来。
+fn merge_exchange_positions(
+    positions: &mut Vec<Position>,
+    snapshots: Vec<VenuePositions>,
+    groups: &HashMap<(String, String, Side), Uuid>,
+) {
     for snapshot in snapshots {
         let (mut local, mut retained): (Vec<Position>, Vec<Position>) = positions
             .drain(..)
             .partition(|position| position.venue == snapshot.venue);
 
         for mut position in snapshot.positions {
+            let key = (
+                position.venue.clone(),
+                position.symbol.clone(),
+                position.side,
+            );
             if let Some(index) = local
                 .iter()
                 .position(|item| item.symbol == position.symbol && item.side == position.side)
@@ -363,6 +476,9 @@ fn merge_exchange_positions(positions: &mut Vec<Position>, snapshots: Vec<VenueP
                 position.id = existing.id;
                 position.strategy_id = existing.strategy_id;
                 position.group_id = existing.group_id;
+            }
+            if position.group_id.is_none() {
+                position.group_id = groups.get(&key).copied();
             }
             retained.push(position);
         }

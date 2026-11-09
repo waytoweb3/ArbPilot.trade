@@ -1,14 +1,14 @@
 use std::{collections::HashMap, sync::RwLock};
 
 use arb_core::{
-    BacktestReport, Order, SandboxArtifact, StrategyAuthorCard, StrategyCode, StrategyDefinition,
-    StrategyEventLevel, StrategyPerformanceRecord, StrategyPublication, StrategyRecord,
-    StrategyRunScope, StrategySettlement, StrategySource, StrategyStatus, StrategySubscription,
-    StrategyValidation,
+    BacktestReport, Order, SandboxArtifact, Side, StrategyAuthorCard, StrategyCode,
+    StrategyDefinition, StrategyEventLevel, StrategyPerformanceRecord, StrategyPublication,
+    StrategyRecord, StrategyRunScope, StrategySettlement, StrategySource, StrategyStatus,
+    StrategySubscription, StrategyValidation,
 };
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 use uuid::Uuid;
 
@@ -35,6 +35,14 @@ pub struct FundingSummary {
     pub rate: Decimal,
     /// 窗口内的结算期数。
     pub count: i64,
+}
+
+/// 仓位组成员：`(venue, symbol, side)` 三元组用于重启后把交易所同步回来的仓位归回原仓位组。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PositionGroupMember {
+    pub venue: String,
+    pub symbol: String,
+    pub side: Side,
 }
 
 /// 策略可选的交易所：`segment` 区分现货腿与永续腿。
@@ -360,6 +368,97 @@ impl Store {
 
         if let Err(error) = result {
             tracing::error!(%error, order_id = %order.id, "写入订单失败");
+        }
+    }
+
+    /// 读取全部历史订单，用于重启后从订单库回填仓位组映射。
+    ///
+    /// 未连接数据库时为内存模式，订单只存在于进程内，这里返回空表。
+    pub async fn orders(&self) -> Vec<Order> {
+        sqlite_branch!(self, db => db.orders().await);
+        let Some(pool) = &self.pool else {
+            return Vec::new();
+        };
+        load_payloads(pool, "orders").await
+    }
+
+    /// 记录一次双腿开仓产生的仓位组，重启后据此把交易所持仓还原回同一组。
+    ///
+    /// 未连接数据库时为内存模式，仓位组随进程结束而消失。
+    pub async fn save_position_group(&self, group_id: Uuid, members: &[PositionGroupMember]) {
+        sqlite_branch!(self, db => db.save_position_group(group_id, members).await);
+        let Some(pool) = &self.pool else {
+            return;
+        };
+
+        let payload = match serde_json::to_value(members) {
+            Ok(payload) => payload,
+            Err(error) => {
+                tracing::error!(%error, %group_id, "仓位组序列化失败，未写入数据库");
+                return;
+            }
+        };
+        let result = sqlx::query(
+            r#"
+            insert into position_groups (group_id, members)
+            values ($1, $2)
+            on conflict (group_id) do update set members = excluded.members
+            "#,
+        )
+        .bind(group_id)
+        .bind(payload)
+        .execute(pool)
+        .await;
+
+        if let Err(error) = result {
+            tracing::error!(%error, %group_id, "写入仓位组失败");
+        }
+    }
+
+    /// 读取全部仓位组。未连接数据库时返回空表。
+    pub async fn load_position_groups(&self) -> Vec<(Uuid, Vec<PositionGroupMember>)> {
+        sqlite_branch!(self, db => db.position_groups().await);
+        let Some(pool) = &self.pool else {
+            return Vec::new();
+        };
+
+        let rows: Vec<sqlx::postgres::PgRow> =
+            match sqlx::query("select group_id, members from position_groups")
+                .fetch_all(pool)
+                .await
+            {
+                Ok(rows) => rows,
+                Err(error) => {
+                    tracing::error!(%error, "读取仓位组失败");
+                    return Vec::new();
+                }
+            };
+        rows.iter()
+            .filter_map(|row| {
+                let group_id: Uuid = row.try_get("group_id").ok()?;
+                let members: serde_json::Value = row.try_get("members").ok()?;
+                let members: Vec<PositionGroupMember> = serde_json::from_value(members).ok()?;
+                Some((group_id, members))
+            })
+            .collect()
+    }
+
+    /// 删除已完全平仓的仓位组，避免同键位的新仓位被错误归组。
+    pub async fn delete_position_groups(&self, group_ids: &[Uuid]) {
+        if group_ids.is_empty() {
+            return;
+        }
+        sqlite_branch!(self, db => db.delete_position_groups(group_ids).await);
+        let Some(pool) = &self.pool else {
+            return;
+        };
+
+        let result = sqlx::query("delete from position_groups where group_id = any($1)")
+            .bind(group_ids)
+            .execute(pool)
+            .await;
+        if let Err(error) = result {
+            tracing::error!(%error, "删除仓位组失败");
         }
     }
 

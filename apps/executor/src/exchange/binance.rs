@@ -343,6 +343,10 @@ impl BinanceMarketClient {
             match filter.filter_type.as_str() {
                 "LOT_SIZE" => {
                     spec.min_quantity = filter.min_qty.as_deref().and_then(parse_decimal);
+                    spec.step_size = filter.step_size.as_deref().and_then(parse_decimal);
+                }
+                "PRICE_FILTER" => {
+                    spec.tick_size = filter.tick_size.as_deref().and_then(parse_decimal);
                 }
                 // 合约用 notional，现货用 minNotional；两者都存在时以较大值为准。
                 "MIN_NOTIONAL" | "NOTIONAL" => {
@@ -442,6 +446,12 @@ struct ExchangeFilter {
     min_notional: Option<String>,
     #[serde(default)]
     notional: Option<String>,
+    /// LOT_SIZE 的数量步长。
+    #[serde(default)]
+    step_size: Option<String>,
+    /// PRICE_FILTER 的价格步长。
+    #[serde(default)]
+    tick_size: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -524,6 +534,34 @@ mod tests {
 
         assert_eq!(parse_decimal(&payload.bid_price), Some(dec!(78000.10)));
         assert_eq!(parse_decimal(&payload.ask_qty), Some(dec!(1.5)));
+    }
+
+    #[test]
+    fn parses_order_step_and_tick_size() {
+        let payload: ExchangeInfo = serde_json::from_str(
+            r#"{"symbols":[{"symbol":"ETHUSDT","status":"TRADING","contractType":"PERPETUAL",
+                "filters":[{"filterType":"LOT_SIZE","minQty":"0.001","stepSize":"0.001"},
+                           {"filterType":"PRICE_FILTER","tickSize":"0.01"}]}]}"#,
+        )
+        .expect("fixture 应可解析");
+
+        let filters = &payload.symbols[0].filters;
+        let lot = filters
+            .iter()
+            .find(|filter| filter.filter_type == "LOT_SIZE")
+            .expect("应含 LOT_SIZE");
+        assert_eq!(
+            lot.step_size.as_deref().and_then(parse_decimal),
+            Some(dec!(0.001))
+        );
+        let price = filters
+            .iter()
+            .find(|filter| filter.filter_type == "PRICE_FILTER")
+            .expect("应含 PRICE_FILTER");
+        assert_eq!(
+            price.tick_size.as_deref().and_then(parse_decimal),
+            Some(dec!(0.01))
+        );
     }
 
     #[test]

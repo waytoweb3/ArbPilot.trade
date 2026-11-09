@@ -18,7 +18,7 @@ use crate::{
     exchange::FundingRate,
     store::{
         EquityPoint, ExchangeVenueConfig, FundingSummary, MarketSnapshot, NotificationSettings,
-        StrategyRun, StrategyRunEvent, StrategyVersion, TradableSymbolConfig,
+        PositionGroupMember, StrategyRun, StrategyRunEvent, StrategyVersion, TradableSymbolConfig,
     },
     templates::StrategyTemplate,
 };
@@ -150,6 +150,10 @@ impl SqliteStore {
         if let Err(error) = self.put_doc("orders", &order.id.to_string(), order).await {
             tracing::error!(%error, order_id = %order.id, "写入订单失败");
         }
+    }
+
+    pub async fn orders(&self) -> Vec<Order> {
+        self.docs("orders").await
     }
 
     pub async fn append_order_event(
@@ -727,6 +731,52 @@ impl SqliteStore {
             .await
         {
             tracing::error!(%error, %id, "写入条件单失败");
+        }
+    }
+
+    pub async fn save_position_group(&self, group_id: Uuid, members: &[PositionGroupMember]) {
+        if let Err(error) = self
+            .put_doc("position_groups", &group_id.to_string(), &members)
+            .await
+        {
+            tracing::error!(%error, %group_id, "写入仓位组失败");
+        }
+    }
+
+    pub async fn position_groups(&self) -> Vec<(Uuid, Vec<PositionGroupMember>)> {
+        let rows = match sqlx::query(
+            "select id, payload from documents where collection = ? order by created_at asc",
+        )
+        .bind("position_groups")
+        .fetch_all(&self.pool)
+        .await
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::error!(%error, "读取仓位组失败");
+                return Vec::new();
+            }
+        };
+
+        rows.iter()
+            .filter_map(|row| {
+                let id: String = row.try_get("id").ok()?;
+                let group_id = Uuid::parse_str(&id).ok()?;
+                let payload: String = row.try_get("payload").ok()?;
+                let members: Vec<PositionGroupMember> = serde_json::from_str(&payload).ok()?;
+                Some((group_id, members))
+            })
+            .collect()
+    }
+
+    pub async fn delete_position_groups(&self, group_ids: &[Uuid]) {
+        for group_id in group_ids {
+            if let Err(error) = self
+                .delete_doc("position_groups", &group_id.to_string())
+                .await
+            {
+                tracing::error!(%error, %group_id, "删除仓位组失败");
+            }
         }
     }
 

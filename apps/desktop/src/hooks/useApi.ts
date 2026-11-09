@@ -7,6 +7,7 @@ import type {
   CreatePerformanceRequest,
   CreatePublicationRequest,
   ImportAccountRequest,
+  Position,
   SandboxDryRunRequest,
   SettlementStatus,
   StrategyDefinition,
@@ -141,6 +142,40 @@ export function useClosePosition() {
         throw new Error(result.order.note ?? "平仓被风控拒绝");
       }
       return result;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["positions"] });
+      queryClient.invalidateQueries({ queryKey: ["orders"] });
+    },
+  });
+}
+
+/** 一键平仓：把给定仓位先按组整体平掉，再平掉未分组的单腿仓位。 */
+export function useCloseAllPositions() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (positions: Position[]) => {
+      const groups = new Set<string>();
+      for (const position of positions) {
+        if (position.group_id) {
+          groups.add(position.group_id);
+        }
+      }
+      for (const groupId of groups) {
+        const result = await api.closePositionGroup(groupId);
+        if (result.order.status === "rejected") {
+          throw new Error(result.order.note ?? "整组平仓被风控拒绝");
+        }
+      }
+      for (const position of positions) {
+        if (position.group_id) {
+          continue;
+        }
+        const result = await api.closePosition(position.id);
+        if (result.order.status === "rejected") {
+          throw new Error(result.order.note ?? "平仓被风控拒绝");
+        }
+      }
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["positions"] });

@@ -150,11 +150,29 @@ impl HyperliquidFundingClient {
             .post_json(&format!("{}/info", self.base_url), &payload)
     }
 
-    /// Hyperliquid 对所有永续统一要求最低 $10 名义额，无逐币数量限制。
+    /// Hyperliquid 对所有永续统一要求最低 $10 名义额，数量精度取 `meta` 里的 `szDecimals`。
     pub fn min_order(&self, symbol: &str) -> anyhow::Result<Option<MinOrderSpec>> {
         let mut spec = MinOrderSpec::new(VENUE, symbol);
         spec.min_notional_usd = Some(Decimal::from(MIN_ORDER_NOTIONAL_USD));
+        // 精度查询失败时只返回名义额下限，数量对齐交给下单接口兜底。
+        if let Ok(size_decimals) = self.size_decimals(symbol) {
+            spec.step_size = size_decimals
+                .filter(|decimals| *decimals < 28)
+                .map(|decimals| Decimal::new(1, decimals));
+        }
         Ok(Some(spec))
+    }
+
+    /// 交易对的数量精度（`meta.universe[].szDecimals`）。
+    fn size_decimals(&self, symbol: &str) -> anyhow::Result<Option<u32>> {
+        let coin = venue_coin(symbol)?;
+        let meta = self.info(json!({ "type": "meta" }))?;
+        Ok(meta["universe"].as_array().and_then(|rows| {
+            rows.iter()
+                .find(|row| row["name"].as_str() == Some(coin))
+                .and_then(|row| row["szDecimals"].as_u64())
+                .map(|value| value as u32)
+        }))
     }
 
     /// 永续的买一/卖一档；`l2Book` 的数量单位是币。

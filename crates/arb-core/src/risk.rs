@@ -82,11 +82,11 @@ impl RiskLimits {
 
 /// 交易所硬性最小下单名义额（美元）。低于该值时交易所会直接拒单。
 ///
-/// Lighter 的永续合约要求 GTC 挂单单腿名义额不低于 10 USDC，
+/// Lighter 与 Hyperliquid 的永续 GTC 挂单都要求单腿名义额不低于 10 USDC，
 /// 与 `min_base_amount` 取较大者；这里只前置拦截名义额部分。
 pub fn venue_min_notional_usd(venue: &str) -> Option<Decimal> {
     match venue.to_ascii_lowercase().as_str() {
-        "lighter" => Some(Decimal::from(10)),
+        "lighter" | "hyperliquid" => Some(Decimal::from(10)),
         _ => None,
     }
 }
