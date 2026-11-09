@@ -17,7 +17,13 @@ export type Side = "buy" | "sell";
 
 export type OrderOrigin = "desktop" | "telegram" | "strategy";
 
-export type LegStatus = "pending" | "submitted" | "partially_filled" | "filled" | "cancelled" | "rejected";
+export type LegStatus =
+  | "pending"
+  | "submitted"
+  | "partially_filled"
+  | "filled"
+  | "cancelled"
+  | "rejected";
 
 export type OrderStatus =
   | "pending_risk"
@@ -490,6 +496,14 @@ export interface ImportAccountRequest {
   account_index?: number;
 }
 
+export interface VenueRiskLimits {
+  max_order_notional_usd?: Decimal;
+  max_leverage?: Decimal;
+  max_slippage_bps?: Decimal;
+  allowed_symbols?: string[];
+  max_legs?: number;
+}
+
 export interface RiskLimits {
   max_order_notional_usd: Decimal;
   max_total_notional_usd: Decimal;
@@ -499,6 +513,8 @@ export interface RiskLimits {
   allowed_symbols: string[];
   allowed_venues: string[];
   max_legs: number;
+  /** 按交易所覆盖；键为小写交易所标识。 */
+  venue_overrides: Record<string, VenueRiskLimits>;
 }
 
 export interface RiskViolation {
@@ -617,6 +633,8 @@ export interface TelegramBinding {
   chat_id: number;
   username: string | null;
   permissions: string[];
+  /** 机器人在该会话里使用的语言；旧绑定没有该字段。 */
+  lang?: "zh" | "en" | null;
   paired_at: string;
 }
 
@@ -670,18 +688,16 @@ export type PricingModel = "free" | "monthly";
 
 /** 表现记录来源：作者自报与平台可复现记录分开统计。 */
 export type PerformanceSource =
-  | "author_backtest"
-  | "platform_replay"
-  | "authorized_live";
+  "author_backtest" | "platform_replay" | "authorized_live";
 
-export type SubscriptionStatus = "pending_payment" | "trial" | "active" | "cancelled" | "expired";
+export type SubscriptionStatus =
+  "pending_payment" | "trial" | "active" | "cancelled" | "expired";
 
 export type SettlementStatus = "pending" | "paid" | "disputed";
 
 export interface StrategyAuthorCard {
   author_id: string;
   display_name: string;
-  headline: string;
   bio: string;
   /** 结算收款标识（平台账户 ID），不含私钥或银行账号。 */
   payout_account: string | null;
@@ -858,7 +874,12 @@ export interface SandboxBinding {
 
 /** 模块唯一可输出的动作集合，没有撤单、转账或密钥能力。 */
 export type SandboxDecision =
-  | { action: "open"; symbol: string; notional_usd: Decimal; reason?: string | null }
+  | {
+      action: "open";
+      symbol: string;
+      notional_usd: Decimal;
+      reason?: string | null;
+    }
   | { action: "close"; symbol: string; reason?: string | null }
   | { action: "hold"; reason?: string | null };
 

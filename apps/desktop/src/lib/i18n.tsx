@@ -35,7 +35,8 @@ const zh = {
   },
   docs: {
     title: "自托管部署文档",
-    subtitle: "自托管部署向导：填一次服务器信息，之后在客户端里一键部署与更新。",
+    subtitle:
+      "自托管部署向导：填一次服务器信息，之后在客户端里一键部署与更新。",
     desktopOnly: "服务器部署需要在桌面端运行，浏览器预览不支持 SSH。",
     server: "服务器连接",
     serverDesc: "填写云服务器的 SSH 登录信息，凭据只保存在本机系统钥匙串。",
@@ -48,7 +49,8 @@ const zh = {
     authKey: "私钥",
     password: "登录密码",
     privateKey: "SSH 私钥",
-    privateKeyHint: "粘贴以 -----BEGIN 开头的私钥文本，或 ~/.ssh 下私钥文件的内容。",
+    privateKeyHint:
+      "粘贴以 -----BEGIN 开头的私钥文本，或 ~/.ssh 下私钥文件的内容。",
     passphrase: "私钥口令（可选）",
     installDir: "安装目录",
     installDirHint: "代码与 docker-compose 所在目录，默认 /opt/arbpilot。",
@@ -63,7 +65,8 @@ const zh = {
     save: "保存到本机",
     saved: "已保存",
     release: "版本与更新",
-    releaseDesc: "客户端从官方发布源检查执行器版本，再通过 SSH 自动安装到你的服务器。",
+    releaseDesc:
+      "客户端从官方发布源检查执行器版本，再通过 SSH 自动安装到你的服务器。",
     serverVersion: "服务器版本",
     latestVersion: "最新版本",
     unknown: "未知",
@@ -79,7 +82,8 @@ const zh = {
     logs: "部署日志",
     logsEmpty: "开始部署后，这里会实时显示服务器输出。",
     cli: "服务器命令行部署",
-    cliDesc: "不想让客户端连服务器时，登录服务器执行下面的命令即可，不需要 clone 仓库。",
+    cliDesc:
+      "不想让客户端连服务器时，登录服务器执行下面的命令即可，不需要 clone 仓库。",
     cliInstall: "首次安装",
     cliUpdate: "后续更新",
     cliCopy: "复制",
@@ -92,7 +96,8 @@ const zh = {
     step1:
       "选一台到交易所与 DEX 节点延迟低的云服务器（香港、新加坡、东京等免备案地区），系统用 Ubuntu 22.04/24.04，配置按实际策略规模自选；安全组只放行 SSH 22 端口。",
     step2Title: "填写登录信息",
-    step2: "在上方填入服务器公网 IP、SSH 账号与密码（或私钥），点击测试连接确认能登录。",
+    step2:
+      "在上方填入服务器公网 IP、SSH 账号与密码（或私钥），点击测试连接确认能登录。",
     step3Title: "一键部署",
     step3:
       "点击「一键部署」，客户端会自动下载并安装执行器与 PostgreSQL；有新版本时按钮会变成「更新」。",
@@ -116,12 +121,11 @@ const zh = {
     noticeClose: "关闭通知",
   },
   updates: {
-    clientTitle: "客户端有新版本 {version}",
-    clientBody: "更新只替换客户端本体，本机配置、执行器与服务器数据都会保留。",
     executorTitle: "执行器有新版本 {version}",
     executorBody: "当前运行 v{current}，升级会保留部署配置与数据库。",
     action: "去升级",
     dismiss: "稍后提醒",
+    dotHint: "有新版本，点击查看",
   },
   overview: {
     title: "总览",
@@ -148,7 +152,8 @@ const zh = {
     walletAddress: "钱包地址",
     lighterAddress: "L1 地址或账户索引",
     asterAddress: "主账户钱包地址",
-    walletHint: "钱包地址用于查询余额，签名私钥用于本机签名下单，两者都必须填写。",
+    walletHint:
+      "钱包地址用于查询余额，签名私钥用于本机签名下单，两者都必须填写。",
     signerKey: "签名私钥",
     signerKeyPlaceholder: "0x…",
     signerKeyHint:
@@ -176,7 +181,8 @@ const zh = {
     refresh: "刷新",
     refreshFailed: "刷新失败：{message}",
     importFailed: "导入失败：{message}",
-    empty: "还没有导入交易账户。导入 API Key 或填写 DEX 钱包地址后，这里会显示余额与权益走势。",
+    empty:
+      "还没有导入交易账户。导入 API Key 或填写 DEX 钱包地址后，这里会显示余额与权益走势。",
     emptyCta: "导入账号",
     unavailable: "无法读取账户数据，请确认执行器已启动。",
     updatedAt: "更新于 {value}",
@@ -223,7 +229,8 @@ const zh = {
     net: "净收益",
     notional: "可执行额度",
     observed: "观测时间",
-    empty: "暂无可用机会。执行器会持续刷新各交易所的永续盘口，永续-永续费率差出现时显示在这里。",
+    empty:
+      "暂无可用机会。执行器会持续刷新各交易所的永续盘口，永续-永续费率差出现时显示在这里。",
   },
   trade: {
     title: "下单确认",
@@ -255,7 +262,8 @@ const zh = {
     short: "空头：{value}",
     notional: "每条腿名义价值（USD）",
     leverage: "杠杆",
-    confirm: "我已核对交易所、方向、金额与杠杆，并理解套利存在滑点与双腿成交风险。",
+    confirm:
+      "我已核对交易所、方向、金额与杠杆，并理解套利存在滑点与双腿成交风险。",
     submit: "二次确认并开仓",
     submitting: "提交中…",
     orderStatus: "订单状态",
@@ -280,7 +288,8 @@ const zh = {
     action: "操作",
     close: "平仓",
     closeTitle: "确认平仓",
-    closeMessage: "将按市价反向平掉 {venue} {symbol} 的 {quantity} 仓位，成交后不可撤销。",
+    closeMessage:
+      "将按市价反向平掉 {venue} {symbol} 的 {quantity} 仓位，成交后不可撤销。",
     closeConfirm: "确认平仓",
     closeCancel: "取消",
     history: "订单历史",
@@ -315,7 +324,8 @@ const zh = {
       "本期 3 天策略创建试用已结束，订阅「策略创建」附加包（+$10/月）后可继续创建。",
     createTitle: "新建资金费率策略",
     templatesTitle: "内置模板",
-    templatesDesc: "模板存在数据库里，启动时编译成沙箱模块；实例化后仍走统一风控。",
+    templatesDesc:
+      "模板存在数据库里，启动时编译成沙箱模块；实例化后仍走统一风控。",
     useTemplate: "使用模板",
     instantiating: "创建中…",
     empty: "暂无策略。新建一条策略，先校验、回测，再启动。",
@@ -335,8 +345,10 @@ const zh = {
     backtesting: "回测中…",
     backtestDays: "回放窗口（天）",
     delete: "删除策略",
-    deleteConfirm: "删除后策略定义与版本历史将不可恢复，已有仓位与订单保留。确认删除？",
-    rollbackConfirm: "回滚会用该版本定义生成一个新版本，当前定义会被替换。继续？",
+    deleteConfirm:
+      "删除后策略定义与版本历史将不可恢复，已有仓位与订单保留。确认删除？",
+    rollbackConfirm:
+      "回滚会用该版本定义生成一个新版本，当前定义会被替换。继续？",
     rollback: "回滚到此版本",
     cancel: "取消",
     fields: {
@@ -480,7 +492,8 @@ const zh = {
     scopeSymbols: "交易对",
     scopeSymbolsPlaceholder: "选择交易对…",
     scopeSymbolsEmpty: "暂无可选交易对，请先在数据库中配置交易对。",
-    scopeVenuesEmpty: "数据库还没有可用的交易所配置，请先配置现货与合约交易所。",
+    scopeVenuesEmpty:
+      "数据库还没有可用的交易所配置，请先配置现货与合约交易所。",
     scopeSuggest: "可用交易对",
     scopeSave: "保存范围",
     scopeSaving: "保存中…",
@@ -506,7 +519,7 @@ const zh = {
   market: {
     title: "策略市场",
     subtitle:
-      "这里只展示公开策略与我的订阅；策略发布在「策略」页，作者卡片与结算在「设置」里管理。",
+      "这里只展示公开策略与我的订阅；策略发布在「策略」页，用户资料与结算在「设置」里管理。",
     detailTitle: "策略详情",
     leaderboardTitle: "表现榜",
     leaderboardDesc:
@@ -514,7 +527,7 @@ const zh = {
     leaderboardEmpty: "暂无已发布策略。",
     rank: "排名",
     strategy: "策略",
-    author: "作者",
+    author: "用户",
     score: "综合评分",
     reproducibility: "可复现性",
     sample: "样本",
@@ -526,14 +539,14 @@ const zh = {
     publicationsDesc:
       "订阅前请确认逻辑说明、已知限制、运行环境与定价；撤回只影响市场曝光，不影响已有仓位。",
     showHidden: "显示私有与已撤回",
-    publicationsEmpty: "暂无发布。先创建作者卡片，再把本机策略发布到市场。",
+    publicationsEmpty: "暂无发布。先创建用户资料，再把本机策略发布到市场。",
     statusPrivate: "私有草稿",
     statusPublished: "已发布",
     statusWithdrawn: "已撤回",
     publish: "发布",
     withdraw: "撤回",
     versionTag: "绑定 v{version}",
-    authorCard: "作者卡片",
+    authorCard: "用户资料",
     riskLevel: "风险等级",
     riskLow: "低风险",
     riskMedium: "中风险",
@@ -560,29 +573,30 @@ const zh = {
     cancelSubscription: "取消订阅",
     importStrategy: "导入到我的策略",
     importing: "导入中…",
-    importUnavailable: "作者尚未发布可运行版本，暂时无法导入。",
+    importUnavailable: "该用户尚未发布可运行版本，暂时无法导入。",
     subscriptionEntitled: "有效期至 {value}",
     performanceTitle: "表现记录",
-    performanceDesc: "作者自报记录不计入可复现性评分，只有平台记录才能标记为可复现。",
+    performanceDesc:
+      "用户自报记录不计入可复现性评分，只有平台记录才能标记为可复现。",
     performanceEmpty: "暂无表现记录。",
     addPerformance: "补充表现记录",
-    sourceAuthorBacktest: "作者回测",
+    sourceAuthorBacktest: "用户回测",
     sourcePlatformReplay: "平台回放",
     sourceLive: "授权实盘",
     reproducible: "可复现",
     notReproducible: "不可复现",
     periodRange: "{start} → {end}",
-    authorsTitle: "作者卡片",
-    authorsDesc: "收款标识只保存平台账户 ID，请勿填写私钥或银行账号。",
-    authorsEmpty: "还没有作者卡片。",
-    displayName: "作者名称",
-    headline: "一句话介绍",
-    bio: "作者简介",
+    authorsTitle: "用户资料",
+    authorsDesc: "收款标识固定使用当前登录的平台账号 ID，不可修改。",
+    authorsEmpty: "还没有用户资料。",
+    displayName: "用户姓名",
+    bio: "简介",
     payout: "收款标识",
-    payoutHint: "平台账户 ID，可留空",
-    saveAuthor: "保存作者",
+    payoutHint: "登录后自动使用平台账号 ID",
+    saveAuthor: "保存用户资料",
     publishTitle: "发布策略",
-    publishDesc: "发布必须绑定已通过校验、且回测版本一致的策略；新建后默认为私有草稿。",
+    publishDesc:
+      "发布必须绑定已通过校验、且回测版本一致的策略；新建后默认为私有草稿。",
     titleLabel: "标题",
     summaryLabel: "摘要",
     logicLabel: "逻辑说明（至少 40 字，覆盖入场、退出与阻止交易条件）",
@@ -597,12 +611,14 @@ const zh = {
     createDraft: "创建私有草稿",
     creating: "创建中…",
     myPublications: "这条策略的发布记录",
-    authorMissing: "还没有作者卡片，请先在「设置 → 作者」中创建。",
+    authorMissing: "还没有用户资料，请先在「设置 → 用户」中创建。",
     subscriptionsTitle: "我的订阅",
-    subscriptionsDesc: "取消后保留到当前计费周期结束，已有仓位与安全处置不受影响。",
+    subscriptionsDesc:
+      "取消后保留到当前计费周期结束，已有仓位与安全处置不受影响。",
     subscriptionsEmpty: "暂无订阅。",
-    settlementsTitle: "作者结算",
-    settlementsDesc: "按周期汇总付费订阅，扣除平台服务费（{bps} bps）后生成结算单。",
+    settlementsTitle: "用户结算",
+    settlementsDesc:
+      "按周期汇总付费订阅，扣除平台服务费（{bps} bps）后生成结算单。",
     settlementsEmpty: "暂无结算单。",
     createSettlement: "生成本月结算单",
     period: "周期",
@@ -623,14 +639,16 @@ const zh = {
       expired: "已过期",
     },
     actionFailed: "操作失败：{message}",
-    subscribePendingHint: "付费订阅会生成待支付记录，请在支付服务完成付款后生效。",
+    subscribePendingHint:
+      "付费订阅会生成待支付记录，请在支付服务完成付款后生效。",
     subscribeLoginHint:
       "未登录时购买记录只保存在本机；登录账号后订阅会绑定账号，换设备或重装可同步已购策略。",
     openCheckout: "打开收银台",
     checkoutNeedsKey: "支付服务未配置支付密钥，暂时无法创建收银台会话。",
     checkoutUnreachable: "支付服务不可达（{url}），请先启动本地支付服务。",
     checkoutFailed: "创建支付会话失败：{message}",
-    checkoutLoginRequired: "购买策略需要先登录账号，请点击右上角头像使用 Google 登录。",
+    checkoutLoginRequired:
+      "购买策略需要先登录账号，请点击右上角头像使用 Google 登录。",
     fields: {
       trades: "交易次数",
       sample: "样本条数",
@@ -731,13 +749,15 @@ const zh = {
     pageInfo: "第 {page} / {pages} 页",
     prevPage: "上一页",
     nextPage: "下一页",
-    empty: "暂无交割基差机会：需要同交易所的现货与交割合约同时有盘口，且交割价格高于现货。",
+    empty:
+      "暂无交割基差机会：需要同交易所的现货与交割合约同时有盘口，且交割价格高于现货。",
     noMatch: "没有符合条件的交易对。",
     unavailable: "无法读取交割基差数据，请确认执行器已启动。",
   },
   news: {
     title: "新闻订阅",
-    subtitle: "订阅 Binance、Upbit、OKX、Bybit、Bitget 的上币公告；新消息会汇总在这里并计入未读。",
+    subtitle:
+      "订阅 Binance、Upbit、OKX、Bybit、Bitget 的上币公告；新消息会汇总在这里并计入未读。",
     sourcesTitle: "订阅来源",
     feedTitle: "最新公告",
     unread: "{count} 条未读",
@@ -770,11 +790,10 @@ const zh = {
     subtitle: "凭证由执行器持有。桌面端只保存访问令牌，不保存交易所 API Key。",
     tabConnection: "连接",
     tabRisk: "风控",
-    tabAccount: "账号与账单",
-    tabAuthor: "作者",
+    tabAccount: "订阅",
+    tabAuthor: "用户",
     tabNotify: "通知",
-    tabClient: "客户端",
-    tabDeploy: "自托管部署文档",
+    tabTelegram: "Telegram 机器人",
     connection: "执行器连接",
     connectionDesc: "内置执行器与自托管实例是两类独立配置",
     mode: "实例类型",
@@ -803,6 +822,15 @@ const zh = {
     limitsSaved: "已保存，立即生效",
     limitsSymbolsHint: "逗号分隔；留空表示不限制，保存时自动转为大写。",
     limitsVenuesHint: "逗号分隔；例如 binance, okx；留空表示不限制。",
+    venueOverrides: "按交易所覆盖",
+    venueOverridesDesc:
+      "为单个交易所设置更严格的限额；未填写的项沿用全局默认，数值只能收紧不能放宽。",
+    venueOverridesEmpty: "暂无交易所覆盖，全部沿用全局默认。",
+    venueName: "交易所",
+    venueNamePlaceholder: "如 binance",
+    venueAdd: "添加交易所",
+    venueRemove: "移除",
+    venueInherit: "留空沿用全局",
     limitsLegsHint: "1 - 4 条腿",
     notConnected: "未连接",
     maxOrder: "单笔名义上限",
@@ -818,13 +846,15 @@ const zh = {
     unavailable: "无法读取风控配置，请确认执行器在线。",
     security: "安全提示",
     securityDesc: "本地与自托管模式下的默认约定",
-    security1: "交易所 API Key 只保存在执行器所在服务器，不进入桌面前端或数据库。",
+    security1:
+      "交易所 API Key 只保存在执行器所在服务器，不进入桌面前端或数据库。",
     security2: "API Key 应关闭提现与资金划转权限，并在交易所侧配置 IP 白名单。",
-    security3: "所有开仓指令都必须通过执行器风控，Telegram 与策略插件无法绕过。",
+    security3:
+      "所有开仓指令都必须通过执行器风控，Telegram 与策略插件无法绕过。",
     security4: "自动更新只接受签名制品；升级前备份数据库并暂停新开仓。",
     accountTitle: "账号与设备",
     accountDesc:
-      "登录只用于授权、设备数量、作者身份与策略购买同步；交易凭证、订单与数据库始终留在本机，换设备重新登录即可恢复已购内容。",
+      "登录只用于授权、设备数量、用户身份与策略购买同步；交易凭证、订单与数据库始终留在本机，换设备重新登录即可恢复已购内容。",
     accountLoginTitle: "登录 ArbPilot",
     accountLoginDesc:
       "通过浏览器完成第三方登录，桌面端不会接触你的密码，也不会因此获得任何交易或提现权限。",
@@ -841,7 +871,8 @@ const zh = {
     accountRetry: "重新生成",
     accountLogout: "退出登录",
     accountSwitch: "切换账号",
-    accountSwitchHint: "已退出当前账号，浏览器会重新选择要登录的账号，确认后在本机生效。",
+    accountSwitchHint:
+      "已退出当前账号，浏览器会重新选择要登录的账号，确认后在本机生效。",
     accountSignedIn: "已登录",
     accountPlan: "当前套餐",
     accountPlanNone: "未订阅",
@@ -890,7 +921,7 @@ const zh = {
     billingAddonHint: "在自托管部署基础上升级",
     billingAddonTrialHint: "本期试用至 {value}，之后需订阅附加包",
     billingMarketNote:
-      "策略市场中的策略由作者定价，可免费或按月收费；购买和使用已订阅策略不需要再额外付费。",
+      "策略市场中的策略由用户定价，可免费或按月收费；购买和使用已订阅策略不需要再额外付费。",
     billingSubscribe: "订阅{plan}",
     billingOpening: "正在创建收银台…",
     billingRefresh: "刷新状态",
@@ -903,7 +934,8 @@ const zh = {
     billingOpenManual: "如浏览器未自动打开，请复制下面的链接完成支付：",
     billingCopy: "复制链接",
     billingCopied: "已复制",
-    billingNote: "卡数据由 Waffo Pancake 处理，不经过本机；取消订阅不影响查看仓位与撤单。",
+    billingNote:
+      "卡数据由 Waffo Pancake 处理，不经过本机；取消订阅不影响查看仓位与撤单。",
     billingStatuses: {
       pending: "等待支付",
       active: "已开通",
@@ -937,14 +969,17 @@ const zh = {
     telegramPairing: "正在生成…",
     telegramPairingHint: "在 Telegram 中向机器人发送以下命令完成绑定：",
     telegramExpiresAt: "配对码有效期至 {value}",
+    telegramOpenInBrowser: "在浏览器中打开 Telegram",
     telegramBindings: "已绑定账号",
     telegramEmpty: "暂无绑定账号。",
     telegramRevoke: "撤销",
     telegramPolling: "轮询中",
     telegramNote:
-      "机器人只转发指令，不接收交易所密钥、不直接签名；交易使用执行器所在服务器上的 API Key，开仓需 /confirm 二次确认并经过执行器风控。",
+      "机器人只转发指令，不接收交易所密钥、不直接签名；交易使用执行器所在服务器上的 API Key，开仓需点击确认按钮二次确认并经过执行器风控。",
     notifyTitle: "消息开关",
     notifyDesc: "选择需要推送的消息类型、触发条件与推送渠道，保存后立即生效。",
+    notifyTabNews: "新闻消息",
+    notifyTabFunding: "资金费率",
     notifyNews: "新闻消息推送",
     notifyNewsHint: "交易所上币公告出现新条目时推送。",
     notifyNewsSources: "新闻来源",
@@ -963,22 +998,18 @@ const zh = {
     notifySaved: "已保存，立即生效",
     notifyUnavailable: "无法读取通知配置，请确认执行器在线。",
     update: "客户端更新",
-    updateDesc: "版本清单来自官方发布源，安装包带签名校验",
     updateCurrent: "当前版本",
     updateLatest: "最新版本",
-    updateCheck: "检查更新",
-    updateChecking: "正在检查…",
-    updateUpToDate: "已是最新版本",
     updateAvailable: "发现新版本 {version}",
     updateNotes: "更新说明",
     updateAction: "下载并安装",
+    updateLater: "稍后",
     updateInstalling: "正在下载…",
     updatePercent: "{value}%",
     updateInstalled: "下载完成，重启后生效",
     updateRestart: "立即重启",
     updateRestarting: "正在重启…",
     updateFailed: "更新失败：{message}",
-    updateDesktopOnly: "客户端更新只能在桌面端使用。",
     updateNote: "更新只替换客户端本体，执行器、服务器数据与本机配置都会保留。",
   },
   status: {
@@ -1038,9 +1069,11 @@ const en: typeof zh = {
     title: "Self-hosted deployment",
     subtitle:
       "Self-hosting guide: enter your server once, then deploy and update from the desktop app.",
-    desktopOnly: "Server deployment requires the desktop app; SSH is unavailable in the browser preview.",
+    desktopOnly:
+      "Server deployment requires the desktop app; SSH is unavailable in the browser preview.",
     server: "Server connection",
-    serverDesc: "SSH login for your cloud server. Credentials are stored only in the local system keychain.",
+    serverDesc:
+      "SSH login for your cloud server. Credentials are stored only in the local system keychain.",
     host: "Server address",
     hostHint: "Public IP or hostname, e.g. 1.2.3.4",
     port: "SSH port",
@@ -1050,10 +1083,12 @@ const en: typeof zh = {
     authKey: "Private key",
     password: "Password",
     privateKey: "SSH private key",
-    privateKeyHint: "Paste the key text starting with -----BEGIN, or the contents of a file in ~/.ssh.",
+    privateKeyHint:
+      "Paste the key text starting with -----BEGIN, or the contents of a file in ~/.ssh.",
     passphrase: "Key passphrase (optional)",
     installDir: "Install directory",
-    installDirHint: "Where the source and docker-compose live. Defaults to /opt/arbpilot.",
+    installDirHint:
+      "Where the source and docker-compose live. Defaults to /opt/arbpilot.",
     credentialNote:
       "Passwords and keys are written to the local system keychain (macOS Keychain / Windows Credential Manager) and never uploaded.",
     test: "Test connection",
@@ -1091,22 +1126,27 @@ const en: typeof zh = {
     cliCopied: "Copied",
     cliNote:
       "The script also installs PostgreSQL and generates a random API token and database password. Data lives in Docker volumes, so updates keep it.",
-    tokenFilled: "Executor address and token were filled in. Open the SSH tunnel to connect.",
+    tokenFilled:
+      "Executor address and token were filled in. Open the SSH tunnel to connect.",
     steps: "Deployment steps",
     step1Title: "Prepare a server",
     step1:
       "Pick a cloud server with low latency to your exchange and DEX endpoints (Hong Kong, Singapore, Tokyo, etc.), run Ubuntu 22.04/24.04, size the instance to your strategy load, and allow only port 22 in the firewall.",
     step2Title: "Enter login details",
-    step2: "Fill in the public IP, SSH user and password (or key), then test the connection.",
+    step2:
+      "Fill in the public IP, SSH user and password (or key), then test the connection.",
     step3Title: "Deploy",
     step3:
       "Click one-click deploy: the app downloads and installs the executor plus PostgreSQL. When a new release ships, the button becomes Update.",
     step4Title: "Connect the executor",
     step4:
       "The executor address and token are filled in automatically. For remote use, open an SSH tunnel: ssh -N -L 8787:127.0.0.1:8787 user@server.",
-    security1: "Passwords and keys live only in the local keychain — no config file, no upload.",
-    security2: "The executor binds to the server loopback address; the desktop app connects through SSH.",
-    security3: "Exchange API keys and DEX signing keys stay on your server; the desktop never sees them.",
+    security1:
+      "Passwords and keys live only in the local keychain — no config file, no upload.",
+    security2:
+      "The executor binds to the server loopback address; the desktop app connects through SSH.",
+    security3:
+      "Exchange API keys and DEX signing keys stay on your server; the desktop never sees them.",
   },
   shell: {
     online: "Executor online",
@@ -1121,16 +1161,17 @@ const en: typeof zh = {
     noticeClose: "Dismiss notification",
   },
   updates: {
-    clientTitle: "Client version {version} is available",
-    clientBody: "Updating only replaces the desktop app; local settings, the executor and server data are kept.",
     executorTitle: "Executor version {version} is available",
-    executorBody: "Currently running v{current}; upgrading keeps the deployment config and database.",
+    executorBody:
+      "Currently running v{current}; upgrading keeps the deployment config and database.",
     action: "Update",
     dismiss: "Remind me later",
+    dotHint: "New version available, click to view",
   },
   overview: {
     title: "Overview",
-    subtitle: "Total equity, equity curve and balances across your imported trading accounts.",
+    subtitle:
+      "Total equity, equity curve and balances across your imported trading accounts.",
   },
   accounts: {
     title: "Trading accounts",
@@ -1149,7 +1190,8 @@ const en: typeof zh = {
     apiKey: "API Key",
     apiSecret: "API Secret",
     passphrase: "Passphrase",
-    passphraseHint: "OKX and Bitget require the passphrase set when creating the key",
+    passphraseHint:
+      "OKX and Bitget require the passphrase set when creating the key",
     walletAddress: "Wallet address",
     lighterAddress: "L1 address or account index",
     asterAddress: "Master account wallet address",
@@ -1191,7 +1233,8 @@ const en: typeof zh = {
     neverUpdated: "Not collected yet",
     chartTitle: "Equity trend",
     chartDesc: "Combined USD equity across imported accounts",
-    chartEmpty: "No equity history yet. The executor records snapshots on its polling interval.",
+    chartEmpty:
+      "No equity history yet. The executor records snapshots on its polling interval.",
     range24h: "24 hours",
     range7d: "7 days",
     range30d: "30 days",
@@ -1218,7 +1261,8 @@ const en: typeof zh = {
     title: "Opportunities",
     subtitle:
       "Perp-perp funding-spread scan across the enabled venues. Select a row to fill the order panel.",
-    error: "Unable to load opportunities. Check that the executor is running and the token is correct.",
+    error:
+      "Unable to load opportunities. Check that the executor is running and the token is correct.",
     listTitle: "Opportunity list",
     count: "{count} items · refreshed every 2s",
   },
@@ -1239,10 +1283,12 @@ const en: typeof zh = {
     title: "Order confirmation",
     desc: "Every order passes through the executor risk engine. No bypass.",
     pageTitle: "Two-leg trade",
-    pageDesc: "{pair} hedged pair: long the lower-funding leg and short the higher one to collect the funding spread.",
+    pageDesc:
+      "{pair} hedged pair: long the lower-funding leg and short the higher one to collect the funding spread.",
     long1Short2: "Leg 1 long / leg 2 short",
     short1Long2: "Leg 1 short / leg 2 long",
-    noPair: "Fewer than two venues quote live funding for this pair, so a two-leg position cannot be built.",
+    noPair:
+      "Fewer than two venues quote live funding for this pair, so a two-leg position cannot be built.",
     longBadge: "Long",
     shortBadge: "Short",
     legLabel: "Leg {index} venue",
@@ -1253,11 +1299,13 @@ const en: typeof zh = {
     nextFunding: "Settles in {value}",
     markPrice: "Mark price",
     netTitle: "Net funding",
-    netDesc: "Short-leg rate minus long-leg rate. Positive means the position collects funding.",
+    netDesc:
+      "Short-leg rate minus long-leg rate. Positive means the position collects funding.",
     netAnnualizedLabel: "Net annualized",
     netPerSettleLabel: "Net per settlement",
     priceGapLabel: "Price gap (short − long)",
-    intervalMismatch: "Legs settle on different intervals; annualized is indicative only",
+    intervalMismatch:
+      "Legs settle on different intervals; annualized is indicative only",
     chartTitle: "{venue} daily funding",
     chartDesc: "Settled rates summed by calendar day",
     noChart: "No funding history yet",
@@ -1315,7 +1363,8 @@ const en: typeof zh = {
     subtitle:
       "Strategies only emit order intents. They cannot read keys or bypass the executor risk engine.",
     listTitle: "Strategy list",
-    listDesc: "Draft, running and paused states at a glance; every order is re-checked by risk.",
+    listDesc:
+      "Draft, running and paused states at a glance; every order is re-checked by risk.",
     venues: "Venues: {value}",
     symbols: "Symbols: {value}",
     heartbeat: "Last heartbeat: {value}",
@@ -1334,7 +1383,8 @@ const en: typeof zh = {
     useTemplate: "Use template",
     instantiating: "Creating…",
     empty: "No strategies yet. Create one, validate, backtest, then start it.",
-    selectHint: "Pick a strategy to see its definition, validation, backtest and runtime state.",
+    selectHint:
+      "Pick a strategy to see its definition, validation, backtest and runtime state.",
     version: "v{version}",
     sourceBuiltIn: "Built-in",
     sourceManual: "Manual",
@@ -1374,10 +1424,12 @@ const en: typeof zh = {
       feeBpsPerLeg: "Fee per leg (bps)",
       slippageBps: "Slippage per leg (bps)",
       notes: "Notes",
-      notesPlaceholder: "Explain entry, exit, blocking conditions and open assumptions",
+      notesPlaceholder:
+        "Explain entry, exit, blocking conditions and open assumptions",
     },
     validationTitle: "Validation",
-    validationDesc: "A valid structure is not a good strategy; it still needs a backtest.",
+    validationDesc:
+      "A valid structure is not a good strategy; it still needs a backtest.",
     validationPass: "Validation passed",
     validationErrors: "{count} errors",
     validationWarnings: "{count} warnings",
@@ -1432,7 +1484,8 @@ const en: typeof zh = {
     runHeartbeat: "Heartbeat {value}",
     dryRun: "Dry run once",
     dryRunning: "Running…",
-    dryRunDesc: "Evaluates one snapshot of live quotes without placing any order.",
+    dryRunDesc:
+      "Evaluates one snapshot of live quotes without placing any order.",
     dryRunNeedDeploy: "Compile and deploy the strategy code before a dry run.",
     dryRunStatus: "Status",
     dryRunDecisions: "Decisions",
@@ -1453,7 +1506,8 @@ const en: typeof zh = {
     events: "Recent events",
     eventsEmpty: "No runtime events yet.",
     versionsTitle: "Version history",
-    versionsDesc: "Definition, validation, backtest and deployment state for replay and rollback.",
+    versionsDesc:
+      "Definition, validation, backtest and deployment state for replay and rollback.",
     versionsEmpty: "No versions recorded yet.",
     current: "Current",
     codeTitle: "Strategy code",
@@ -1465,7 +1519,8 @@ const en: typeof zh = {
     codeGenerate: "Generate with AI",
     codeGenerating: "Generating…",
     codeSource: "Source (WebAssembly Text)",
-    codeTemplateHint: "This is a compilable template; save it to make it this strategy's code.",
+    codeTemplateHint:
+      "This is a compilable template; save it to make it this strategy's code.",
     codeSave: "Save code",
     codeSaving: "Saving…",
     codeCompile: "Compile and check",
@@ -1478,9 +1533,11 @@ const en: typeof zh = {
     codeOriginAi: "AI generated",
     codeOriginUser: "Manually edited",
     codeOriginTemplate: "Template",
-    codeNeedStop: "Strategy is running: pause it before generating, editing or deploying code.",
+    codeNeedStop:
+      "Strategy is running: pause it before generating, editing or deploying code.",
     codeCompileOk: "Compiled and passed the sandbox static checks.",
-    codeDeployOk: "Deployed to the sandbox; every runtime order still goes through the risk gateway.",
+    codeDeployOk:
+      "Deployed to the sandbox; every runtime order still goes through the risk gateway.",
     codePromptRequired: "Describe the strategy first.",
     createDesc:
       "Create with just a name. You can describe the strategy in natural language first, then review, edit and deploy the generated code.",
@@ -1490,7 +1547,8 @@ const en: typeof zh = {
     createSubmit: "Create strategy",
     createNameRequired: "Enter a strategy name.",
     chatEmpty: "Describe what you want; AI will generate reviewable code.",
-    chatAssistant: "Code updated from the conversation. Review the source, then compile and deploy.",
+    chatAssistant:
+      "Code updated from the conversation. Review the source, then compile and deploy.",
     chatSend: "Send",
     chatSending: "Generating…",
     scopeTitle: "Execution scope",
@@ -1500,14 +1558,17 @@ const en: typeof zh = {
     scopePerp: "Perp venue",
     scopeSymbols: "Symbols",
     scopeSymbolsPlaceholder: "Select a symbol…",
-    scopeSymbolsEmpty: "No symbols configured. Add symbols to the database first.",
-    scopeVenuesEmpty: "No venues configured yet. Add spot and perp venues to the database first.",
+    scopeSymbolsEmpty:
+      "No symbols configured. Add symbols to the database first.",
+    scopeVenuesEmpty:
+      "No venues configured yet. Add spot and perp venues to the database first.",
     scopeSuggest: "Available symbols",
     scopeSave: "Save scope",
     scopeSaving: "Saving…",
     scopeSaved: "Scope updated. Re-validate and backtest before running.",
     scopeRequired: "Add at least one symbol.",
-    scopeNeedStop: "Strategy is running: pause it before changing the execution scope.",
+    scopeNeedStop:
+      "Strategy is running: pause it before changing the execution scope.",
     scopeEventsTitle: "Event listening (optional)",
     scopeEventsDesc:
       "Sandbox strategies can read exchange listing announcements through events(). Leave blank for no restriction; only announcements matching this strategy's symbols and inside the window are injected.",
@@ -1516,7 +1577,8 @@ const en: typeof zh = {
     scopeEventKeywords: "Event keywords",
     scopeEventKeywordsPlaceholder: "list, listing (blank = no filter)",
     scopeEventWindow: "Event window (seconds)",
-    scopeEventWindowInvalid: "Event window must be between 60 and 604800 seconds.",
+    scopeEventWindowInvalid:
+      "Event window must be between 60 and 604800 seconds.",
     publishLockedTitle: "Validate before publishing",
     publishLockedDesc:
       "Compile and deploy the strategy code first, then run validation. The publish panel appears once validation reports no errors. Backtesting is optional reference data; event-driven strategies have no historical announcements to replay.",
@@ -1527,7 +1589,7 @@ const en: typeof zh = {
   market: {
     title: "Strategy market",
     subtitle:
-      "This page lists public strategies and your subscriptions only. Publishing lives under Strategies; author cards and settlements live under Settings.",
+      "This page lists public strategies and your subscriptions only. Publishing lives under Strategies; user profiles and settlements live under Settings.",
     detailTitle: "Strategy details",
     leaderboardTitle: "Performance board",
     leaderboardDesc:
@@ -1535,7 +1597,7 @@ const en: typeof zh = {
     leaderboardEmpty: "No published strategies yet.",
     rank: "Rank",
     strategy: "Strategy",
-    author: "Author",
+    author: "User",
     score: "Score",
     reproducibility: "Reproducibility",
     sample: "Sample",
@@ -1547,14 +1609,15 @@ const en: typeof zh = {
     publicationsDesc:
       "Check the logic, known limits, runtime and pricing before subscribing. Withdrawing only affects exposure, never existing positions.",
     showHidden: "Show private and withdrawn",
-    publicationsEmpty: "No publications yet. Create an author card, then publish a local strategy.",
+    publicationsEmpty:
+      "No publications yet. Create a user profile, then publish a local strategy.",
     statusPrivate: "Private draft",
     statusPublished: "Published",
     statusWithdrawn: "Withdrawn",
     publish: "Publish",
     withdraw: "Withdraw",
     versionTag: "Bound v{version}",
-    authorCard: "Author card",
+    authorCard: "User profile",
     riskLevel: "Risk level",
     riskLow: "Low risk",
     riskMedium: "Medium risk",
@@ -1581,28 +1644,28 @@ const en: typeof zh = {
     cancelSubscription: "Cancel subscription",
     importStrategy: "Import to my strategies",
     importing: "Importing…",
-    importUnavailable: "The author has not published a runnable build yet.",
+    importUnavailable: "This user has not published a runnable build yet.",
     subscriptionEntitled: "Valid until {value}",
     performanceTitle: "Performance records",
     performanceDesc:
-      "Author-reported records never count as reproducible; only platform records can be marked reproducible.",
+      "User-reported records never count as reproducible; only platform records can be marked reproducible.",
     performanceEmpty: "No performance records yet.",
     addPerformance: "Add performance record",
-    sourceAuthorBacktest: "Author backtest",
+    sourceAuthorBacktest: "User backtest",
     sourcePlatformReplay: "Platform replay",
     sourceLive: "Authorized live",
     reproducible: "Reproducible",
     notReproducible: "Not reproducible",
     periodRange: "{start} → {end}",
-    authorsTitle: "Author cards",
-    authorsDesc: "Payout identifiers store a platform account ID only — never a private key or bank account.",
-    authorsEmpty: "No author cards yet.",
-    displayName: "Display name",
-    headline: "Headline",
+    authorsTitle: "User profile",
+    authorsDesc:
+      "The payout identifier is fixed to your signed-in platform account ID and cannot be changed.",
+    authorsEmpty: "No user profile yet.",
+    displayName: "User name",
     bio: "Bio",
     payout: "Payout account",
-    payoutHint: "Platform account ID, optional",
-    saveAuthor: "Save author",
+    payoutHint: "Uses your signed-in platform account ID",
+    saveAuthor: "Save profile",
     publishTitle: "Publish a strategy",
     publishDesc:
       "Publishing binds a validated strategy whose backtest matches the current version. New publications start as private drafts.",
@@ -1620,12 +1683,12 @@ const en: typeof zh = {
     createDraft: "Create private draft",
     creating: "Creating…",
     myPublications: "Publications for this strategy",
-    authorMissing: "No author card yet. Create one under Settings → Author.",
+    authorMissing: "No user profile yet. Create one under Settings → User.",
     subscriptionsTitle: "My subscriptions",
     subscriptionsDesc:
       "Cancelling keeps access until the current billing period ends; positions and safety actions are unaffected.",
     subscriptionsEmpty: "No subscriptions yet.",
-    settlementsTitle: "Author settlements",
+    settlementsTitle: "User settlements",
     settlementsDesc:
       "Aggregates paid subscriptions per period and deducts the platform fee ({bps} bps).",
     settlementsEmpty: "No settlements yet.",
@@ -1653,8 +1716,10 @@ const en: typeof zh = {
     subscribeLoginHint:
       "Signed out, purchases stay on this device only. Sign in to bind subscriptions to your account and sync purchased strategies to other devices.",
     openCheckout: "Open checkout",
-    checkoutNeedsKey: "The payment service has no payment key configured, so checkout is unavailable.",
-    checkoutUnreachable: "Payment service unreachable ({url}); start the local payment service first.",
+    checkoutNeedsKey:
+      "The payment service has no payment key configured, so checkout is unavailable.",
+    checkoutUnreachable:
+      "Payment service unreachable ({url}); start the local payment service first.",
     checkoutFailed: "Failed to create a checkout session: {message}",
     checkoutLoginRequired:
       "Sign in first to purchase a strategy — use the avatar in the top right to continue with Google.",
@@ -1699,7 +1764,8 @@ const en: typeof zh = {
     poll: "Polling every {value}s",
     source: "Source {value}",
     error: "Last collection failed: {message}",
-    unavailable: "Unable to load funding data. Check that the executor is running and collection is enabled.",
+    unavailable:
+      "Unable to load funding data. Check that the executor is running and collection is enabled.",
     annualized: "Annualized (actual settlement interval)",
     settleInterval: "Settled every {value}",
     lastSettled: "Last settled rate",
@@ -1709,7 +1775,8 @@ const en: typeof zh = {
     markPrice: "Mark price",
     colPrice: "Price",
     chartTitle: "Funding rate history",
-    chartDesc: "Daily totals of settled funding rates; negative means shorts are paid",
+    chartDesc:
+      "Daily totals of settled funding rates; negative means shorts are paid",
     historyTitle: "Settlement records",
     historyDesc: "Newest first, {count} rows",
     rows: "{count} rows",
@@ -1723,7 +1790,8 @@ const en: typeof zh = {
     openHistory: "Open funding history",
     openTrade: "Open trade page",
     historyPageTitle: "Funding rate history",
-    historyPageDesc: "Settled funding rates for {symbol} on {venue}, newest first",
+    historyPageDesc:
+      "Settled funding rates for {symbol} on {venue}, newest first",
     backToFunding: "Back to funding rates",
     perPage: "{count} per page",
     customPerPage: "Custom page size",
@@ -1761,7 +1829,8 @@ const en: typeof zh = {
     empty:
       "No delivery basis yet: the same exchange needs both a spot and a delivery book, with the delivery price above spot.",
     noMatch: "No symbols match the filters.",
-    unavailable: "Unable to load delivery basis. Check that the executor is running.",
+    unavailable:
+      "Unable to load delivery basis. Check that the executor is running.",
   },
   news: {
     title: "Listing news",
@@ -1775,8 +1844,10 @@ const en: typeof zh = {
     unsubscribed: "Not subscribed",
     toggleOn: "Subscribe",
     toggleOff: "Unsubscribe",
-    empty: "No messages yet. Turn on a source above and new announcements will show up here.",
-    noMatch: "No announcements from subscribed sources yet; the next collection round will update this list.",
+    empty:
+      "No messages yet. Turn on a source above and new announcements will show up here.",
+    noMatch:
+      "No announcements from subscribed sources yet; the next collection round will update this list.",
     updatedAt: "Last fetch {value}",
     never: "Not fetched yet",
     failed: "Fetch failed",
@@ -1787,11 +1858,23 @@ const en: typeof zh = {
     prevPage: "Previous",
     nextPage: "Next",
     sources: {
-      binance: { name: "Binance new listings", desc: "Spot and futures listing announcements" },
-      upbit: { name: "Upbit listings", desc: "KRW and BTC market announcements" },
-      okx: { name: "OKX new listings", desc: "Spot launches and new trading pairs" },
+      binance: {
+        name: "Binance new listings",
+        desc: "Spot and futures listing announcements",
+      },
+      upbit: {
+        name: "Upbit listings",
+        desc: "KRW and BTC market announcements",
+      },
+      okx: {
+        name: "OKX new listings",
+        desc: "Spot launches and new trading pairs",
+      },
       bybit: { name: "Bybit new listings", desc: "Spot listing announcements" },
-      bitget: { name: "Bitget listings", desc: "Spot and futures listing announcements" },
+      bitget: {
+        name: "Bitget listings",
+        desc: "Spot and futures listing announcements",
+      },
     },
   },
   settings: {
@@ -1800,11 +1883,10 @@ const en: typeof zh = {
       "Credentials live in the executor. The desktop only stores the access token, never exchange API keys.",
     tabConnection: "Connection",
     tabRisk: "Risk",
-    tabAccount: "Account & billing",
-    tabAuthor: "Author",
+    tabAccount: "Subscription",
+    tabAuthor: "User",
     tabNotify: "Notifications",
-    tabClient: "Client",
-    tabDeploy: "Self-hosted deployment",
+    tabTelegram: "Telegram bot",
     connection: "Executor connection",
     connectionDesc: "Built-in and self-hosted instances keep separate settings",
     mode: "Instance type",
@@ -1826,13 +1908,26 @@ const en: typeof zh = {
     tokenNote:
       "The token only grants the desktop access to the local executor API. For server mode, use an encrypted tunnel or VPN instead of exposing the port publicly.",
     limits: "Risk limits",
-    limitsDesc: "Editable here; changes apply to new orders immediately and are saved on the executor host.",
+    limitsDesc:
+      "Editable here; changes apply to new orders immediately and are saved on the executor host.",
     limitsEdit: "Edit",
     limitsSave: "Save limits",
     limitsCancel: "Cancel",
     limitsSaved: "Saved and active",
-    limitsSymbolsHint: "Comma-separated; leave empty for no restriction. Symbols are uppercased on save.",
-    limitsVenuesHint: "Comma-separated, e.g. binance, okx; leave empty for no restriction.",
+    limitsSymbolsHint:
+      "Comma-separated; leave empty for no restriction. Symbols are uppercased on save.",
+    limitsVenuesHint:
+      "Comma-separated, e.g. binance, okx; leave empty for no restriction.",
+    venueOverrides: "Per-venue overrides",
+    venueOverridesDesc:
+      "Set stricter limits for a single venue. Empty fields inherit the global default; numeric values can only tighten limits.",
+    venueOverridesEmpty:
+      "No venue overrides; all limits use the global defaults.",
+    venueName: "Venue",
+    venueNamePlaceholder: "e.g. binance",
+    venueAdd: "Add venue",
+    venueRemove: "Remove",
+    venueInherit: "Empty = global",
     limitsLegsHint: "1 - 4 legs",
     notConnected: "Not connected",
     maxOrder: "Max order notional",
@@ -1845,7 +1940,8 @@ const en: typeof zh = {
     venues: "Allowed venues",
     unlimited: "Unrestricted",
     seconds: "{value}s",
-    unavailable: "Unable to read risk limits. Check that the executor is online.",
+    unavailable:
+      "Unable to read risk limits. Check that the executor is online.",
     security: "Security notes",
     securityDesc: "Defaults for local and self-hosted mode",
     security1:
@@ -1858,7 +1954,7 @@ const en: typeof zh = {
       "Auto-updates only accept signed artifacts. Back up the database and pause new entries before upgrading.",
     accountTitle: "Account & devices",
     accountDesc:
-      "Signing in covers licensing, device limits, author identity and purchased strategies. Trading credentials, orders and the database stay local; signing in on a new machine restores what you bought.",
+      "Signing in covers licensing, device limits, user identity and purchased strategies. Trading credentials, orders and the database stay local; signing in on a new machine restores what you bought.",
     accountLoginTitle: "Sign in to ArbPilot",
     accountLoginDesc:
       "Complete third-party sign-in in your browser. The desktop never sees your password and gains no trading or withdrawal permission.",
@@ -1867,7 +1963,8 @@ const en: typeof zh = {
     accountSignIn: "Sign in",
     accountContinueGoogle: "Continue with Google",
     accountLoginDenied: "Sign-in was denied. Generate a new code.",
-    accountLoginCodeHint: "Open the link below in your browser and confirm the pairing code:",
+    accountLoginCodeHint:
+      "Open the link below in your browser and confirm the pairing code:",
     accountLoginOpen: "Open sign-in page",
     accountLoginWaiting: "Waiting for browser confirmation…",
     accountLoginExpired: "The pairing code expired. Generate a new one.",
@@ -1893,10 +1990,12 @@ const en: typeof zh = {
     accountSubEmpty: "No subscriptions yet.",
     accountSubCancel: "Cancel subscription",
     accountSubCanceling: "Cancelling…",
-    accountSubCanceled: "Cancellation submitted; access remains until the period ends.",
+    accountSubCanceled:
+      "Cancellation submitted; access remains until the period ends.",
     accountSubFailed: "Could not cancel: {message}",
     accountRefresh: "Refresh",
-    accountUnreachable: "Cannot reach the accounts service ({url}). Start apps/accounts first.",
+    accountUnreachable:
+      "Cannot reach the accounts service ({url}). Start apps/accounts first.",
     signInRequiredTitle: "Sign in with Google to continue",
     signInRequiredDesc:
       "All ArbPilot features require an account. Sign-in only covers licensing, device limits and subscription sync; it never touches exchange credentials, orders or funds.",
@@ -1919,25 +2018,30 @@ const en: typeof zh = {
       "If the account service is unreachable, the executor keeps running deployed strategies locally, and position review and order cancellation keep working.",
     ],
     billingStatus: "Current license",
-    billingNone: "No license linked yet. Choosing a plan opens a payment page to complete the subscription.",
+    billingNone:
+      "No license linked yet. Choosing a plan opens a payment page to complete the subscription.",
     billingArbitrage: "Self-hosted Deployment",
     billingStrategy: "Strategy Creation",
     billingStrategyTrial: "Strategy Creation trial (until {value})",
     billingAddonMissingBase: "Subscribe to self-hosted deployment first",
     billingAddonHint: "Add-on on top of self-hosted deployment",
-    billingAddonTrialHint: "Trial until {value}; subscribe to the add-on afterwards",
+    billingAddonTrialHint:
+      "Trial until {value}; subscribe to the add-on afterwards",
     billingMarketNote:
-      "Strategies in the market are priced by their authors, free or monthly; using a subscribed strategy needs no extra add-on.",
+      "Strategies in the market are priced by their users, free or monthly; using a subscribed strategy needs no extra add-on.",
     billingSubscribe: "Subscribe · {plan}",
     billingOpening: "Opening checkout…",
     billingRefresh: "Refresh",
     billingPlan: "Plan",
     billingExpires: "Current period ends",
     billingRef: "Order ref",
-    billingNeedsKey: "WAFFO_PRIVATE_KEY is not configured, so checkout cannot be created yet.",
-    billingUnreachable: "Cannot reach the payments service ({url}). Start apps/payments first.",
+    billingNeedsKey:
+      "WAFFO_PRIVATE_KEY is not configured, so checkout cannot be created yet.",
+    billingUnreachable:
+      "Cannot reach the payments service ({url}). Start apps/payments first.",
     billingFailed: "Could not create checkout: {message}",
-    billingOpenManual: "If your browser did not open, copy the link below to finish payment:",
+    billingOpenManual:
+      "If your browser did not open, copy the link below to finish payment:",
     billingCopy: "Copy link",
     billingCopied: "Copied",
     billingNote:
@@ -1953,7 +2057,8 @@ const en: typeof zh = {
     },
     billingLoginPrompt:
       "You are not signed in. Use the avatar in the top right to continue with Google so subscriptions, strategy purchases and device licences are bound to your account.",
-    billingRequireLogin: "Sign in first — use the avatar in the top right, then try again.",
+    billingRequireLogin:
+      "Sign in first — use the avatar in the top right, then try again.",
     billingLicenseTitle: "Executor licence",
     billingLicenseEnforced: "Enforced",
     billingLicenseOptional: "Not enforced",
@@ -1966,33 +2071,41 @@ const en: typeof zh = {
     billingLicenseGrace: "Expired; grace until {value}",
     billingLicenseExpired: "Expired; sign in again to sync",
     telegram: "Telegram bot",
-    telegramDesc: "Bind Telegram accounts to review positions, pause trading and confirm entries from your phone",
+    telegramDesc:
+      "Bind Telegram accounts to review positions, pause trading and confirm entries from your phone",
     telegramEnabled: "Enabled",
     telegramDisabled: "Disabled",
     telegramNotConfigured:
       "No bot token configured. Set ARBPILOT_TELEGRAM_BOT_TOKEN in the executor server's .env and restart it. The token and exchange API keys stay on the server and never reach the desktop.",
     telegramPairingAction: "Create pairing code",
     telegramPairing: "Creating…",
-    telegramPairingHint: "Send this command to the bot in Telegram to finish binding:",
+    telegramPairingHint:
+      "Send this command to the bot in Telegram to finish binding:",
     telegramExpiresAt: "Code valid until {value}",
+    telegramOpenInBrowser: "Open in Telegram (browser)",
     telegramBindings: "Bound accounts",
     telegramEmpty: "No accounts bound yet.",
     telegramRevoke: "Revoke",
     telegramPolling: "Polling",
     telegramNote:
-      "The bot only relays commands: it never receives exchange keys or signs orders. Trades use the API keys on the executor host, and entries require /confirm plus the executor risk engine.",
+      "The bot only relays commands: it never receives exchange keys or signs orders. Trades use the API keys on the executor host, and entries require a confirm button plus the executor risk engine.",
     notifyTitle: "Message switches",
     notifyDesc:
       "Choose which messages to push, when they trigger, and which channels to use. Changes apply immediately.",
+    notifyTabNews: "News",
+    notifyTabFunding: "Funding",
     notifyNews: "News push",
     notifyNewsHint: "Push when a new exchange listing announcement appears.",
     notifyNewsSources: "News sources",
     notifyFunding: "Funding arbitrage alerts",
-    notifyFundingHint: "Push perp-perp opportunities once the annualized funding spread reaches the threshold.",
+    notifyFundingHint:
+      "Push perp-perp opportunities once the annualized funding spread reaches the threshold.",
     notifyThreshold: "Min annualized (%)",
-    notifyThresholdHint: "For example 10 means only alert when annualized funding is above 10%.",
+    notifyThresholdHint:
+      "For example 10 means only alert when annualized funding is above 10%.",
     notifyCooldown: "Alert cooldown (hours)",
-    notifyCooldownHint: "The same symbol is not alerted twice within this window.",
+    notifyCooldownHint:
+      "The same symbol is not alerted twice within this window.",
     notifyChannels: "Channels",
     notifyTelegram: "Telegram",
     notifyTelegramHint: "Send to the bound Telegram accounts.",
@@ -2000,24 +2113,21 @@ const en: typeof zh = {
     notifyDesktopHint: "Show an in-app notification on the desktop client.",
     notifySave: "Save notification settings",
     notifySaved: "Saved and active",
-    notifyUnavailable: "Cannot read notification settings. Check that the executor is online.",
+    notifyUnavailable:
+      "Cannot read notification settings. Check that the executor is online.",
     update: "Client update",
-    updateDesc: "Version list comes from the official release feed; installers are signature-checked",
     updateCurrent: "Current version",
     updateLatest: "Latest version",
-    updateCheck: "Check for updates",
-    updateChecking: "Checking…",
-    updateUpToDate: "You're on the latest version",
     updateAvailable: "Version {version} is available",
     updateNotes: "Release notes",
     updateAction: "Download and install",
+    updateLater: "Later",
     updateInstalling: "Downloading…",
     updatePercent: "{value}%",
     updateInstalled: "Download complete, restart to apply",
     updateRestart: "Restart now",
     updateRestarting: "Restarting…",
     updateFailed: "Update failed: {message}",
-    updateDesktopOnly: "Client updates are only available in the desktop app.",
     updateNote:
       "Updating replaces the client only; the executor, server data and local settings are kept.",
   },
@@ -2076,7 +2186,10 @@ export function getCopy(): Copy {
 }
 
 /** 将 {name} 占位符替换为变量值。 */
-export function fmt(template: string, vars?: Record<string, string | number>): string {
+export function fmt(
+  template: string,
+  vars?: Record<string, string | number>,
+): string {
   if (!vars) {
     return template;
   }

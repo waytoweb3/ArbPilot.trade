@@ -504,7 +504,6 @@ export function useCreateMarketAuthor() {
   return useMutation({
     mutationFn: (body: {
       display_name: string;
-      headline?: string;
       bio?: string;
       payout_account?: string;
     }) => api.createMarketAuthor(body),
@@ -520,7 +519,7 @@ export function useUpdateMarketAuthor() {
       body,
     }: {
       id: string;
-      body: { display_name?: string; headline?: string; bio?: string; payout_account?: string };
+      body: { display_name?: string; bio?: string; payout_account?: string };
     }) => api.updateMarketAuthor(id, body),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["market"] }),
   });

@@ -436,7 +436,6 @@ export const api = {
 
   createMarketAuthor: (body: {
     display_name: string;
-    headline?: string;
     bio?: string;
     payout_account?: string;
   }) =>
@@ -447,7 +446,7 @@ export const api = {
 
   updateMarketAuthor: (
     id: string,
-    body: { display_name?: string; headline?: string; bio?: string; payout_account?: string },
+    body: { display_name?: string; bio?: string; payout_account?: string },
   ) =>
     request<StrategyAuthorCard>(`/api/v1/market/authors/${id}`, {
       method: "PATCH",

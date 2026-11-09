@@ -22,8 +22,10 @@ import { useCallback, useState } from "react";
 import { NavLink, Outlet } from "react-router-dom";
 
 import { useHealth, useNews } from "../../hooks/useApi";
+import { useAppUpdateCheck } from "../../hooks/useAppUpdateCheck";
 import { useLicenseSync } from "../../hooks/useAccount";
 import { useExecutorStream } from "../../hooks/useExecutorStream";
+import { useAppUpdateDialog } from "../../lib/appUpdateDialog";
 import { formatDateTime, formatUptime } from "../../lib/format";
 import { useI18n } from "../../lib/i18n";
 import { countUnread, useNewsPrefs } from "../../lib/news";
@@ -33,20 +35,26 @@ import { useExecutorStore } from "../../state/executor";
 import { Button } from "../ui/button";
 import { AccountButton } from "./AccountButton";
 import { UpdateBanner } from "./UpdateBanner";
+import { UpdateDialog } from "./UpdateDialog";
 
 const SIDEBAR_KEY = "arbpilot.sidebar.collapsed";
 
 export function AppShell() {
   useExecutorStream();
+  useAppUpdateCheck();
   // 登录后把账号授权写入执行器，退出登录时清除。
   useLicenseSync();
   const health = useHealth();
   const streamConnected = useExecutorStore((state) => state.streamConnected);
   const notices = useExecutorStore((state) => state.notices);
   const dismissNotice = useExecutorStore((state) => state.dismissNotice);
+  const updatePending = useAppUpdateDialog((state) => state.pending);
+  const showUpdate = useAppUpdateDialog((state) => state.show);
   const { t, locale, toggleLocale } = useI18n();
   const { resolved, toggleTheme } = useTheme();
-  const [collapsed, setCollapsed] = useState(() => localStorage.getItem(SIDEBAR_KEY) === "1");
+  const [collapsed, setCollapsed] = useState(
+    () => localStorage.getItem(SIDEBAR_KEY) === "1",
+  );
   const [statusHint, setStatusHint] = useState<string | null>(null);
 
   const toggleStatusHint = (label: string) =>
@@ -93,14 +101,21 @@ export function AppShell() {
         )}
       >
         <div className={cn("pt-5 pb-3", collapsed ? "px-2" : "px-5")}>
-          <div className={cn("flex items-center", collapsed ? "justify-center" : "gap-2.5")}>
+          <div
+            className={cn(
+              "flex items-center",
+              collapsed ? "justify-center" : "gap-2.5",
+            )}
+          >
             <div className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-accent/15 text-accent">
               <Radar size={18} />
             </div>
             {!collapsed && (
               <>
                 <div className="min-w-0 flex-1">
-                  <p className="truncate text-sm font-semibold tracking-wide text-fg">ArbPilot</p>
+                  <p className="truncate text-sm font-semibold tracking-wide text-fg">
+                    ArbPilot
+                  </p>
                   <p className="truncate text-[10px] tracking-[0.2em] text-subtle uppercase">
                     {t.app.tagline}
                   </p>
@@ -166,27 +181,57 @@ export function AppShell() {
         {!collapsed && (
           <div className="relative border-t border-line px-4 py-2 text-[11px] text-subtle">
             <div className="flex items-center justify-between gap-2 font-mono">
-              <span>v{health.data?.version ?? "0.1.0"}</span>
+              <span className="inline-flex items-center gap-1.5">
+                v{health.data?.version ?? "0.1.0"}
+                {updatePending && (
+                  <button
+                    type="button"
+                    title={t.updates.dotHint}
+                    aria-label={t.updates.dotHint}
+                    onClick={showUpdate}
+                    className="inline-flex items-center"
+                  >
+                    <span className="h-2 w-2 rounded-full bg-danger" />
+                  </button>
+                )}
+              </span>
               <div className="flex items-center gap-2">
-                {health.data && <span>{formatUptime(health.data.uptime_secs)}</span>}
+                {health.data && (
+                  <span>{formatUptime(health.data.uptime_secs)}</span>
+                )}
                 <button
                   type="button"
                   title={online ? t.shell.online : t.shell.offline}
                   aria-label={online ? t.shell.online : t.shell.offline}
-                  onClick={() => toggleStatusHint(online ? t.shell.online : t.shell.offline)}
+                  onClick={() =>
+                    toggleStatusHint(online ? t.shell.online : t.shell.offline)
+                  }
                   className="inline-flex items-center"
                 >
                   <span
-                    className={cn("h-2 w-2 rounded-full", online ? "bg-accent" : "bg-danger")}
+                    className={cn(
+                      "h-2 w-2 rounded-full",
+                      online ? "bg-accent" : "bg-danger",
+                    )}
                   />
                 </button>
                 <button
                   type="button"
-                  title={streamConnected ? t.shell.streamConnected : t.shell.streamDisconnected}
-                  aria-label={streamConnected ? t.shell.streamConnected : t.shell.streamDisconnected}
+                  title={
+                    streamConnected
+                      ? t.shell.streamConnected
+                      : t.shell.streamDisconnected
+                  }
+                  aria-label={
+                    streamConnected
+                      ? t.shell.streamConnected
+                      : t.shell.streamDisconnected
+                  }
                   onClick={() =>
                     toggleStatusHint(
-                      streamConnected ? t.shell.streamConnected : t.shell.streamDisconnected,
+                      streamConnected
+                        ? t.shell.streamConnected
+                        : t.shell.streamDisconnected,
                     )
                   }
                   className="inline-flex items-center"
@@ -254,6 +299,9 @@ export function AppShell() {
         </main>
       </div>
 
+      {/* 客户端更新：发现新版本自动弹窗，左下角红点可再次打开。 */}
+      <UpdateDialog />
+
       {/* 应用内通知：执行器按通知设置推送新闻与资金费率套利提醒。 */}
       <div className="pointer-events-none fixed right-4 bottom-4 z-50 flex w-80 flex-col gap-2">
         {notices.map((notice) => (
@@ -277,8 +325,10 @@ export function AppShell() {
               {notice.message}
             </p>
             <p className="mt-1 font-mono text-[10px] text-subtle">
-              {notice.kind === "funding" ? t.settings.notifyFunding : t.settings.notifyNews} ·{" "}
-              {formatDateTime(notice.at)}
+              {notice.kind === "funding"
+                ? t.settings.notifyFunding
+                : t.settings.notifyNews}{" "}
+              · {formatDateTime(notice.at)}
             </p>
           </div>
         ))}

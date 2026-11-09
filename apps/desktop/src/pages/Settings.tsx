@@ -5,12 +5,15 @@ import { Users, Wallet } from "lucide-react";
 
 import { Badge } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "../components/ui/card";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "../components/ui/card";
 import { BillingCard } from "../components/BillingCard";
 import DocsPage from "./Docs";
-import { checkAppUpdate, currentAppVersion, relaunchApp } from "../lib/appUpdate";
-import type { DownloadProgress, PendingUpdate } from "../lib/appUpdate";
-import { isDesktopRuntime } from "../lib/deploy";
 import {
   useCreateMarketAuthor,
   useCreateSettlement,
@@ -26,6 +29,7 @@ import {
   useUpdateRiskLimits,
   useUpdateSettlement,
 } from "../hooks/useApi";
+import { useAccount } from "../hooks/useAccount";
 import {
   getApiToken,
   getExecutorMode,
@@ -40,7 +44,13 @@ import {
 } from "../lib/api";
 import { formatDateTime, formatUsd } from "../lib/format";
 import { fmt, useI18n } from "../lib/i18n";
-import type { NotificationSettings, RiskLimits, SettlementStatus } from "../lib/types";
+import { openExternal } from "../lib/openExternal";
+import type {
+  NotificationSettings,
+  RiskLimits,
+  SettlementStatus,
+  VenueRiskLimits,
+} from "../lib/types";
 import { cn } from "../lib/utils";
 
 const inputClass =
@@ -49,7 +59,8 @@ const inputClass =
 const smallInputClass =
   "w-full rounded-md border border-line bg-panel-soft px-2 py-1 text-xs text-body outline-none focus:border-accent/60";
 
-type SettingsTab = "connection" | "risk" | "account" | "author" | "notify" | "client" | "deploy";
+type SettingsTab =
+  "connection" | "risk" | "account" | "author" | "notify" | "telegram";
 
 const SETTINGS_TABS: SettingsTab[] = [
   "connection",
@@ -57,8 +68,7 @@ const SETTINGS_TABS: SettingsTab[] = [
   "account",
   "author",
   "notify",
-  "client",
-  "deploy",
+  "telegram",
 ];
 
 const isSettingsTab = (value: string | null): value is SettingsTab =>
@@ -71,9 +81,10 @@ export default function SettingsPage() {
   const [address, setAddress] = useState(getExecutorUrl());
   const [saved, setSaved] = useState(false);
   const loopback =
-    mode === "self" && /^https?:\/\/(127\.0\.0\.1|localhost)(:|\/|$)/.test(address.trim());
+    mode === "self" &&
+    /^https?:\/\/(127\.0\.0\.1|localhost)(:|\/|$)/.test(address.trim());
   const { t } = useI18n();
-  // 支持从升级提示直接跳到对应标签页：/settings?tab=client|deploy
+  // 支持从升级提示直接跳到连接标签页：/settings?tab=connection
   const [searchParams, setSearchParams] = useSearchParams();
   const requested = searchParams.get("tab");
   const tab: SettingsTab = isSettingsTab(requested) ? requested : "connection";
@@ -101,7 +112,10 @@ export default function SettingsPage() {
       setAddress(nextUrl);
       setApiToken(token.trim());
     }
-    if (mode !== prevMode || (mode === "self" && getExecutorUrl() !== prevUrl)) {
+    if (
+      mode !== prevMode ||
+      (mode === "self" && getExecutorUrl() !== prevUrl)
+    ) {
       window.location.reload();
       return;
     }
@@ -123,8 +137,7 @@ export default function SettingsPage() {
     { id: "account", label: t.settings.tabAccount },
     { id: "author", label: t.settings.tabAuthor },
     { id: "notify", label: t.settings.tabNotify },
-    { id: "client", label: t.settings.tabClient },
-    { id: "deploy", label: t.settings.tabDeploy },
+    { id: "telegram", label: t.settings.tabTelegram },
   ];
 
   return (
@@ -153,97 +166,112 @@ export default function SettingsPage() {
       </div>
 
       {tab === "connection" && (
-        <Card>
-          <CardHeader>
-            <div>
-              <CardTitle>{t.settings.connection}</CardTitle>
-              <CardDescription>{t.settings.connectionDesc}</CardDescription>
-            </div>
-            <Badge tone="info">
-              {mode === "local"
-                ? t.settings.localExecutor
-                : loopback
-                  ? t.settings.local
-                  : t.settings.remote}
-            </Badge>
-          </CardHeader>
-          <CardContent className="space-y-4">
-            <div className="space-y-1.5">
-              <span className="text-xs text-muted">{t.settings.mode}</span>
-              <div className="flex gap-1.5">
-                {modeOptions.map((item) => (
-                  <button
-                    key={item.id}
-                    type="button"
-                    onClick={() => switchMode(item.id)}
-                    className={cn(
-                      "rounded-lg border px-3 py-1.5 text-xs transition-colors",
-                      mode === item.id
-                        ? "border-accent/40 bg-accent/10 font-medium text-fg"
-                        : "border-line text-muted hover:bg-hover hover:text-body",
-                    )}
-                  >
-                    {item.label}
-                  </button>
-                ))}
+        <div className="space-y-4">
+          <Card>
+            <CardHeader>
+              <div>
+                <CardTitle>{t.settings.connection}</CardTitle>
+                <CardDescription>{t.settings.connectionDesc}</CardDescription>
               </div>
-              <span className="block text-[11px] leading-relaxed text-muted">
-                {t.settings.modeHint}
-              </span>
-            </div>
-
-            {mode === "local" ? (
+              <Badge tone="info">
+                {mode === "local"
+                  ? t.settings.localExecutor
+                  : loopback
+                    ? t.settings.local
+                    : t.settings.remote}
+              </Badge>
+            </CardHeader>
+            <CardContent className="space-y-4">
               <div className="space-y-1.5">
-                <span className="text-xs text-muted">{t.settings.address}</span>
-                <div className={`${inputClass} font-mono text-muted`}>
-                  {getExecutorUrl("local")}
-                </div>
-                <span className="text-xs text-muted">{t.settings.database}</span>
-                <div className={`${inputClass} font-mono text-muted`}>
-                  {localExecutorDatabase()}
+                <span className="text-xs text-muted">{t.settings.mode}</span>
+                <div className="flex gap-1.5">
+                  {modeOptions.map((item) => (
+                    <button
+                      key={item.id}
+                      type="button"
+                      onClick={() => switchMode(item.id)}
+                      className={cn(
+                        "rounded-lg border px-3 py-1.5 text-xs transition-colors",
+                        mode === item.id
+                          ? "border-accent/40 bg-accent/10 font-medium text-fg"
+                          : "border-line text-muted hover:bg-hover hover:text-body",
+                      )}
+                    >
+                      {item.label}
+                    </button>
+                  ))}
                 </div>
                 <span className="block text-[11px] leading-relaxed text-muted">
-                  {t.settings.localExecutorNote}
+                  {t.settings.modeHint}
                 </span>
               </div>
-            ) : (
-              <>
-                <label className="block space-y-1.5">
-                  <span className="text-xs text-muted">{t.settings.address}</span>
-                  <input
-                    className={`${inputClass} font-mono`}
-                    value={address}
-                    onChange={(event) => setAddress(event.target.value)}
-                    placeholder="http://45.76.177.242:8787 或 https://exec.example.com"
-                  />
-                  <span className="block text-[11px] leading-relaxed text-muted">
-                    {t.settings.addressHint}
-                  </span>
-                </label>
-                <label className="block space-y-1.5">
-                  <span className="text-xs text-muted">{t.settings.token}</span>
-                  <input
-                    className={`${inputClass} font-mono`}
-                    type="password"
-                    value={token}
-                    onChange={(event) => setToken(event.target.value)}
-                    placeholder="ARBPILOT_API_TOKEN"
-                  />
-                  <span className="block text-[11px] leading-relaxed text-muted">
-                    {t.settings.tokenNote}
-                  </span>
-                </label>
-              </>
-            )}
 
-            <div className="flex items-center gap-3">
-              <Button size="sm" onClick={save}>
-                {t.settings.save}
-              </Button>
-              {saved && <span className="text-xs text-accent">{t.settings.saved}</span>}
-            </div>
-          </CardContent>
-        </Card>
+              {mode === "local" ? (
+                <div className="space-y-1.5">
+                  <span className="text-xs text-muted">
+                    {t.settings.address}
+                  </span>
+                  <div className={`${inputClass} font-mono text-muted`}>
+                    {getExecutorUrl("local")}
+                  </div>
+                  <span className="text-xs text-muted">
+                    {t.settings.database}
+                  </span>
+                  <div className={`${inputClass} font-mono text-muted`}>
+                    {localExecutorDatabase()}
+                  </div>
+                  <span className="block text-[11px] leading-relaxed text-muted">
+                    {t.settings.localExecutorNote}
+                  </span>
+                </div>
+              ) : (
+                <>
+                  <label className="block space-y-1.5">
+                    <span className="text-xs text-muted">
+                      {t.settings.address}
+                    </span>
+                    <input
+                      className={`${inputClass} font-mono`}
+                      value={address}
+                      onChange={(event) => setAddress(event.target.value)}
+                      placeholder="http://45.76.177.242:8787 或 https://exec.example.com"
+                    />
+                    <span className="block text-[11px] leading-relaxed text-muted">
+                      {t.settings.addressHint}
+                    </span>
+                  </label>
+                  <label className="block space-y-1.5">
+                    <span className="text-xs text-muted">
+                      {t.settings.token}
+                    </span>
+                    <input
+                      className={`${inputClass} font-mono`}
+                      type="password"
+                      value={token}
+                      onChange={(event) => setToken(event.target.value)}
+                      placeholder="ARBPILOT_API_TOKEN"
+                    />
+                    <span className="block text-[11px] leading-relaxed text-muted">
+                      {t.settings.tokenNote}
+                    </span>
+                  </label>
+                </>
+              )}
+
+              <div className="flex items-center gap-3">
+                <Button size="sm" onClick={save}>
+                  {t.settings.save}
+                </Button>
+                {saved && (
+                  <span className="text-xs text-accent">
+                    {t.settings.saved}
+                  </span>
+                )}
+              </div>
+            </CardContent>
+          </Card>
+          {mode === "self" && <DocsPage embedded />}
+        </div>
       )}
 
       {tab === "risk" && <RiskLimitsCard />}
@@ -252,45 +280,19 @@ export default function SettingsPage() {
 
       {tab === "author" && <AuthorSettings />}
 
-      {tab === "notify" && (
-        <div className="space-y-4">
-          <NotificationCard />
-          <TelegramCard />
-        </div>
-      )}
+      {tab === "notify" && <NotificationCard />}
 
-      {tab === "deploy" && <DocsPage embedded />}
-
-      {tab === "client" && (
-        <div className="space-y-4">
-          <ClientUpdateCard />
-          <Card>
-            <CardHeader>
-              <div>
-                <CardTitle>{t.settings.security}</CardTitle>
-                <CardDescription>{t.settings.securityDesc}</CardDescription>
-              </div>
-            </CardHeader>
-            <CardContent>
-              <ul className="list-disc space-y-1.5 pl-5 text-xs leading-relaxed text-muted">
-                <li>{t.settings.security1}</li>
-                <li>{t.settings.security2}</li>
-                <li>{t.settings.security3}</li>
-                <li>{t.settings.security4}</li>
-              </ul>
-            </CardContent>
-          </Card>
-        </div>
-      )}
+      {tab === "telegram" && <TelegramCard />}
     </div>
   );
 }
 
-/** 作者卡片与结算都只处理平台账户 ID，不接触私钥或银行账号。 */
+/** 用户资料与结算都只处理平台账户 ID，不接触私钥或银行账号。 */
 function AuthorSettings() {
   const { t } = useI18n();
   const copy = t.market;
   const authors = useMarketAuthors();
+  const account = useAccount();
   const createAuthor = useCreateMarketAuthor();
   const updateAuthor = useUpdateMarketAuthor();
   const createSettlement = useCreateSettlement();
@@ -298,33 +300,31 @@ function AuthorSettings() {
 
   const [selectedId, setSelectedId] = useState("");
   const active =
-    authors.data?.find((author) => author.author_id === selectedId) ?? authors.data?.[0] ?? null;
+    authors.data?.find((author) => author.author_id === selectedId) ??
+    authors.data?.[0] ??
+    null;
   const activeId = active?.author_id ?? "";
   const settlements = useSettlements(activeId || undefined);
+  // 收款标识固定使用当前登录的平台账号 ID，不允许手动修改。
+  const payoutAccount = account.data?.user.id ?? active?.payout_account ?? "";
 
-  const [form, setForm] = useState({
-    display_name: "",
-    headline: "",
-    bio: "",
-    payout_account: "",
-  });
+  const [form, setForm] = useState({ display_name: "", bio: "" });
 
-  // 切换作者或保存成功后，用最新数据回填表单。
+  // 切换用户或保存成功后，用最新数据回填表单。
   useEffect(() => {
     if (!active) {
       return;
     }
-    setForm({
-      display_name: active.display_name,
-      headline: active.headline,
-      bio: active.bio,
-      payout_account: active.payout_account ?? "",
-    });
+    setForm({ display_name: active.display_name, bio: active.bio });
   }, [active?.author_id, active?.updated_at]);
 
   const pending = createAuthor.isPending || updateAuthor.isPending;
-  const error = [createAuthor.error, updateAuthor.error, createSettlement.error, updateSettlement.error]
-    .find(Boolean);
+  const error = [
+    createAuthor.error,
+    updateAuthor.error,
+    createSettlement.error,
+    updateSettlement.error,
+  ].find(Boolean);
 
   const saveAuthor = () => {
     const name = form.display_name.trim();
@@ -333,9 +333,8 @@ function AuthorSettings() {
     }
     const body = {
       display_name: name,
-      headline: form.headline,
       bio: form.bio,
-      payout_account: form.payout_account || undefined,
+      ...(payoutAccount ? { payout_account: payoutAccount } : {}),
     };
     if (active) {
       updateAuthor.mutate({ id: active.author_id, body });
@@ -344,7 +343,10 @@ function AuthorSettings() {
     }
   };
 
-  const settlementTone: Record<SettlementStatus, "success" | "warning" | "danger"> = {
+  const settlementTone: Record<
+    SettlementStatus,
+    "success" | "warning" | "danger"
+  > = {
     pending: "warning",
     paid: "success",
     disputed: "danger",
@@ -392,10 +394,9 @@ function AuthorSettings() {
                         : "border-line hover:bg-hover",
                     )}
                   >
-                    <span className="block font-medium text-fg">{author.display_name}</span>
-                    {author.headline && (
-                      <span className="block text-[11px] text-muted">{author.headline}</span>
-                    )}
+                    <span className="block font-medium text-fg">
+                      {author.display_name}
+                    </span>
                   </button>
                 ))}
               </div>
@@ -403,38 +404,37 @@ function AuthorSettings() {
               <p className="text-xs text-muted">{copy.authorsEmpty}</p>
             )}
 
-            <div className="grid gap-2 sm:grid-cols-2">
+            <div className="grid gap-2">
               <label className="text-[11px] text-muted">
                 {copy.displayName}
                 <input
                   className={smallInputClass}
                   value={form.display_name}
-                  onChange={(event) => setForm({ ...form, display_name: event.target.value })}
+                  onChange={(event) =>
+                    setForm({ ...form, display_name: event.target.value })
+                  }
                 />
               </label>
               <label className="text-[11px] text-muted">
-                {copy.headline}
-                <input
-                  className={smallInputClass}
-                  value={form.headline}
-                  onChange={(event) => setForm({ ...form, headline: event.target.value })}
-                />
-              </label>
-              <label className="text-[11px] text-muted sm:col-span-2">
                 {copy.bio}
                 <textarea
                   className={cn(smallInputClass, "min-h-16")}
                   value={form.bio}
-                  onChange={(event) => setForm({ ...form, bio: event.target.value })}
+                  onChange={(event) =>
+                    setForm({ ...form, bio: event.target.value })
+                  }
                 />
               </label>
-              <label className="text-[11px] text-muted sm:col-span-2">
+              <label className="text-[11px] text-muted">
                 {copy.payout}
                 <input
-                  className={smallInputClass}
+                  className={cn(
+                    smallInputClass,
+                    "cursor-not-allowed opacity-70",
+                  )}
                   placeholder={copy.payoutHint}
-                  value={form.payout_account}
-                  onChange={(event) => setForm({ ...form, payout_account: event.target.value })}
+                  value={payoutAccount}
+                  readOnly
                 />
               </label>
             </div>
@@ -466,7 +466,9 @@ function AuthorSettings() {
               size="sm"
               variant="secondary"
               disabled={!activeId || createSettlement.isPending}
-              onClick={() => activeId && createSettlement.mutate({ authorId: activeId })}
+              onClick={() =>
+                activeId && createSettlement.mutate({ authorId: activeId })
+              }
             >
               {copy.createSettlement}
             </Button>
@@ -481,7 +483,9 @@ function AuthorSettings() {
                   <div className="flex items-center justify-between gap-2">
                     <span className="font-medium text-fg">
                       {settlement.period} ·{" "}
-                      {fmt(copy.subscriptionCount, { count: settlement.subscription_count })}
+                      {fmt(copy.subscriptionCount, {
+                        count: settlement.subscription_count,
+                      })}
                     </span>
                     <Badge tone={settlementTone[settlement.status]}>
                       {settlementLabel[settlement.status]}
@@ -492,7 +496,8 @@ function AuthorSettings() {
                       {copy.gross} {formatUsd(settlement.gross_usd)}
                     </span>
                     <span>
-                      {copy.platformFee} {formatUsd(settlement.platform_fee_usd)}
+                      {copy.platformFee}{" "}
+                      {formatUsd(settlement.platform_fee_usd)}
                     </span>
                     <span className="text-body">
                       {copy.net} {formatUsd(settlement.net_usd)}
@@ -504,7 +509,10 @@ function AuthorSettings() {
                         size="sm"
                         variant="ghost"
                         onClick={() =>
-                          updateSettlement.mutate({ id: settlement.id, status: "paid" })
+                          updateSettlement.mutate({
+                            id: settlement.id,
+                            status: "paid",
+                          })
                         }
                       >
                         {copy.markPaid}
@@ -515,7 +523,10 @@ function AuthorSettings() {
                         size="sm"
                         variant="ghost"
                         onClick={() =>
-                          updateSettlement.mutate({ id: settlement.id, status: "disputed" })
+                          updateSettlement.mutate({
+                            id: settlement.id,
+                            status: "disputed",
+                          })
                         }
                       >
                         {copy.markDisputed}
@@ -531,142 +542,6 @@ function AuthorSettings() {
         </Card>
       </div>
     </div>
-  );
-}
-
-
-function ClientUpdateCard() {
-  const { t } = useI18n();
-  const desktop = isDesktopRuntime();
-  const [version, setVersion] = useState("");
-  const [pending, setPending] = useState<PendingUpdate | null>(null);
-  const [checked, setChecked] = useState(false);
-  const [progress, setProgress] = useState<DownloadProgress | null>(null);
-  const [installed, setInstalled] = useState(false);
-  const [busy, setBusy] = useState<"check" | "install" | "restart" | null>(null);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    currentAppVersion()
-      .then(setVersion)
-      .catch(() => undefined);
-  }, []);
-
-  const check = async () => {
-    setBusy("check");
-    setError(null);
-    setProgress(null);
-    setInstalled(false);
-    try {
-      setPending(await checkAppUpdate());
-      setChecked(true);
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
-    } finally {
-      setBusy(null);
-    }
-  };
-
-  const install = async () => {
-    if (!pending) return;
-    setBusy("install");
-    setError(null);
-    try {
-      await pending.install(setProgress);
-      setInstalled(true);
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
-    } finally {
-      setBusy(null);
-    }
-  };
-
-  const restart = async () => {
-    setBusy("restart");
-    setError(null);
-    try {
-      await relaunchApp();
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
-      setBusy(null);
-    }
-  };
-
-  const percent = progress?.total
-    ? Math.min(100, Math.round((progress.downloaded / progress.total) * 100))
-    : null;
-
-  return (
-    <Card>
-      <CardHeader>
-        <div>
-          <CardTitle>{t.settings.update}</CardTitle>
-          <CardDescription>{t.settings.updateDesc}</CardDescription>
-        </div>
-        {version && <Badge tone="neutral">v{version}</Badge>}
-      </CardHeader>
-      <CardContent className="space-y-3">
-        {!desktop ? (
-          <p className="rounded-lg border border-line bg-panel-soft px-3 py-2 text-[11px] text-muted">
-            {t.settings.updateDesktopOnly}
-          </p>
-        ) : (
-          <>
-            <div className="flex flex-wrap items-center gap-3">
-              <Button size="sm" variant="secondary" onClick={check} disabled={busy !== null}>
-                {busy === "check" ? t.settings.updateChecking : t.settings.updateCheck}
-              </Button>
-              {pending && !installed && (
-                <Button size="sm" onClick={install} disabled={busy !== null}>
-                  {busy === "install" ? t.settings.updateInstalling : t.settings.updateAction}
-                </Button>
-              )}
-              {installed && (
-                <Button size="sm" onClick={restart} disabled={busy !== null}>
-                  {busy === "restart" ? t.settings.updateRestarting : t.settings.updateRestart}
-                </Button>
-              )}
-            </div>
-
-            {checked && !pending && (
-              <p className="text-xs text-accent">{t.settings.updateUpToDate}</p>
-            )}
-            {pending && (
-              <div className="rounded-lg border border-line bg-panel-soft px-3 py-2">
-                <p className="text-xs text-body">
-                  {fmt(t.settings.updateAvailable, { version: pending.info.version })}
-                </p>
-                {pending.info.notes && (
-                  <p className="mt-1 whitespace-pre-wrap text-[11px] leading-relaxed text-muted">
-                    {pending.info.notes}
-                  </p>
-                )}
-              </div>
-            )}
-            {progress && (
-              <div className="space-y-1">
-                <div className="h-1.5 overflow-hidden rounded-full bg-panel-soft">
-                  <div
-                    className="h-full rounded-full bg-accent transition-all"
-                    style={{ width: `${percent ?? 5}%` }}
-                  />
-                </div>
-                <p className="text-[11px] text-muted">
-                  {percent !== null
-                    ? fmt(t.settings.updatePercent, { value: percent })
-                    : t.settings.updateInstalling}
-                </p>
-              </div>
-            )}
-            {installed && <p className="text-xs text-accent">{t.settings.updateInstalled}</p>}
-            {error && (
-              <p className="text-xs text-danger">{fmt(t.settings.updateFailed, { message: error })}</p>
-            )}
-            <p className="text-[11px] leading-relaxed text-muted">{t.settings.updateNote}</p>
-          </>
-        )}
-      </CardContent>
-    </Card>
   );
 }
 
@@ -694,9 +569,22 @@ function LimitsField({
         value={value}
         onChange={(event) => onChange(event.target.value)}
       />
-      {hint && <span className="block text-[11px] leading-relaxed text-subtle">{hint}</span>}
+      {hint && (
+        <span className="block text-[11px] leading-relaxed text-subtle">
+          {hint}
+        </span>
+      )}
     </label>
   );
+}
+
+interface VenueLimitsDraft {
+  venue: string;
+  maxOrder: string;
+  maxLeverage: string;
+  maxSlippage: string;
+  maxLegs: string;
+  symbols: string;
 }
 
 interface LimitsDraft {
@@ -708,6 +596,7 @@ interface LimitsDraft {
   maxLegs: string;
   symbols: string;
   venues: string;
+  overrides: VenueLimitsDraft[];
 }
 
 function toDraft(limits: RiskLimits): LimitsDraft {
@@ -720,7 +609,53 @@ function toDraft(limits: RiskLimits): LimitsDraft {
     maxLegs: String(limits.max_legs),
     symbols: limits.allowed_symbols.join(", "),
     venues: limits.allowed_venues.join(", "),
+    overrides: Object.entries(limits.venue_overrides ?? {}).map(
+      ([venue, value]) => ({
+        venue,
+        maxOrder:
+          value.max_order_notional_usd === undefined
+            ? ""
+            : String(value.max_order_notional_usd),
+        maxLeverage:
+          value.max_leverage === undefined ? "" : String(value.max_leverage),
+        maxSlippage:
+          value.max_slippage_bps === undefined
+            ? ""
+            : String(value.max_slippage_bps),
+        maxLegs: value.max_legs === undefined ? "" : String(value.max_legs),
+        symbols: value.allowed_symbols?.join(", ") ?? "",
+      }),
+    ),
   };
+}
+
+/** 空字段不提交，保持「沿用全局」。 */
+function toVenueOverrides(
+  overrides: VenueLimitsDraft[],
+): Record<string, VenueRiskLimits> {
+  const result: Record<string, VenueRiskLimits> = {};
+  for (const item of overrides) {
+    const venue = item.venue.trim().toLowerCase();
+    if (!venue) continue;
+    const value: VenueRiskLimits = {};
+    if (item.maxOrder.trim()) {
+      value.max_order_notional_usd = Number(item.maxOrder);
+    }
+    if (item.maxLeverage.trim()) {
+      value.max_leverage = Number(item.maxLeverage);
+    }
+    if (item.maxSlippage.trim()) {
+      value.max_slippage_bps = Number(item.maxSlippage);
+    }
+    if (item.maxLegs.trim()) {
+      value.max_legs = Number(item.maxLegs);
+    }
+    if (item.symbols.trim()) {
+      value.allowed_symbols = splitList(item.symbols);
+    }
+    result[venue] = value;
+  }
+  return result;
 }
 
 function splitList(value: string): string[] {
@@ -759,9 +694,46 @@ function RiskLimitsCard() {
         max_legs: Number(draft.maxLegs),
         allowed_symbols: splitList(draft.symbols),
         allowed_venues: splitList(draft.venues),
+        venue_overrides: toVenueOverrides(draft.overrides),
       },
       { onSuccess: () => setDraft(null) },
     );
+  };
+
+  const addOverride = () => {
+    if (!draft) return;
+    setDraft({
+      ...draft,
+      overrides: [
+        ...draft.overrides,
+        {
+          venue: "",
+          maxOrder: "",
+          maxLeverage: "",
+          maxSlippage: "",
+          maxLegs: "",
+          symbols: "",
+        },
+      ],
+    });
+  };
+
+  const updateOverride = (index: number, patch: Partial<VenueLimitsDraft>) => {
+    if (!draft) return;
+    setDraft({
+      ...draft,
+      overrides: draft.overrides.map((item, itemIndex) =>
+        itemIndex === index ? { ...item, ...patch } : item,
+      ),
+    });
+  };
+
+  const removeOverride = (index: number) => {
+    if (!draft) return;
+    setDraft({
+      ...draft,
+      overrides: draft.overrides.filter((_, itemIndex) => itemIndex !== index),
+    });
   };
 
   return (
@@ -772,7 +744,9 @@ function RiskLimitsCard() {
           <CardDescription>{t.settings.limitsDesc}</CardDescription>
         </div>
         <div className="flex items-center gap-2">
-          {limits.isError && <Badge tone="danger">{t.settings.notConnected}</Badge>}
+          {limits.isError && (
+            <Badge tone="danger">{t.settings.notConnected}</Badge>
+          )}
           {limits.data && !draft && (
             <Button size="sm" variant="secondary" onClick={startEdit}>
               {t.settings.limitsEdit}
@@ -783,38 +757,123 @@ function RiskLimitsCard() {
       <CardContent>
         {(() => {
           if (!limits.data) {
-            return <p className="py-8 text-center text-xs text-muted">{t.settings.unavailable}</p>;
+            return (
+              <p className="py-8 text-center text-xs text-muted">
+                {t.settings.unavailable}
+              </p>
+            );
           }
           if (!draft) {
+            const overrides = Object.entries(limits.data.venue_overrides ?? {});
             return (
-              <dl className="grid grid-cols-2 gap-x-6 gap-y-3 text-sm">
-                <LimitItem
-                  label={t.settings.maxOrder}
-                  value={`$${Number(limits.data.max_order_notional_usd).toLocaleString()}`}
-                />
-                <LimitItem
-                  label={t.settings.maxTotal}
-                  value={`$${Number(limits.data.max_total_notional_usd).toLocaleString()}`}
-                />
-                <LimitItem label={t.settings.maxLeverage} value={`${Number(limits.data.max_leverage)}x`} />
-                <LimitItem
-                  label={t.settings.maxSlippage}
-                  value={`${Number(limits.data.max_slippage_bps)} bps`}
-                />
-                <LimitItem
-                  label={t.settings.quoteAge}
-                  value={fmt(t.settings.seconds, { value: limits.data.max_quote_age_secs })}
-                />
-                <LimitItem label={t.settings.maxLegs} value={String(limits.data.max_legs)} />
-                <LimitItem
-                  label={t.settings.symbols}
-                  value={limits.data.allowed_symbols.join(" / ") || t.settings.unlimited}
-                />
-                <LimitItem
-                  label={t.settings.venues}
-                  value={limits.data.allowed_venues.join(" / ") || t.settings.unlimited}
-                />
-              </dl>
+              <div className="space-y-5">
+                <dl className="grid grid-cols-2 gap-x-6 gap-y-3 text-sm">
+                  <LimitItem
+                    label={t.settings.maxOrder}
+                    value={`$${Number(limits.data.max_order_notional_usd).toLocaleString()}`}
+                  />
+                  <LimitItem
+                    label={t.settings.maxTotal}
+                    value={`$${Number(limits.data.max_total_notional_usd).toLocaleString()}`}
+                  />
+                  <LimitItem
+                    label={t.settings.maxLeverage}
+                    value={`${Number(limits.data.max_leverage)}x`}
+                  />
+                  <LimitItem
+                    label={t.settings.maxSlippage}
+                    value={`${Number(limits.data.max_slippage_bps)} bps`}
+                  />
+                  <LimitItem
+                    label={t.settings.quoteAge}
+                    value={fmt(t.settings.seconds, {
+                      value: limits.data.max_quote_age_secs,
+                    })}
+                  />
+                  <LimitItem
+                    label={t.settings.maxLegs}
+                    value={String(limits.data.max_legs)}
+                  />
+                  <LimitItem
+                    label={t.settings.symbols}
+                    value={
+                      limits.data.allowed_symbols.join(" / ") ||
+                      t.settings.unlimited
+                    }
+                  />
+                  <LimitItem
+                    label={t.settings.venues}
+                    value={
+                      limits.data.allowed_venues.join(" / ") ||
+                      t.settings.unlimited
+                    }
+                  />
+                </dl>
+                <div className="border-t border-line pt-4">
+                  <p className="text-xs font-medium text-body">
+                    {t.settings.venueOverrides}
+                  </p>
+                  {overrides.length === 0 ? (
+                    <p className="mt-1 text-[11px] text-subtle">
+                      {t.settings.venueOverridesEmpty}
+                    </p>
+                  ) : (
+                    <div className="mt-2 space-y-2">
+                      {overrides.map(([venue, value]) => (
+                        <div
+                          key={venue}
+                          className="rounded-lg border border-line bg-panel-soft/60 px-3 py-2"
+                        >
+                          <p className="font-mono text-xs text-body">{venue}</p>
+                          <dl className="mt-1.5 grid grid-cols-2 gap-x-4 gap-y-1.5 sm:grid-cols-5">
+                            <LimitItem
+                              label={t.settings.maxOrder}
+                              value={
+                                value.max_order_notional_usd === undefined
+                                  ? t.settings.venueInherit
+                                  : `$${Number(value.max_order_notional_usd).toLocaleString()}`
+                              }
+                            />
+                            <LimitItem
+                              label={t.settings.maxLeverage}
+                              value={
+                                value.max_leverage === undefined
+                                  ? t.settings.venueInherit
+                                  : `${Number(value.max_leverage)}x`
+                              }
+                            />
+                            <LimitItem
+                              label={t.settings.maxSlippage}
+                              value={
+                                value.max_slippage_bps === undefined
+                                  ? t.settings.venueInherit
+                                  : `${Number(value.max_slippage_bps)} bps`
+                              }
+                            />
+                            <LimitItem
+                              label={t.settings.maxLegs}
+                              value={
+                                value.max_legs === undefined
+                                  ? t.settings.venueInherit
+                                  : String(value.max_legs)
+                              }
+                            />
+                            <LimitItem
+                              label={t.settings.symbols}
+                              value={
+                                value.allowed_symbols === undefined
+                                  ? t.settings.venueInherit
+                                  : value.allowed_symbols.join(" / ") ||
+                                    t.settings.unlimited
+                              }
+                            />
+                          </dl>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
             );
           }
           return (
@@ -834,12 +893,16 @@ function RiskLimitsCard() {
                   label={t.settings.maxLeverage}
                   value={draft.maxLeverage}
                   step="0.1"
-                  onChange={(value) => setDraft({ ...draft, maxLeverage: value })}
+                  onChange={(value) =>
+                    setDraft({ ...draft, maxLeverage: value })
+                  }
                 />
                 <LimitsField
                   label={t.settings.maxSlippage}
                   value={draft.maxSlippage}
-                  onChange={(value) => setDraft({ ...draft, maxSlippage: value })}
+                  onChange={(value) =>
+                    setDraft({ ...draft, maxSlippage: value })
+                  }
                 />
                 <LimitsField
                   label={t.settings.quoteAge}
@@ -867,15 +930,132 @@ function RiskLimitsCard() {
                   onChange={(value) => setDraft({ ...draft, venues: value })}
                 />
               </div>
+              <div className="space-y-3 rounded-lg border border-line p-3">
+                <div className="flex flex-wrap items-start justify-between gap-2">
+                  <div>
+                    <p className="text-xs font-medium text-body">
+                      {t.settings.venueOverrides}
+                    </p>
+                    <p className="mt-0.5 text-[11px] text-muted">
+                      {t.settings.venueOverridesDesc}
+                    </p>
+                  </div>
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    onClick={addOverride}
+                    disabled={update.isPending}
+                  >
+                    {t.settings.venueAdd}
+                  </Button>
+                </div>
+                {draft.overrides.length === 0 ? (
+                  <p className="text-[11px] text-subtle">
+                    {t.settings.venueOverridesEmpty}
+                  </p>
+                ) : (
+                  <div className="space-y-3">
+                    {draft.overrides.map((item, index) => (
+                      <div
+                        key={index}
+                        className="space-y-2.5 rounded-md border border-line bg-panel-soft/60 p-3"
+                      >
+                        <div className="flex items-end gap-2">
+                          <label className="block flex-1 space-y-1.5">
+                            <span className="text-[11px] text-muted">
+                              {t.settings.venueName}
+                            </span>
+                            <input
+                              className={`${inputClass} font-mono`}
+                              value={item.venue}
+                              placeholder={t.settings.venueNamePlaceholder}
+                              onChange={(event) =>
+                                updateOverride(index, {
+                                  venue: event.target.value,
+                                })
+                              }
+                            />
+                          </label>
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            onClick={() => removeOverride(index)}
+                            disabled={update.isPending}
+                          >
+                            {t.settings.venueRemove}
+                          </Button>
+                        </div>
+                        <div className="grid gap-2.5 sm:grid-cols-2">
+                          <LimitsField
+                            label={t.settings.maxOrder}
+                            hint={t.settings.venueInherit}
+                            value={item.maxOrder}
+                            onChange={(value) =>
+                              updateOverride(index, { maxOrder: value })
+                            }
+                          />
+                          <LimitsField
+                            label={t.settings.maxLeverage}
+                            hint={t.settings.venueInherit}
+                            step="0.1"
+                            value={item.maxLeverage}
+                            onChange={(value) =>
+                              updateOverride(index, { maxLeverage: value })
+                            }
+                          />
+                          <LimitsField
+                            label={t.settings.maxSlippage}
+                            hint={t.settings.venueInherit}
+                            value={item.maxSlippage}
+                            onChange={(value) =>
+                              updateOverride(index, { maxSlippage: value })
+                            }
+                          />
+                          <LimitsField
+                            label={t.settings.maxLegs}
+                            hint={t.settings.venueInherit}
+                            step="1"
+                            value={item.maxLegs}
+                            onChange={(value) =>
+                              updateOverride(index, { maxLegs: value })
+                            }
+                          />
+                          <LimitsField
+                            label={t.settings.symbols}
+                            hint={t.settings.venueInherit}
+                            value={item.symbols}
+                            onChange={(value) =>
+                              updateOverride(index, { symbols: value })
+                            }
+                          />
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
               <div className="flex items-center gap-3">
                 <Button size="sm" onClick={save} disabled={update.isPending}>
                   {t.settings.limitsSave}
                 </Button>
-                <Button size="sm" variant="ghost" onClick={cancel} disabled={update.isPending}>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  onClick={cancel}
+                  disabled={update.isPending}
+                >
                   {t.settings.limitsCancel}
                 </Button>
-                {update.isSuccess && <span className="text-xs text-accent">{t.settings.limitsSaved}</span>}
-                {update.isError && <span className="text-xs text-danger">{update.error.message}</span>}
+                {update.isSuccess && (
+                  <span className="text-xs text-accent">
+                    {t.settings.limitsSaved}
+                  </span>
+                )}
+                {update.isError && (
+                  <span className="text-xs text-danger">
+                    {update.error.message}
+                  </span>
+                )}
               </div>
             </div>
           );
@@ -907,13 +1087,19 @@ interface NotificationDraft {
   desktopEnabled: boolean;
 }
 
-function toNotificationDraft(settings: NotificationSettings): NotificationDraft {
+function toNotificationDraft(
+  settings: NotificationSettings,
+): NotificationDraft {
   return {
     newsEnabled: settings.news_enabled,
-    newsSources: settings.news_sources.length ? settings.news_sources : [...NEWS_SOURCE_IDS],
+    newsSources: settings.news_sources.length
+      ? settings.news_sources
+      : [...NEWS_SOURCE_IDS],
     fundingEnabled: settings.funding_enabled,
     fundingThreshold: String(Number(settings.funding_min_annualized_pct)),
-    fundingCooldownHours: String(Math.round((settings.funding_cooldown_secs / 3600) * 10) / 10),
+    fundingCooldownHours: String(
+      Math.round((settings.funding_cooldown_secs / 3600) * 10) / 10,
+    ),
     telegramEnabled: settings.telegram_enabled,
     desktopEnabled: settings.desktop_enabled,
   };
@@ -925,6 +1111,7 @@ function NotificationCard() {
   const settings = useNotificationSettings();
   const update = useUpdateNotificationSettings();
   const [draft, setDraft] = useState<NotificationDraft | null>(null);
+  const [section, setSection] = useState<"news" | "funding">("news");
 
   // 首次拿到配置后回填表单；保存成功后不清空，便于继续微调。
   useEffect(() => {
@@ -948,13 +1135,16 @@ function NotificationCard() {
       news_sources: draft.newsSources,
       funding_enabled: draft.fundingEnabled,
       funding_min_annualized_pct: Number(draft.fundingThreshold) || 0,
-      funding_cooldown_secs: Math.round((Number(draft.fundingCooldownHours) || 0) * 3600),
+      funding_cooldown_secs: Math.round(
+        (Number(draft.fundingCooldownHours) || 0) * 3600,
+      ),
       telegram_enabled: draft.telegramEnabled,
       desktop_enabled: draft.desktopEnabled,
     });
   };
 
-  const sourceName = (source: (typeof NEWS_SOURCE_IDS)[number]) => t.news.sources[source].name;
+  const sourceName = (source: (typeof NEWS_SOURCE_IDS)[number]) =>
+    t.news.sources[source].name;
 
   return (
     <Card>
@@ -963,106 +1153,160 @@ function NotificationCard() {
           <CardTitle>{t.settings.notifyTitle}</CardTitle>
           <CardDescription>{t.settings.notifyDesc}</CardDescription>
         </div>
-        {settings.isError && <Badge tone="danger">{t.settings.notConnected}</Badge>}
+        {settings.isError && (
+          <Badge tone="danger">{t.settings.notConnected}</Badge>
+        )}
       </CardHeader>
       <CardContent className="space-y-4">
         {!draft ? (
           <p className="py-8 text-center text-xs text-muted">
-            {settings.isError ? t.settings.notifyUnavailable : t.settings.unavailable}
+            {settings.isError
+              ? t.settings.notifyUnavailable
+              : t.settings.unavailable}
           </p>
         ) : (
           <>
-            <div className="grid gap-2 sm:grid-cols-2">
-              <NotifyToggle
-                label={t.settings.notifyNews}
-                hint={t.settings.notifyNewsHint}
-                checked={draft.newsEnabled}
-                onChange={(checked) => setDraft({ ...draft, newsEnabled: checked })}
-              />
-              <NotifyToggle
-                label={t.settings.notifyFunding}
-                hint={t.settings.notifyFundingHint}
-                checked={draft.fundingEnabled}
-                onChange={(checked) => setDraft({ ...draft, fundingEnabled: checked })}
-              />
+            <div className="flex flex-wrap gap-1.5">
+              {(
+                [
+                  { id: "news", label: t.settings.notifyTabNews },
+                  { id: "funding", label: t.settings.notifyTabFunding },
+                ] as const
+              ).map((item) => (
+                <button
+                  key={item.id}
+                  type="button"
+                  onClick={() => setSection(item.id)}
+                  className={cn(
+                    "rounded-lg border px-3 py-1.5 text-xs transition-colors",
+                    section === item.id
+                      ? "border-accent/40 bg-accent/10 font-medium text-fg"
+                      : "border-line text-muted hover:bg-hover hover:text-body",
+                  )}
+                >
+                  {item.label}
+                </button>
+              ))}
             </div>
 
-            <div className="space-y-2">
-              <p className="text-[11px] text-muted">{t.settings.notifyNewsSources}</p>
-              <div className="flex flex-wrap gap-1.5">
-                {NEWS_SOURCE_IDS.map((source) => {
-                  const active = draft.newsSources.includes(source);
-                  return (
-                    <button
-                      key={source}
-                      type="button"
-                      disabled={!draft.newsEnabled}
-                      onClick={() => toggleSource(source)}
-                      className={cn(
-                        "rounded-lg border px-2.5 py-1 text-xs transition-colors disabled:opacity-50",
-                        active
-                          ? "border-accent/40 bg-accent/10 text-fg"
-                          : "border-line text-muted hover:bg-hover",
-                      )}
-                    >
-                      {sourceName(source)}
-                    </button>
-                  );
-                })}
+            {section === "news" ? (
+              <div className="space-y-3">
+                <NotifyToggle
+                  label={t.settings.notifyNews}
+                  hint={t.settings.notifyNewsHint}
+                  checked={draft.newsEnabled}
+                  onChange={(checked) =>
+                    setDraft({ ...draft, newsEnabled: checked })
+                  }
+                />
+
+                <div className="space-y-2">
+                  <p className="text-[11px] text-muted">
+                    {t.settings.notifyNewsSources}
+                  </p>
+                  <div className="flex flex-wrap gap-1.5">
+                    {NEWS_SOURCE_IDS.map((source) => {
+                      const active = draft.newsSources.includes(source);
+                      return (
+                        <button
+                          key={source}
+                          type="button"
+                          disabled={!draft.newsEnabled}
+                          onClick={() => toggleSource(source)}
+                          className={cn(
+                            "rounded-lg border px-2.5 py-1 text-xs transition-colors disabled:opacity-50",
+                            active
+                              ? "border-accent/40 bg-accent/10 text-fg"
+                              : "border-line text-muted hover:bg-hover",
+                          )}
+                        >
+                          {sourceName(source)}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
               </div>
-            </div>
+            ) : (
+              <div className="space-y-3">
+                <NotifyToggle
+                  label={t.settings.notifyFunding}
+                  hint={t.settings.notifyFundingHint}
+                  checked={draft.fundingEnabled}
+                  onChange={(checked) =>
+                    setDraft({ ...draft, fundingEnabled: checked })
+                  }
+                />
 
-            <div className="grid gap-3 sm:grid-cols-2">
-              <label className="block space-y-1.5">
-                <span className="text-[11px] text-muted">{t.settings.notifyThreshold}</span>
-                <input
-                  className={`${inputClass} font-mono`}
-                  type="number"
-                  min="0"
-                  step="0.1"
-                  disabled={!draft.fundingEnabled}
-                  value={draft.fundingThreshold}
-                  onChange={(event) =>
-                    setDraft({ ...draft, fundingThreshold: event.target.value })
-                  }
-                />
-                <span className="block text-[11px] leading-relaxed text-subtle">
-                  {t.settings.notifyThresholdHint}
-                </span>
-              </label>
-              <label className="block space-y-1.5">
-                <span className="text-[11px] text-muted">{t.settings.notifyCooldown}</span>
-                <input
-                  className={`${inputClass} font-mono`}
-                  type="number"
-                  min="0"
-                  step="0.5"
-                  disabled={!draft.fundingEnabled}
-                  value={draft.fundingCooldownHours}
-                  onChange={(event) =>
-                    setDraft({ ...draft, fundingCooldownHours: event.target.value })
-                  }
-                />
-                <span className="block text-[11px] leading-relaxed text-subtle">
-                  {t.settings.notifyCooldownHint}
-                </span>
-              </label>
-            </div>
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <label className="block space-y-1.5">
+                    <span className="text-[11px] text-muted">
+                      {t.settings.notifyThreshold}
+                    </span>
+                    <input
+                      className={`${inputClass} font-mono`}
+                      type="number"
+                      min="0"
+                      step="0.1"
+                      disabled={!draft.fundingEnabled}
+                      value={draft.fundingThreshold}
+                      onChange={(event) =>
+                        setDraft({
+                          ...draft,
+                          fundingThreshold: event.target.value,
+                        })
+                      }
+                    />
+                    <span className="block text-[11px] leading-relaxed text-subtle">
+                      {t.settings.notifyThresholdHint}
+                    </span>
+                  </label>
+                  <label className="block space-y-1.5">
+                    <span className="text-[11px] text-muted">
+                      {t.settings.notifyCooldown}
+                    </span>
+                    <input
+                      className={`${inputClass} font-mono`}
+                      type="number"
+                      min="0"
+                      step="0.5"
+                      disabled={!draft.fundingEnabled}
+                      value={draft.fundingCooldownHours}
+                      onChange={(event) =>
+                        setDraft({
+                          ...draft,
+                          fundingCooldownHours: event.target.value,
+                        })
+                      }
+                    />
+                    <span className="block text-[11px] leading-relaxed text-subtle">
+                      {t.settings.notifyCooldownHint}
+                    </span>
+                  </label>
+                </div>
+              </div>
+            )}
 
             <div className="space-y-2">
-              <p className="text-[11px] text-muted">{t.settings.notifyChannels}</p>
+              <p className="text-[11px] text-muted">
+                {t.settings.notifyChannels}
+              </p>
               <div className="grid gap-2 sm:grid-cols-2">
                 <NotifyToggle
                   label={t.settings.notifyTelegram}
                   hint={t.settings.notifyTelegramHint}
                   checked={draft.telegramEnabled}
-                  onChange={(checked) => setDraft({ ...draft, telegramEnabled: checked })}
+                  onChange={(checked) =>
+                    setDraft({ ...draft, telegramEnabled: checked })
+                  }
                 />
                 <NotifyToggle
                   label={t.settings.notifyDesktop}
                   hint={t.settings.notifyDesktopHint}
                   checked={draft.desktopEnabled}
-                  onChange={(checked) => setDraft({ ...draft, desktopEnabled: checked })}
+                  onChange={(checked) =>
+                    setDraft({ ...draft, desktopEnabled: checked })
+                  }
                 />
               </div>
             </div>
@@ -1072,9 +1316,15 @@ function NotificationCard() {
                 {t.settings.notifySave}
               </Button>
               {update.isSuccess && (
-                <span className="text-xs text-accent">{t.settings.notifySaved}</span>
+                <span className="text-xs text-accent">
+                  {t.settings.notifySaved}
+                </span>
               )}
-              {update.isError && <span className="text-xs text-danger">{update.error.message}</span>}
+              {update.isError && (
+                <span className="text-xs text-danger">
+                  {update.error.message}
+                </span>
+              )}
             </div>
           </>
         )}
@@ -1098,7 +1348,9 @@ function NotifyToggle({
     <label className="flex cursor-pointer items-start justify-between gap-3 rounded-lg border border-line px-3 py-2.5">
       <span className="min-w-0">
         <span className="block text-xs font-medium text-body">{label}</span>
-        <span className="mt-0.5 block text-[11px] leading-relaxed text-muted">{hint}</span>
+        <span className="mt-0.5 block text-[11px] leading-relaxed text-muted">
+          {hint}
+        </span>
       </span>
       <input
         type="checkbox"
@@ -1125,15 +1377,21 @@ function TelegramCard() {
           <CardDescription>{t.settings.telegramDesc}</CardDescription>
         </div>
         <div className="flex items-center gap-2">
-          {data?.bot_username && <Badge tone="info">@{data.bot_username}</Badge>}
+          {data?.bot_username && (
+            <Badge tone="info">@{data.bot_username}</Badge>
+          )}
           <Badge tone={data?.enabled ? "success" : "neutral"}>
-            {data?.enabled ? t.settings.telegramEnabled : t.settings.telegramDisabled}
+            {data?.enabled
+              ? t.settings.telegramEnabled
+              : t.settings.telegramDisabled}
           </Badge>
         </div>
       </CardHeader>
       <CardContent className="space-y-4">
         {status.isError ? (
-          <p className="py-4 text-center text-xs text-muted">{t.settings.unavailable}</p>
+          <p className="py-4 text-center text-xs text-muted">
+            {t.settings.unavailable}
+          </p>
         ) : !data ? null : (
           <>
             {!data.enabled && (
@@ -1143,8 +1401,14 @@ function TelegramCard() {
             )}
 
             <div className="flex flex-wrap items-center gap-3">
-              <Button size="sm" onClick={() => pairing.mutate()} disabled={pairing.isPending}>
-                {pairing.isPending ? t.settings.telegramPairing : t.settings.telegramPairingAction}
+              <Button
+                size="sm"
+                onClick={() => pairing.mutate()}
+                disabled={pairing.isPending}
+              >
+                {pairing.isPending
+                  ? t.settings.telegramPairing
+                  : t.settings.telegramPairingAction}
               </Button>
               {data.enabled && data.polling && (
                 <Badge tone="success">{t.settings.telegramPolling}</Badge>
@@ -1153,7 +1417,9 @@ function TelegramCard() {
 
             {pairing.data && (
               <div className="rounded-lg border border-accent/30 bg-accent/5 px-3 py-3">
-                <p className="text-[11px] text-muted">{t.settings.telegramPairingHint}</p>
+                <p className="text-[11px] text-muted">
+                  {t.settings.telegramPairingHint}
+                </p>
                 <p className="mt-1 font-mono text-lg tracking-[0.15em] text-accent">
                   /bind {pairing.data.code}
                 </p>
@@ -1162,18 +1428,39 @@ function TelegramCard() {
                     value: formatDateTime(pairing.data.expires_at),
                   })}
                 </p>
+                {data.bot_username && (
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    className="mt-2"
+                    onClick={() => {
+                      const command = `/bind ${pairing.data?.code ?? ""}`;
+                      void openExternal(
+                        `https://t.me/${data.bot_username}?text=${encodeURIComponent(command)}`,
+                      );
+                    }}
+                  >
+                    {t.settings.telegramOpenInBrowser}
+                  </Button>
+                )}
               </div>
             )}
-            {pairing.isError && <p className="text-xs text-danger">{pairing.error.message}</p>}
+            {pairing.isError && (
+              <p className="text-xs text-danger">{pairing.error.message}</p>
+            )}
             {data.enabled && data.last_error && (
               <p className="text-xs text-warning">{data.last_error}</p>
             )}
 
             {data.enabled && (
               <div>
-                <p className="mb-2 text-xs text-muted">{t.settings.telegramBindings}</p>
+                <p className="mb-2 text-xs text-muted">
+                  {t.settings.telegramBindings}
+                </p>
                 {data.bindings.length === 0 ? (
-                  <p className="text-xs text-subtle">{t.settings.telegramEmpty}</p>
+                  <p className="text-xs text-subtle">
+                    {t.settings.telegramEmpty}
+                  </p>
                 ) : (
                   <ul className="divide-y divide-line rounded-lg border border-line">
                     {data.bindings.map((binding) => (
@@ -1183,10 +1470,13 @@ function TelegramCard() {
                       >
                         <div>
                           <p className="text-sm text-body">
-                            {binding.username ? `@${binding.username}` : binding.telegram_user_id}
+                            {binding.username
+                              ? `@${binding.username}`
+                              : binding.telegram_user_id}
                           </p>
                           <p className="mt-0.5 font-mono text-[11px] text-subtle">
-                            ID {binding.telegram_user_id} · {formatDateTime(binding.paired_at)}
+                            ID {binding.telegram_user_id} ·{" "}
+                            {formatDateTime(binding.paired_at)}
                           </p>
                         </div>
                         <div className="flex items-center gap-2">
@@ -1199,7 +1489,9 @@ function TelegramCard() {
                             size="sm"
                             variant="danger"
                             disabled={revoke.isPending}
-                            onClick={() => revoke.mutate(binding.telegram_user_id)}
+                            onClick={() =>
+                              revoke.mutate(binding.telegram_user_id)
+                            }
                           >
                             {t.settings.telegramRevoke}
                           </Button>
@@ -1212,7 +1504,9 @@ function TelegramCard() {
             )}
           </>
         )}
-        <p className="text-[11px] leading-relaxed text-muted">{t.settings.telegramNote}</p>
+        <p className="text-[11px] leading-relaxed text-muted">
+          {t.settings.telegramNote}
+        </p>
       </CardContent>
     </Card>
   );
