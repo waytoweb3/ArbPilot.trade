@@ -352,6 +352,10 @@ fn persist_token(path: &Path, token: &str) -> anyhow::Result<()> {
 /// 订阅并导入市场策略后的使用（查看、编辑定义、配置范围、启停、删除）不要求套餐。
 pub fn required_plan(method: &str, path: &str) -> Option<&'static str> {
     let path = path.strip_prefix("/api/v1").unwrap_or(path);
+    // 资金费率历史登录即可读取，不校验套餐；其余资金费率接口仍属套利套餐。
+    if path == "/funding/history" {
+        return None;
+    }
     if path.starts_with("/opportunities")
         || path.starts_with("/funding")
         || path.starts_with("/news")
@@ -559,6 +563,7 @@ mod tests {
             required_plan("GET", "/api/v1/funding/status"),
             Some("arbitrage")
         );
+        assert_eq!(required_plan("GET", "/api/v1/funding/history"), None);
         assert_eq!(required_plan("GET", "/api/v1/news"), Some("arbitrage"));
         assert_eq!(
             required_plan("POST", "/api/v1/strategies"),
