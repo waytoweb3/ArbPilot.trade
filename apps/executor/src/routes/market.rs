@@ -30,6 +30,157 @@ use crate::{error::ApiError, state::AppState};
 use super::strategies;
 
 // ---------------------------------------------------------------------------
+// 官方策略目录
+// ---------------------------------------------------------------------------
+
+/// 官方内置模板在策略市场上的发布。
+const OFFICIAL_TEMPLATE_KEYS: [&str; 4] = [
+    "turtle-breakout",
+    "ma-trend",
+    "grid",
+    "listing-follow",
+];
+
+fn official_uuid(name: &str) -> Uuid {
+    Uuid::new_v5(&Uuid::NAMESPACE_URL, name.as_bytes())
+}
+
+fn official_author_id() -> Uuid {
+    official_uuid("https://arbpilot.trade/market/author/official")
+}
+
+fn official_publication_id(key: &str) -> Uuid {
+    official_uuid(&format!("https://arbpilot.trade/market/publication/{key}"))
+}
+
+fn official_strategy_id(key: &str) -> Uuid {
+    official_uuid(&format!("https://arbpilot.trade/market/strategy/{key}"))
+}
+
+fn official_risk_level(key: &str) -> RiskLevel {
+    match key {
+        "listing-follow" => RiskLevel::High,
+        _ => RiskLevel::Medium,
+    }
+}
+
+fn official_data_sources(key: &str) -> Vec<String> {
+    match key {
+        "listing-follow" => vec!["交易所上币公告".to_string(), "实时盘口".to_string()],
+        _ => vec!["历史 K 线".to_string(), "实时盘口".to_string()],
+    }
+}
+
+/// 官方只读实例启动时把四个内置模板发布到策略市场，供所有用户免费订阅。
+///
+/// 其他实例（桌面内置执行器、用户自托管）不会自动生成这些发布，市场仍以数据库为准。
+pub(crate) async fn seed_official(state: &AppState) {
+    if !state.config.public_mode {
+        return;
+    }
+
+    let snapshot = state.store.market_snapshot().await;
+    let author_id = official_author_id();
+    let now = Utc::now();
+    let mut author = snapshot
+        .authors
+        .iter()
+        .find(|card| card.author_id == author_id)
+        .cloned()
+        .unwrap_or_else(|| {
+            let mut card = StrategyAuthorCard::new("ArbPilot 官方");
+            card.author_id = author_id;
+            card
+        });
+    author.display_name = "ArbPilot 官方".to_string();
+    author.headline = "官方内置策略，免费开放".to_string();
+    author.bio =
+        "由 ArbPilot 维护的内置策略模板，全部免费开放；导入后可在自己的执行器上修改参数并运行。"
+            .to_string();
+    author.updated_at = now;
+    state.store.save_author_card(&author).await;
+
+    let limit = state.risk_limits().max_order_notional_usd;
+    for template in state
+        .store
+        .strategy_templates()
+        .await
+        .into_iter()
+        .filter(|template| OFFICIAL_TEMPLATE_KEYS.contains(&template.key.as_str()))
+    {
+        // 模板还没编译成功时跳过，下次启动会重试。
+        let Some(sha256) = template.artifact_sha256.clone() else {
+            continue;
+        };
+        let existing = snapshot
+            .publications
+            .iter()
+            .find(|publication| publication.id == official_publication_id(&template.key))
+            .cloned();
+
+        let definition = template.definition.clone();
+        let notes = definition.notes.clone().unwrap_or_default();
+        let mut suggested_max_notional_usd = definition.risk.max_notional_usd.min(limit);
+        if suggested_max_notional_usd <= Decimal::ZERO {
+            suggested_max_notional_usd = Decimal::from(100);
+        }
+
+        let publication = StrategyPublication {
+            id: official_publication_id(&template.key),
+            strategy_id: official_strategy_id(&template.key),
+            strategy_version: 1,
+            author_id,
+            author_name: author.display_name.clone(),
+            title: definition.name.clone(),
+            summary: template.description.clone(),
+            logic_summary: format!("{} {}", template.description, notes),
+            risk_level: official_risk_level(&template.key),
+            suggested_max_notional_usd,
+            supported_venues: definition.universe.venues.clone(),
+            supported_symbols: definition.universe.symbols.clone(),
+            data_sources: official_data_sources(&template.key),
+            runtime: format!("WASM 沙箱 · {}", &sha256[..sha256.len().min(12)]),
+            known_limits: vec![
+                "需要足够的可用保证金".to_string(),
+                "行情或公告源中断时不会开新仓".to_string(),
+                "所有订单仍受本地风控与交易所限额约束".to_string(),
+            ],
+            source_visibility: SourceVisibility::OpenSource,
+            visibility: MarketVisibility::Public,
+            pricing: StrategyPricing::free(),
+            status: existing
+                .as_ref()
+                .map(|publication| publication.status)
+                .unwrap_or(PublicationStatus::Published),
+            artifact_sha256: Some(sha256),
+            definition: Some(definition),
+            changelog: existing
+                .as_ref()
+                .map(|publication| publication.changelog.clone())
+                .filter(|changelog| !changelog.is_empty())
+                .unwrap_or_else(|| {
+                    vec![StrategyChangelogEntry {
+                        version: 1,
+                        at: now,
+                        summary: "官方内置策略，免费开放".to_string(),
+                    }]
+                }),
+            created_at: existing
+                .as_ref()
+                .map(|publication| publication.created_at)
+                .unwrap_or(now),
+            updated_at: now,
+        };
+
+        if publication.has_errors() {
+            tracing::error!(key = %template.key, "官方策略发布未通过校验，已跳过");
+            continue;
+        }
+        state.store.save_publication(&publication).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 作者卡片
 // ---------------------------------------------------------------------------
 
@@ -590,7 +741,7 @@ pub async fn cancel_subscription(
 // ---------------------------------------------------------------------------
 
 /// 一次发布的可运行交付物：冻结的定义 + 沙箱模块。
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct PublicationBundle {
     pub publication_id: Uuid,
     pub strategy_version: u32,
@@ -620,6 +771,25 @@ pub struct ImportPublicationRequest {
     pub subscriber_id: Uuid,
 }
 
+/// 本地执行器导入官方交付物：官方发布不在本地数据库，因此直接接收交付物本身。
+///
+/// 模块哈希必须与交付物声明一致，导入后作为一条自托管策略落库，可编辑、配置与执行。
+pub async fn import_bundle(
+    State(state): State<AppState>,
+    Json(bundle): Json<PublicationBundle>,
+) -> Result<(StatusCode, Json<arb_core::StrategyRecord>), ApiError> {
+    let title = bundle.definition.name.clone();
+    let record = install_bundle(
+        &state,
+        bundle,
+        title,
+        state.risk_limits().max_order_notional_usd,
+        "从策略市场导入",
+    )
+    .await?;
+    Ok((StatusCode::CREATED, Json(record)))
+}
+
 /// 订阅者在自己的执行器导入发布版本：校验哈希后落库为一条自托管策略。
 pub async fn import_publication(
     State(state): State<AppState>,
@@ -630,6 +800,27 @@ pub async fn import_publication(
     ensure_entitled(&state, &publication, Some(body.subscriber_id)).await?;
     let bundle = load_bundle(&state, &publication).await?;
 
+    let title = publication.title.clone();
+    let suggested_max_notional_usd = publication.suggested_max_notional_usd;
+    let record = install_bundle(
+        &state,
+        bundle,
+        title,
+        suggested_max_notional_usd,
+        "从策略市场导入",
+    )
+    .await?;
+    Ok((StatusCode::CREATED, Json(record)))
+}
+
+/// 校验交付代码并把冻结定义落库为一条可自托管的策略。
+async fn install_bundle(
+    state: &AppState,
+    bundle: PublicationBundle,
+    title: String,
+    suggested_max_notional_usd: Decimal,
+    note: &str,
+) -> Result<arb_core::StrategyRecord, ApiError> {
     let wasm = BASE64
         .decode(bundle.wasm_base64.as_bytes())
         .map_err(|error| ApiError::BadRequest(format!("交付代码无法解码: {error}")))?;
@@ -642,28 +833,43 @@ pub async fn import_publication(
         .map_err(|error| ApiError::BadRequest(format!("交付代码未通过沙箱检查: {error}")))?;
 
     let short_hash = &bundle.artifact_sha256[..bundle.artifact_sha256.len().min(12)];
-    let artifact = SandboxArtifact {
-        id: Uuid::new_v4(),
-        name: format!("market-{short_hash}"),
-        sha256: bundle.artifact_sha256.clone(),
-        size_bytes: wasm.len(),
-        abi_version: Some(abi_version),
-        source: SandboxArtifactSource::Uploaded,
-        notes: Some(format!("订阅导入：{}", publication.title)),
-        created_at: Utc::now(),
-    };
-    state
+    // 官方模板与本机内置模板字节完全相同，哈希已入库时直接复用，避免重复插入。
+    let artifact = match state
         .store
-        .save_sandbox_artifact(&artifact, &wasm)
+        .sandbox_artifacts()
         .await
-        .map_err(|error| ApiError::Internal(format!("保存沙箱模块失败: {error}")))?;
+        .into_iter()
+        .find(|artifact| artifact.sha256 == bundle.artifact_sha256)
+    {
+        Some(artifact) => artifact,
+        None => {
+            let artifact = SandboxArtifact {
+                id: Uuid::new_v4(),
+                name: format!("market-{short_hash}"),
+                sha256: bundle.artifact_sha256.clone(),
+                size_bytes: wasm.len(),
+                abi_version: Some(abi_version),
+                source: SandboxArtifactSource::Uploaded,
+                notes: Some(format!("{note}：{title}")),
+                created_at: Utc::now(),
+            };
+            state
+                .store
+                .save_sandbox_artifact(&artifact, &wasm)
+                .await
+                .map_err(|error| {
+                    ApiError::Internal(format!("保存沙箱模块失败: {error}"))
+                })?;
+            artifact
+        }
+    };
 
     let mut definition = bundle.definition;
-    definition.name = publication.title.clone();
+    definition.name = title.clone();
     definition.risk.max_notional_usd = definition
         .risk
         .max_notional_usd
-        .min(publication.suggested_max_notional_usd)
+        .min(suggested_max_notional_usd)
         .min(state.risk_limits().max_order_notional_usd);
 
     let mut record = arb_core::StrategyRecord::new(
@@ -674,14 +880,14 @@ pub async fn import_publication(
     record.sandbox = Some(SandboxBinding::new(&artifact, state.config.sandbox));
     record.runtime.record(
         StrategyEventLevel::Info,
-        format!("从策略市场导入：{}", publication.title),
+        format!("{note}：{title}"),
         None,
     );
     record.validation = record.definition.validate(&state.risk_limits());
 
-    strategies::replace(&state, &record);
-    strategies::persist(&state, &record).await;
-    Ok((StatusCode::CREATED, Json(record)))
+    strategies::replace(state, &record);
+    strategies::persist(state, &record).await;
+    Ok(record)
 }
 
 /// 只有作者本人或持有效订阅的订阅者可以拿到交付物。

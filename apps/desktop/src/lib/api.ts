@@ -287,6 +287,30 @@ async function dataRequest<T>(
   }
 }
 
+/**
+ * 策略市场请求：内置执行器模式下统一走官方目录与订阅服务，
+ * 托管模式下走用户自己的执行器；市场以官方为准，不做本地兜底。
+ */
+async function marketRequest<T>(
+  path: string,
+  init: RequestInit = {},
+  acceptedStatuses: number[] = [],
+): Promise<T> {
+  if (getExecutorMode() !== "local" || !DATA_URL || DATA_URL === getExecutorUrl("local")) {
+    return request<T>(path, init, acceptedStatuses);
+  }
+  const license = getLicenseToken();
+  return send<T>(
+    `${DATA_URL}${path}`,
+    {
+      Authorization: `Bearer ${DEFAULT_TOKEN}`,
+      ...(license ? { "X-ArbPilot-License": license } : {}),
+    },
+    init,
+    acceptedStatuses,
+  );
+}
+
 export const api = {
   health: () => request<HealthResponse>("/api/v1/health"),
 
@@ -462,9 +486,11 @@ export const api = {
       params.set("author_id", options.authorId);
     }
     const query = params.toString();
-    return request<StrategyPublication[]>(
-      `/api/v1/market/publications${query ? `?${query}` : ""}`,
-    );
+    const path = `/api/v1/market/publications${query ? `?${query}` : ""}`;
+    // 私有草稿只存在于作者自己的执行器；公开目录以内置模式下的官方市场为准。
+    return options.includeHidden
+      ? request<StrategyPublication[]>(path)
+      : marketRequest<StrategyPublication[]>(path);
   },
 
   createPublication: (body: CreatePublicationRequest) =>
@@ -490,35 +516,51 @@ export const api = {
       body: JSON.stringify(body),
     }),
 
-  leaderboard: () => request<LeaderboardEntry[]>("/api/v1/market/leaderboard"),
+  leaderboard: () => marketRequest<LeaderboardEntry[]>("/api/v1/market/leaderboard"),
 
   /** 订阅只保存订阅者本地身份与支付引用，不上传任何账号密码。 */
   subscribe: (publicationId: string, subscriberId: string, paymentRef?: string) =>
-    request<StrategySubscription>(`/api/v1/market/publications/${publicationId}/subscribe`, {
-      method: "POST",
-      body: JSON.stringify({ subscriber_id: subscriberId, payment_ref: paymentRef ?? null }),
-    }),
+    marketRequest<StrategySubscription>(
+      `/api/v1/market/publications/${publicationId}/subscribe`,
+      {
+        method: "POST",
+        body: JSON.stringify({ subscriber_id: subscriberId, payment_ref: paymentRef ?? null }),
+      },
+    ),
 
   subscriptions: (subscriberId: string) =>
-    request<StrategySubscription[]>(
+    marketRequest<StrategySubscription[]>(
       `/api/v1/market/subscriptions?subscriber_id=${encodeURIComponent(subscriberId)}`,
     ),
 
   /** 已订阅策略的交付物：冻结定义 + wasm 模块字节。 */
   publicationBundle: (publicationId: string, subscriberId: string) =>
-    request<PublicationBundle>(
+    marketRequest<PublicationBundle>(
       `/api/v1/market/publications/${publicationId}/bundle?subscriber_id=${encodeURIComponent(subscriberId)}`,
     ),
 
   /** 把已订阅的策略导入为自己的自托管策略，代码在本机执行器运行。 */
-  importPublication: (publicationId: string, subscriberId: string) =>
-    request<StrategyRecord>(`/api/v1/market/publications/${publicationId}/import`, {
+  importPublication: async (publicationId: string, subscriberId: string) => {
+    if (getExecutorMode() !== "local" || !DATA_URL || DATA_URL === getExecutorUrl("local")) {
+      return request<StrategyRecord>(`/api/v1/market/publications/${publicationId}/import`, {
+        method: "POST",
+        body: JSON.stringify({ subscriber_id: subscriberId }),
+      });
+    }
+    // 官方发布不在本机数据库：先取交付物，再交给本机执行器校验并落库。
+    const bundle = await marketRequest<PublicationBundle>(
+      `/api/v1/market/publications/${publicationId}/bundle?subscriber_id=${encodeURIComponent(subscriberId)}`,
+    );
+    return request<StrategyRecord>("/api/v1/market/publications/import", {
       method: "POST",
-      body: JSON.stringify({ subscriber_id: subscriberId }),
-    }),
+      body: JSON.stringify(bundle),
+    });
+  },
 
   cancelSubscription: (id: string) =>
-    request<StrategySubscription>(`/api/v1/market/subscriptions/${id}`, { method: "DELETE" }),
+    marketRequest<StrategySubscription>(`/api/v1/market/subscriptions/${id}`, {
+      method: "DELETE",
+    }),
 
   settlements: (authorId?: string) =>
     request<StrategySettlement[]>(

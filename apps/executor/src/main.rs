@@ -53,6 +53,8 @@ async fn main() -> anyhow::Result<()> {
     let state = state::AppState::new(config.clone(), store).await;
     // 内置模板存数据库：补齐缺失模板并把源码编译成沙箱模块。
     templates::seed(&state).await;
+    // 官方只读实例把内置模板发布到策略市场，供所有用户免费订阅。
+    routes::market::seed_official(&state).await;
     // 策略只在「运行中」且执行器未暂停时产生订单意图，并通过统一风控网关下单。
     strategy_runner::spawn(state.clone());
     let app = routes::build(state);

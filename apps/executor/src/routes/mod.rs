@@ -6,7 +6,7 @@ mod control;
 mod funding;
 mod health;
 mod license;
-mod market;
+pub(crate) mod market;
 mod news;
 mod opportunities;
 mod orders;
@@ -98,6 +98,10 @@ pub fn build(state: AppState) -> Router {
         .route(
             "/market/publications",
             get(market::list_publications).post(market::create_publication),
+        )
+        .route(
+            "/market/publications/import",
+            post(market::import_bundle),
         )
         .route(
             "/market/publications/{id}",

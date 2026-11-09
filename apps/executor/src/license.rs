@@ -380,11 +380,16 @@ pub fn required_plan(method: &str, path: &str) -> Option<&'static str> {
 
     if path.starts_with("/market") {
         if !write {
-            return Some("arbitrage");
+            // 市场目录、榜单与交付物免费浏览；结算单属于作者收款信息。
+            if path.starts_with("/market/settlements") {
+                return Some("arbitrage");
+            }
+            return None;
         }
-        // 订阅/导入他人的策略属于“使用策略”，只需基础版；其余写入是作者行为。
+        // 订阅/导入他人的策略属于“使用策略”，免费策略不要求套餐；
+        // 付费订阅仍只是生成待支付记录，实际授权由支付回调开通。
         if path.ends_with("/subscribe") || path.ends_with("/import") {
-            return Some("arbitrage");
+            return None;
         }
         return Some("strategy");
     }
@@ -577,15 +582,27 @@ mod tests {
         );
         assert_eq!(
             required_plan("GET", "/api/v1/market/leaderboard"),
+            None
+        );
+        assert_eq!(
+            required_plan("GET", "/api/v1/market/subscriptions"),
+            None
+        );
+        assert_eq!(
+            required_plan("GET", "/api/v1/market/settlements"),
             Some("arbitrage")
         );
         assert_eq!(
             required_plan("POST", "/api/v1/market/publications/abc/subscribe"),
-            Some("arbitrage")
+            None
         );
         assert_eq!(
             required_plan("POST", "/api/v1/market/publications/abc/import"),
-            Some("arbitrage")
+            None
+        );
+        assert_eq!(
+            required_plan("POST", "/api/v1/market/publications/import"),
+            None
         );
         assert_eq!(
             required_plan("POST", "/api/v1/market/publications"),

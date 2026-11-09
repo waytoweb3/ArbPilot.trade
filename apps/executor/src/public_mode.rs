@@ -25,6 +25,16 @@ fn is_public_read(path: &str) -> bool {
         || path.starts_with("/market/")
 }
 
+/// 官网无需登录即可读取的市场目录（不含 `/api/v1` 前缀）。
+///
+/// 官方免费策略以此对所有人可见；订阅列表与结算信息仍要求登录。
+fn is_market_public_read(path: &str) -> bool {
+    path == "/market/publications"
+        || path.starts_with("/market/publications/")
+        || path == "/market/leaderboard"
+        || path == "/market/authors"
+}
+
 /// 官网资金费用页无需令牌即可读取的公共路径（不含 `/api/v1` 前缀）。
 ///
 /// 只放行公开市场数据，且仅限只读请求；账户、下单与策略写入仍然必须带令牌。
@@ -33,7 +43,22 @@ pub fn allows_anonymous(method: &Method, path: &str) -> bool {
         return false;
     }
     let path = path.strip_prefix("/api/v1").unwrap_or(path);
-    path == "/funding/status"
+    path == "/funding/status" || is_market_public_read(path)
+}
+
+/// 官方实例上凭账号身份即可访问、无需共享 API 令牌的市场路径。
+///
+/// 公开目录允许匿名浏览；订阅与退订需要登录账号，但不该依赖客户端内置的静态令牌。
+pub fn allows_without_api_token(method: &Method, path: &str) -> bool {
+    if allows_anonymous(method, path) {
+        return true;
+    }
+    let path = path.strip_prefix("/api/v1").unwrap_or(path);
+    (*method == Method::POST
+        && path.starts_with("/market/publications/")
+        && path.ends_with("/subscribe"))
+        || (*method == Method::DELETE && path.starts_with("/market/subscriptions/"))
+        || (*method == Method::GET && path == "/market/subscriptions")
 }
 
 /// 中间件：托管实例只提供只读公共数据。
@@ -55,6 +80,14 @@ pub async fn require_public_reads(
     if readable && is_public_read(path) {
         return Ok(next.run(request).await);
     }
+    // 免费策略的订阅与退订只写入订阅关系，不涉及密钥、下单或策略运行。
+    let subscription_action = (request.method() == Method::POST
+        && path.starts_with("/market/publications/")
+        && path.ends_with("/subscribe"))
+        || (request.method() == Method::DELETE && path.starts_with("/market/subscriptions/"));
+    if subscription_action {
+        return Ok(next.run(request).await);
+    }
 
     Err(ApiError::Forbidden(
         "官方托管实例仅提供只读公共数据，交易与账户操作请切换到自托管实例".to_string(),
@@ -66,16 +99,28 @@ mod tests {
     use super::{allows_anonymous, is_public_read};
 
     #[test]
-    fn allows_anonymous_only_for_public_funding_reads() {
+    fn allows_anonymous_only_for_public_market_reads() {
         use axum::http::Method;
         assert!(allows_anonymous(
             &Method::GET,
             "/api/v1/funding/status"
         ));
         assert!(allows_anonymous(&Method::GET, "/funding/status"));
+        assert!(allows_anonymous(
+            &Method::GET,
+            "/api/v1/market/publications"
+        ));
+        assert!(allows_anonymous(
+            &Method::GET,
+            "/api/v1/market/publications/abc/bundle"
+        ));
         assert!(!allows_anonymous(
             &Method::POST,
             "/api/v1/funding/status"
+        ));
+        assert!(!allows_anonymous(
+            &Method::GET,
+            "/api/v1/market/subscriptions"
         ));
         assert!(!allows_anonymous(
             &Method::GET,
