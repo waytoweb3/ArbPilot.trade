@@ -394,7 +394,9 @@ pub fn fetch_book_quote(
     let book = match venue.as_str() {
         VENUE => BinanceMarketClient::new(&config.binance_spot_url, &config.binance_fapi_url, http)
             .book(symbol, Segment::Swap)?,
-        OKX_VENUE => OkxMarketClient::new(&config.okx_base_url, http).book(symbol, Segment::Swap)?,
+        OKX_VENUE => {
+            OkxMarketClient::new(&config.okx_base_url, http).book(symbol, Segment::Swap)?
+        }
         BYBIT_VENUE => BybitFundingClient::new(&config.bybit_base_url, http).book(symbol)?,
         BITGET_VENUE => BitgetFundingClient::new(&config.bitget_base_url, http).book(symbol)?,
         GATE_VENUE => GateFundingClient::new(&config.gate_base_url, http).book(symbol)?,
@@ -899,11 +901,10 @@ impl MarketFeed {
             bingx: self.bingx.clone(),
         };
         let target = requested.clone();
-        let mut snapshot = tokio::task::spawn_blocking(move || {
-            clients.depth(&target, &symbol, segment, limit)
-        })
-        .await
-        .map_err(|error| anyhow!("盘口深度任务异常退出: {error}"))??;
+        let mut snapshot =
+            tokio::task::spawn_blocking(move || clients.depth(&target, &symbol, segment, limit))
+                .await
+                .map_err(|error| anyhow!("盘口深度任务异常退出: {error}"))??;
         // Aster 复用 Binance 客户端，这里统一改用请求方传入的 venue。
         snapshot.venue = requested;
         snapshot.bids.truncate(limit as usize);
@@ -1231,13 +1232,8 @@ impl MarketFeed {
             .map(|feed| feed.intervals())
             .unwrap_or_default();
 
-        let mut opportunities = perp_perp_opportunities(
-            &latest,
-            &funding,
-            &intervals,
-            now,
-            self.poll.as_secs(),
-        );
+        let mut opportunities =
+            perp_perp_opportunities(&latest, &funding, &intervals, now, self.poll.as_secs());
         // 各所结算间隔不同（Hyperliquid 1h、多数 CEX 8h），只按年化收益排序。
         opportunities.sort_by(|a, b| {
             b.funding_annualized_pct

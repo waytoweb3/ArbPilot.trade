@@ -89,16 +89,13 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let close_only = env_string("ARBPILOT_SELFTEST_CLOSE_ONLY").is_some();
     for venue in &venues {
         let report = if close_only {
-            close_only_venue(&config, &http, &exchange, &accounts, venue, &symbol, leverage).await
+            close_only_venue(
+                &config, &http, &exchange, &accounts, venue, &symbol, leverage,
+            )
+            .await
         } else {
             test_venue(
-                &config,
-                &http,
-                &exchange,
-                &accounts,
-                venue,
-                &symbol,
-                leverage,
+                &config, &http, &exchange, &accounts, venue, &symbol, leverage,
             )
             .await
         };
@@ -162,7 +159,11 @@ async fn test_venue(
     }
 
     match accounts.open_positions_for(venue).await {
-        Ok(positions) if positions.iter().any(|p| p.symbol.eq_ignore_ascii_case(symbol)) => {
+        Ok(positions)
+            if positions
+                .iter()
+                .any(|p| p.symbol.eq_ignore_ascii_case(symbol)) =>
+        {
             report.note = format!("已有 {symbol} 持仓，跳过以免干扰");
             return report;
         }
@@ -180,7 +181,12 @@ async fn test_venue(
     };
     let quantity = min_quantity(venue, book.ask);
     let open_price = nudge_up(book.ask);
-    report.note = format!("计划 {} @ {} ≈ ${}", quantity, open_price, quantity * open_price);
+    report.note = format!(
+        "计划 {} @ {} ≈ ${}",
+        quantity,
+        open_price,
+        quantity * open_price
+    );
 
     if let Err(error) = exchange.set_leverage(venue, symbol, leverage).await {
         push_note(&mut report.note, &format!("设置杠杆失败: {error}"));
@@ -336,10 +342,7 @@ async fn close_position(
             quantity,
             limit_price: nudge_down(close_book.bid),
             reduce_only: true,
-            client_order_id: format!(
-                "selftest-close-{}-{attempt}",
-                Utc::now().timestamp_millis()
-            ),
+            client_order_id: format!("selftest-close-{}-{attempt}", Utc::now().timestamp_millis()),
             leverage: Some(leverage),
         };
         match exchange.place_order(venue, request).await {
@@ -381,10 +384,7 @@ fn min_quantity(venue: &str, price: Decimal) -> Decimal {
         // OKX / Gate 内部按张数换算，0.0001 BTC 即 1 张。
         "okx" | "gate" => Decimal::new(1, 4),
         // Hyperliquid 最小名义额 10 美元，步长 0.00001 BTC。
-        "hyperliquid" => ceil_to(
-            Decimal::from(10) / price,
-            Decimal::new(1, 5),
-        ),
+        "hyperliquid" => ceil_to(Decimal::from(10) / price, Decimal::new(1, 5)),
         // Lighter 同时限制最小币量与 10 USDC 名义额。
         "lighter" => ceil_to(Decimal::from(10) / price, Decimal::new(1, 4)).max(Decimal::new(1, 4)),
         _ => Decimal::new(1, 4),

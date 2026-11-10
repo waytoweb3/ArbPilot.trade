@@ -161,15 +161,12 @@ impl BingxFundingClient {
             self.base_url
         );
         let rows = rows(self.http.get_json(&url)?, "contracts")?;
-        let Some(row) = rows
-            .into_iter()
-            .find(|row| {
-                field(row, "symbol")
-                    .and_then(Value::as_str)
-                    .map(|value| value.eq_ignore_ascii_case(&contract))
-                    .unwrap_or(false)
-            })
-        else {
+        let Some(row) = rows.into_iter().find(|row| {
+            field(row, "symbol")
+                .and_then(Value::as_str)
+                .map(|value| value.eq_ignore_ascii_case(&contract))
+                .unwrap_or(false)
+        }) else {
             return Ok(None);
         };
 

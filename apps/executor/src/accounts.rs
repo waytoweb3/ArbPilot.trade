@@ -222,7 +222,9 @@ impl Accounts {
         // 旧版本留下的是明文 JSON；首次读取成功后立即改写为加密信封。
         if plaintext && cipher.is_some() {
             match write_accounts(&data_file, &accounts, cipher.as_ref()) {
-                Ok(()) => tracing::info!(path = %data_file.display(), "已将明文账户文件迁移为加密存储"),
+                Ok(()) => {
+                    tracing::info!(path = %data_file.display(), "已将明文账户文件迁移为加密存储")
+                }
                 Err(error) => tracing::warn!(%error, "迁移账户文件为加密存储失败"),
             }
         }
@@ -786,7 +788,8 @@ fn write_accounts(
         .and_then(|name| name.to_str())
         .unwrap_or("accounts.json");
     let tmp = path.with_file_name(format!("{file_name}.tmp"));
-    std::fs::write(&tmp, sealed).with_context(|| format!("写入临时账户文件失败: {}", tmp.display()))?;
+    std::fs::write(&tmp, sealed)
+        .with_context(|| format!("写入临时账户文件失败: {}", tmp.display()))?;
     restrict_permissions(&tmp)?;
     if std::fs::rename(&tmp, path).is_err() {
         // Windows 不允许 rename 覆盖已存在文件，退化为先删除再替换。

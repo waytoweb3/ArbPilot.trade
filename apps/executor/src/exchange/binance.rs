@@ -76,12 +76,14 @@ impl BinanceFundingClient {
     /// Aster 的接口与 Binance 兼容，同一份实现可以直接复用。
     pub fn funding_intervals(&self) -> anyhow::Result<HashMap<String, i64>> {
         let url = format!("{}/fapi/v1/fundingInfo", self.base_url);
-        let rows: Vec<FundingInfoRow> = serde_json::from_value(self.http.get_json(&url)?)
-            .context("解析 fundingInfo 失败")?;
+        let rows: Vec<FundingInfoRow> =
+            serde_json::from_value(self.http.get_json(&url)?).context("解析 fundingInfo 失败")?;
 
         let mut intervals = HashMap::with_capacity(rows.len());
         for row in rows {
-            let Some(hours) = row.funding_interval_hours.filter(|value| (1..=24).contains(value))
+            let Some(hours) = row
+                .funding_interval_hours
+                .filter(|value| (1..=24).contains(value))
             else {
                 continue;
             };
@@ -328,8 +330,8 @@ impl BinanceMarketClient {
             Segment::Swap | Segment::Delivery => (&self.futures_base_url, "/fapi/v1/exchangeInfo"),
         };
         let url = format!("{base_url}{path}?symbol={symbol}");
-        let payload: ExchangeInfo = serde_json::from_value(self.http.get_json(&url)?)
-            .context("解析 exchangeInfo 失败")?;
+        let payload: ExchangeInfo =
+            serde_json::from_value(self.http.get_json(&url)?).context("解析 exchangeInfo 失败")?;
         let Some(row) = payload
             .symbols
             .into_iter()

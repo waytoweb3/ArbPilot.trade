@@ -9,12 +9,7 @@ use axum::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    error::ApiError,
-    routes::strategies,
-    state::AppState,
-    templates::StrategyTemplate,
-};
+use crate::{error::ApiError, routes::strategies, state::AppState, templates::StrategyTemplate};
 
 /// 模板列表的精简视图：只返回定义与说明，实例化由技能运行时接管。
 #[derive(Debug, Serialize)]

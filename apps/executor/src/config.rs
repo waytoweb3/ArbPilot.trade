@@ -497,7 +497,9 @@ impl Config {
 
         let mut sandbox = SandboxLimits::default();
         if let Ok(value) = env::var("ARBPILOT_SANDBOX_MAX_FUEL") {
-            sandbox.max_fuel = value.parse().context("解析 ARBPILOT_SANDBOX_MAX_FUEL 失败")?;
+            sandbox.max_fuel = value
+                .parse()
+                .context("解析 ARBPILOT_SANDBOX_MAX_FUEL 失败")?;
         }
         if let Ok(value) = env::var("ARBPILOT_SANDBOX_MAX_MEMORY_BYTES") {
             sandbox.max_memory_bytes = value

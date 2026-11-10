@@ -96,7 +96,9 @@ fn check_indicators(issues: &mut Vec<Issue>) {
                     issues,
                     code,
                     name,
-                    runtime_value.map(|value| value.to_string()).unwrap_or_default(),
+                    runtime_value
+                        .map(|value| value.to_string())
+                        .unwrap_or_default(),
                     expected.map(|value| value.to_string()).unwrap_or_default(),
                 );
             }
@@ -108,10 +110,22 @@ fn check_indicators(issues: &mut Vec<Issue>) {
     match (runtime.channel_high, runtime.channel_low, channel) {
         (Some(high), Some(low), Some((expected_high, expected_low))) => {
             if !close_enough(high, expected_high) {
-                report(issues, "math.channel_high_mismatch", "通道上轨", high, expected_high);
+                report(
+                    issues,
+                    "math.channel_high_mismatch",
+                    "通道上轨",
+                    high,
+                    expected_high,
+                );
             }
             if !close_enough(low, expected_low) {
-                report(issues, "math.channel_low_mismatch", "通道下轨", low, expected_low);
+                report(
+                    issues,
+                    "math.channel_low_mismatch",
+                    "通道下轨",
+                    low,
+                    expected_low,
+                );
             }
         }
         (None, None, Some(_)) => issues.push(Issue::error(
@@ -130,13 +144,62 @@ fn check_indicators(issues: &mut Vec<Issue>) {
 
 /// 信号独立校验：用固定输入核对方向限制与边界（等于轨道不算突破）。
 fn check_signals(issues: &mut Vec<Issue>) {
-    let cases: [(Decimal, Decimal, Decimal, SkillDirection, Option<Side>, &str); 6] = [
-        (Decimal::from(105), Decimal::from(104), Decimal::from(96), SkillDirection::Both, Some(Side::Buy), "突破上轨应做多"),
-        (Decimal::from(95), Decimal::from(104), Decimal::from(96), SkillDirection::Both, Some(Side::Sell), "跌破下轨应做空"),
-        (Decimal::from(104), Decimal::from(104), Decimal::from(96), SkillDirection::Both, None, "等于上轨不应触发"),
-        (Decimal::from(96), Decimal::from(104), Decimal::from(96), SkillDirection::Both, None, "等于下轨不应触发"),
-        (Decimal::from(95), Decimal::from(104), Decimal::from(96), SkillDirection::Long, None, "只做多时不应做空"),
-        (Decimal::from(105), Decimal::from(104), Decimal::from(96), SkillDirection::Short, None, "只做空时不应做多"),
+    let cases: [(
+        Decimal,
+        Decimal,
+        Decimal,
+        SkillDirection,
+        Option<Side>,
+        &str,
+    ); 6] = [
+        (
+            Decimal::from(105),
+            Decimal::from(104),
+            Decimal::from(96),
+            SkillDirection::Both,
+            Some(Side::Buy),
+            "突破上轨应做多",
+        ),
+        (
+            Decimal::from(95),
+            Decimal::from(104),
+            Decimal::from(96),
+            SkillDirection::Both,
+            Some(Side::Sell),
+            "跌破下轨应做空",
+        ),
+        (
+            Decimal::from(104),
+            Decimal::from(104),
+            Decimal::from(96),
+            SkillDirection::Both,
+            None,
+            "等于上轨不应触发",
+        ),
+        (
+            Decimal::from(96),
+            Decimal::from(104),
+            Decimal::from(96),
+            SkillDirection::Both,
+            None,
+            "等于下轨不应触发",
+        ),
+        (
+            Decimal::from(95),
+            Decimal::from(104),
+            Decimal::from(96),
+            SkillDirection::Long,
+            None,
+            "只做多时不应做空",
+        ),
+        (
+            Decimal::from(105),
+            Decimal::from(104),
+            Decimal::from(96),
+            SkillDirection::Short,
+            None,
+            "只做空时不应做多",
+        ),
     ];
     for (last, high, low, direction, expected, name) in cases {
         let actual = skill::breakout_signal(last, high, low, direction);
@@ -149,12 +212,54 @@ fn check_signals(issues: &mut Vec<Issue>) {
         }
     }
 
-    let trend_cases: [(Decimal, Decimal, Decimal, SkillDirection, Option<Side>, &str); 5] = [
-        (Decimal::from(103), Decimal::from(102), Decimal::from(100), SkillDirection::Both, Some(Side::Buy), "快线在上且价格站上快线应做多"),
-        (Decimal::from(101), Decimal::from(102), Decimal::from(100), SkillDirection::Both, None, "价格未站上快线不应做多"),
-        (Decimal::from(97), Decimal::from(98), Decimal::from(100), SkillDirection::Both, Some(Side::Sell), "快线在下且价格跌破快线应做空"),
-        (Decimal::from(97), Decimal::from(98), Decimal::from(100), SkillDirection::Long, None, "只做多时不应做空"),
-        (Decimal::from(103), Decimal::ZERO, Decimal::from(100), SkillDirection::Both, None, "快线为 0 时应拒绝信号"),
+    let trend_cases: [(
+        Decimal,
+        Decimal,
+        Decimal,
+        SkillDirection,
+        Option<Side>,
+        &str,
+    ); 5] = [
+        (
+            Decimal::from(103),
+            Decimal::from(102),
+            Decimal::from(100),
+            SkillDirection::Both,
+            Some(Side::Buy),
+            "快线在上且价格站上快线应做多",
+        ),
+        (
+            Decimal::from(101),
+            Decimal::from(102),
+            Decimal::from(100),
+            SkillDirection::Both,
+            None,
+            "价格未站上快线不应做多",
+        ),
+        (
+            Decimal::from(97),
+            Decimal::from(98),
+            Decimal::from(100),
+            SkillDirection::Both,
+            Some(Side::Sell),
+            "快线在下且价格跌破快线应做空",
+        ),
+        (
+            Decimal::from(97),
+            Decimal::from(98),
+            Decimal::from(100),
+            SkillDirection::Long,
+            None,
+            "只做多时不应做空",
+        ),
+        (
+            Decimal::from(103),
+            Decimal::ZERO,
+            Decimal::from(100),
+            SkillDirection::Both,
+            None,
+            "快线为 0 时应拒绝信号",
+        ),
     ];
     for (last, fast, slow, direction, expected, name) in trend_cases {
         let actual = skill::ma_trend_signal(last, fast, slow, direction);
@@ -171,7 +276,11 @@ fn check_signals(issues: &mut Vec<Issue>) {
 /// 网格档位比对：锚定 100、3 档、0.5% 间距应为 99.5/99/98.5 与 100.5/101/101.5。
 fn check_grid(issues: &mut Vec<Issue>) {
     let (buys, sells) = skill::grid_levels(Decimal::from(100), 3, Decimal::new(5, 1));
-    let expected_buys = [Decimal::from(995) / Decimal::from(10), Decimal::from(99), Decimal::new(985, 1)];
+    let expected_buys = [
+        Decimal::from(995) / Decimal::from(10),
+        Decimal::from(99),
+        Decimal::new(985, 1),
+    ];
     let expected_sells = [
         Decimal::from(1005) / Decimal::from(10),
         Decimal::from(101),
@@ -201,12 +310,60 @@ fn check_grid(issues: &mut Vec<Issue>) {
 fn check_stop(issues: &mut Vec<Issue>) {
     let atr = Some(Decimal::from(2));
     let cases: [(Side, Decimal, Decimal, Option<Decimal>, Decimal, bool, &str); 6] = [
-        (Side::Buy, Decimal::from(100), Decimal::from(96), atr, Decimal::from(2), true, "做多触及 2×ATR 应止损"),
-        (Side::Buy, Decimal::from(100), Decimal::new(961, 1), atr, Decimal::from(2), false, "做多未触及止损价不应离场"),
-        (Side::Buy, Decimal::from(100), Decimal::from(90), None, Decimal::from(2), false, "ATR 缺失时不应止损"),
-        (Side::Sell, Decimal::from(100), Decimal::from(104), atr, Decimal::from(2), true, "做空触及 2×ATR 应止损"),
-        (Side::Sell, Decimal::from(100), Decimal::new(1039, 1), atr, Decimal::from(2), false, "做空未触及止损价不应离场"),
-        (Side::Buy, Decimal::from(100), Decimal::from(90), atr, Decimal::ZERO, false, "倍数为 0 时不应止损"),
+        (
+            Side::Buy,
+            Decimal::from(100),
+            Decimal::from(96),
+            atr,
+            Decimal::from(2),
+            true,
+            "做多触及 2×ATR 应止损",
+        ),
+        (
+            Side::Buy,
+            Decimal::from(100),
+            Decimal::new(961, 1),
+            atr,
+            Decimal::from(2),
+            false,
+            "做多未触及止损价不应离场",
+        ),
+        (
+            Side::Buy,
+            Decimal::from(100),
+            Decimal::from(90),
+            None,
+            Decimal::from(2),
+            false,
+            "ATR 缺失时不应止损",
+        ),
+        (
+            Side::Sell,
+            Decimal::from(100),
+            Decimal::from(104),
+            atr,
+            Decimal::from(2),
+            true,
+            "做空触及 2×ATR 应止损",
+        ),
+        (
+            Side::Sell,
+            Decimal::from(100),
+            Decimal::new(1039, 1),
+            atr,
+            Decimal::from(2),
+            false,
+            "做空未触及止损价不应离场",
+        ),
+        (
+            Side::Buy,
+            Decimal::from(100),
+            Decimal::from(90),
+            atr,
+            Decimal::ZERO,
+            false,
+            "倍数为 0 时不应止损",
+        ),
     ];
     for (side, entry, last, atr, multiple, expected, name) in cases {
         let actual = skill::atr_stop_hit(side, entry, last, atr, multiple);
@@ -223,10 +380,30 @@ fn check_stop(issues: &mut Vec<Issue>) {
 /// 盈亏比对：做多价格上涨为正、做空价格上涨为负，百分数保留两位。
 fn check_pnl(issues: &mut Vec<Issue>) {
     let cases = [
-        (Side::Buy, Decimal::from(100), Decimal::from(110), Decimal::from(10)),
-        (Side::Buy, Decimal::from(100), Decimal::from(90), Decimal::from(-10)),
-        (Side::Sell, Decimal::from(100), Decimal::from(110), Decimal::from(-10)),
-        (Side::Sell, Decimal::from(100), Decimal::from(90), Decimal::from(10)),
+        (
+            Side::Buy,
+            Decimal::from(100),
+            Decimal::from(110),
+            Decimal::from(10),
+        ),
+        (
+            Side::Buy,
+            Decimal::from(100),
+            Decimal::from(90),
+            Decimal::from(-10),
+        ),
+        (
+            Side::Sell,
+            Decimal::from(100),
+            Decimal::from(110),
+            Decimal::from(-10),
+        ),
+        (
+            Side::Sell,
+            Decimal::from(100),
+            Decimal::from(90),
+            Decimal::from(10),
+        ),
         (Side::Buy, Decimal::ZERO, Decimal::from(110), Decimal::ZERO),
     ];
     for (side, entry, price, expected) in cases {
@@ -235,7 +412,9 @@ fn check_pnl(issues: &mut Vec<Issue>) {
             issues.push(Issue::error(
                 Dimension::Math,
                 "math.pnl_mismatch",
-                format!("{side:?} 入场 {entry} 出场 {price}：运行期 {actual}%，独立实现 {expected}%"),
+                format!(
+                    "{side:?} 入场 {entry} 出场 {price}：运行期 {actual}%，独立实现 {expected}%"
+                ),
             ));
         }
     }
@@ -244,7 +423,9 @@ fn check_pnl(issues: &mut Vec<Issue>) {
 /// 有效下单金额比对：业务金额与注意事项上限取小。
 fn check_notional(rule: &SkillRule, issues: &mut Vec<Issue>) {
     let expected = if rule.cautions.max_notional_usd > Decimal::ZERO {
-        rule.business.notional_usd.min(rule.cautions.max_notional_usd)
+        rule.business
+            .notional_usd
+            .min(rule.cautions.max_notional_usd)
     } else {
         rule.business.notional_usd
     };
@@ -263,7 +444,10 @@ fn fixture() -> Vec<SandboxCandle> {
         .map(|index| {
             let base = Decimal::from(100 + (index % 7) * 3 + index);
             SandboxCandle {
-                open_time: Utc.timestamp_opt(index * 3_600, 0).single().expect("合法时间"),
+                open_time: Utc
+                    .timestamp_opt(index * 3_600, 0)
+                    .single()
+                    .expect("合法时间"),
                 open: base,
                 high: base + Decimal::from(2),
                 low: base - Decimal::from(2),
@@ -376,7 +560,9 @@ mod tests {
         assert_eq!(runtime.atr, atr(&candles, 3));
         assert_eq!(
             (runtime.channel_high, runtime.channel_low),
-            donchian(&candles, 4).map(|(high, low)| (Some(high), Some(low))).unwrap_or((None, None))
+            donchian(&candles, 4)
+                .map(|(high, low)| (Some(high), Some(low)))
+                .unwrap_or((None, None))
         );
     }
 
@@ -409,7 +595,10 @@ mod tests {
 
     #[test]
     fn pnl_sign_follows_side() {
-        assert_eq!(crate::listing::pnl_pct(Side::Buy, dec!(100), dec!(110)), dec!(10));
+        assert_eq!(
+            crate::listing::pnl_pct(Side::Buy, dec!(100), dec!(110)),
+            dec!(10)
+        );
         assert_eq!(
             crate::listing::pnl_pct(Side::Sell, dec!(100), dec!(110)),
             dec!(-10)

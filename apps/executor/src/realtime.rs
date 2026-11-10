@@ -28,10 +28,10 @@ use serde_json::{json, Value};
 use crate::{
     config::Config,
     exchange::{
-        make_book, millis_to_time, parse_decimal, BookSnapshot, FundingSnapshot,
-        GateFundingClient, HtxFundingClient, LighterFundingClient, MexcFundingClient,
-        OkxMarketClient, ASTER_VENUE, BINGX_VENUE, BITGET_VENUE, BYBIT_VENUE, GATE_VENUE,
-        HTX_VENUE, HYPERLIQUID_VENUE, LIGHTER_VENUE, MEXC_VENUE, OKX_VENUE, VENUE,
+        make_book, millis_to_time, parse_decimal, BookSnapshot, FundingSnapshot, GateFundingClient,
+        HtxFundingClient, LighterFundingClient, MexcFundingClient, OkxMarketClient, ASTER_VENUE,
+        BINGX_VENUE, BITGET_VENUE, BYBIT_VENUE, GATE_VENUE, HTX_VENUE, HYPERLIQUID_VENUE,
+        LIGHTER_VENUE, MEXC_VENUE, OKX_VENUE, VENUE,
     },
     http_client::HttpClient,
     market::{OKX_SPOT_VENUE, SPOT_VENUE},
@@ -218,7 +218,14 @@ impl RealtimeFeed {
             let okx_http = http.clone();
             let okx_symbols = book_symbols.clone();
             spawn("okx-ws", move || {
-                run_okx(okx_feed, okx_http, okx_ws_url, client, okx_symbols, registry)
+                run_okx(
+                    okx_feed,
+                    okx_http,
+                    okx_ws_url,
+                    client,
+                    okx_symbols,
+                    registry,
+                )
             });
         }
 
@@ -274,12 +281,7 @@ impl RealtimeFeed {
             let bitget_url = config.bitget_ws_url.clone();
             let bitget_symbols = book_symbols.clone();
             spawn_loop("bitget-ws", move || {
-                stream_bitget(
-                    &bitget_feed,
-                    &bitget_http,
-                    &bitget_url,
-                    &bitget_symbols,
-                )
+                stream_bitget(&bitget_feed, &bitget_http, &bitget_url, &bitget_symbols)
             });
         }
 
@@ -322,12 +324,7 @@ impl RealtimeFeed {
             let bingx_url = config.bingx_ws_url.clone();
             let bingx_symbols = book_symbols.clone();
             spawn_loop("bingx-ws", move || {
-                stream_bingx(
-                    &bingx_feed,
-                    &bingx_http,
-                    &bingx_url,
-                    &bingx_symbols,
-                )
+                stream_bingx(&bingx_feed, &bingx_http, &bingx_url, &bingx_symbols)
             });
         }
 
@@ -497,10 +494,7 @@ fn message_text(event: WsEvent, gzip: bool) -> anyhow::Result<Option<String>> {
 }
 
 /// 上线前预取每张合约的乘数，避免盘口推送时逐条查 REST。
-fn fetch_multipliers(
-    client: &GateFundingClient,
-    symbols: &[String],
-) -> HashMap<String, Decimal> {
+fn fetch_multipliers(client: &GateFundingClient, symbols: &[String]) -> HashMap<String, Decimal> {
     let mut multipliers = HashMap::new();
     for symbol in symbols {
         match client.symbol_multiplier(symbol) {
@@ -515,10 +509,7 @@ fn fetch_multipliers(
     multipliers
 }
 
-fn fetch_contract_sizes(
-    client: &HtxFundingClient,
-    symbols: &[String],
-) -> HashMap<String, Decimal> {
+fn fetch_contract_sizes(client: &HtxFundingClient, symbols: &[String]) -> HashMap<String, Decimal> {
     let mut sizes = HashMap::new();
     for symbol in symbols {
         match client.symbol_contract_size(symbol) {
@@ -533,10 +524,7 @@ fn fetch_contract_sizes(
     sizes
 }
 
-fn fetch_mexc_sizes(
-    client: &MexcFundingClient,
-    symbols: &[String],
-) -> HashMap<String, Decimal> {
+fn fetch_mexc_sizes(client: &MexcFundingClient, symbols: &[String]) -> HashMap<String, Decimal> {
     let mut sizes = HashMap::new();
     for symbol in symbols {
         match client.symbol_contract_size(symbol) {
@@ -718,7 +706,12 @@ fn stream_bitget(
             continue;
         };
         if let Ok(snapshot) = make_book(bid, bid_qty, ask, ask_qty) {
-            feed.store_book(BITGET_VENUE, &symbol.to_ascii_uppercase(), snapshot, Utc::now());
+            feed.store_book(
+                BITGET_VENUE,
+                &symbol.to_ascii_uppercase(),
+                snapshot,
+                Utc::now(),
+            );
         }
     }
 }
@@ -760,8 +753,7 @@ fn stream_gate(
         }
         if last_ping.elapsed() >= GATE_PING_INTERVAL {
             ws.send_text(
-                &json!({ "time": Utc::now().timestamp(), "channel": "futures.ping" })
-                    .to_string(),
+                &json!({ "time": Utc::now().timestamp(), "channel": "futures.ping" }).to_string(),
             )?;
             last_ping = Instant::now();
         }
@@ -807,13 +799,11 @@ fn stream_gate(
         let Some(multiplier) = multipliers.get(&symbol).copied() else {
             continue;
         };
-        let text_field = |name: &str| -> Option<Decimal> {
-            parse_decimal(result.get(name)?.as_str()?).ok()
-        };
+        let text_field =
+            |name: &str| -> Option<Decimal> { parse_decimal(result.get(name)?.as_str()?).ok() };
         // Gate 的数量字段 `B` / `A` 是数字而不是字符串。
-        let number_field = |name: &str| -> Option<Decimal> {
-            parse_decimal(&result.get(name)?.to_string()).ok()
-        };
+        let number_field =
+            |name: &str| -> Option<Decimal> { parse_decimal(&result.get(name)?.to_string()).ok() };
         let (Some(bid), Some(bid_size), Some(ask), Some(ask_size)) = (
             text_field("b"),
             number_field("B"),
@@ -822,12 +812,7 @@ fn stream_gate(
         ) else {
             continue;
         };
-        if let Ok(snapshot) = make_book(
-            bid,
-            bid_size * multiplier,
-            ask,
-            ask_size * multiplier,
-        ) {
+        if let Ok(snapshot) = make_book(bid, bid_size * multiplier, ask, ask_size * multiplier) {
             feed.store_book(GATE_VENUE, &symbol, snapshot, Utc::now());
         }
     }
@@ -851,8 +836,7 @@ fn stream_htx(
     for symbol in &symbols {
         if let Some(contract) = dash_contract(symbol) {
             ws.send_text(
-                &json!({ "sub": format!("market.{contract}.bbo"), "id": "arbpilot" })
-                    .to_string(),
+                &json!({ "sub": format!("market.{contract}.bbo"), "id": "arbpilot" }).to_string(),
             )?;
         }
     }
@@ -1028,7 +1012,9 @@ fn stream_bingx(
             return Ok(());
         }
         if last_ping.elapsed() >= BINGX_PING_INTERVAL {
-            ws.send_text(&json!({ "ping": Utc::now().timestamp_millis().to_string() }).to_string())?;
+            ws.send_text(
+                &json!({ "ping": Utc::now().timestamp_millis().to_string() }).to_string(),
+            )?;
             last_ping = Instant::now();
         }
         let Some(event) = ws.poll()? else {
@@ -1057,9 +1043,8 @@ fn stream_bingx(
             continue;
         };
         let symbol = contract.replace('-', "").to_ascii_uppercase();
-        let field = |name: &str| -> Option<Decimal> {
-            parse_decimal(data.get(name)?.as_str()?).ok()
-        };
+        let field =
+            |name: &str| -> Option<Decimal> { parse_decimal(data.get(name)?.as_str()?).ok() };
         let (Some(bid), Some(bid_qty), Some(ask), Some(ask_qty)) =
             (field("b"), field("B"), field("a"), field("A"))
         else {
@@ -1228,7 +1213,6 @@ fn stream_lighter(
     }
 }
 
-
 /// Binance 盘口线程：`/stream?streams=` 组合多条 `<symbol>@bookTicker`。
 fn run_binance_books(
     feed: Arc<RealtimeFeed>,
@@ -1336,15 +1320,7 @@ fn run_okx(
             }
         }
 
-        match stream_okx(
-            &feed,
-            &http,
-            &url,
-            &symbols,
-            &ct_values,
-            &books,
-            &funding,
-        ) {
+        match stream_okx(&feed, &http, &url, &symbols, &ct_values, &books, &funding) {
             Ok(()) => tracing::warn!("OKX WebSocket 已结束，准备重连"),
             Err(error) => {
                 let now = Instant::now();

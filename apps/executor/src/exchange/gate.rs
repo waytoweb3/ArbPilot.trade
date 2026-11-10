@@ -169,7 +169,9 @@ impl GateFundingClient {
             let Some(symbol) = internal_symbol(&row.name) else {
                 continue;
             };
-            let Some(secs) = row.funding_interval.filter(|secs| (60..=86_400).contains(secs))
+            let Some(secs) = row
+                .funding_interval
+                .filter(|secs| (60..=86_400).contains(secs))
             else {
                 continue;
             };
@@ -201,10 +203,7 @@ impl GateFundingClient {
             let level = rows
                 .first()
                 .ok_or_else(|| anyhow!("Gate order_book 缺少{label}: {contract}"))?;
-            Ok((
-                parse_json_decimal(&level.p)?,
-                parse_json_decimal(&level.s)?,
-            ))
+            Ok((parse_json_decimal(&level.p)?, parse_json_decimal(&level.s)?))
         };
         let (bid, bid_size) = level(&row.bids, "买一")?;
         let (ask, ask_size) = level(&row.asks, "卖一")?;
@@ -240,12 +239,7 @@ impl GateFundingClient {
     ///
     /// Gate v4 的 K 线行是 `{t, o, h, l, c, v}` 对象（`t` 为 Unix 秒），
     /// 与其它交易所的数组行不同，这里单独解析。
-    pub fn candles(
-        &self,
-        symbol: &str,
-        interval: &str,
-        limit: u32,
-    ) -> anyhow::Result<Vec<Candle>> {
+    pub fn candles(&self, symbol: &str, interval: &str, limit: u32) -> anyhow::Result<Vec<Candle>> {
         let contract = gate_contract(symbol)?;
         let interval = gate_interval(interval)?;
         let url = format!(

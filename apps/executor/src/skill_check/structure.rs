@@ -63,10 +63,7 @@ pub fn parse(text: &str) -> Parsed {
                 "structure.syntax",
                 format!("YAML 语法错误：{error}"),
             ));
-            return Parsed {
-                rule: None,
-                issues,
-            };
+            return Parsed { rule: None, issues };
         }
     };
     let Some(root) = value.as_mapping() else {
@@ -75,10 +72,7 @@ pub fn parse(text: &str) -> Parsed {
             "structure.root_mapping",
             "SKILL.md 顶层必须是键值映射，实际不是",
         ));
-        return Parsed {
-            rule: None,
-            issues,
-        };
+        return Parsed { rule: None, issues };
     };
     unknown_fields(root, ROOT_FIELDS, "skill", &mut issues);
 
@@ -427,9 +421,8 @@ fn optional_string(
     issues: &mut Vec<Issue>,
 ) -> String {
     match lookup(map, name) {
-        Some(value) => {
-            as_string(value, &format!("{path}.{name}"), issues).unwrap_or_else(|| default.to_string())
-        }
+        Some(value) => as_string(value, &format!("{path}.{name}"), issues)
+            .unwrap_or_else(|| default.to_string()),
         None => {
             default_applied(path, name, default, issues);
             default.to_string()
@@ -824,9 +817,6 @@ business:
     fn documented_aliases_are_accepted() {
         let text = MINIMAL.replace("kind: grid", "kind: ma-trend");
         let parsed = parse(&text);
-        assert_eq!(
-            parsed.rule.expect("别名应可解析").kind,
-            SkillKind::MaTrend
-        );
+        assert_eq!(parsed.rule.expect("别名应可解析").kind, SkillKind::MaTrend);
     }
 }

@@ -72,8 +72,7 @@ pub async fn update_settings(
         }
         rule.name = rule.name.trim().to_string();
         rule.watch_venues = normalize(std::mem::take(&mut rule.watch_venues), &watch);
-        rule.execution_venues =
-            normalize(std::mem::take(&mut rule.execution_venues), &execution);
+        rule.execution_venues = normalize(std::mem::take(&mut rule.execution_venues), &execution);
     }
 
     let saved = state

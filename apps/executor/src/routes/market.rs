@@ -326,9 +326,7 @@ pub async fn create_publication(
     let record = find_strategy(&state, body.strategy_id)?;
     // 订阅导入的策略属于他人发布，不允许再次对外发布。
     if record.source_publication_id.is_some() {
-        return Err(ApiError::Conflict(
-            "订阅导入的策略不能再次发布".to_string(),
-        ));
+        return Err(ApiError::Conflict("订阅导入的策略不能再次发布".to_string()));
     }
 
     let now = Utc::now();
@@ -461,9 +459,7 @@ pub async fn update_publication(
             // 重新读取策略当前版本，确保发布的是通过校验且代码已部署的版本。
             let mut record = find_strategy(&state, publication.strategy_id)?;
             if record.source_publication_id.is_some() {
-                return Err(ApiError::Conflict(
-                    "订阅导入的策略不能再次发布".to_string(),
-                ));
+                return Err(ApiError::Conflict("订阅导入的策略不能再次发布".to_string()));
             }
             record.validation = record.definition.validate(&state.config.risk);
             let readiness = publish_readiness(&record, &record.validation);
@@ -481,8 +477,10 @@ pub async fn update_publication(
                 publication.author_name = author.display_name.clone();
             }
             // 冻结发布版本的运行载体：沙箱模块或技能参数，订阅者据此在自己机器上运行。
-            publication.artifact_sha256 =
-                record.sandbox.as_ref().map(|binding| binding.artifact_hash.clone());
+            publication.artifact_sha256 = record
+                .sandbox
+                .as_ref()
+                .map(|binding| binding.artifact_hash.clone());
             publication.skill = record.skill.clone();
             if publication.artifact_sha256.is_none() && publication.skill.is_none() {
                 return Err(ApiError::Conflict(
@@ -860,8 +858,10 @@ async fn install_bundle(
                     "交付代码与发布哈希不一致，已拒绝导入".to_string(),
                 ));
             }
-            let abi_version = crate::sandbox::inspect(&wasm, &state.config.sandbox)
-                .map_err(|error| ApiError::BadRequest(format!("交付代码未通过沙箱检查: {error}")))?;
+            let abi_version =
+                crate::sandbox::inspect(&wasm, &state.config.sandbox).map_err(|error| {
+                    ApiError::BadRequest(format!("交付代码未通过沙箱检查: {error}"))
+                })?;
 
             let short_hash = &sha256[..sha256.len().min(12)];
             // 官方模板与本机内置模板字节完全相同，哈希已入库时直接复用，避免重复插入。
@@ -921,11 +921,9 @@ async fn install_bundle(
     record.source_publication_id = Some(publication_id);
     record.sandbox = sandbox;
     record.skill = skill;
-    record.runtime.record(
-        StrategyEventLevel::Info,
-        format!("{note}：{title}"),
-        None,
-    );
+    record
+        .runtime
+        .record(StrategyEventLevel::Info, format!("{note}：{title}"), None);
     record.validation = record.definition.validate(&state.risk_limits());
 
     strategies::replace(state, &record);

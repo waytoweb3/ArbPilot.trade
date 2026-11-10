@@ -294,7 +294,8 @@ impl BybitFundingClient {
             self.base_url
         );
         let envelope: Envelope<InstrumentResult> =
-            serde_json::from_value(self.http.get_json(&url)?).context("解析 Bybit instruments 失败")?;
+            serde_json::from_value(self.http.get_json(&url)?)
+                .context("解析 Bybit instruments 失败")?;
         let Some(row) = into_result(envelope, "market/instruments-info")?
             .list
             .into_iter()
@@ -462,12 +463,7 @@ impl BybitFundingClient {
     }
 
     /// 线性永续 K 线；Bybit 返回按时间倒序的数组行。
-    pub fn candles(
-        &self,
-        symbol: &str,
-        interval: &str,
-        limit: u32,
-    ) -> anyhow::Result<Vec<Candle>> {
+    pub fn candles(&self, symbol: &str, interval: &str, limit: u32) -> anyhow::Result<Vec<Candle>> {
         let interval = bybit_interval(interval)?;
         let url = format!(
             "{}/v5/market/kline?category=linear&symbol={symbol}&interval={interval}&limit={}",
@@ -576,12 +572,17 @@ mod tests {
         let row = payload.list.into_iter().next().expect("应含一条合约");
         let lot = row.lot_size_filter.expect("应含 lotSizeFilter");
         assert_eq!(
-            lot.qty_step.as_deref().and_then(|value| parse_decimal(value).ok()),
+            lot.qty_step
+                .as_deref()
+                .and_then(|value| parse_decimal(value).ok()),
             Some(dec!(0.001))
         );
         let price = row.price_filter.expect("应含 priceFilter");
         assert_eq!(
-            price.tick_size.as_deref().and_then(|value| parse_decimal(value).ok()),
+            price
+                .tick_size
+                .as_deref()
+                .and_then(|value| parse_decimal(value).ok()),
             Some(dec!(0.1))
         );
     }

@@ -1,7 +1,4 @@
-use std::{
-    sync::RwLock,
-    time::Duration,
-};
+use std::{sync::RwLock, time::Duration};
 
 use arb_core::OrderOrigin;
 use chrono::{DateTime, Utc};
@@ -208,7 +205,9 @@ pub async fn cancel(state: &AppState, id: Uuid) -> Result<ConditionalOrder, ApiE
         return Err(ApiError::NotFound("条件单不存在".to_string()));
     };
     if order.status != ConditionalStatus::Active {
-        return Err(ApiError::BadRequest("只有等待中的条件单可以撤销".to_string()));
+        return Err(ApiError::BadRequest(
+            "只有等待中的条件单可以撤销".to_string(),
+        ));
     }
     let Some(order) = state.conditional.update(id, |order| {
         order.status = ConditionalStatus::Cancelled;
@@ -242,10 +241,7 @@ async fn evaluate(state: &AppState) {
     let mut funding: Option<Vec<crate::funding::FundingStatus>> = None;
     for order in pending {
         let now = Utc::now();
-        if order
-            .expires_at
-            .is_some_and(|expires_at| expires_at <= now)
-        {
+        if order.expires_at.is_some_and(|expires_at| expires_at <= now) {
             if let Some(expired) = state.conditional.update(order.id, |order| {
                 order.status = ConditionalStatus::Expired;
                 order.note = Some("已超过有效期，条件单自动失效".to_string());

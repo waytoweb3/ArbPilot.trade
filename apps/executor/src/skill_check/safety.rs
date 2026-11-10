@@ -150,7 +150,8 @@ fn check_engine(limits: &RiskLimits, issues: &mut Vec<Issue>) {
             {
                 let mut intent = base(now);
                 intent.legs[0].reduce_only = true;
-                intent.legs[0].quantity = (limits.max_order_notional_usd * Decimal::from(10)) / price;
+                intent.legs[0].quantity =
+                    (limits.max_order_notional_usd * Decimal::from(10)) / price;
                 intent
             },
             context(limits, now, limits.max_total_notional_usd, false),
@@ -191,7 +192,12 @@ fn check_engine(limits: &RiskLimits, issues: &mut Vec<Issue>) {
     ));
 }
 
-fn intent(rule: &SkillRule, limits: &RiskLimits, notional: Decimal, now: DateTime<Utc>) -> OrderIntent {
+fn intent(
+    rule: &SkillRule,
+    limits: &RiskLimits,
+    notional: Decimal,
+    now: DateTime<Utc>,
+) -> OrderIntent {
     let price = Decimal::from(SAMPLE_PRICE);
     let venue = rule
         .steps

@@ -306,8 +306,7 @@ fn check_grid(rule: &SkillRule, effective_notional: Decimal, issues: &mut Vec<Is
                 business.grid_spacing_pct
             ),
         ));
-    } else if business.grid_spacing_pct * Decimal::from(business.grid_levels)
-        >= Decimal::from(100)
+    } else if business.grid_spacing_pct * Decimal::from(business.grid_levels) >= Decimal::from(100)
     {
         issues.push(Issue::error(
             Dimension::Rules,
@@ -335,9 +334,7 @@ fn check_grid(rule: &SkillRule, effective_notional: Decimal, issues: &mut Vec<Is
                     issues.push(Issue::error(
                         Dimension::Rules,
                         "rules.grid_below_min_notional",
-                        format!(
-                            "{venue} 每档金额 {per_level} 低于交易所最小下单额 {minimum}"
-                        ),
+                        format!("{venue} 每档金额 {per_level} 低于交易所最小下单额 {minimum}"),
                     ));
                 }
             }
@@ -464,8 +461,7 @@ mod tests {
         let mut rule = breakout();
         rule.trigger.lookback = 30;
         assert!(
-            error_codes(&check(&rule, &limits()))
-                .contains(&"rules.indicator_window_not_covered")
+            error_codes(&check(&rule, &limits())).contains(&"rules.indicator_window_not_covered")
         );
     }
 
@@ -511,9 +507,7 @@ mod tests {
         let mut rule = breakout();
         rule.kind = SkillKind::Event;
         rule.steps.direction = SkillDirection::Short;
-        assert!(
-            error_codes(&check(&rule, &limits())).contains(&"rules.event_direction_long_only")
-        );
+        assert!(error_codes(&check(&rule, &limits())).contains(&"rules.event_direction_long_only"));
     }
 
     #[test]
@@ -523,10 +517,8 @@ mod tests {
         rule.business.take_profit_pct = Decimal::ZERO;
         rule.business.stop_loss_pct = Decimal::ZERO;
         let issues = check(&rule, &limits());
-        assert!(issues
-            .iter()
-            .any(|issue| issue.code == "rules.no_exit"
-                && issue.severity == super::super::Severity::Warning));
+        assert!(issues.iter().any(|issue| issue.code == "rules.no_exit"
+            && issue.severity == super::super::Severity::Warning));
     }
 
     #[test]

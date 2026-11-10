@@ -102,10 +102,7 @@ mod tests {
     #[test]
     fn allows_anonymous_only_for_public_market_reads() {
         use axum::http::Method;
-        assert!(allows_anonymous(
-            &Method::GET,
-            "/api/v1/funding/status"
-        ));
+        assert!(allows_anonymous(&Method::GET, "/api/v1/funding/status"));
         assert!(allows_anonymous(&Method::GET, "/funding/status"));
         assert!(allows_anonymous(
             &Method::GET,
@@ -115,24 +112,26 @@ mod tests {
             &Method::GET,
             "/api/v1/market/publications/abc/bundle"
         ));
-        assert!(!allows_anonymous(
-            &Method::POST,
-            "/api/v1/funding/status"
-        ));
+        assert!(!allows_anonymous(&Method::POST, "/api/v1/funding/status"));
         assert!(!allows_anonymous(
             &Method::GET,
             "/api/v1/market/subscriptions"
         ));
-        assert!(!allows_anonymous(
-            &Method::GET,
-            "/api/v1/funding/history"
-        ));
+        assert!(!allows_anonymous(&Method::GET, "/api/v1/funding/history"));
         assert!(!allows_anonymous(&Method::GET, "/api/v1/accounts"));
     }
 
     #[test]
     fn allows_market_data_and_blocks_trading_paths() {
-        for path in ["/funding/status", "/news", "/chain/prices", "/market/leaderboard", "/events", "/prices/stream", "/templates"] {
+        for path in [
+            "/funding/status",
+            "/news",
+            "/chain/prices",
+            "/market/leaderboard",
+            "/events",
+            "/prices/stream",
+            "/templates",
+        ] {
             assert!(is_public_read(path), "{path} 应允许只读访问");
         }
         for path in [

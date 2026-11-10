@@ -410,12 +410,7 @@ impl LighterFundingClient {
     }
 
     /// 永续 K 线；`/api/v1/candles` 单次最多返回 500 根。
-    pub fn candles(
-        &self,
-        symbol: &str,
-        interval: &str,
-        limit: u32,
-    ) -> anyhow::Result<Vec<Candle>> {
+    pub fn candles(&self, symbol: &str, interval: &str, limit: u32) -> anyhow::Result<Vec<Candle>> {
         let (resolution, step) = lighter_resolution(interval)?;
         let mut market_id = self.market_ids(false)?.get(symbol).copied();
         if market_id.is_none() {

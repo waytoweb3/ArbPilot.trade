@@ -106,7 +106,10 @@ fn signal_series(direction: SkillDirection) -> Vec<SandboxCandle> {
         }
         let close = price.max(Decimal::ONE);
         candles.push(SandboxCandle {
-            open_time: Utc.timestamp_opt(index * 3_600, 0).single().expect("合法时间"),
+            open_time: Utc
+                .timestamp_opt(index * 3_600, 0)
+                .single()
+                .expect("合法时间"),
             open: close,
             high: close,
             low: close,
@@ -123,7 +126,10 @@ fn grid_series() -> Vec<SandboxCandle> {
         .map(|index| {
             let close = Decimal::from(100 + (index % 5) * 2 - 4);
             SandboxCandle {
-                open_time: Utc.timestamp_opt(index * 3_600, 0).single().expect("合法时间"),
+                open_time: Utc
+                    .timestamp_opt(index * 3_600, 0)
+                    .single()
+                    .expect("合法时间"),
                 open: close,
                 high: close + Decimal::ONE,
                 low: close - Decimal::ONE,
@@ -173,8 +179,11 @@ fn grid_hits(rule: &SkillRule, candles: &[SandboxCandle]) -> usize {
     let Some(anchor) = candles.first().map(|candle| candle.close) else {
         return 0;
     };
-    let (buys, sells) =
-        skill::grid_levels(anchor, rule.business.grid_levels, rule.business.grid_spacing_pct);
+    let (buys, sells) = skill::grid_levels(
+        anchor,
+        rule.business.grid_levels,
+        rule.business.grid_spacing_pct,
+    );
     if buys.is_empty() && sells.is_empty() {
         return 0;
     }
@@ -265,10 +274,14 @@ mod tests {
     fn rising_market_triggers_breakout() {
         let issues = check(&breakout_rule(SkillDirection::Both));
         assert!(
-            !issues.iter().any(|issue| issue.code == "agent.never_triggers"),
+            !issues
+                .iter()
+                .any(|issue| issue.code == "agent.never_triggers"),
             "单边上涨应识别到突破：{issues:?}"
         );
-        assert!(!issues.iter().any(|issue| issue.code == "agent.notify_only_ignored"));
+        assert!(!issues
+            .iter()
+            .any(|issue| issue.code == "agent.notify_only_ignored"));
     }
 
     #[test]
@@ -288,10 +301,12 @@ mod tests {
         rule.kind = SkillKind::Event;
         rule.output.action = SkillAction::NotifyOnly;
         let issues = check(&rule);
-        assert!(!issues.iter().any(|issue| {
-            issue.severity == super::super::Severity::Error
-        }));
-        assert!(issues.iter().any(|issue| issue.code == "agent.event_notify_only"));
+        assert!(!issues
+            .iter()
+            .any(|issue| { issue.severity == super::super::Severity::Error }));
+        assert!(issues
+            .iter()
+            .any(|issue| issue.code == "agent.event_notify_only"));
     }
 
     #[test]
@@ -299,7 +314,9 @@ mod tests {
         let mut rule = breakout_rule(SkillDirection::Both);
         rule.steps.execution_venues.clear();
         let issues = check(&rule);
-        assert!(issues.iter().any(|issue| issue.code == "agent.venues_fallback"));
+        assert!(issues
+            .iter()
+            .any(|issue| issue.code == "agent.venues_fallback"));
     }
 
     #[test]
@@ -309,7 +326,9 @@ mod tests {
         rule.business.grid_levels = 2;
         rule.business.grid_spacing_pct = rust_decimal_macros::dec!(1);
         let issues = check(&rule);
-        assert!(!issues.iter().any(|issue| issue.code == "agent.never_triggers"));
+        assert!(!issues
+            .iter()
+            .any(|issue| issue.code == "agent.never_triggers"));
     }
 
     #[test]

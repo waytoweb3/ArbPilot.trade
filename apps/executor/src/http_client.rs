@@ -565,7 +565,10 @@ mod tests {
     fn accepts_non_200_success_status() {
         // Gate v4 下单成功时返回 201，响应体是订单 JSON。
         let raw = b"HTTP/1.1 201 Created\r\nContent-Length: 8\r\n\r\n{\"id\":1}";
-        assert_eq!(parse_response(raw).expect("2xx 应可解析"), b"{\"id\":1}".to_vec());
+        assert_eq!(
+            parse_response(raw).expect("2xx 应可解析"),
+            b"{\"id\":1}".to_vec()
+        );
     }
 
     #[test]

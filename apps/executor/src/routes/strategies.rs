@@ -224,9 +224,7 @@ pub async fn update_execution_mode(
         return Ok(Json(record));
     }
     if record.status == StrategyStatus::Running {
-        return Err(ApiError::Conflict(
-            "请先暂停策略再切换下单模式".to_string(),
-        ));
+        return Err(ApiError::Conflict("请先暂停策略再切换下单模式".to_string()));
     }
     if record.runtime.open.is_some() {
         return Err(ApiError::Conflict(
@@ -240,9 +238,11 @@ pub async fn update_execution_mode(
         StrategyExecutionMode::Real => "真实下单",
         StrategyExecutionMode::Paper => "模拟下单",
     };
-    record
-        .runtime
-        .record(StrategyEventLevel::Info, format!("下单模式已切换为{label}"), None);
+    record.runtime.record(
+        StrategyEventLevel::Info,
+        format!("下单模式已切换为{label}"),
+        None,
+    );
 
     replace(&state, &record);
     persist(&state, &record).await;
@@ -635,7 +635,11 @@ pub(crate) async fn listing_note(state: &AppState, record: &StrategyRecord) -> O
                         [] => "内置关键词".to_string(),
                         [only] => only.clone(),
                         [first, ..] => {
-                            format!("{} 等 {} 个关键词", first, rule.trigger.event_keywords.len())
+                            format!(
+                                "{} 等 {} 个关键词",
+                                first,
+                                rule.trigger.event_keywords.len()
+                            )
                         }
                     };
                     format!("{sources}（{keywords}）")

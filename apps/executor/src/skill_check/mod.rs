@@ -350,10 +350,7 @@ cautions:
                 evaluation.report.passed(dimension),
                 "{} 未通过：{:?}",
                 dimension.label(),
-                evaluation
-                    .report
-                    .issues_in(dimension)
-                    .collect::<Vec<_>>()
+                evaluation.report.issues_in(dimension).collect::<Vec<_>>()
             );
         }
         let view = evaluation.report.view();

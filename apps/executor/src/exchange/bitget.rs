@@ -386,12 +386,7 @@ impl BitgetFundingClient {
     }
 
     /// USDT 本位永续 K 线；Bitget 返回按时间倒序的数组行，单次最多 200 条。
-    pub fn candles(
-        &self,
-        symbol: &str,
-        interval: &str,
-        limit: u32,
-    ) -> anyhow::Result<Vec<Candle>> {
+    pub fn candles(&self, symbol: &str, interval: &str, limit: u32) -> anyhow::Result<Vec<Candle>> {
         let granularity = bitget_interval(interval)?;
         let url = format!(
             "{}/api/v2/mix/market/candles?symbol={symbol}&productType=usdt-futures&granularity={granularity}&limit={}",

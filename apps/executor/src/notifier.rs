@@ -144,14 +144,8 @@ impl Notifier {
                 opportunity.net_edge_bps,
                 opportunity.max_notional_usd,
             );
-            self.deliver(
-                &settings,
-                NoticeKind::Funding,
-                title,
-                message,
-                message_en,
-            )
-            .await;
+            self.deliver(&settings, NoticeKind::Funding, title, message, message_en)
+                .await;
             sent += 1;
         }
     }

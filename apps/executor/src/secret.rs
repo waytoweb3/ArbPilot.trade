@@ -69,8 +69,8 @@ impl CredentialCipher {
     pub fn open(data_file: &Path) -> anyhow::Result<Self> {
         let key_file = key_file_path(data_file);
         let (key, backend) = load_or_create_key(&key_file, data_file)?;
-        let unbound = UnboundKey::new(&CHACHA20_POLY1305, &key)
-            .map_err(|_| anyhow!("主密钥长度无效"))?;
+        let unbound =
+            UnboundKey::new(&CHACHA20_POLY1305, &key).map_err(|_| anyhow!("主密钥长度无效"))?;
         Ok(Self {
             key: LessSafeKey::new(unbound),
             backend,
@@ -139,11 +139,7 @@ impl CredentialCipher {
             .context("解析密文失败")?;
         let plaintext = self
             .key
-            .open_in_place(
-                Nonce::assume_unique_for_key(nonce),
-                Aad::empty(),
-                &mut data,
-            )
+            .open_in_place(Nonce::assume_unique_for_key(nonce), Aad::empty(), &mut data)
             .map_err(|_| anyhow!("解密凭证失败：主密钥不匹配或文件已损坏"))?;
         Ok(plaintext.to_vec())
     }
@@ -179,8 +175,12 @@ fn load_or_create_key(
         // 不必再让系统弹窗授权。
         #[cfg(all(debug_assertions, target_os = "macos"))]
         match write_key_file(key_file, &key) {
-            Ok(()) => tracing::info!(path = %key_file.display(), "已将系统钥匙串主密钥镜像到本机密钥文件"),
-            Err(error) => tracing::warn!(%error, path = %key_file.display(), "镜像主密钥到本机密钥文件失败，继续使用系统钥匙串"),
+            Ok(()) => {
+                tracing::info!(path = %key_file.display(), "已将系统钥匙串主密钥镜像到本机密钥文件")
+            }
+            Err(error) => {
+                tracing::warn!(%error, path = %key_file.display(), "镜像主密钥到本机密钥文件失败，继续使用系统钥匙串")
+            }
         }
         return Ok((key, StorageBackend::Keychain));
     }

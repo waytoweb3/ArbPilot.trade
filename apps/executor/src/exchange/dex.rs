@@ -10,7 +10,9 @@ use sha2::{Digest as _, Sha256};
 use sha3::Keccak256;
 
 use lighters::{
-    constants::{CROSS_MARGIN, GOOD_TILL_TIME, LIMIT_ORDER, MAX_ORDER_EXPIRY, TX_TYPE_L2_CREATE_ORDER},
+    constants::{
+        CROSS_MARGIN, GOOD_TILL_TIME, LIMIT_ORDER, MAX_ORDER_EXPIRY, TX_TYPE_L2_CREATE_ORDER,
+    },
     signer::KeyManager,
     transactions::{sign_tx, CreateOrder, OrderInfo, TxInfo, UpdateLeverage},
 };

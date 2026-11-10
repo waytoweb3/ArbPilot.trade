@@ -30,12 +30,8 @@ pub struct StrategyTemplate {
 }
 
 /// 官方内置模板：由官方实例发布到策略市场，用户执行器通过导入获得。
-pub const OFFICIAL_TEMPLATE_KEYS: [&str; 4] = [
-    "turtle-breakout",
-    "ma-trend",
-    "grid",
-    "listing-follow",
-];
+pub const OFFICIAL_TEMPLATE_KEYS: [&str; 4] =
+    ["turtle-breakout", "ma-trend", "grid", "listing-follow"];
 
 /// 五个内置模板的默认集合。
 pub fn builtin() -> Vec<StrategyTemplate> {
@@ -224,7 +220,10 @@ async fn rename_legacy_strategies(state: &AppState, builtins: &[StrategyTemplate
         })
         .collect();
     for mut record in state.store.load_strategies().await {
-        let Some((_, name)) = legacy.iter().find(|(old, _)| *old == record.definition.name) else {
+        let Some((_, name)) = legacy
+            .iter()
+            .find(|(old, _)| *old == record.definition.name)
+        else {
             continue;
         };
         record.definition.name = name.clone();

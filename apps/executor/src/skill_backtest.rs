@@ -296,12 +296,8 @@ fn exit_by_signal(
     match rule.kind {
         SkillKind::Breakout => {
             let reverse = match open.side {
-                Side::Buy => indicators
-                    .channel_low
-                    .is_some_and(|low| last < low),
-                Side::Sell => indicators
-                    .channel_high
-                    .is_some_and(|high| last > high),
+                Side::Buy => indicators.channel_low.is_some_and(|low| last < low),
+                Side::Sell => indicators.channel_high.is_some_and(|high| last > high),
             };
             reverse
                 || skill::atr_stop_hit(
@@ -603,9 +599,7 @@ pub async fn run(
     }
 
     if notional <= Decimal::ZERO {
-        return Err(
-            "公告类技能依赖实时公告，历史 K 线无法回放；请改用模拟模式实测".to_string(),
-        );
+        return Err("公告类技能依赖实时公告，历史 K 线无法回放；请改用模拟模式实测".to_string());
     }
     if bars == 0 {
         return Err("没有取到历史 K 线，无法回测；请检查交易对与交易所配置".to_string());
@@ -695,9 +689,18 @@ mod tests {
     use chrono::TimeZone;
     use rust_decimal_macros::dec;
 
-    fn candle(index: i64, open: Decimal, high: Decimal, low: Decimal, close: Decimal) -> SandboxCandle {
+    fn candle(
+        index: i64,
+        open: Decimal,
+        high: Decimal,
+        low: Decimal,
+        close: Decimal,
+    ) -> SandboxCandle {
         SandboxCandle {
-            open_time: Utc.timestamp_opt(index * 3_600, 0).single().expect("合法时间"),
+            open_time: Utc
+                .timestamp_opt(index * 3_600, 0)
+                .single()
+                .expect("合法时间"),
             open,
             high,
             low,
@@ -802,7 +805,13 @@ mod tests {
         rule.business.grid_spacing_pct = dec!(1);
         rule.business.grid_share_pct = dec!(50);
         let prices = [100, 100, 99, 99, 100, 100, 101, 101, 100];
-        let trades = replay(&rule, "BTCUSDT", &series(&prices), dec!(1000), Costs::default());
+        let trades = replay(
+            &rule,
+            "BTCUSDT",
+            &series(&prices),
+            dec!(1000),
+            Costs::default(),
+        );
         assert!(!trades.is_empty(), "触及网格档位应成交：{trades:?}");
         // 锚定 100、间距 1%、两档：档位价只能是 99/98（买）或 101/102（卖）。
         assert!(trades.iter().all(|trade| {
@@ -818,7 +827,13 @@ mod tests {
     fn event_rule_cannot_be_replayed() {
         let mut rule = breakout_rule();
         rule.kind = SkillKind::Event;
-        let trades = replay(&rule, "BTCUSDT", &series(&[10, 11, 12]), dec!(1000), Costs::default());
+        let trades = replay(
+            &rule,
+            "BTCUSDT",
+            &series(&[10, 11, 12]),
+            dec!(1000),
+            Costs::default(),
+        );
         assert!(trades.is_empty());
     }
 }

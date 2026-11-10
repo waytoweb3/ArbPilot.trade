@@ -47,10 +47,7 @@ pub fn build(state: AppState) -> Router {
             "/conditional-orders",
             get(conditional::list).post(conditional::create),
         )
-        .route(
-            "/conditional-orders/{id}/cancel",
-            post(conditional::cancel),
-        )
+        .route("/conditional-orders/{id}/cancel", post(conditional::cancel))
         .route("/positions", get(portfolio::positions))
         .route("/positions/{id}/close", post(portfolio::close))
         .route(
@@ -81,10 +78,7 @@ pub fn build(state: AppState) -> Router {
             "/strategies/{id}/definition",
             patch(strategies::update_definition),
         )
-        .route(
-            "/strategies/{id}/scope",
-            patch(strategies::update_scope),
-        )
+        .route("/strategies/{id}/scope", patch(strategies::update_scope))
         .route(
             "/strategies/{id}/execution-mode",
             patch(strategies::update_execution_mode),
@@ -118,10 +112,7 @@ pub fn build(state: AppState) -> Router {
             post(strategy_code::deploy_code),
         )
         .route("/templates", get(templates::list))
-        .route(
-            "/templates/{key}/instantiate",
-            post(templates::instantiate),
-        )
+        .route("/templates/{key}/instantiate", post(templates::instantiate))
         .route(
             "/market/authors",
             get(market::list_authors).post(market::create_author),
@@ -131,10 +122,7 @@ pub fn build(state: AppState) -> Router {
             "/market/publications",
             get(market::list_publications).post(market::create_publication),
         )
-        .route(
-            "/market/publications/import",
-            post(market::import_bundle),
-        )
+        .route("/market/publications/import", post(market::import_bundle))
         .route(
             "/market/publications/{id}",
             get(market::publication_detail).patch(market::update_publication),
@@ -165,10 +153,7 @@ pub fn build(state: AppState) -> Router {
             "/market/settlements",
             get(market::list_settlements).post(market::create_settlement),
         )
-        .route(
-            "/market/settlements/{id}",
-            patch(market::update_settlement),
-        )
+        .route("/market/settlements/{id}", patch(market::update_settlement))
         .route(
             "/sandbox/artifacts",
             get(sandbox::list_artifacts).post(sandbox::upload_artifact),

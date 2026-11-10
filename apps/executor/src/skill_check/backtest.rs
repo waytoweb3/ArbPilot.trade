@@ -228,10 +228,8 @@ mod tests {
             slippage_bps: Decimal::ONE,
         };
         let issues = check(&rule(SkillKind::Breakout), &trending(), costs);
-        assert!(issues
-            .iter()
-            .any(|issue| issue.code == "backtest.zero_fees"
-                && issue.severity == super::super::Severity::Error));
+        assert!(issues.iter().any(|issue| issue.code == "backtest.zero_fees"
+            && issue.severity == super::super::Severity::Error));
     }
 
     #[test]
@@ -245,15 +243,17 @@ mod tests {
     #[test]
     fn empty_sample_is_reported() {
         let issues = check(&rule(SkillKind::Breakout), &[], Costs::default());
-        assert!(issues.iter().any(|issue| issue.code == "backtest.no_sample"));
+        assert!(issues
+            .iter()
+            .any(|issue| issue.code == "backtest.no_sample"));
     }
 
     #[test]
     fn flat_market_reports_no_trades() {
-        let flat: Vec<SandboxCandle> = (0..160)
-            .map(|index| candle(index, dec!(100)))
-            .collect();
+        let flat: Vec<SandboxCandle> = (0..160).map(|index| candle(index, dec!(100))).collect();
         let issues = check(&rule(SkillKind::Breakout), &flat, Costs::default());
-        assert!(issues.iter().any(|issue| issue.code == "backtest.no_trades"));
+        assert!(issues
+            .iter()
+            .any(|issue| issue.code == "backtest.no_trades"));
     }
 }

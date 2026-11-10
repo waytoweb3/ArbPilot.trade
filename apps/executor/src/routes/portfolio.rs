@@ -32,10 +32,7 @@ pub async fn close(
     let position = {
         let mut positions = state.positions.write().expect("仓位锁不可用");
         state.apply_realtime_prices(&mut positions);
-        positions
-            .iter()
-            .find(|position| position.id == id)
-            .cloned()
+        positions.iter().find(|position| position.id == id).cloned()
     };
     let Some(position) = position else {
         return Err(ApiError::NotFound("仓位不存在或已平仓".to_string()));

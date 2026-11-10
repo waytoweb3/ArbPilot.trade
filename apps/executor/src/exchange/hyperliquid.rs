@@ -213,12 +213,7 @@ impl HyperliquidFundingClient {
     }
 
     /// 永续 K 线；`candleSnapshot` 按毫秒时间窗返回 `{t, o, h, l, c, v}` 对象数组。
-    pub fn candles(
-        &self,
-        symbol: &str,
-        interval: &str,
-        limit: u32,
-    ) -> anyhow::Result<Vec<Candle>> {
+    pub fn candles(&self, symbol: &str, interval: &str, limit: u32) -> anyhow::Result<Vec<Candle>> {
         let coin = venue_coin(symbol)?;
         let (interval, step) = hyperliquid_interval(interval)?;
         let limit = limit.clamp(1, 5_000);

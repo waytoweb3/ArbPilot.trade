@@ -573,30 +573,15 @@ mod tests {
             required_plan("POST", "/api/v1/strategies"),
             Some("strategy")
         );
-        assert_eq!(
-            required_plan("GET", "/api/v1/strategies/abc"),
-            None
-        );
-        assert_eq!(
-            required_plan("PATCH", "/api/v1/strategies/abc"),
-            None
-        );
-        assert_eq!(
-            required_plan("PATCH", "/api/v1/strategies/abc/scope"),
-            None
-        );
-        assert_eq!(
-            required_plan("GET", "/api/v1/strategies/abc/code"),
-            None
-        );
+        assert_eq!(required_plan("GET", "/api/v1/strategies/abc"), None);
+        assert_eq!(required_plan("PATCH", "/api/v1/strategies/abc"), None);
+        assert_eq!(required_plan("PATCH", "/api/v1/strategies/abc/scope"), None);
+        assert_eq!(required_plan("GET", "/api/v1/strategies/abc/code"), None);
         assert_eq!(
             required_plan("PUT", "/api/v1/strategies/abc/code"),
             Some("strategy")
         );
-        assert_eq!(
-            required_plan("GET", "/api/v1/templates"),
-            None
-        );
+        assert_eq!(required_plan("GET", "/api/v1/templates"), None);
         assert_eq!(
             required_plan("POST", "/api/v1/templates/turtle-breakout/instantiate"),
             Some("strategy")
@@ -605,14 +590,8 @@ mod tests {
             required_plan("POST", "/api/v1/strategies/abc/backtest"),
             Some("strategy")
         );
-        assert_eq!(
-            required_plan("GET", "/api/v1/market/leaderboard"),
-            None
-        );
-        assert_eq!(
-            required_plan("GET", "/api/v1/market/subscriptions"),
-            None
-        );
+        assert_eq!(required_plan("GET", "/api/v1/market/leaderboard"), None);
+        assert_eq!(required_plan("GET", "/api/v1/market/subscriptions"), None);
         assert_eq!(
             required_plan("GET", "/api/v1/market/settlements"),
             Some("arbitrage")
