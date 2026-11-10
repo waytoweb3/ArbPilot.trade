@@ -166,7 +166,22 @@ fn load_or_create_key(
     key_file: &Path,
     data_file: &Path,
 ) -> anyhow::Result<([u8; KEY_LEN], StorageBackend)> {
+    // macOS 调试构建是 ad-hoc 签名，每次重新编译都会改变 cdhash，系统钥匙串随之拒绝
+    // 旧条目（访问控制按 cdhash 绑定）。因此调试态优先读本机密钥文件，避免开发过程中
+    // 每改一次代码就“凭证加密不可用”。
+    #[cfg(all(debug_assertions, target_os = "macos"))]
+    if let Some(key) = read_key_file(key_file) {
+        return Ok((key, StorageBackend::KeyFile));
+    }
+
     if let Some(key) = keychain_key() {
+        // 首次从钥匙串读到主密钥时镜像一份到密钥文件；之后重建二进制也能直接解密，
+        // 不必再让系统弹窗授权。
+        #[cfg(all(debug_assertions, target_os = "macos"))]
+        match write_key_file(key_file, &key) {
+            Ok(()) => tracing::info!(path = %key_file.display(), "已将系统钥匙串主密钥镜像到本机密钥文件"),
+            Err(error) => tracing::warn!(%error, path = %key_file.display(), "镜像主密钥到本机密钥文件失败，继续使用系统钥匙串"),
+        }
         return Ok((key, StorageBackend::Keychain));
     }
     if let Some(key) = read_key_file(key_file) {
