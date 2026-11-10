@@ -54,19 +54,8 @@ impl Default for RiskLimits {
             max_quote_age_secs: 5,
             // 默认不限制交易对，由各交易所实际支持的合约决定。
             allowed_symbols: Vec::new(),
-            allowed_venues: vec![
-                "binance".to_string(),
-                "binance-spot".to_string(),
-                "okx".to_string(),
-                "okx-spot".to_string(),
-                "bybit".to_string(),
-                "bybit-spot".to_string(),
-                "bitget".to_string(),
-                "gate".to_string(),
-                "aster".to_string(),
-                "hyperliquid".to_string(),
-                "lighter".to_string(),
-            ],
+            // 默认不限制交易所，所有已接入的交易所均可交易。
+            allowed_venues: Vec::new(),
             max_legs: 2,
             venue_overrides: BTreeMap::new(),
         }
