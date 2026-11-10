@@ -883,11 +883,11 @@ fn bitget_leverage(
     Ok(())
 }
 
-/// Gate 永续设置逐合约杠杆，优先按全仓设置。
+/// Gate 永续设置逐合约杠杆，固定按全仓设置。
 ///
-/// 旧接口用 `leverage=0` 表示全仓，但 Gate 会把 0 当成「缺少 leverage」直接拒单，
-/// 所以先用新接口把保证金模式显式传进去；新接口不可用时退回旧接口的逐仓杠杆，
-/// 至少不让下单被杠杆设置卡死。
+/// Gate 只有全仓，没有逐仓模式，两种接口设置的都是全仓杠杆：
+/// 新接口用 `margin_mode=cross` 显式声明；新接口不可用时退回旧接口，
+/// 旧接口默认就是全仓，不会再切换保证金模式。
 fn gate_leverage(
     http: &HttpClient,
     base_url: &str,
@@ -907,7 +907,7 @@ fn gate_leverage(
     ) {
         Ok(()) => Ok(()),
         Err(error) => {
-            tracing::warn!(%error, "Gate 全仓杠杆设置失败，退回逐仓杠杆");
+            tracing::warn!(%error, "Gate 全仓杠杆新接口失败，改用旧接口按全仓设置");
             gate_leverage_request(
                 http,
                 base_url,
