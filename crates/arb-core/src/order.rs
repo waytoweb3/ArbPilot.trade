@@ -1,4 +1,4 @@
-use crate::types::{Order, OrderLeg, OrderStatus};
+use crate::types::{LegStatus, Order, OrderLeg, OrderStatus};
 
 /// 异常状态下执行器应采取的动作。禁止静默重试，必须先与交易所对账。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +46,14 @@ impl OrderStatus {
             .map(|(index, _)| index)
             .collect();
         let pending = legs.iter().any(|leg| !leg.is_filled());
+        // 只有还能撤销的腿才算可撤单：已拒绝/已撤销的腿没有剩余动作，
+        // 单腿订单失败时不应再给出「撤销剩余腿」的补偿。
+        let cancellable = legs.iter().any(|leg| {
+            matches!(
+                leg.status,
+                LegStatus::Pending | LegStatus::Submitted | LegStatus::PartiallyFilled
+            )
+        });
 
         match self {
             OrderStatus::Rejected | OrderStatus::Filled | OrderStatus::Cancelled => {
@@ -62,7 +70,7 @@ impl OrderStatus {
             }
             OrderStatus::PartiallyFilled | OrderStatus::Unwinding | OrderStatus::Failed => {
                 if filled.is_empty() {
-                    if pending {
+                    if cancellable {
                         Compensation::CancelRemainingLegs
                     } else {
                         Compensation::None
@@ -121,6 +129,15 @@ mod tests {
         assert_eq!(
             OrderStatus::PartiallyFilled.compensation(&legs),
             Compensation::UnwindFilledLegs(vec![0])
+        );
+    }
+
+    #[test]
+    fn rejected_single_leg_needs_no_compensation() {
+        let legs = vec![leg(LegStatus::Rejected)];
+        assert_eq!(
+            OrderStatus::PartiallyFilled.compensation(&legs),
+            Compensation::None
         );
     }
 

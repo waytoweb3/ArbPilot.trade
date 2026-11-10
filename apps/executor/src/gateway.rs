@@ -1,6 +1,6 @@
 use arb_core::{
-    LegStatus, Order, OrderIntent, OrderLegIntent, OrderOrigin, OrderStatus, PlaceOrderRequest,
-    Position, Quote, RiskContext, RiskDecision, RiskEngine, Side,
+    Compensation, LegStatus, Order, OrderIntent, OrderLegIntent, OrderOrigin, OrderStatus,
+    PlaceOrderRequest, Position, Quote, RiskContext, RiskDecision, RiskEngine, Side,
 };
 use std::time::Duration;
 
@@ -9,12 +9,7 @@ use rust_decimal::Decimal;
 use serde_json::json;
 use uuid::Uuid;
 
-use crate::{
-    error::ApiError,
-    events::ExecutorEvent,
-    state::AppState,
-    store::PositionGroupMember,
-};
+use crate::{error::ApiError, events::ExecutorEvent, state::AppState, store::PositionGroupMember};
 
 /// 内存里保留的订单条数上限；重启时从库里恢复的历史订单同样按此截断。
 pub(crate) const MAX_IN_MEMORY_ORDERS: usize = 500;
@@ -337,7 +332,11 @@ pub async fn submit_legs(
         // 这里提前拦截并给出可执行的下限提示；对齐后的数量同时写回订单腿，
         // 避免本地记录与实际成交量不一致。
         if !request.closing {
-            if let Some(spec) = state.market.swap_contract_spec(&leg.venue, &leg.symbol).await {
+            if let Some(spec) = state
+                .market
+                .swap_contract_spec(&leg.venue, &leg.symbol)
+                .await
+            {
                 let contracts = ((quantity / spec.ct_val) / spec.lot_sz).floor() * spec.lot_sz;
                 if contracts < spec.min_sz {
                     let reason = format!(
@@ -523,7 +522,11 @@ pub async fn submit_legs(
                 }),
             )
             .await;
-            if let Err(error) = state.exchange.set_leverage(&venue, &leg.symbol, leverage).await {
+            if let Err(error) = state
+                .exchange
+                .set_leverage(&venue, &leg.symbol, leverage)
+                .await
+            {
                 order.legs[index].status = LegStatus::Rejected;
                 log_event(
                     state,
@@ -538,7 +541,7 @@ pub async fn submit_legs(
                     }),
                 )
                 .await;
-                failure = Some(format!("第 {} 腿设置杠杆失败: {error}", index + 1));
+                failure = Some(format!("第 {} 个交易所设置杠杆失败: {error}", index + 1));
                 break;
             }
         }
@@ -575,13 +578,16 @@ pub async fn submit_legs(
                 let remaining =
                     limit as i64 - Utc::now().signed_duration_since(filled_at).num_seconds();
                 if remaining <= 0 {
-                    Err(format!("第 {} 腿超过双腿间隔上限 {limit} 秒", index + 1))
+                    Err(format!(
+                        "第 {} 个交易所超过下单间隔上限 {limit} 秒",
+                        index + 1
+                    ))
                 } else {
                     match tokio::time::timeout(Duration::from_secs(remaining as u64), executed)
                         .await
                     {
                         Ok(result) => result.map_err(|error| error.to_string()),
-                        Err(_) => Err(format!("第 {} 腿等待成交超时", index + 1)),
+                        Err(_) => Err(format!("第 {} 个交易所等待成交超时", index + 1)),
                     }
                 }
             }
@@ -629,7 +635,7 @@ pub async fn submit_legs(
                     }),
                 )
                 .await;
-                failure = Some(format!("第 {} 腿下单失败: {error}", index + 1));
+                failure = Some(format!("第 {} 个交易所下单失败: {error}", index + 1));
                 break;
             }
         }
@@ -638,7 +644,11 @@ pub async fn submit_legs(
     if let Some(message) = failure {
         let has_filled_leg = order.legs.iter().any(|leg| leg.is_filled());
         let compensation = OrderStatus::PartiallyFilled.compensation(&order.legs);
-        order.note = Some(format!("{message}；补偿动作: {compensation:?}"));
+        // 单腿订单（例如策略/上币单腿交易）失败时没有剩余腿可撤，备注只保留真实原因。
+        order.note = Some(match compensation {
+            Compensation::None => message,
+            _ => format!("{message}；补偿动作: {compensation:?}"),
+        });
         order.status = if has_filled_leg {
             OrderStatus::Unwinding
         } else {
