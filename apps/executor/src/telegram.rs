@@ -22,6 +22,7 @@ use crate::{
     listing::{
         self, CloseReason, ListingAnnouncement, ListingRule, ListingTrade, OpenListingRequest,
     },
+    skill,
     state::AppState,
 };
 
@@ -165,7 +166,7 @@ struct OpenDraft {
     expires_at: DateTime<Utc>,
 }
 
-/// 机器人回复：正文 + 可选内联键盘（确认按钮、面板菜单等）。
+/// 机器人回复：正文 + 可选内联键盘（确认按钮、交易所选择等）。
 struct BotReply {
     text: String,
     markup: Option<Value>,
@@ -179,55 +180,10 @@ impl BotReply {
         }
     }
 
-    /// 面板里的子页面：正文上方附加「返回面板」按钮。
-    fn section(lang: Lang, text: impl Into<String>) -> Self {
-        let markup = serde_json::json!({
-            "inline_keyboard": [[{
-                "text": pick(lang, "返回面板", "Back to panel"),
-                "callback_data": "menu",
-            }]],
-        });
-        Self {
-            text: text.into(),
-            markup: Some(markup),
-        }
-    }
-
     fn with_markup(text: impl Into<String>, markup: Value) -> Self {
         Self {
             text: text.into(),
             markup: Some(markup),
-        }
-    }
-}
-
-/// 内联键盘按钮触发的动作，对应面板上的各个菜单项。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PanelAction {
-    Status,
-    Positions,
-    Orders,
-    News,
-    Open,
-    Listing,
-    Toggle,
-    Language,
-    Help,
-}
-
-impl PanelAction {
-    fn parse(value: &str) -> Option<Self> {
-        match value {
-            "status" => Some(Self::Status),
-            "positions" => Some(Self::Positions),
-            "orders" => Some(Self::Orders),
-            "news" => Some(Self::News),
-            "open" => Some(Self::Open),
-            "listing" => Some(Self::Listing),
-            "toggle" => Some(Self::Toggle),
-            "lang" => Some(Self::Language),
-            "help" => Some(Self::Help),
-            _ => None,
         }
     }
 }
@@ -265,13 +221,11 @@ enum ListingStep {
     Cancel(String),
 }
 
-/// 按钮回调：待确认订单的确认/取消、面板菜单、开仓向导，以及上币卡片。
+/// 按钮回调：待确认订单的确认/取消、开仓向导，以及上币卡片。
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Callback {
     Confirm(String),
     Cancel(String),
-    Menu,
-    Action(PanelAction),
     Open(OpenStep),
     Listing(ListingStep),
 }
@@ -526,17 +480,7 @@ impl TelegramBot {
 
         let mut markup = None;
         let reply = match command.as_str() {
-            "/start" => {
-                // 已绑定账号直接给按钮面板；未绑定仍提示配对流程。
-                if self.binding(user_id).is_some() {
-                    let reply = self.panel(state, user_id, lang);
-                    markup = reply.markup;
-                    reply.text
-                } else {
-                    help_text(lang, self.enabled())
-                }
-            }
-            "/help" => help_text(lang, self.enabled()),
+            "/start" | "/help" => help_text(lang, self.enabled()),
             "/bind" => self.bind(chat_id, user_id, username, language_code, &args),
             _ => {
                 if self.binding(user_id).is_none() {
@@ -548,23 +492,19 @@ impl TelegramBot {
                     .to_string()
                 } else {
                     match command.as_str() {
-                        "/menu" | "/panel" => {
-                            let prepared = self.panel(state, user_id, lang);
-                            markup = prepared.markup;
-                            prepared.text
-                        }
                         "/status" => status_text(lang, state),
                         "/positions" => positions_text(lang, state),
                         "/orders" => orders_text(lang, state),
                         "/news" => news_text(lang, state),
+                        "/pause" => self.toggle_pause(state, user_id, lang, true),
+                        "/resume" => self.toggle_pause(state, user_id, lang, false),
                         "/open" => {
                             let prepared = self.prepare_open(state, user_id, lang, &args);
                             markup = prepared.markup;
                             prepared.text
                         }
                         "/listing" => {
-                            let prepared =
-                                self.listing_command(state, user_id, lang, &args).await;
+                            let prepared = self.listing_command(state, user_id, lang, &args).await;
                             markup = prepared.markup;
                             prepared.text
                         }
@@ -627,10 +567,6 @@ impl TelegramBot {
                     }
                 }
                 Some(Callback::Cancel(token)) => BotReply::text(self.cancel(user_id, lang, &token)),
-                Some(Callback::Menu) => self.panel(state, user_id, lang),
-                Some(Callback::Action(action)) => {
-                    self.panel_action(state, user_id, lang, action).await
-                }
                 Some(Callback::Open(step)) => {
                     if self.can_trade(user_id) {
                         self.open_step(state, user_id, lang, step)
@@ -853,19 +789,15 @@ impl TelegramBot {
     /// `/open` 入口：交易对与交易所都可以逐步选择，金额和杠杆由用户输入。
     fn prepare_open(&self, state: &AppState, user_id: i64, lang: Lang, args: &[&str]) -> BotReply {
         if !self.can_trade(user_id) {
-            return BotReply::section(
+            return BotReply::text(pick(
                 lang,
-                pick(
-                    lang,
-                    "该账号没有交易权限。",
-                    "This account has no trading permission.",
-                ),
-            );
+                "该账号没有交易权限。",
+                "This account has no trading permission.",
+            ));
         }
         let venues = tradable_venues(state);
         if venues.is_empty() {
-            return BotReply::section(
-                lang,
+            return BotReply::text(
                 pick(
                     lang,
                     "还没有可交易的交易所账户，请先在桌面端「账户」导入 API Key。",
@@ -874,7 +806,7 @@ impl TelegramBot {
             );
         }
         if args.len() > 3 {
-            return BotReply::section(lang, wizard_only_text(lang));
+            return BotReply::text(wizard_only_text(lang));
         }
 
         let mut draft = OpenDraft {
@@ -886,7 +818,7 @@ impl TelegramBot {
         };
         if let Some(raw) = args.first() {
             let Some(symbol) = parse_symbol(raw) else {
-                return BotReply::section(lang, symbol_error_text(lang));
+                return BotReply::text(symbol_error_text(lang));
             };
             draft.symbol = Some(symbol);
             draft.stage = OpenStage::Long;
@@ -894,7 +826,7 @@ impl TelegramBot {
         if let Some(raw) = args.get(1) {
             let venue = raw.to_ascii_lowercase();
             if !venues.contains(&venue) {
-                return BotReply::section(lang, unknown_venue_text(lang, &venue));
+                return BotReply::text(unknown_venue_text(lang, &venue));
             }
             draft.long_venue = Some(venue);
             draft.stage = OpenStage::Short;
@@ -902,10 +834,10 @@ impl TelegramBot {
         if let Some(raw) = args.get(2) {
             let venue = raw.to_ascii_lowercase();
             if !venues.contains(&venue) {
-                return BotReply::section(lang, unknown_venue_text(lang, &venue));
+                return BotReply::text(unknown_venue_text(lang, &venue));
             }
             if draft.long_venue.as_ref() == Some(&venue) {
-                return BotReply::section(lang, same_venue_text(lang));
+                return BotReply::text(same_venue_text(lang));
             }
             draft.short_venue = Some(venue);
             draft.stage = OpenStage::Amount;
@@ -928,19 +860,14 @@ impl TelegramBot {
     ) -> BotReply {
         for venue in [long_venue, short_venue] {
             if state.market.quote(venue, symbol).is_none() {
-                return BotReply::section(
-                    lang,
-                    match lang {
-                        Lang::Zh => {
-                            format!("{symbol} 在 {venue} 没有可用行情，无法下单。")
-                        }
-                        Lang::En => {
-                            format!(
-                                "No market data for {symbol} on {venue}; cannot place the order."
-                            )
-                        }
-                    },
-                );
+                return BotReply::text(match lang {
+                    Lang::Zh => {
+                        format!("{symbol} 在 {venue} 没有可用行情，无法下单。")
+                    }
+                    Lang::En => {
+                        format!("No market data for {symbol} on {venue}; cannot place the order.")
+                    }
+                });
             }
         }
 
@@ -955,8 +882,7 @@ impl TelegramBot {
                 .count()
                 >= MAX_PENDING
             {
-                return BotReply::section(
-                    lang,
+                return BotReply::text(
                     pick(
                         lang,
                         "待确认订单过多，请等待旧订单过期或点击旧订单的取消按钮。",
@@ -1064,17 +990,17 @@ impl TelegramBot {
         match step {
             OpenStep::Cancel => {
                 self.clear_draft(user_id);
-                BotReply::section(lang, pick(lang, "已取消开仓。", "Entry cancelled."))
+                BotReply::text(pick(lang, "已取消开仓。", "Entry cancelled."))
             }
             OpenStep::Long(venue) => {
                 let Some(draft) = self.current_draft(user_id) else {
-                    return BotReply::section(lang, expired_open_text(lang));
+                    return BotReply::text(expired_open_text(lang));
                 };
                 if draft.stage != OpenStage::Long {
-                    return BotReply::section(lang, expired_open_text(lang));
+                    return BotReply::text(expired_open_text(lang));
                 }
                 if !tradable_venues(state).contains(&venue) {
-                    return BotReply::section(lang, unknown_venue_text(lang, &venue));
+                    return BotReply::text(unknown_venue_text(lang, &venue));
                 }
                 let mut draft = draft;
                 draft.long_venue = Some(venue);
@@ -1085,16 +1011,16 @@ impl TelegramBot {
             }
             OpenStep::Short(venue) => {
                 let Some(draft) = self.current_draft(user_id) else {
-                    return BotReply::section(lang, expired_open_text(lang));
+                    return BotReply::text(expired_open_text(lang));
                 };
                 if draft.stage != OpenStage::Short {
-                    return BotReply::section(lang, expired_open_text(lang));
+                    return BotReply::text(expired_open_text(lang));
                 }
                 if !tradable_venues(state).contains(&venue) {
-                    return BotReply::section(lang, unknown_venue_text(lang, &venue));
+                    return BotReply::text(unknown_venue_text(lang, &venue));
                 }
                 if draft.long_venue.as_ref() == Some(&venue) {
-                    return BotReply::section(lang, same_venue_text(lang));
+                    return BotReply::text(same_venue_text(lang));
                 }
                 let mut draft = draft;
                 draft.short_venue = Some(venue);
@@ -1128,11 +1054,11 @@ impl TelegramBot {
                     self.store_draft(user_id, draft.clone());
                     Some(self.open_prompt(state, lang, &draft))
                 }
-                None => Some(BotReply::section(lang, symbol_error_text(lang))),
+                None => Some(BotReply::text(symbol_error_text(lang))),
             },
             OpenStage::Amount => {
                 let Some((notional_usd, leverage)) = parse_amount_input(text) else {
-                    return Some(BotReply::section(lang, amount_error_text(lang)));
+                    return Some(BotReply::text(amount_error_text(lang)));
                 };
                 let (Some(symbol), Some(long_venue), Some(short_venue)) = (
                     draft.symbol.clone(),
@@ -1140,7 +1066,7 @@ impl TelegramBot {
                     draft.short_venue.clone(),
                 ) else {
                     self.clear_draft(user_id);
-                    return Some(BotReply::section(lang, expired_open_text(lang)));
+                    return Some(BotReply::text(expired_open_text(lang)));
                 };
                 self.clear_draft(user_id);
                 Some(self.create_pending(
@@ -1185,128 +1111,47 @@ impl TelegramBot {
             .remove(&user_id);
     }
 
-    /// 控制面板：状态概览 + 按钮菜单。开仓按钮进入按钮向导，实际下单仍需确认。
-    fn panel(&self, state: &AppState, user_id: i64, lang: Lang) -> BotReply {
-        let paused = state.is_paused();
-        let positions = state.positions.read().expect("仓位锁不可用").len();
-        let pending = self
-            .pending
-            .lock()
-            .expect("待确认订单锁不可用")
-            .values()
-            .filter(|trade| trade.owner == user_id && trade.expires_at > Utc::now())
-            .count();
-        let text = match lang {
-            Lang::Zh => format!(
-                "ArbPilot 控制面板\n执行器：{}\n账户权益：{} USD\n仓位：{positions} 条 · 待确认：{pending} 单\n\n选择下方操作；开仓需要二次确认。",
-                if paused { "已暂停开仓" } else { "运行中" },
-                state.accounts.total_equity_usd().round_dp(2),
-            ),
-            Lang::En => format!(
-                "ArbPilot control panel\nExecutor: {}\nAccount equity: {} USD\nPositions: {positions} · Pending: {pending}\n\nPick an action below; entries need a second confirmation.",
-                if paused { "paused" } else { "active" },
-                state.accounts.total_equity_usd().round_dp(2),
-            ),
-        };
-        let toggle_label = if paused {
-            pick(lang, "恢复开仓", "Resume")
-        } else {
-            pick(lang, "暂停开仓", "Pause")
-        };
-        let language_label = match lang {
-            Lang::Zh => "English",
-            Lang::En => "中文",
-        };
-        let markup = serde_json::json!({
-            "inline_keyboard": [
-                [
-                    { "text": pick(lang, "状态", "Status"), "callback_data": "panel:status" },
-                    { "text": pick(lang, "仓位", "Positions"), "callback_data": "panel:positions" },
-                ],
-                [
-                    { "text": pick(lang, "订单", "Orders"), "callback_data": "panel:orders" },
-                    { "text": pick(lang, "新闻", "News"), "callback_data": "panel:news" },
-                ],
-                [
-                    { "text": pick(lang, "开仓", "Open entry"), "callback_data": "panel:open" },
-                    { "text": pick(lang, "上币交易", "Listing"), "callback_data": "panel:listing" },
-                ],
-                [
-                    { "text": toggle_label, "callback_data": "panel:toggle" },
-                ],
-                [
-                    { "text": language_label, "callback_data": "panel:lang" },
-                    { "text": pick(lang, "帮助", "Help"), "callback_data": "panel:help" },
-                ],
-            ],
-        });
-        BotReply {
-            text,
-            markup: Some(markup),
+    /// 暂停或恢复开仓；只有具备交易权限的账号才能切换。
+    fn toggle_pause(&self, state: &AppState, user_id: i64, lang: Lang, paused: bool) -> String {
+        if !self.can_trade(user_id) {
+            return pick(
+                lang,
+                "该账号没有交易权限。",
+                "This account has no trading permission.",
+            )
+            .to_string();
         }
-    }
-
-    /// 面板按钮的响应：查询类覆盖原消息并保留「返回面板」，暂停/切换语言后直接回到面板。
-    async fn panel_action(
-        &self,
-        state: &AppState,
-        user_id: i64,
-        lang: Lang,
-        action: PanelAction,
-    ) -> BotReply {
-        match action {
-            PanelAction::Status => BotReply::section(lang, status_text(lang, state)),
-            PanelAction::Positions => BotReply::section(lang, positions_text(lang, state)),
-            PanelAction::Orders => BotReply::section(lang, orders_text(lang, state)),
-            PanelAction::News => BotReply::section(lang, news_text(lang, state)),
-            PanelAction::Help => BotReply::section(lang, help_text(lang, self.enabled())),
-            PanelAction::Open => self.prepare_open(state, user_id, lang, &[]),
-            PanelAction::Listing => {
-                BotReply::section(lang, listing_status_text(lang, state).await)
-            }
-            PanelAction::Toggle => {
-                if !self.can_trade(user_id) {
-                    return BotReply::section(
-                        lang,
-                        pick(
-                            lang,
-                            "该账号没有交易权限。",
-                            "This account has no trading permission.",
-                        ),
-                    );
-                }
-                let was_paused = state.is_paused();
-                state.set_paused(!was_paused, None);
-                let mut reply = self.panel(state, user_id, lang);
-                let notice = if was_paused {
-                    pick(lang, "已恢复开仓。", "Entries resumed.")
+        if state.is_paused() == paused {
+            return pick(
+                lang,
+                if paused {
+                    "开仓已处于暂停状态。"
                 } else {
-                    pick(lang, "已暂停开仓。", "Entries paused.")
-                };
-                reply.text = format!("{notice}\n\n{}", reply.text);
-                reply
-            }
-            PanelAction::Language => {
-                let next = match lang {
-                    Lang::Zh => Lang::En,
-                    Lang::En => Lang::Zh,
-                };
-                match self.store_lang(user_id, next) {
-                    Ok(()) => self.panel(state, user_id, next),
-                    Err(error) => {
-                        let mut reply = self.panel(state, user_id, next);
-                        reply.text = match next {
-                            Lang::Zh => format!("语言已切换，但写入绑定文件失败：{error}\n\n{}", reply.text),
-                            Lang::En => format!(
-                                "Language switched, but writing the bindings file failed: {error}\n\n{}",
-                                reply.text
-                            ),
-                        };
-                        reply
-                    }
-                }
-            }
+                    "开仓正在运行。"
+                },
+                if paused {
+                    "Entries are already paused."
+                } else {
+                    "Entries are already active."
+                },
+            )
+            .to_string();
         }
+        state.set_paused(paused, None);
+        pick(
+            lang,
+            if paused {
+                "已暂停开仓。"
+            } else {
+                "已恢复开仓。"
+            },
+            if paused {
+                "Entries paused."
+            } else {
+                "Entries resumed."
+            },
+        )
+        .to_string()
     }
 
     async fn confirm(&self, state: &AppState, user_id: i64, lang: Lang, token: &str) -> String {
@@ -1431,12 +1276,12 @@ impl TelegramBot {
             cards.get(&id).cloned()
         };
         let Some(card) = card else {
-            return BotReply::section(lang, listing_expired_text(lang));
+            return BotReply::text(listing_expired_text(lang));
         };
         let venue = venue.trim().to_ascii_lowercase();
         let settings = listing::manual_settings(state).await;
         if !listing_venues(state, &settings).contains(&venue) {
-            return BotReply::section(lang, unknown_venue_text(lang, &venue));
+            return BotReply::text(unknown_venue_text(lang, &venue));
         }
         self.listing_drafts
             .lock()
@@ -1472,7 +1317,7 @@ impl TelegramBot {
             .remove(&user_id);
         let Some(draft) = draft.filter(|draft| draft.id == id && draft.expires_at > Utc::now())
         else {
-            return BotReply::section(lang, listing_expired_text(lang));
+            return BotReply::text(listing_expired_text(lang));
         };
 
         let settings = listing::manual_settings(state).await;
@@ -1497,14 +1342,11 @@ impl TelegramBot {
             notify: true,
         };
         match listing::open_position(state, request).await {
-            Ok(trade) => BotReply::section(lang, listing_opened_text(lang, &trade)),
-            Err(error) => BotReply::section(
-                lang,
-                match lang {
-                    Lang::Zh => format!("下单失败：{}", describe_error(lang, &error)),
-                    Lang::En => format!("Order failed: {}", describe_error(lang, &error)),
-                },
-            ),
+            Ok(trade) => BotReply::text(listing_opened_text(lang, &trade)),
+            Err(error) => BotReply::text(match lang {
+                Lang::Zh => format!("下单失败：{}", describe_error(lang, &error)),
+                Lang::En => format!("Order failed: {}", describe_error(lang, &error)),
+            }),
         }
     }
 
@@ -1516,14 +1358,14 @@ impl TelegramBot {
             .expect("上币草稿锁不可用")
             .remove(&user_id);
         match removed {
-            Some(draft) if draft.id == id => BotReply::section(
+            Some(draft) if draft.id == id => {
+                BotReply::text(pick(lang, "已取消该上币订单。", "Listing order cancelled."))
+            }
+            _ => BotReply::text(pick(
                 lang,
-                pick(lang, "已取消该上币订单。", "Listing order cancelled."),
-            ),
-            _ => BotReply::section(
-                lang,
-                pick(lang, "没有待确认的上币订单。", "No pending listing order."),
-            ),
+                "没有待确认的上币订单。",
+                "No pending listing order.",
+            )),
         }
     }
 
@@ -1536,27 +1378,32 @@ impl TelegramBot {
         args: &[&str],
     ) -> BotReply {
         let Some(sub) = args.first().map(|value| value.to_ascii_lowercase()) else {
-            return BotReply::section(lang, listing_status_text(lang, state).await);
+            return BotReply::text(listing_status_text(lang, state).await);
         };
         let value = args.get(1).copied();
         match sub.as_str() {
             "amount" | "leverage" | "tp" | "sl" => {
                 if !self.can_trade(user_id) {
-                    return BotReply::section(lang, listing_permission_text(lang));
+                    return BotReply::text(listing_permission_text(lang));
                 }
                 let Some(number) = value.and_then(|value| value.parse::<Decimal>().ok()) else {
-                    return BotReply::section(lang, listing_number_error_text(lang));
+                    return BotReply::text(listing_number_error_text(lang));
                 };
                 let requires_positive = matches!(sub.as_str(), "amount" | "leverage");
                 if number < Decimal::ZERO || (requires_positive && number == Decimal::ZERO) {
-                    return BotReply::section(lang, listing_number_error_text(lang));
+                    return BotReply::text(listing_number_error_text(lang));
                 }
                 let strategies = listing::running_strategies(state).await;
                 if strategies.is_empty() {
-                    return BotReply::section(lang, listing_no_running_text(lang));
+                    return BotReply::text(listing_no_running_text(lang));
                 }
-                // 参数写到运行中策略的每一条规则上。
+                // 参数写到运行中策略的每一条规则上；技能接管的策略写技能设置，
+                // 否则状态仍会读到旧的上币监听设置，出现「显示模拟、实际真实」的偏差。
                 for (strategy_id, _, mut settings) in strategies {
+                    if skill::update_listing_number(state, strategy_id, sub.as_str(), number).await
+                    {
+                        continue;
+                    }
                     for rule in &mut settings.rules {
                         match sub.as_str() {
                             "amount" => rule.notional_usd = number,
@@ -1567,11 +1414,11 @@ impl TelegramBot {
                     }
                     state.listing.update_settings(strategy_id, settings).await;
                 }
-                BotReply::section(lang, listing_status_text(lang, state).await)
+                BotReply::text(listing_status_text(lang, state).await)
             }
             "open" => {
                 if !self.can_trade(user_id) {
-                    return BotReply::section(lang, listing_permission_text(lang));
+                    return BotReply::text(listing_permission_text(lang));
                 }
                 let Some(token) = args
                     .get(1)
@@ -1579,10 +1426,10 @@ impl TelegramBot {
                     .filter(|token| token.len() >= 2 && token.len() <= 12)
                     .filter(|token| token.chars().all(|ch| ch.is_ascii_alphanumeric()))
                 else {
-                    return BotReply::section(lang, listing_usage_text(lang));
+                    return BotReply::text(listing_usage_text(lang));
                 };
                 let Some(venue) = args.get(2).map(|value| value.to_ascii_lowercase()) else {
-                    return BotReply::section(lang, listing_usage_text(lang));
+                    return BotReply::text(listing_usage_text(lang));
                 };
                 let symbol = args
                     .get(3)
@@ -1617,29 +1464,27 @@ impl TelegramBot {
             }
             "close" => {
                 if !self.can_trade(user_id) {
-                    return BotReply::section(lang, listing_permission_text(lang));
+                    return BotReply::text(listing_permission_text(lang));
                 }
                 let Some(prefix) = args.get(1) else {
-                    return BotReply::section(lang, listing_usage_text(lang));
+                    return BotReply::text(listing_usage_text(lang));
                 };
                 let Some(trade) = state.listing.find_open_by_prefix(prefix) else {
-                    return BotReply::section(
+                    return BotReply::text(pick(
                         lang,
-                        pick(lang, "没有找到匹配的持仓。", "No matching open trade."),
-                    );
+                        "没有找到匹配的持仓。",
+                        "No matching open trade.",
+                    ));
                 };
                 match listing::close_position(state, trade.id, CloseReason::Manual).await {
-                    Ok(closed) => BotReply::section(lang, listing_closed_text(lang, &closed)),
-                    Err(error) => BotReply::section(
-                        lang,
-                        match lang {
-                            Lang::Zh => format!("平仓失败：{}", describe_error(lang, &error)),
-                            Lang::En => format!("Close failed: {}", describe_error(lang, &error)),
-                        },
-                    ),
+                    Ok(closed) => BotReply::text(listing_closed_text(lang, &closed)),
+                    Err(error) => BotReply::text(match lang {
+                        Lang::Zh => format!("平仓失败：{}", describe_error(lang, &error)),
+                        Lang::En => format!("Close failed: {}", describe_error(lang, &error)),
+                    }),
                 }
             }
-            _ => BotReply::section(lang, listing_status_text(lang, state).await),
+            _ => BotReply::text(listing_status_text(lang, state).await),
         }
     }
 
@@ -1802,11 +1647,12 @@ fn help_text(lang: Lang, enabled: bool) -> String {
     match lang {
         Lang::Zh => [
             "ArbPilot 指令：",
-            "/menu 打开按钮面板（查询、暂停/恢复、切换语言）",
             "/status 执行器状态",
             "/positions 当前仓位",
             "/orders 最近订单",
             "/news 最新上币公告",
+            "/pause 暂停开仓",
+            "/resume 恢复开仓",
             "/open 开仓向导：按钮选交易所，输入金额与杠杆（默认 10x）",
             "开仓会回复确认按钮，点击「确认开仓」后才真正下单",
             "/listing 上币单腿交易：金额、杠杆、止盈止损与手动平仓",
@@ -1820,11 +1666,12 @@ fn help_text(lang: Lang, enabled: bool) -> String {
         .join("\n"),
         Lang::En => [
             "ArbPilot commands:",
-            "/menu Open the button panel (queries, pause/resume, language)",
             "/status Executor status",
             "/positions Current positions",
             "/orders Recent orders",
             "/news Latest listing announcements",
+            "/pause Pause entries",
+            "/resume Resume entries",
             "/open Entry wizard: pick venues with buttons, then type the amount and leverage (default 10x)",
             "Entries reply with a confirm button; tap it to place the order",
             "/listing Listing single-leg trades: notional, leverage, TP/SL and manual close",
@@ -2126,24 +1973,26 @@ async fn listing_status_text(lang: Lang, state: &AppState) -> String {
         });
     }
     lines.push(String::new());
-    lines.extend(match lang {
-        Lang::Zh => [
-            "/listing amount 100 设置单笔金额",
-            "/listing leverage 1 设置杠杆（默认取风控杠杆上限）",
-            "/listing tp 20 / sl 10 设置止盈止损，0 关闭",
-            "/listing open <代币> <交易所> [交易对] 手动发起",
-            "/listing close <编号前缀> 手动平仓",
-        ],
-        Lang::En => [
-            "/listing amount 100 sets the order size",
-            "/listing leverage 1 sets leverage (defaults to the risk leverage cap)",
-            "/listing tp 20 / sl 10 sets TP/SL, 0 disables",
-            "/listing open <token> <venue> [symbol] starts one manually",
-            "/listing close <id prefix> closes manually",
-        ],
-    }
-    .iter()
-    .map(|line| line.to_string()));
+    lines.extend(
+        match lang {
+            Lang::Zh => [
+                "/listing amount 100 设置单笔金额",
+                "/listing leverage 1 设置杠杆（默认取风控杠杆上限）",
+                "/listing tp 20 / sl 10 设置止盈止损，0 关闭",
+                "/listing open <代币> <交易所> [交易对] 手动发起",
+                "/listing close <编号前缀> 手动平仓",
+            ],
+            Lang::En => [
+                "/listing amount 100 sets the order size",
+                "/listing leverage 1 sets leverage (defaults to the risk leverage cap)",
+                "/listing tp 20 / sl 10 sets TP/SL, 0 disables",
+                "/listing open <token> <venue> [symbol] starts one manually",
+                "/listing close <id prefix> closes manually",
+            ],
+        }
+        .iter()
+        .map(|line| line.to_string()),
+    );
     lines.join("\n")
 }
 
@@ -2241,22 +2090,24 @@ fn listing_no_running_text(lang: Lang) -> &'static str {
 fn command_menu(lang: Lang) -> Value {
     let items: &[(&str, &str)] = match lang {
         Lang::Zh => &[
-            ("menu", "打开控制面板"),
             ("status", "执行器状态"),
             ("positions", "当前仓位"),
             ("orders", "最近订单"),
             ("news", "最新上币公告"),
+            ("pause", "暂停开仓"),
+            ("resume", "恢复开仓"),
             ("open", "发起双腿开仓（需二次确认）"),
             ("listing", "上币单腿交易设置与持仓"),
             ("lang", "切换机器人语言"),
             ("unbind", "解除绑定"),
         ],
         Lang::En => &[
-            ("menu", "Open the control panel"),
             ("status", "Executor status"),
             ("positions", "Current positions"),
             ("orders", "Recent orders"),
             ("news", "Latest listing announcements"),
+            ("pause", "Pause entries"),
+            ("resume", "Resume entries"),
             ("open", "Prepare a hedged entry (needs confirmation)"),
             ("listing", "Listing single-leg settings and trades"),
             ("lang", "Switch the bot language"),
@@ -2373,18 +2224,18 @@ fn describe_error(lang: Lang, error: &ApiError) -> String {
         | ApiError::Internal(message) => message.clone(),
         ApiError::SkillValidation(report) => match lang {
             Lang::Zh => format!("技能参数未通过校验（{} 项错误）", report.errors),
-            Lang::En => format!("Skill parameters failed validation ({} errors)", report.errors),
+            Lang::En => format!(
+                "Skill parameters failed validation ({} errors)",
+                report.errors
+            ),
         },
     }
 }
 
 /// 解析内联按钮的 `callback_data`：
-/// `confirm:<编号>` / `cancel:<编号>` 对应待确认订单，`menu` 打开面板，
-/// `panel:<动作>` 是面板菜单项，`open:<步骤>` 是开仓向导的交易所选择。
+/// `confirm:<编号>` / `cancel:<编号>` 对应待确认订单，
+/// `open:<步骤>` 是开仓向导的交易所选择。
 fn parse_callback(data: &str) -> Option<Callback> {
-    if data == "menu" {
-        return Some(Callback::Menu);
-    }
     let (action, value) = data.split_once(':')?;
     if value.is_empty() {
         return None;
@@ -2392,7 +2243,6 @@ fn parse_callback(data: &str) -> Option<Callback> {
     match action {
         "confirm" => Some(Callback::Confirm(value.to_string())),
         "cancel" => Some(Callback::Cancel(value.to_string())),
-        "panel" => PanelAction::parse(value).map(Callback::Action),
         "open" => match value {
             "cancel" => Some(Callback::Open(OpenStep::Cancel)),
             _ => {
@@ -2503,7 +2353,9 @@ mod tests {
     #[test]
     fn help_lists_trade_commands() {
         let text = help_text(Lang::Zh, true);
-        assert!(text.contains("/menu"));
+        assert!(!text.contains("/menu"));
+        assert!(text.contains("/pause"));
+        assert!(text.contains("/resume"));
         assert!(text.contains("/open"));
         assert!(text.contains("确认按钮"));
         assert!(!text.contains("/confirm"));
@@ -2513,12 +2365,14 @@ mod tests {
     }
 
     #[test]
-    fn command_menu_lists_panel_and_trade_commands() {
+    fn command_menu_lists_trade_commands() {
         for lang in [Lang::Zh, Lang::En] {
             let menu = command_menu(lang);
             let commands = menu.as_array().expect("命令菜单应为数组");
-            assert!(commands.iter().any(|item| item["command"] == "menu"));
+            assert!(!commands.iter().any(|item| item["command"] == "menu"));
             assert!(commands.iter().any(|item| item["command"] == "open"));
+            assert!(commands.iter().any(|item| item["command"] == "pause"));
+            assert!(commands.iter().any(|item| item["command"] == "resume"));
             assert!(commands
                 .iter()
                 .all(|item| item["description"].as_str().is_some()));
@@ -2535,18 +2389,10 @@ mod tests {
             parse_callback("cancel:ABC123"),
             Some(Callback::Cancel(token)) if token == "ABC123"
         ));
-        assert_eq!(parse_callback("menu"), Some(Callback::Menu));
-        assert_eq!(
-            parse_callback("panel:status"),
-            Some(Callback::Action(PanelAction::Status))
-        );
-        assert_eq!(
-            parse_callback("panel:toggle"),
-            Some(Callback::Action(PanelAction::Toggle))
-        );
         assert_eq!(parse_callback("confirm:"), None);
         assert_eq!(parse_callback("delete:ABC123"), None);
-        assert_eq!(parse_callback("panel:unknown"), None);
+        assert_eq!(parse_callback("panel:status"), None);
+        assert_eq!(parse_callback("menu"), None);
         assert_eq!(parse_callback("ABC123"), None);
     }
 
@@ -2579,7 +2425,9 @@ mod tests {
         );
         assert_eq!(
             parse_callback("listing:confirm:ABC123"),
-            Some(Callback::Listing(ListingStep::Confirm("ABC123".to_string())))
+            Some(Callback::Listing(ListingStep::Confirm(
+                "ABC123".to_string()
+            )))
         );
         assert_eq!(
             parse_callback("listing:cancel:ABC123"),
