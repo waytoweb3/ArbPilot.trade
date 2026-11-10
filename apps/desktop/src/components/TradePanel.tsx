@@ -34,17 +34,29 @@ const chipClass =
   "rounded-md border border-line bg-panel-soft px-2 py-1 text-[11px] text-muted transition-colors hover:border-accent/50 hover:text-fg";
 const NOTIONAL_PRESETS = [200, 500, 1_000, 2_000, 5_000];
 
-/** 有效最小下单额：名义额与「最小数量 × 当前价」取较大值。 */
+/** 有效最小下单额：名义额与「最小数量 × 当前价」取较大值，并按数量步长向上取整。 */
 function effectiveMinNotional(
-  spec: { min_quantity?: number | string | null; min_notional_usd?: number | string | null } | null | undefined,
+  spec: {
+    min_quantity?: number | string | null;
+    min_notional_usd?: number | string | null;
+    step_size?: number | string | null;
+  } | null | undefined,
   price: number | null,
 ): number | null {
   if (!spec) {
     return null;
   }
+  // 下单数量按步长向下取整，门槛名义额换算成数量后需向上取整到步长，否则恰好
+  // 等于门槛的金额取整后会低于交易所要求（如 Lighter BTC 5 位精度、10 USDC 门槛）。
+  const step = toNumber(spec.step_size ?? 0);
+  const roundUp = (value: number): number =>
+    step > 0 ? Math.ceil(value / step - 1e-9) * step : value;
   const candidates: number[] = [];
   if (spec.min_notional_usd !== undefined && spec.min_notional_usd !== null) {
-    candidates.push(toNumber(spec.min_notional_usd));
+    const minimum = toNumber(spec.min_notional_usd);
+    candidates.push(
+      price && price > 0 ? roundUp(minimum / price) * price : minimum,
+    );
   }
   if (
     spec.min_quantity !== undefined &&
@@ -52,7 +64,7 @@ function effectiveMinNotional(
     price &&
     price > 0
   ) {
-    candidates.push(toNumber(spec.min_quantity) * price);
+    candidates.push(roundUp(toNumber(spec.min_quantity)) * price);
   }
   const positive = candidates.filter((value) => Number.isFinite(value) && value > 0);
   return positive.length > 0 ? Math.max(...positive) : null;
