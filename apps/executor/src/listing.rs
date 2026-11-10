@@ -40,6 +40,8 @@ const STARTUP_GRACE_SECS: u64 = 60;
 const NEWS_SCAN_LIMIT: usize = 40;
 /// 同一代币的自动开仓冷却时间，避免多个来源对同一条上币重复下单。
 const TOKEN_COOLDOWN_SECS: i64 = 24 * 60 * 60;
+/// 电报手动下单参数的持久化键；与策略 ID 共用同一张设置表，重启后仍可复用。
+const MANUAL_RULE_KEY: &str = "manual";
 
 /// 一条上币公告跟随规则：监听哪家交易所的公告、按什么优先级在哪下单。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -358,6 +360,26 @@ impl ListingDesk {
         };
         self.store.save_listing_settings(&snapshot).await;
         next
+    }
+
+    /// 电报手动下单保存的参数；没有保存过时返回 None。
+    pub fn manual_rule(&self) -> Option<ListingRule> {
+        self.settings
+            .read()
+            .expect("上币交易设置锁不可用")
+            .get(MANUAL_RULE_KEY)
+            .and_then(|settings| settings.rules.first().cloned())
+    }
+
+    /// 保存电报手动下单参数，下次手动下单直接复用。
+    pub async fn save_manual_rule(&self, rule: ListingRule) {
+        let next = ListingSettings { rules: vec![rule] }.normalized(self.default_leverage);
+        let snapshot = {
+            let mut settings = self.settings.write().expect("上币交易设置锁不可用");
+            settings.insert(MANUAL_RULE_KEY.to_string(), next);
+            settings.clone()
+        };
+        self.store.save_listing_settings(&snapshot).await;
     }
 
     /// 仍处于持仓中的交易。
@@ -940,8 +962,11 @@ pub async fn running_strategies(state: &AppState) -> Vec<(Uuid, String, ListingS
         .collect()
 }
 
-/// 电报手动命令使用的设置：优先取运行中上币策略的第一条规则，否则用默认值。
+/// 电报手动命令使用的设置：优先用保存过的手动参数，其次取运行中上币策略的第一条规则，否则用默认值。
 pub async fn manual_settings(state: &AppState) -> ListingRule {
+    if let Some(rule) = state.listing.manual_rule() {
+        return rule;
+    }
     running_strategies(state)
         .await
         .into_iter()

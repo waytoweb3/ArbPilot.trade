@@ -1,12 +1,12 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, RwLock},
     time::Duration,
 };
 
 use anyhow::{bail, Context};
-use arb_core::{OrderOrigin, Side, StrategyExecutionMode};
+use arb_core::{OrderOrigin, OrderStatus, Side};
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -17,17 +17,18 @@ use crate::{
     config::Config,
     error::ApiError,
     events::ExecutorEvent,
-    gateway::{self, PairOrderRequest},
+    gateway::{self, LegOrderRequest, OrderBatchRequest},
     http_client::HttpClient,
     listing::{
         self, CloseReason, ListingAnnouncement, ListingRule, ListingTrade, OpenListingRequest,
     },
-    skill,
     state::AppState,
 };
 
 /// 待确认订单的有效期。
 const PENDING_TTL_SECS: i64 = 120;
+/// 一键平仓确认卡片的有效期；过期后按钮失效，避免误点旧消息平掉新仓位。
+const CLOSE_ALL_TTL_SECS: i64 = 120;
 /// 单个绑定用户最多保留的待确认订单数。
 const MAX_PENDING: usize = 5;
 /// 上币公告卡片在电报里的有效时间；超过后按钮失效，需要重新扫到公告。
@@ -133,14 +134,29 @@ struct ActivePairing {
     expires_at: DateTime<Utc>,
 }
 
+/// 待确认订单里的一条腿：交易所与方向。
+#[derive(Debug, Clone)]
+struct PendingLeg {
+    venue: String,
+    side: Side,
+}
+
 struct PendingTrade {
     owner: i64,
     symbol: String,
-    long_venue: String,
-    short_venue: String,
+    /// 单腿或双腿；开仓时按顺序提交。
+    legs: Vec<PendingLeg>,
     notional_usd: Decimal,
     leverage: Decimal,
     expires_at: DateTime<Utc>,
+}
+
+/// 开仓方式：双腿对冲，或者只做其中一条腿。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenMode {
+    Hedge,
+    LongOnly,
+    ShortOnly,
 }
 
 /// 开仓向导当前在等用户做什么。
@@ -148,6 +164,8 @@ struct PendingTrade {
 enum OpenStage {
     /// 等用户发送交易对（`/open` 不带参数时）。
     Symbol,
+    /// 等用户点按钮选开仓方式：双腿对冲或单腿。
+    Mode,
     /// 等用户点按钮选多头交易所。
     Long,
     /// 等用户点按钮选空头交易所。
@@ -160,6 +178,7 @@ enum OpenStage {
 #[derive(Debug, Clone)]
 struct OpenDraft {
     symbol: Option<String>,
+    mode: Option<OpenMode>,
     long_venue: Option<String>,
     short_venue: Option<String>,
     stage: OpenStage,
@@ -188,9 +207,10 @@ impl BotReply {
     }
 }
 
-/// 开仓向导里的按钮动作：选多头、选空头、取消。
+/// 开仓向导里的按钮动作：选开仓方式、选多头、选空头、取消。
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum OpenStep {
+    Mode(OpenMode),
     Long(String),
     Short(String),
     Cancel,
@@ -200,6 +220,8 @@ enum OpenStep {
 #[derive(Debug, Clone)]
 struct ListingCard {
     announcement: ListingAnnouncement,
+    /// 开仓方向：手动发起时可指定做多或做空。
+    side: Side,
     expires_at: DateTime<Utc>,
 }
 
@@ -209,14 +231,46 @@ struct ListingDraft {
     /// 卡片编号，用于校验回调与草稿是否匹配。
     id: String,
     announcement: ListingAnnouncement,
+    /// 开仓方向，确认下单时沿用到订单。
+    side: Side,
     venue: String,
     expires_at: DateTime<Utc>,
 }
 
-/// 上币卡片上的按钮动作：选交易所、确认开仓、取消。
+/// 上币手动下单的引导阶段。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListingStage {
+    /// 等用户发送代币代码。
+    Token,
+    /// 等用户点按钮选择做多还是做空。
+    Side,
+    /// 等用户点按钮选择交易所。
+    Venue,
+    /// 首次手动下单：等用户发送金额、杠杆与止盈止损。
+    Params,
+}
+
+/// 用户正在通过 `/listing open` 引导下单的草稿。
+#[derive(Debug, Clone)]
+struct ListingWizard {
+    /// 卡片编号，回调时用于校验草稿。
+    id: String,
+    /// 已识别出的代币代码。
+    token: Option<String>,
+    /// 已选好的交易所；只有参数引导阶段会用到。
+    venue: Option<String>,
+    stage: ListingStage,
+    expires_at: DateTime<Utc>,
+}
+
+/// 上币卡片上的按钮动作：选方向、选交易所、修改参数、确认开仓、取消。
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ListingStep {
+    /// 放弃当前上币引导。
+    Abort,
+    Side { id: String, side: Side },
     Venue { id: String, venue: String },
+    Params(String),
     Confirm(String),
     Cancel(String),
 }
@@ -228,9 +282,14 @@ enum Callback {
     Cancel(String),
     Open(OpenStep),
     Listing(ListingStep),
+    /// 一键平仓：`token` 校验确认卡片，`confirm` 为 false 表示取消。
+    CloseAll {
+        token: String,
+        confirm: bool,
+    },
 }
 
-/// Telegram 机器人：配对绑定、查询、暂停/恢复与经确认的双腿开仓。
+/// Telegram 机器人：配对绑定、查询、暂停/恢复与经确认的开仓。
 pub struct TelegramBot {
     http: Option<Arc<HttpClient>>,
     api_base: String,
@@ -243,8 +302,12 @@ pub struct TelegramBot {
     drafts: Mutex<HashMap<i64, OpenDraft>>,
     /// 已推送的上币公告卡片：编号 → 公告信息。
     listing_cards: Mutex<HashMap<String, ListingCard>>,
+    /// 每个用户进行中的上币下单引导。
+    listing_wizards: Mutex<HashMap<i64, ListingWizard>>,
     /// 每个用户已选交易所、等待确认的上币单腿订单。
     listing_drafts: Mutex<HashMap<i64, ListingDraft>>,
+    /// 待确认的一键平仓请求：编号 → (发起用户, 过期时间)。
+    close_all: Mutex<HashMap<String, (i64, DateTime<Utc>)>>,
     offset: Mutex<i64>,
     bot_username: RwLock<Option<String>>,
     last_error: RwLock<Option<String>>,
@@ -268,7 +331,9 @@ impl TelegramBot {
             pending: Mutex::new(HashMap::new()),
             drafts: Mutex::new(HashMap::new()),
             listing_cards: Mutex::new(HashMap::new()),
+            listing_wizards: Mutex::new(HashMap::new()),
             listing_drafts: Mutex::new(HashMap::new()),
+            close_all: Mutex::new(HashMap::new()),
             offset: Mutex::new(0),
             bot_username: RwLock::new(None),
             last_error: RwLock::new(None),
@@ -478,9 +543,20 @@ impl TelegramBot {
             }
         }
 
+        // 上币下单引导进行中时，用户下一条普通文本就是代币代码。
+        if !text.starts_with('/') {
+            if let Some(reply) = self.listing_input(state, user_id, lang, text).await {
+                self.send_with_markup(chat_id, &reply.text, reply.markup.as_ref())
+                    .await;
+                return;
+            }
+        }
+
         let mut markup = None;
         let reply = match command.as_str() {
-            "/start" | "/help" => help_text(lang, self.enabled()),
+            // /menu、/panel 是旧版按钮面板留下的指令，Telegram 客户端的命令菜单
+            // 会缓存一段时间，这里回落到帮助列表，避免用户点到后收到“未识别”。
+            "/start" | "/help" | "/menu" | "/panel" => help_text(lang, self.enabled()),
             "/bind" => self.bind(chat_id, user_id, username, language_code, &args),
             _ => {
                 if self.binding(user_id).is_none() {
@@ -496,8 +572,6 @@ impl TelegramBot {
                         "/positions" => positions_text(lang, state),
                         "/orders" => orders_text(lang, state),
                         "/news" => news_text(lang, state),
-                        "/pause" => self.toggle_pause(state, user_id, lang, true),
-                        "/resume" => self.toggle_pause(state, user_id, lang, false),
                         "/open" => {
                             let prepared = self.prepare_open(state, user_id, lang, &args);
                             markup = prepared.markup;
@@ -508,6 +582,12 @@ impl TelegramBot {
                             markup = prepared.markup;
                             prepared.text
                         }
+                        "/closeall" => {
+                            let prepared = self.prepare_close_all(state, user_id, lang);
+                            markup = prepared.markup;
+                            prepared.text
+                        }
+                        "/close" => self.close_one(state, user_id, lang, &args).await,
                         "/lang" | "/language" => self.set_lang(user_id, lang, &args),
                         "/unbind" => self.unbind(user_id, lang),
                         other => format!(
@@ -579,10 +659,35 @@ impl TelegramBot {
                     }
                 }
                 Some(Callback::Listing(step)) => match step {
+                    ListingStep::Abort => self.abort_listing(user_id, lang),
+                    ListingStep::Side { id, side } => {
+                        if self.can_trade(user_id) {
+                            self.listing_side_step(state, user_id, lang, &id, side)
+                                .await
+                        } else {
+                            BotReply::text(pick(
+                                lang,
+                                "该账号没有交易权限。",
+                                "This account has no trading permission.",
+                            ))
+                        }
+                    }
                     ListingStep::Venue { id, venue } => {
                         if self.can_trade(user_id) {
-                            self.listing_preview(state, user_id, lang, &id, &venue)
+                            self.clear_listing_wizard(user_id);
+                            self.listing_after_venue(state, user_id, lang, &id, &venue)
                                 .await
+                        } else {
+                            BotReply::text(pick(
+                                lang,
+                                "该账号没有交易权限。",
+                                "This account has no trading permission.",
+                            ))
+                        }
+                    }
+                    ListingStep::Params(id) => {
+                        if self.can_trade(user_id) {
+                            self.listing_params_step(state, user_id, lang, &id).await
                         } else {
                             BotReply::text(pick(
                                 lang,
@@ -604,6 +709,19 @@ impl TelegramBot {
                     }
                     ListingStep::Cancel(id) => self.cancel_listing(user_id, lang, &id),
                 },
+                Some(Callback::CloseAll { token, confirm }) => {
+                    if !confirm {
+                        BotReply::text(self.cancel_close_all(user_id, lang, &token))
+                    } else if self.can_trade(user_id) {
+                        BotReply::text(self.confirm_close_all(state, user_id, lang, &token).await)
+                    } else {
+                        BotReply::text(pick(
+                            lang,
+                            "该账号没有交易权限。",
+                            "This account has no trading permission.",
+                        ))
+                    }
+                }
                 None => BotReply::text(pick(lang, "无法识别的操作。", "Unrecognized action.")),
             }
         };
@@ -786,7 +904,8 @@ impl TelegramBot {
         self.persist()
     }
 
-    /// `/open` 入口：交易对与交易所都可以逐步选择，金额和杠杆由用户输入。
+    /// `/open` 入口：交易对可随指令给出，开仓方式与交易所都用按钮选择，
+    /// 金额和杠杆由用户输入。支持双腿对冲，也支持只开多或只开空。
     fn prepare_open(&self, state: &AppState, user_id: i64, lang: Lang, args: &[&str]) -> BotReply {
         if !self.can_trade(user_id) {
             return BotReply::text(pick(
@@ -805,12 +924,15 @@ impl TelegramBot {
                 ),
             );
         }
-        if args.len() > 3 {
+        if args.len() > 1 {
             return BotReply::text(wizard_only_text(lang));
         }
 
+        // 开始开仓向导时放弃可能残留的上币引导，避免用户下一条文本被另一套向导吃掉。
+        self.clear_listing_wizard(user_id);
         let mut draft = OpenDraft {
             symbol: None,
+            mode: None,
             long_venue: None,
             short_venue: None,
             stage: OpenStage::Symbol,
@@ -821,26 +943,7 @@ impl TelegramBot {
                 return BotReply::text(symbol_error_text(lang));
             };
             draft.symbol = Some(symbol);
-            draft.stage = OpenStage::Long;
-        }
-        if let Some(raw) = args.get(1) {
-            let venue = raw.to_ascii_lowercase();
-            if !venues.contains(&venue) {
-                return BotReply::text(unknown_venue_text(lang, &venue));
-            }
-            draft.long_venue = Some(venue);
-            draft.stage = OpenStage::Short;
-        }
-        if let Some(raw) = args.get(2) {
-            let venue = raw.to_ascii_lowercase();
-            if !venues.contains(&venue) {
-                return BotReply::text(unknown_venue_text(lang, &venue));
-            }
-            if draft.long_venue.as_ref() == Some(&venue) {
-                return BotReply::text(same_venue_text(lang));
-            }
-            draft.short_venue = Some(venue);
-            draft.stage = OpenStage::Amount;
+            draft.stage = OpenStage::Mode;
         }
         self.store_draft(user_id, draft.clone());
         self.open_prompt(state, lang, &draft)
@@ -853,19 +956,21 @@ impl TelegramBot {
         user_id: i64,
         lang: Lang,
         symbol: &str,
-        long_venue: &str,
-        short_venue: &str,
+        legs: Vec<PendingLeg>,
         notional_usd: Decimal,
         leverage: Decimal,
     ) -> BotReply {
-        for venue in [long_venue, short_venue] {
-            if state.market.quote(venue, symbol).is_none() {
+        for leg in &legs {
+            if state.market.quote(&leg.venue, symbol).is_none() {
                 return BotReply::text(match lang {
                     Lang::Zh => {
-                        format!("{symbol} 在 {venue} 没有可用行情，无法下单。")
+                        format!("{symbol} 在 {} 没有可用行情，无法下单。", venue_label(&leg.venue))
                     }
                     Lang::En => {
-                        format!("No market data for {symbol} on {venue}; cannot place the order.")
+                        format!(
+                            "No market data for {symbol} on {}; cannot place the order.",
+                            venue_label(&leg.venue)
+                        )
                     }
                 });
             }
@@ -873,6 +978,8 @@ impl TelegramBot {
 
         let token = Uuid::new_v4().simple().to_string()[..6].to_ascii_uppercase();
         let expires_at = Utc::now() + chrono::Duration::seconds(PENDING_TTL_SECS);
+        let legs_label = pending_legs_label(lang, &legs);
+        let single_leg = legs.len() == 1;
         {
             let mut pending = self.pending.lock().expect("待确认订单锁不可用");
             pending.retain(|_, trade| trade.expires_at > Utc::now() && trade.owner != user_id);
@@ -895,8 +1002,7 @@ impl TelegramBot {
                 PendingTrade {
                     owner: user_id,
                     symbol: symbol.to_string(),
-                    long_venue: long_venue.to_string(),
-                    short_venue: short_venue.to_string(),
+                    legs,
                     notional_usd,
                     leverage,
                     expires_at,
@@ -906,10 +1012,12 @@ impl TelegramBot {
 
         let text = match lang {
             Lang::Zh => format!(
-                "待确认 {token}\n{symbol}：{long_venue} 多头 / {short_venue} 空头\n每条腿 {notional_usd} USD，杠杆 {leverage}x\n\n请点击下方按钮在 {PENDING_TTL_SECS} 秒内确认或取消。下单仍会经过执行器风控。"
+                "待确认 {token}\n{symbol}：{legs_label}\n{} {notional_usd} USD，杠杆 {leverage}x\n\n请点击下方按钮在 {PENDING_TTL_SECS} 秒内确认或取消。下单仍会经过执行器风控。",
+                if single_leg { "单腿" } else { "每条腿" }
             ),
             Lang::En => format!(
-                "Pending {token}\n{symbol}: long {long_venue} / short {short_venue}\n{notional_usd} USD per leg, leverage {leverage}x\n\nTap a button below within {PENDING_TTL_SECS}s to confirm or cancel. Risk checks still apply."
+                "Pending {token}\n{symbol}: {legs_label}\n{} {notional_usd} USD, leverage {leverage}x\n\nTap a button below within {PENDING_TTL_SECS}s to confirm or cancel. Risk checks still apply.",
+                if single_leg { "Single leg" } else { "Per leg" }
             ),
         };
         let markup = serde_json::json!({
@@ -934,6 +1042,7 @@ impl TelegramBot {
     fn open_prompt(&self, state: &AppState, lang: Lang, draft: &OpenDraft) -> BotReply {
         let venues = tradable_venues(state);
         let symbol = draft.symbol.clone().unwrap_or_default();
+        let hedge = draft.mode == Some(OpenMode::Hedge);
         match draft.stage {
             OpenStage::Symbol => BotReply::with_markup(
                 pick(
@@ -943,40 +1052,82 @@ impl TelegramBot {
                 ),
                 cancel_markup(lang),
             ),
+            OpenStage::Mode => {
+                let text = match lang {
+                    Lang::Zh => format!(
+                        "开仓 {symbol}\n第 2 步：选择开仓方式：双腿对冲，或只做多/只做空一条腿。"
+                    ),
+                    Lang::En => format!(
+                        "Entry {symbol}\nStep 2: choose the entry mode: a hedged pair, or a single long/short leg."
+                    ),
+                };
+                BotReply::with_markup(text, mode_markup(lang))
+            }
             OpenStage::Long => {
                 let text = match lang {
-                    Lang::Zh => format!("开仓 {symbol}\n第 2 步：选择多头交易所。"),
-                    Lang::En => format!("Entry {symbol}\nStep 2: choose the long venue."),
+                    Lang::Zh => format!("开仓 {symbol}\n第 3 步：选择多头交易所。"),
+                    Lang::En => format!("Entry {symbol}\nStep 3: choose the long venue."),
                 };
                 BotReply::with_markup(text, venue_markup(lang, "long", &venues, true))
             }
             OpenStage::Short => {
                 let long = draft.long_venue.clone().unwrap_or_default();
-                let options: Vec<String> = venues
-                    .iter()
-                    .filter(|venue| venue.as_str() != long)
-                    .cloned()
-                    .collect();
-                let text = match lang {
-                    Lang::Zh => format!(
-                        "开仓 {symbol}\n多头 {long}\n第 3 步：选择空头交易所（不能与多头相同）。"
-                    ),
-                    Lang::En => format!(
-                        "Entry {symbol}\nLong {long}\nStep 3: choose the short venue (must differ from the long leg)."
-                    ),
+                let long_label = venue_label(&long);
+                let step = if hedge { 4 } else { 3 };
+                let (options, text) = if hedge {
+                    let options = venues
+                        .iter()
+                        .filter(|venue| venue.as_str() != long)
+                        .cloned()
+                        .collect();
+                    let text = match lang {
+                        Lang::Zh => format!(
+                            "开仓 {symbol}\n多头 {long_label}\n第 {step} 步：选择空头交易所（不能与多头相同）。"
+                        ),
+                        Lang::En => format!(
+                            "Entry {symbol}\nLong {long_label}\nStep {step}: choose the short venue (must differ from the long leg)."
+                        ),
+                    };
+                    (options, text)
+                } else {
+                    let text = match lang {
+                        Lang::Zh => {
+                            format!("开仓 {symbol}\n第 {step} 步：选择做空交易所。")
+                        }
+                        Lang::En => {
+                            format!("Entry {symbol}\nStep {step}: choose the short venue.")
+                        }
+                    };
+                    (venues.clone(), text)
                 };
                 BotReply::with_markup(text, venue_markup(lang, "short", &options, true))
             }
             OpenStage::Amount => {
-                let long = draft.long_venue.clone().unwrap_or_default();
-                let short = draft.short_venue.clone().unwrap_or_default();
+                let step = if hedge { 5 } else { 4 };
+                let summary = draft_legs_summary(lang, draft);
+                let amount_label = match lang {
+                    Lang::Zh => {
+                        if hedge {
+                            "每条腿的 USD 金额"
+                        } else {
+                            "单腿的 USD 金额"
+                        }
+                    }
+                    Lang::En => {
+                        if hedge {
+                            "the USD amount per leg"
+                        } else {
+                            "the USD amount for the single leg"
+                        }
+                    }
+                };
                 let text = match lang {
                     Lang::Zh => format!(
-                        "开仓 {symbol}\n多头 {long} / 空头 {short}\n\n第 4 步：发送每条腿的 USD 金额。\n如需自定义杠杆，发送「金额 杠杆」，例如 500 10；只发金额时杠杆默认 {}x。",
+                        "开仓 {symbol}\n{summary}\n\n第 {step} 步：发送{amount_label}。\n如需自定义杠杆，发送「金额 杠杆」，例如 500 10；只发金额时杠杆默认 {}x。",
                         DEFAULT_LEVERAGE
                     ),
                     Lang::En => format!(
-                        "Entry {symbol}\nLong {long} / short {short}\n\nStep 4: send the USD amount per leg.\nTo set leverage, send \"<amount> <leverage>\", e.g. 500 10; amount alone uses the default {}x.",
+                        "Entry {symbol}\n{summary}\n\nStep {step}: send {amount_label}.\nTo set leverage, send \"<amount> <leverage>\", e.g. 500 10; amount alone uses the default {}x.",
                         DEFAULT_LEVERAGE
                     ),
                 };
@@ -985,12 +1136,29 @@ impl TelegramBot {
         }
     }
 
-    /// 向导里的交易所按钮回调。
+    /// 向导里的按钮回调。
     fn open_step(&self, state: &AppState, user_id: i64, lang: Lang, step: OpenStep) -> BotReply {
         match step {
             OpenStep::Cancel => {
                 self.clear_draft(user_id);
                 BotReply::text(pick(lang, "已取消开仓。", "Entry cancelled."))
+            }
+            OpenStep::Mode(mode) => {
+                let Some(draft) = self.current_draft(user_id) else {
+                    return BotReply::text(expired_open_text(lang));
+                };
+                if draft.stage != OpenStage::Mode {
+                    return BotReply::text(expired_open_text(lang));
+                }
+                let mut draft = draft;
+                draft.mode = Some(mode);
+                draft.stage = match mode {
+                    OpenMode::ShortOnly => OpenStage::Short,
+                    OpenMode::Hedge | OpenMode::LongOnly => OpenStage::Long,
+                };
+                draft.expires_at = draft_expiry();
+                self.store_draft(user_id, draft.clone());
+                self.open_prompt(state, lang, &draft)
             }
             OpenStep::Long(venue) => {
                 let Some(draft) = self.current_draft(user_id) else {
@@ -1003,8 +1171,13 @@ impl TelegramBot {
                     return BotReply::text(unknown_venue_text(lang, &venue));
                 }
                 let mut draft = draft;
+                let hedge = draft.mode == Some(OpenMode::Hedge);
                 draft.long_venue = Some(venue);
-                draft.stage = OpenStage::Short;
+                draft.stage = if hedge {
+                    OpenStage::Short
+                } else {
+                    OpenStage::Amount
+                };
                 draft.expires_at = draft_expiry();
                 self.store_draft(user_id, draft.clone());
                 self.open_prompt(state, lang, &draft)
@@ -1019,7 +1192,8 @@ impl TelegramBot {
                 if !tradable_venues(state).contains(&venue) {
                     return BotReply::text(unknown_venue_text(lang, &venue));
                 }
-                if draft.long_venue.as_ref() == Some(&venue) {
+                if draft.mode == Some(OpenMode::Hedge) && draft.long_venue.as_ref() == Some(&venue)
+                {
                     return BotReply::text(same_venue_text(lang));
                 }
                 let mut draft = draft;
@@ -1049,7 +1223,7 @@ impl TelegramBot {
                 Some(symbol) => {
                     let mut draft = draft;
                     draft.symbol = Some(symbol);
-                    draft.stage = OpenStage::Long;
+                    draft.stage = OpenStage::Mode;
                     draft.expires_at = draft_expiry();
                     self.store_draft(user_id, draft.clone());
                     Some(self.open_prompt(state, lang, &draft))
@@ -1060,30 +1234,17 @@ impl TelegramBot {
                 let Some((notional_usd, leverage)) = parse_amount_input(text) else {
                     return Some(BotReply::text(amount_error_text(lang)));
                 };
-                let (Some(symbol), Some(long_venue), Some(short_venue)) = (
-                    draft.symbol.clone(),
-                    draft.long_venue.clone(),
-                    draft.short_venue.clone(),
-                ) else {
+                let (Some(symbol), Some(legs)) = (draft.symbol.clone(), draft_legs(&draft)) else {
                     self.clear_draft(user_id);
                     return Some(BotReply::text(expired_open_text(lang)));
                 };
                 self.clear_draft(user_id);
-                Some(self.create_pending(
-                    state,
-                    user_id,
-                    lang,
-                    &symbol,
-                    &long_venue,
-                    &short_venue,
-                    notional_usd,
-                    leverage,
-                ))
+                Some(self.create_pending(state, user_id, lang, &symbol, legs, notional_usd, leverage))
             }
-            OpenStage::Long | OpenStage::Short => Some(BotReply::text(pick(
+            OpenStage::Mode | OpenStage::Long | OpenStage::Short => Some(BotReply::text(pick(
                 lang,
-                "请点击上方按钮选择交易所，或重新发送 /open 开始新的开仓。",
-                "Tap a venue button above, or send /open to restart the entry.",
+                "请点击上方按钮选择开仓方式或交易所，或重新发送 /open 开始新的开仓。",
+                "Tap a button above to choose the entry mode or venue, or send /open to restart the entry.",
             ))),
         }
     }
@@ -1109,49 +1270,6 @@ impl TelegramBot {
             .lock()
             .expect("开仓向导锁不可用")
             .remove(&user_id);
-    }
-
-    /// 暂停或恢复开仓；只有具备交易权限的账号才能切换。
-    fn toggle_pause(&self, state: &AppState, user_id: i64, lang: Lang, paused: bool) -> String {
-        if !self.can_trade(user_id) {
-            return pick(
-                lang,
-                "该账号没有交易权限。",
-                "This account has no trading permission.",
-            )
-            .to_string();
-        }
-        if state.is_paused() == paused {
-            return pick(
-                lang,
-                if paused {
-                    "开仓已处于暂停状态。"
-                } else {
-                    "开仓正在运行。"
-                },
-                if paused {
-                    "Entries are already paused."
-                } else {
-                    "Entries are already active."
-                },
-            )
-            .to_string();
-        }
-        state.set_paused(paused, None);
-        pick(
-            lang,
-            if paused {
-                "已暂停开仓。"
-            } else {
-                "已恢复开仓。"
-            },
-            if paused {
-                "Entries paused."
-            } else {
-                "Entries resumed."
-            },
-        )
-        .to_string()
     }
 
     async fn confirm(&self, state: &AppState, user_id: i64, lang: Lang, token: &str) -> String {
@@ -1188,16 +1306,25 @@ impl TelegramBot {
             .to_string();
         }
 
-        let outcome = gateway::submit_pair(
+        let outcome = gateway::submit_legs(
             state,
-            PairOrderRequest {
-                symbol: trade.symbol.clone(),
-                long_venue: trade.long_venue.clone(),
-                short_venue: trade.short_venue.clone(),
-                notional_usd: trade.notional_usd,
+            OrderBatchRequest {
+                legs: trade
+                    .legs
+                    .iter()
+                    .map(|leg| LegOrderRequest {
+                        venue: leg.venue.clone(),
+                        symbol: trade.symbol.clone(),
+                        side: leg.side,
+                        notional_usd: trade.notional_usd,
+                        limit_price: None,
+                        quantity: None,
+                    })
+                    .collect(),
                 leverage: Some(trade.leverage),
                 max_slippage_bps: None,
                 strategy_id: None,
+                source: None,
                 origin: OrderOrigin::Telegram,
                 idempotency_key: format!("telegram-{}", Uuid::new_v4()),
                 closing: false,
@@ -1209,27 +1336,39 @@ impl TelegramBot {
         match outcome {
             Ok(outcome) => {
                 let order = outcome.order;
+                let single_leg = order.intent.legs.len() == 1;
+                let legs_label = order
+                    .intent
+                    .legs
+                    .iter()
+                    .map(|leg| {
+                        format!(
+                            "{} {}",
+                            venue_label(&leg.venue),
+                            side_label(lang, leg.side)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" / ");
                 let mut lines = match lang {
                     Lang::Zh => vec![
                         format!("订单 {:?}", order.status),
                         format!("编号 {}", order.id),
                         format!(
-                            "{}：{} 多 / {} 空，每条腿 {} USD",
+                            "{}：{legs_label}，{} {notional} USD",
                             order.intent.legs[0].symbol,
-                            order.intent.legs[0].venue,
-                            order.intent.legs[1].venue,
-                            trade.notional_usd
+                            if single_leg { "单腿" } else { "每条腿" },
+                            notional = trade.notional_usd
                         ),
                     ],
                     Lang::En => vec![
                         format!("Order {:?}", order.status),
                         format!("ID {}", order.id),
                         format!(
-                            "{}: long {} / short {}, {} USD per leg",
+                            "{}: {legs_label}, {} {notional} USD",
                             order.intent.legs[0].symbol,
-                            order.intent.legs[0].venue,
-                            order.intent.legs[1].venue,
-                            trade.notional_usd
+                            if single_leg { "single leg" } else { "per leg" },
+                            notional = trade.notional_usd
                         ),
                     ],
                 };
@@ -1257,6 +1396,413 @@ impl TelegramBot {
                 pick(lang, "已取消该待确认订单。", "Pending order cancelled.").to_string()
             }
             _ => pick(lang, "没有找到该待确认订单。", "Pending order not found.").to_string(),
+        }
+    }
+
+    /// `/closeall`：汇总交易所仓位与上币/技能单腿持仓，回复带确认按钮的卡片。
+    fn prepare_close_all(&self, state: &AppState, user_id: i64, lang: Lang) -> BotReply {
+        let positions = state.positions.read().expect("仓位锁不可用").clone();
+        let trades = state.listing.open_trades();
+        if positions.is_empty() && trades.is_empty() {
+            return BotReply::text(pick(lang, "暂无仓位，无需平仓。", "No open positions."));
+        }
+
+        let token = Uuid::new_v4().simple().to_string()[..6].to_ascii_uppercase();
+        let expires_at = Utc::now() + chrono::Duration::seconds(CLOSE_ALL_TTL_SECS);
+        {
+            let mut pending = self.close_all.lock().expect("一键平仓锁不可用");
+            pending.retain(|_, (_, expiry)| *expiry > Utc::now());
+            pending.insert(token.clone(), (user_id, expires_at));
+        }
+
+        let mut lines = vec![match lang {
+            Lang::Zh => format!("一键平仓确认 {token}"),
+            Lang::En => format!("Close-all confirmation {token}"),
+        }];
+        lines.push(match lang {
+            Lang::Zh => format!(
+                "将平掉：交易所仓位 {} 条，上币/技能单腿 {} 笔。",
+                positions.len(),
+                trades.len()
+            ),
+            Lang::En => format!(
+                "Will close {} exchange positions and {} listing/skill trades.",
+                positions.len(),
+                trades.len()
+            ),
+        });
+        for position in positions.iter().take(8) {
+            lines.push(format!(
+                "{} {} {} {}",
+                position.symbol,
+                venue_label(&position.venue),
+                side_label(lang, position.side),
+                position.quantity
+            ));
+        }
+        for trade in trades.iter().take(8) {
+            lines.push(format!(
+                "{} {} {} {}",
+                trade.symbol,
+                venue_label(&trade.venue),
+                side_label(lang, trade.side),
+                trade.quantity
+            ));
+        }
+        lines.push(match lang {
+            Lang::Zh => format!(
+                "按最新盘口反向市价提交，{CLOSE_ALL_TTL_SECS} 秒内点击下方按钮确认。"
+            ),
+            Lang::En => format!(
+                "Everything is market-closed at the latest quotes; tap a button within {CLOSE_ALL_TTL_SECS}s."
+            ),
+        });
+        let markup = serde_json::json!({
+            "inline_keyboard": [[
+                {
+                    "text": pick(lang, "确认全部平仓", "Confirm close-all"),
+                    "callback_data": format!("closeall:confirm:{token}"),
+                },
+                {
+                    "text": pick(lang, "取消", "Cancel"),
+                    "callback_data": format!("closeall:cancel:{token}"),
+                },
+            ]],
+        });
+        BotReply::with_markup(lines.join("\n"), markup)
+    }
+
+    /// 用户点了「确认全部平仓」：先平上币/技能单腿，再按仓位组批量平掉交易所仓位。
+    async fn confirm_close_all(
+        &self,
+        state: &AppState,
+        user_id: i64,
+        lang: Lang,
+        token: &str,
+    ) -> String {
+        {
+            let mut pending = self.close_all.lock().expect("一键平仓锁不可用");
+            let valid = pending
+                .get(token)
+                .map(|(owner, expiry)| *owner == user_id && *expiry > Utc::now())
+                .unwrap_or(false);
+            if !valid {
+                return pick(
+                    lang,
+                    "确认已过期，请重新发送 /closeall。",
+                    "This confirmation expired; send /closeall again.",
+                )
+                .to_string();
+            }
+            pending.remove(token);
+        }
+
+        let mut closed_trades = 0usize;
+        let mut failures: Vec<String> = Vec::new();
+        // 平仓失败的单腿交易仍会被止盈止损监控接管，跳过对应仓位避免重复提交。
+        let mut skipped: HashSet<(String, String, Side)> = HashSet::new();
+        for trade in state.listing.open_trades() {
+            match listing::close_position(state, trade.id, CloseReason::Manual).await {
+                Ok(_) => closed_trades += 1,
+                Err(error) => {
+                    if !trade.paper {
+                        skipped.insert((trade.venue.clone(), trade.symbol.clone(), trade.side));
+                    }
+                    failures.push(format!(
+                        "{} {}: {}",
+                        venue_label(&trade.venue),
+                        trade.symbol,
+                        describe_error(lang, &error)
+                    ));
+                }
+            }
+        }
+
+        // 平仓会按成交即时减少内存仓位，这里重新取一次再平剩余部分。
+        let positions = {
+            let mut positions = state.positions.write().expect("仓位锁不可用");
+            state.apply_realtime_prices(&mut positions);
+            positions.clone()
+        };
+        let mut batches: Vec<(Option<Uuid>, Vec<arb_core::Position>)> = Vec::new();
+        for position in positions {
+            if skipped.contains(&(
+                position.venue.clone(),
+                position.symbol.clone(),
+                position.side,
+            )) {
+                continue;
+            }
+            if let Some(group_id) = position.group_id {
+                if let Some((_, members)) = batches.iter_mut().find(|(id, _)| *id == Some(group_id))
+                {
+                    members.push(position);
+                    continue;
+                }
+                batches.push((Some(group_id), vec![position]));
+            } else {
+                batches.push((None, vec![position]));
+            }
+        }
+
+        let mut closed_positions = 0usize;
+        let mut closed_batches = 0usize;
+        for (_, members) in batches {
+            let mut legs = Vec::with_capacity(members.len());
+            let mut invalid = None;
+            for position in &members {
+                let notional_usd = position.quantity * position.mark_price;
+                if position.quantity <= Decimal::ZERO || notional_usd <= Decimal::ZERO {
+                    invalid = Some(format!(
+                        "{} {}",
+                        venue_label(&position.venue),
+                        position.symbol
+                    ));
+                    break;
+                }
+                legs.push(LegOrderRequest {
+                    venue: position.venue.clone(),
+                    symbol: position.symbol.clone(),
+                    side: match position.side {
+                        Side::Buy => Side::Sell,
+                        Side::Sell => Side::Buy,
+                    },
+                    notional_usd,
+                    limit_price: None,
+                    // 用同步回来的持仓数量，避免按名义价值换算留下零头。
+                    quantity: Some(position.quantity),
+                });
+            }
+            if let Some(label) = invalid {
+                failures.push(match lang {
+                    Lang::Zh => format!("{label} 仓位数量为 0，无法平仓"),
+                    Lang::En => format!("{label} has zero size; cannot close"),
+                });
+                continue;
+            }
+
+            let outcome = gateway::submit_legs(
+                state,
+                OrderBatchRequest {
+                    legs,
+                    // 同一批共用一个杠杆，取组内最大值以免低估保证金需求。
+                    leverage: Some(
+                        members
+                            .iter()
+                            .map(|position| position.leverage)
+                            .max()
+                            .unwrap_or(Decimal::ONE),
+                    ),
+                    max_slippage_bps: None,
+                    strategy_id: members.iter().find_map(|position| position.strategy_id),
+                    source: None,
+                    origin: OrderOrigin::Telegram,
+                    idempotency_key: format!("telegram-closeall-{}", Uuid::new_v4()),
+                    closing: true,
+                    max_unhedged_secs: None,
+                },
+            )
+            .await;
+
+            match outcome {
+                Ok(outcome) if outcome.order.status == OrderStatus::Filled => {
+                    closed_positions += members.len();
+                    closed_batches += 1;
+                }
+                Ok(outcome) => failures.push(format!(
+                    "{}: {}",
+                    members[0].symbol,
+                    outcome
+                        .order
+                        .note
+                        .unwrap_or_else(|| format!("{:?}", outcome.order.status))
+                )),
+                Err(error) => failures.push(format!(
+                    "{}: {}",
+                    members[0].symbol,
+                    describe_error(lang, &error)
+                )),
+            }
+        }
+
+        let mut lines = vec![match lang {
+            Lang::Zh => format!(
+                "一键平仓完成\n交易所仓位 {} 条（{} 笔订单），上币/技能单腿 {} 笔",
+                closed_positions, closed_batches, closed_trades
+            ),
+            Lang::En => format!(
+                "Close-all finished\n{} exchange positions ({} orders) and {} listing/skill trades closed",
+                closed_positions, closed_batches, closed_trades
+            ),
+        }];
+        if closed_positions == 0 && closed_trades == 0 && failures.is_empty() {
+            lines.push(pick(lang, "没有可平仓位。", "Nothing to close.").to_string());
+        }
+        if !failures.is_empty() {
+            lines.push(match lang {
+                Lang::Zh => "未完成：".to_string(),
+                Lang::En => "Not closed:".to_string(),
+            });
+            for failure in failures.iter().take(8) {
+                lines.push(format!("- {failure}"));
+            }
+        }
+        lines.join("\n")
+    }
+
+    /// `/close <编号前缀>`：平掉单个仓位；编号来自 `/positions`，也兼容上币/技能单腿交易编号。
+    async fn close_one(&self, state: &AppState, user_id: i64, lang: Lang, args: &[&str]) -> String {
+        if !self.can_trade(user_id) {
+            return pick(
+                lang,
+                "该账号没有交易权限。",
+                "This account has no trading permission.",
+            )
+            .to_string();
+        }
+        let Some(prefix) = args
+            .first()
+            .map(|value| value.trim_start_matches('#').trim())
+            .filter(|value| !value.is_empty())
+        else {
+            return pick(
+                lang,
+                "用法：/close <编号前缀>，编号见 /positions。",
+                "Usage: /close <id prefix>; ids are listed by /positions.",
+            )
+            .to_string();
+        };
+        let prefix = prefix.to_ascii_lowercase();
+
+        let matches: Vec<arb_core::Position> = {
+            let mut positions = state.positions.write().expect("仓位锁不可用");
+            state.apply_realtime_prices(&mut positions);
+            positions
+                .iter()
+                .filter(|position| position.id.to_string().starts_with(&prefix))
+                .cloned()
+                .collect()
+        };
+        if matches.len() > 1 {
+            return pick(
+                lang,
+                "匹配到多个仓位，请输入更长的编号前缀。",
+                "Multiple positions match; send a longer id prefix.",
+            )
+            .to_string();
+        }
+        if let Some(position) = matches.first() {
+            return self.close_position_now(state, lang, position).await;
+        }
+
+        match state.listing.find_open_by_prefix(&prefix) {
+            Some(trade) => {
+                match listing::close_position(state, trade.id, CloseReason::Manual).await {
+                    Ok(closed) => listing_closed_text(lang, &closed),
+                    Err(error) => match lang {
+                        Lang::Zh => format!("平仓失败：{}", describe_error(lang, &error)),
+                        Lang::En => format!("Close failed: {}", describe_error(lang, &error)),
+                    },
+                }
+            }
+            None => pick(lang, "没有找到匹配的仓位。", "No matching position.").to_string(),
+        }
+    }
+
+    /// 单个交易所仓位的市价平仓；与一键平仓共用同一套网关风控。
+    async fn close_position_now(
+        &self,
+        state: &AppState,
+        lang: Lang,
+        position: &arb_core::Position,
+    ) -> String {
+        let notional_usd = position.quantity * position.mark_price;
+        if position.quantity <= Decimal::ZERO || notional_usd <= Decimal::ZERO {
+            return match lang {
+                Lang::Zh => format!("{} 仓位数量为 0，无法平仓。", position.symbol),
+                Lang::En => format!("{} has zero size; cannot close.", position.symbol),
+            };
+        }
+        let outcome = gateway::submit_legs(
+            state,
+            OrderBatchRequest {
+                legs: vec![LegOrderRequest {
+                    venue: position.venue.clone(),
+                    symbol: position.symbol.clone(),
+                    side: match position.side {
+                        Side::Buy => Side::Sell,
+                        Side::Sell => Side::Buy,
+                    },
+                    notional_usd,
+                    limit_price: None,
+                    quantity: Some(position.quantity),
+                }],
+                leverage: Some(position.leverage),
+                max_slippage_bps: None,
+                strategy_id: position.strategy_id,
+                source: None,
+                origin: OrderOrigin::Telegram,
+                idempotency_key: format!("telegram-close-{}", Uuid::new_v4()),
+                closing: true,
+                max_unhedged_secs: None,
+            },
+        )
+        .await;
+        match outcome {
+            Ok(outcome) if outcome.order.status == OrderStatus::Filled => match lang {
+                Lang::Zh => format!(
+                    "已平仓 #{} {} {} {} {}",
+                    short_id(position.id),
+                    position.symbol,
+                    venue_label(&position.venue),
+                    side_label(lang, position.side),
+                    position.quantity
+                ),
+                Lang::En => format!(
+                    "Closed #{} {} {} {} {}",
+                    short_id(position.id),
+                    position.symbol,
+                    venue_label(&position.venue),
+                    side_label(lang, position.side),
+                    position.quantity
+                ),
+            },
+            Ok(outcome) => match lang {
+                Lang::Zh => format!(
+                    "平仓未成交：{}",
+                    outcome
+                        .order
+                        .note
+                        .unwrap_or_else(|| format!("{:?}", outcome.order.status))
+                ),
+                Lang::En => format!(
+                    "Close not filled: {}",
+                    outcome
+                        .order
+                        .note
+                        .unwrap_or_else(|| format!("{:?}", outcome.order.status))
+                ),
+            },
+            Err(error) => match lang {
+                Lang::Zh => format!("平仓失败：{}", describe_error(lang, &error)),
+                Lang::En => format!("Close failed: {}", describe_error(lang, &error)),
+            },
+        }
+    }
+
+    fn cancel_close_all(&self, user_id: i64, lang: Lang, token: &str) -> String {
+        let mut pending = self.close_all.lock().expect("一键平仓锁不可用");
+        match pending.get(token) {
+            Some((owner, _)) if *owner == user_id => {
+                pending.remove(token);
+                pick(lang, "已取消一键平仓。", "Close-all cancelled.").to_string()
+            }
+            _ => pick(
+                lang,
+                "确认已过期，请重新发送 /closeall。",
+                "This confirmation expired; send /closeall again.",
+            )
+            .to_string(),
         }
     }
 
@@ -1291,17 +1837,85 @@ impl TelegramBot {
                 ListingDraft {
                     id: id.clone(),
                     announcement: card.announcement.clone(),
+                    side: card.side,
                     venue: venue.clone(),
                     expires_at: listing_expiry(),
                 },
             );
         BotReply::with_markup(
-            listing_confirm_text(lang, &card.announcement, &venue, &settings),
+            listing_confirm_text(lang, &card.announcement, card.side, &venue, &settings),
             listing_confirm_markup(lang, &id),
         )
     }
 
-    /// 用户点了「确认开仓」：按设置里的金额、杠杆与止盈止损单腿做多。
+    /// 选好交易所后：首次手动下单先引导设置金额/杠杆/止盈止损，
+    /// 保存过一次之后直接用上次的参数进入确认卡片。
+    async fn listing_after_venue(
+        &self,
+        state: &AppState,
+        user_id: i64,
+        lang: Lang,
+        id: &str,
+        venue: &str,
+    ) -> BotReply {
+        let id = id.to_ascii_uppercase();
+        let venue = venue.trim().to_ascii_lowercase();
+        let settings = listing::manual_settings(state).await;
+        if !listing_venues(state, &settings).contains(&venue) {
+            return BotReply::text(unknown_venue_text(lang, &venue));
+        }
+        if state.listing.manual_rule().is_some() {
+            return self.listing_preview(state, user_id, lang, &id, &venue).await;
+        }
+        let wizard = ListingWizard {
+            token: None,
+            id,
+            venue: Some(venue),
+            stage: ListingStage::Params,
+            expires_at: listing_expiry(),
+        };
+        self.store_listing_wizard(user_id, wizard);
+        BotReply::with_markup(
+            listing_params_prompt_text(lang, &settings),
+            listing_cancel_markup(lang),
+        )
+    }
+
+    /// 确认卡片上的「修改参数」：回到参数输入，改完再刷新确认卡片。
+    async fn listing_params_step(
+        &self,
+        state: &AppState,
+        user_id: i64,
+        lang: Lang,
+        id: &str,
+    ) -> BotReply {
+        let id = id.to_ascii_uppercase();
+        let venue = {
+            let drafts = self.listing_drafts.lock().expect("上币草稿锁不可用");
+            drafts
+                .get(&user_id)
+                .filter(|draft| draft.id == id && draft.expires_at > Utc::now())
+                .map(|draft| draft.venue.clone())
+        };
+        let Some(venue) = venue else {
+            return BotReply::text(listing_expired_text(lang));
+        };
+        let wizard = ListingWizard {
+            token: None,
+            id,
+            venue: Some(venue),
+            stage: ListingStage::Params,
+            expires_at: listing_expiry(),
+        };
+        self.store_listing_wizard(user_id, wizard);
+        let settings = listing::manual_settings(state).await;
+        BotReply::with_markup(
+            listing_params_prompt_text(lang, &settings),
+            listing_cancel_markup(lang),
+        )
+    }
+
+    /// 用户点了「确认开仓」：按设置里的金额、杠杆与止盈止损单腿下单。
     async fn confirm_listing(
         &self,
         state: &AppState,
@@ -1326,7 +1940,7 @@ impl TelegramBot {
             headline: draft.announcement.headline,
             venue: draft.venue,
             symbol: draft.announcement.symbol,
-            side: Side::Buy,
+            side: draft.side,
             notional_usd: settings.notional_usd,
             leverage: settings.leverage,
             take_profit_pct: settings.take_profit_pct,
@@ -1369,7 +1983,205 @@ impl TelegramBot {
         }
     }
 
-    /// `/listing`：查看与修改上币单腿交易；下单与平仓仍走统一风控网关。
+    /// 放弃当前上币引导与待确认草稿。
+    fn abort_listing(&self, user_id: i64, lang: Lang) -> BotReply {
+        self.listing_wizards
+            .lock()
+            .expect("上币引导锁不可用")
+            .remove(&user_id);
+        self.listing_drafts
+            .lock()
+            .expect("上币草稿锁不可用")
+            .remove(&user_id);
+        BotReply::text(pick(lang, "已取消上币下单。", "Listing order cancelled."))
+    }
+
+    fn store_listing_wizard(&self, user_id: i64, wizard: ListingWizard) {
+        self.listing_wizards
+            .lock()
+            .expect("上币引导锁不可用")
+            .insert(user_id, wizard);
+    }
+
+    fn current_listing_wizard(&self, user_id: i64) -> Option<ListingWizard> {
+        let mut wizards = self.listing_wizards.lock().expect("上币引导锁不可用");
+        if matches!(wizards.get(&user_id), Some(wizard) if wizard.expires_at <= Utc::now()) {
+            wizards.remove(&user_id);
+            return None;
+        }
+        wizards.get(&user_id).cloned()
+    }
+
+    fn clear_listing_wizard(&self, user_id: i64) {
+        self.listing_wizards
+            .lock()
+            .expect("上币引导锁不可用")
+            .remove(&user_id);
+    }
+
+    /// 上币引导的进度提示：按当前阶段告诉用户下一步该做什么。
+    async fn listing_open_prompt(
+        &self,
+        state: &AppState,
+        lang: Lang,
+        wizard: &ListingWizard,
+    ) -> BotReply {
+        match wizard.stage {
+            ListingStage::Token => BotReply::with_markup(
+                pick(
+                    lang,
+                    "上币下单第 1 步：发送代币代码，例如 XYZ。",
+                    "Listing entry step 1: send the token code, e.g. XYZ.",
+                ),
+                listing_cancel_markup(lang),
+            ),
+            ListingStage::Side => {
+                let token = wizard.token.clone().unwrap_or_default();
+                let text = match lang {
+                    Lang::Zh => format!("上币下单 {token}\n第 2 步：选择做多还是做空。"),
+                    Lang::En => format!("Listing entry {token}\nStep 2: choose long or short."),
+                };
+                BotReply::with_markup(text, listing_side_markup(lang, &wizard.id))
+            }
+            ListingStage::Venue => {
+                let settings = listing::manual_settings(state).await;
+                let venues = listing_venues(state, &settings);
+                if venues.is_empty() {
+                    return BotReply::text(listing_no_venue_text(lang));
+                }
+                let token = wizard.token.clone().unwrap_or_default();
+                let side = self
+                    .listing_cards
+                    .lock()
+                    .expect("上币卡片锁不可用")
+                    .get(&wizard.id)
+                    .map(|card| card.side)
+                    .unwrap_or(Side::Buy);
+                let text = match lang {
+                    Lang::Zh => format!(
+                        "上币下单 {token} {}\n第 3 步：选择交易所。",
+                        side_label(lang, side)
+                    ),
+                    Lang::En => format!(
+                        "Listing entry {token} {}\nStep 3: choose the venue.",
+                        side_label(lang, side)
+                    ),
+                };
+                BotReply::with_markup(text, listing_venue_markup(lang, &wizard.id, &venues))
+            }
+            ListingStage::Params => {
+                let settings = listing::manual_settings(state).await;
+                BotReply::with_markup(
+                    listing_params_prompt_text(lang, &settings),
+                    listing_cancel_markup(lang),
+                )
+            }
+        }
+    }
+
+    /// 上币引导进行中收到的普通文本：目前只有代币代码需要手输。
+    async fn listing_input(
+        &self,
+        state: &AppState,
+        user_id: i64,
+        lang: Lang,
+        text: &str,
+    ) -> Option<BotReply> {
+        if !self.can_trade(user_id) {
+            return None;
+        }
+        let mut wizard = self.current_listing_wizard(user_id)?;
+        match wizard.stage {
+            ListingStage::Token => {
+                let Some(token) = parse_token(text) else {
+                    return Some(BotReply::text(token_error_text(lang)));
+                };
+                wizard.token = Some(token);
+                wizard.stage = ListingStage::Side;
+                wizard.expires_at = listing_expiry();
+                self.store_listing_wizard(user_id, wizard.clone());
+                Some(self.listing_open_prompt(state, lang, &wizard).await)
+            }
+            ListingStage::Params => {
+                let mut rule = listing::manual_settings(state).await;
+                let Some((amount, leverage, take_profit, stop_loss)) =
+                    parse_listing_params(text, &rule)
+                else {
+                    return Some(BotReply::text(listing_params_error_text(lang)));
+                };
+                let Some(venue) = wizard.venue.clone() else {
+                    return Some(BotReply::text(listing_expired_text(lang)));
+                };
+                rule.notional_usd = amount;
+                rule.leverage = leverage;
+                rule.take_profit_pct = take_profit;
+                rule.stop_loss_pct = stop_loss;
+                state.listing.save_manual_rule(rule).await;
+                self.clear_listing_wizard(user_id);
+                Some(self.listing_preview(state, user_id, lang, &wizard.id, &venue).await)
+            }
+            _ => Some(BotReply::text(pick(
+                lang,
+                "请点击上方按钮选择方向或交易所，或发送 /listing open 重新开始。",
+                "Tap a button above to choose the direction or venue, or send /listing open to restart.",
+            ))),
+        }
+    }
+
+    /// 用户点了做多/做空按钮：写入卡片并进入交易所选择。
+    async fn listing_side_step(
+        &self,
+        state: &AppState,
+        user_id: i64,
+        lang: Lang,
+        id: &str,
+        side: Side,
+    ) -> BotReply {
+        let id = id.to_ascii_uppercase();
+        let Some(mut wizard) = self.current_listing_wizard(user_id) else {
+            return BotReply::text(listing_expired_text(lang));
+        };
+        if wizard.id != id || wizard.stage != ListingStage::Side {
+            return BotReply::text(listing_expired_text(lang));
+        }
+        let Some(token) = wizard.token.clone() else {
+            return BotReply::text(listing_expired_text(lang));
+        };
+        self.insert_listing_card(&id, &token, None, side, lang);
+        wizard.stage = ListingStage::Venue;
+        wizard.expires_at = listing_expiry();
+        self.store_listing_wizard(user_id, wizard.clone());
+        self.listing_open_prompt(state, lang, &wizard).await
+    }
+
+    /// 写入一张上币卡片，供后续交易所按钮与确认卡片读取。
+    fn insert_listing_card(
+        &self,
+        id: &str,
+        token: &str,
+        symbol: Option<String>,
+        side: Side,
+        lang: Lang,
+    ) {
+        let announcement = ListingAnnouncement {
+            token: token.to_string(),
+            symbol: symbol.unwrap_or_else(|| format!("{token}USDT")),
+            headline: manual_listing_headline(lang, side),
+        };
+        let mut cards = self.listing_cards.lock().expect("上币卡片锁不可用");
+        cards.retain(|_, card| card.expires_at > Utc::now());
+        cards.insert(
+            id.to_string(),
+            ListingCard {
+                announcement,
+                side,
+                expires_at: listing_expiry(),
+            },
+        );
+    }
+
+    /// `/listing`：查看上币单腿交易；下单与平仓仍走统一风控网关。
+    /// 金额、杠杆与止盈止损在首次下单引导里设置一次，之后自动复用。
     async fn listing_command(
         &self,
         state: &AppState,
@@ -1380,109 +2192,70 @@ impl TelegramBot {
         let Some(sub) = args.first().map(|value| value.to_ascii_lowercase()) else {
             return BotReply::text(listing_status_text(lang, state).await);
         };
-        let value = args.get(1).copied();
         match sub.as_str() {
-            "amount" | "leverage" | "tp" | "sl" => {
-                if !self.can_trade(user_id) {
-                    return BotReply::text(listing_permission_text(lang));
-                }
-                let Some(number) = value.and_then(|value| value.parse::<Decimal>().ok()) else {
-                    return BotReply::text(listing_number_error_text(lang));
-                };
-                let requires_positive = matches!(sub.as_str(), "amount" | "leverage");
-                if number < Decimal::ZERO || (requires_positive && number == Decimal::ZERO) {
-                    return BotReply::text(listing_number_error_text(lang));
-                }
-                let strategies = listing::running_strategies(state).await;
-                if strategies.is_empty() {
-                    return BotReply::text(listing_no_running_text(lang));
-                }
-                // 参数写到运行中策略的每一条规则上；技能接管的策略写技能设置，
-                // 否则状态仍会读到旧的上币监听设置，出现「显示模拟、实际真实」的偏差。
-                for (strategy_id, _, mut settings) in strategies {
-                    if skill::update_listing_number(state, strategy_id, sub.as_str(), number).await
-                    {
-                        continue;
-                    }
-                    for rule in &mut settings.rules {
-                        match sub.as_str() {
-                            "amount" => rule.notional_usd = number,
-                            "leverage" => rule.leverage = number,
-                            "tp" => rule.take_profit_pct = number,
-                            _ => rule.stop_loss_pct = number,
-                        }
-                    }
-                    state.listing.update_settings(strategy_id, settings).await;
-                }
-                BotReply::text(listing_status_text(lang, state).await)
-            }
             "open" => {
                 if !self.can_trade(user_id) {
                     return BotReply::text(listing_permission_text(lang));
                 }
-                let Some(token) = args
-                    .get(1)
-                    .map(|value| value.trim().to_ascii_uppercase())
-                    .filter(|token| token.len() >= 2 && token.len() <= 12)
-                    .filter(|token| token.chars().all(|ch| ch.is_ascii_alphanumeric()))
-                else {
-                    return BotReply::text(listing_usage_text(lang));
-                };
-                let Some(venue) = args.get(2).map(|value| value.to_ascii_lowercase()) else {
-                    return BotReply::text(listing_usage_text(lang));
-                };
-                let symbol = args
-                    .get(3)
-                    .map(|value| value.trim().to_ascii_uppercase())
-                    .filter(|value| !value.is_empty())
-                    .unwrap_or_else(|| format!("{token}USDT"));
+                self.clear_listing_wizard(user_id);
+                self.clear_draft(user_id);
 
+                // 不带代币时进入引导第 1 步，由用户下一条文本提供代币代码。
+                let Some(token) = args.get(1).and_then(|value| parse_token(value)) else {
+                    let wizard = ListingWizard {
+                        id: listing_card_id(),
+                        token: None,
+                        venue: None,
+                        stage: ListingStage::Token,
+                        expires_at: listing_expiry(),
+                    };
+                    self.store_listing_wizard(user_id, wizard.clone());
+                    return self.listing_open_prompt(state, lang, &wizard).await;
+                };
+
+                // 交易所与方向都可省略且顺序不限：第 3 个参数既可以是交易所，
+                // 也可以是方向（long/short、多/空），第 4 个参数补交易对或方向。
+                let mut venue = None;
+                let mut side = None;
+                let mut symbol = None;
+                for raw in args.iter().skip(2).take(3) {
+                    let value = raw.trim();
+                    if let Some(parsed) = parse_side(value) {
+                        side = Some(parsed);
+                    } else if !value.is_empty() && venue.is_none() {
+                        venue = Some(value.to_ascii_lowercase());
+                    } else if !value.is_empty() {
+                        symbol = Some(value.to_ascii_uppercase());
+                    }
+                }
+                let has_side = side.is_some();
+                let side = side.unwrap_or(Side::Buy);
+
+                // 交易所已给出：首次下单先补参数，保存过就直接进入确认卡片。
+                if let Some(venue) = venue {
+                    let id = listing_card_id();
+                    self.insert_listing_card(&id, &token, symbol, side, lang);
+                    return self.listing_after_venue(state, user_id, lang, &id, &venue).await;
+                }
+
+                // 交易所未给出：继续用按钮引导选择方向与交易所。
                 let id = listing_card_id();
-                let announcement = ListingAnnouncement {
-                    token,
-                    symbol,
-                    headline: pick(
-                        lang,
-                        "手动发起的上币单腿交易",
-                        "Manually started listing long",
-                    )
-                    .to_string(),
-                };
-                {
-                    let mut cards = self.listing_cards.lock().expect("上币卡片锁不可用");
-                    cards.retain(|_, card| card.expires_at > Utc::now());
-                    cards.insert(
-                        id.clone(),
-                        ListingCard {
-                            announcement,
-                            expires_at: listing_expiry(),
-                        },
-                    );
+                if has_side {
+                    self.insert_listing_card(&id, &token, symbol, side, lang);
                 }
-                self.listing_preview(state, user_id, lang, &id, &venue)
-                    .await
-            }
-            "close" => {
-                if !self.can_trade(user_id) {
-                    return BotReply::text(listing_permission_text(lang));
-                }
-                let Some(prefix) = args.get(1) else {
-                    return BotReply::text(listing_usage_text(lang));
+                let wizard = ListingWizard {
+                    token: Some(token),
+                    id,
+                    venue: None,
+                    stage: if has_side {
+                        ListingStage::Venue
+                    } else {
+                        ListingStage::Side
+                    },
+                    expires_at: listing_expiry(),
                 };
-                let Some(trade) = state.listing.find_open_by_prefix(prefix) else {
-                    return BotReply::text(pick(
-                        lang,
-                        "没有找到匹配的持仓。",
-                        "No matching open trade.",
-                    ));
-                };
-                match listing::close_position(state, trade.id, CloseReason::Manual).await {
-                    Ok(closed) => BotReply::text(listing_closed_text(lang, &closed)),
-                    Err(error) => BotReply::text(match lang {
-                        Lang::Zh => format!("平仓失败：{}", describe_error(lang, &error)),
-                        Lang::En => format!("Close failed: {}", describe_error(lang, &error)),
-                    }),
-                }
+                self.store_listing_wizard(user_id, wizard.clone());
+                self.listing_open_prompt(state, lang, &wizard).await
             }
             _ => BotReply::text(listing_status_text(lang, state).await),
         }
@@ -1651,13 +2424,11 @@ fn help_text(lang: Lang, enabled: bool) -> String {
             "/positions 当前仓位",
             "/orders 最近订单",
             "/news 最新上币公告",
-            "/pause 暂停开仓",
-            "/resume 恢复开仓",
-            "/open 开仓向导：按钮选交易所，输入金额与杠杆（默认 10x）",
+            "/open 开仓向导：按钮选开仓方式与交易所，输入金额与杠杆（默认 10x），支持单腿或双腿",
             "开仓会回复确认按钮，点击「确认开仓」后才真正下单",
-            "/listing 上币单腿交易：金额、杠杆、止盈止损与手动平仓",
-            "/listing amount 100 / leverage 10 调整下单参数",
-            "/listing open <代币> <交易所> [交易对] 手动发起",
+            "/listing open 进入引导：代币 → 方向 → 交易所 → 参数",
+            "/closeall 一键平仓：确认后平掉全部交易所仓位与上币/技能持仓",
+            "/close <编号前缀> 平掉单个仓位（编号见 /positions）",
             "/lang zh|en 切换机器人语言",
             "/unbind 解除绑定",
             "",
@@ -1670,13 +2441,11 @@ fn help_text(lang: Lang, enabled: bool) -> String {
             "/positions Current positions",
             "/orders Recent orders",
             "/news Latest listing announcements",
-            "/pause Pause entries",
-            "/resume Resume entries",
-            "/open Entry wizard: pick venues with buttons, then type the amount and leverage (default 10x)",
+            "/open Entry wizard: pick the mode and venues with buttons, then type the amount and leverage (default 10x); single or hedged legs",
             "Entries reply with a confirm button; tap it to place the order",
-            "/listing Listing single-leg trades: notional, leverage, TP/SL and manual close",
-            "/listing amount 100 / leverage 10 adjusts the order size and leverage",
-            "/listing open <token> <venue> [symbol] starts one manually",
+            "/listing open starts the guide: token → direction → venue → params",
+            "/closeall Close everything: all exchange positions and listing/skill trades, after confirmation",
+            "/close <id prefix> closes one position (ids are listed by /positions)",
             "/lang zh|en Switch the bot language",
             "/unbind Unlink this account",
             "",
@@ -1712,6 +2481,97 @@ fn listing_venues(state: &AppState, rule: &ListingRule) -> Vec<String> {
         .filter(|venue| tradable.contains(venue))
         .cloned()
         .collect()
+}
+
+/// 解析方向输入：常见英文与中文写法都接受。
+fn parse_side(value: &str) -> Option<Side> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "long" | "buy" | "多" | "做多" => Some(Side::Buy),
+        "short" | "sell" | "空" | "做空" => Some(Side::Sell),
+        _ => None,
+    }
+}
+
+/// 解析代币代码：2–12 位字母数字，统一大写。
+fn parse_token(value: &str) -> Option<String> {
+    let token = value.trim().to_ascii_uppercase();
+    if token.len() < 2 || token.len() > 12 {
+        return None;
+    }
+    if !token.chars().all(|ch| ch.is_ascii_alphanumeric()) {
+        return None;
+    }
+    Some(token)
+}
+
+/// 解析手动下单参数：金额 [杠杆] [止盈] [止损]，省略的尾部沿用上次设置。
+fn parse_listing_params(
+    value: &str,
+    current: &ListingRule,
+) -> Option<(Decimal, Decimal, Decimal, Decimal)> {
+    let numbers: Vec<Decimal> = value
+        .split(|ch: char| ch.is_whitespace() || ch == ',' || ch == '/' || ch == '，')
+        .filter(|part| !part.trim().is_empty())
+        .map(|part| part.trim().parse::<Decimal>().ok())
+        .collect::<Option<_>>()?;
+    if numbers.is_empty() || numbers.len() > 4 {
+        return None;
+    }
+    let amount = numbers[0];
+    let leverage = numbers.get(1).copied().unwrap_or(current.leverage);
+    let take_profit = numbers
+        .get(2)
+        .copied()
+        .unwrap_or(current.take_profit_pct);
+    let stop_loss = numbers.get(3).copied().unwrap_or(current.stop_loss_pct);
+    if amount <= Decimal::ZERO
+        || leverage <= Decimal::ZERO
+        || take_profit < Decimal::ZERO
+        || stop_loss < Decimal::ZERO
+    {
+        return None;
+    }
+    Some((amount, leverage, take_profit, stop_loss))
+}
+
+/// 第一次手动下单时，引导用户一次性设置金额、杠杆与止盈止损。
+fn listing_params_prompt_text(lang: Lang, settings: &ListingRule) -> String {
+    match lang {
+        Lang::Zh => format!(
+            "上币下单参数：发送「金额 杠杆 止盈 止损」，例如 100 1 20 10（止盈/止损填 0 关闭）。\n当前参数：{} USD · {}x · 止盈 {}% · 止损 {}%。设置一次后，下次直接复用。",
+            settings.notional_usd,
+            settings.leverage,
+            settings.take_profit_pct,
+            settings.stop_loss_pct
+        ),
+        Lang::En => format!(
+            "Listing entry params: send \"amount leverage TP SL\", e.g. 100 1 20 10 (TP/SL 0 disables).\nCurrent: {} USD · {}x · TP {}% · SL {}%. Saved once and reused next time.",
+            settings.notional_usd,
+            settings.leverage,
+            settings.take_profit_pct,
+            settings.stop_loss_pct
+        ),
+    }
+}
+
+/// 手动下单参数格式不正确时的提示。
+fn listing_params_error_text(lang: Lang) -> &'static str {
+    pick(
+        lang,
+        "参数不正确：请发送「金额 杠杆 止盈 止损」，金额与杠杆需大于 0，止盈止损可为 0（关闭）。",
+        "Invalid parameters: send \"amount leverage TP SL\"; amount and leverage must be positive, TP/SL may be 0 to disable.",
+    )
+}
+
+/// 手动发起上币单腿交易时的公告标题，按方向区分。
+fn manual_listing_headline(lang: Lang, side: Side) -> String {
+    match (lang, side) {
+        (Lang::Zh, Side::Buy) => "手动发起的上币单腿做多",
+        (Lang::Zh, Side::Sell) => "手动发起的上币单腿做空",
+        (Lang::En, Side::Buy) => "Manually started listing long",
+        (Lang::En, Side::Sell) => "Manually started listing short",
+    }
+    .to_string()
 }
 
 /// 交易对统一为大写，仅接受 USDT 本位永续（形如 `BTCUSDT`）。
@@ -1753,6 +2613,90 @@ fn draft_expiry() -> DateTime<Utc> {
     Utc::now() + chrono::Duration::seconds(PENDING_TTL_SECS)
 }
 
+/// 向导草稿对应的下单腿：双腿返回多、空各一条，单腿只返回一条。
+fn draft_legs(draft: &OpenDraft) -> Option<Vec<PendingLeg>> {
+    match draft.mode? {
+        OpenMode::Hedge => Some(vec![
+            PendingLeg {
+                venue: draft.long_venue.clone()?,
+                side: Side::Buy,
+            },
+            PendingLeg {
+                venue: draft.short_venue.clone()?,
+                side: Side::Sell,
+            },
+        ]),
+        OpenMode::LongOnly => Some(vec![PendingLeg {
+            venue: draft.long_venue.clone()?,
+            side: Side::Buy,
+        }]),
+        OpenMode::ShortOnly => Some(vec![PendingLeg {
+            venue: draft.short_venue.clone()?,
+            side: Side::Sell,
+        }]),
+    }
+}
+
+/// 向导金额步骤的摘要：双腿显示多空两边，单腿标注“单腿”。
+fn draft_legs_summary(lang: Lang, draft: &OpenDraft) -> String {
+    match draft.mode {
+        Some(OpenMode::Hedge) => {
+            let long = venue_label(&draft.long_venue.clone().unwrap_or_default());
+            let short = venue_label(&draft.short_venue.clone().unwrap_or_default());
+            match lang {
+                Lang::Zh => format!("多头 {long} / 空头 {short}"),
+                Lang::En => format!("Long {long} / short {short}"),
+            }
+        }
+        Some(OpenMode::LongOnly) => {
+            let long = venue_label(&draft.long_venue.clone().unwrap_or_default());
+            match lang {
+                Lang::Zh => format!("多头 {long}（单腿）"),
+                Lang::En => format!("Long {long} (single leg)"),
+            }
+        }
+        Some(OpenMode::ShortOnly) => {
+            let short = venue_label(&draft.short_venue.clone().unwrap_or_default());
+            match lang {
+                Lang::Zh => format!("空头 {short}（单腿）"),
+                Lang::En => format!("Short {short} (single leg)"),
+            }
+        }
+        None => String::new(),
+    }
+}
+
+/// 待确认订单的腿描述，例如 “binance 多 / okx 空”。
+fn pending_legs_label(lang: Lang, legs: &[PendingLeg]) -> String {
+    legs.iter()
+        .map(|leg| format!("{} {}", venue_label(&leg.venue), side_label(lang, leg.side)))
+        .collect::<Vec<_>>()
+        .join(" / ")
+}
+
+/// 开仓方式按钮：双腿对冲 / 仅做多 / 仅做空。
+fn mode_markup(lang: Lang) -> Value {
+    serde_json::json!({
+        "inline_keyboard": [
+            [
+                {
+                    "text": pick(lang, "双腿对冲", "Hedged pair"),
+                    "callback_data": "open:mode:hedge",
+                },
+                {
+                    "text": pick(lang, "仅做多", "Long only"),
+                    "callback_data": "open:mode:long",
+                },
+                {
+                    "text": pick(lang, "仅做空", "Short only"),
+                    "callback_data": "open:mode:short",
+                },
+            ],
+            cancel_row(lang),
+        ]
+    })
+}
+
 /// 交易所按钮：每行两个，`step` 为 `long` 或 `short`。
 fn venue_markup(lang: Lang, step: &str, venues: &[String], cancel: bool) -> Value {
     let mut rows: Vec<Vec<Value>> = venues
@@ -1762,7 +2706,7 @@ fn venue_markup(lang: Lang, step: &str, venues: &[String], cancel: bool) -> Valu
                 .iter()
                 .map(|venue| {
                     serde_json::json!({
-                        "text": venue,
+                        "text": venue_label(venue),
                         "callback_data": format!("open:{step}:{venue}"),
                     })
                 })
@@ -1805,8 +2749,8 @@ fn amount_error_text(lang: Lang) -> &'static str {
 fn wizard_only_text(lang: Lang) -> &'static str {
     pick(
         lang,
-        "金额与杠杆在向导最后一步输入。请发送 /open <交易对> [多头] [空头] 开始。",
-        "Amount and leverage are entered in the last wizard step. Send /open <symbol> [long] [short] to start.",
+        "开仓方式、交易所、金额与杠杆都在向导里选择。请发送 /open [交易对] 开始。",
+        "The entry mode, venues, amount and leverage are all chosen in the wizard. Send /open [symbol] to start.",
     )
 }
 
@@ -1828,8 +2772,23 @@ fn expired_open_text(lang: Lang) -> &'static str {
 
 fn unknown_venue_text(lang: Lang, venue: &str) -> String {
     match lang {
-        Lang::Zh => format!("没有该交易所的可交易账户：{venue}，请用按钮选择。"),
-        Lang::En => format!("No tradable account for venue {venue}; pick one of the buttons."),
+        Lang::Zh => format!(
+            "没有该交易所的可交易账户：{}，请用按钮选择。",
+            venue_label(venue)
+        ),
+        Lang::En => format!(
+            "No tradable account for venue {}; pick one of the buttons.",
+            venue_label(venue)
+        ),
+    }
+}
+
+/// 交易所名称展示：首字母大写；内部匹配与回调数据仍使用小写。
+fn venue_label(venue: &str) -> String {
+    let mut chars = venue.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
     }
 }
 
@@ -1857,23 +2816,36 @@ fn short_id(id: Uuid) -> String {
 fn listing_confirm_text(
     lang: Lang,
     announcement: &ListingAnnouncement,
+    side: Side,
     venue: &str,
     settings: &ListingRule,
 ) -> String {
+    let side_zh = if side == Side::Buy {
+        "做多"
+    } else {
+        "做空"
+    };
+    let side_en = if side == Side::Buy { "long" } else { "short" };
+    let action_zh = if side == Side::Buy {
+        "买入"
+    } else {
+        "卖出"
+    };
+    let action_en = if side == Side::Buy { "buy" } else { "sell" };
     match lang {
         Lang::Zh => format!(
-            "确认上币单腿开仓\n{} · {}\n市价买入 {} USD，杠杆 {}x\n止盈 {} · 止损 {}\n\n点击「确认开仓」后才会下单；成交后由后台按标记价监控止盈止损。",
+            "确认上币单腿开仓（{side_zh}）\n{} · {}\n市价{action_zh} {} USD，杠杆 {}x\n止盈 {} · 止损 {}\n\n点击「确认开仓」后才会下单；成交后由后台按标记价监控止盈止损。",
             announcement.symbol,
-            venue,
+            venue_label(venue),
             settings.notional_usd.round_dp(2),
             settings.leverage.round_dp(2),
             pct_label(lang, settings.take_profit_pct),
             pct_label(lang, settings.stop_loss_pct),
         ),
         Lang::En => format!(
-            "Confirm the listing long\n{} · {}\nMarket buy {} USD, leverage {}x\nTP {} · SL {}\n\nThe order is placed only after you tap Confirm; once filled, the executor watches mark price for TP/SL.",
+            "Confirm the listing {side_en}\n{} · {}\nMarket {action_en} {} USD, leverage {}x\nTP {} · SL {}\n\nThe order is placed only after you tap Confirm; once filled, the executor watches mark price for TP/SL.",
             announcement.symbol,
-            venue,
+            venue_label(venue),
             settings.notional_usd.round_dp(2),
             settings.leverage.round_dp(2),
             pct_label(lang, settings.take_profit_pct),
@@ -1884,79 +2856,97 @@ fn listing_confirm_text(
 
 fn listing_confirm_markup(lang: Lang, id: &str) -> Value {
     serde_json::json!({
-        "inline_keyboard": [[
-            {
-                "text": pick(lang, "确认开仓", "Confirm entry"),
-                "callback_data": format!("listing:confirm:{id}"),
-            },
-            {
-                "text": pick(lang, "取消", "Cancel"),
-                "callback_data": format!("listing:cancel:{id}"),
-            },
-        ]],
+        "inline_keyboard": [
+            [
+                {
+                    "text": pick(lang, "确认开仓", "Confirm entry"),
+                    "callback_data": format!("listing:confirm:{id}"),
+                },
+                {
+                    "text": pick(lang, "取消", "Cancel"),
+                    "callback_data": format!("listing:cancel:{id}"),
+                },
+            ],
+            [{
+                "text": pick(lang, "修改参数", "Edit params"),
+                "callback_data": format!("listing:params:{id}"),
+            }],
+        ],
     })
 }
 
+/// 上币引导里的「取消」按钮。
+fn listing_cancel_markup(lang: Lang) -> Value {
+    serde_json::json!({
+        "inline_keyboard": [[{
+            "text": pick(lang, "取消", "Cancel"),
+            "callback_data": "listing:abort",
+        }]],
+    })
+}
+
+/// 上币引导第 2 步：做多/做空按钮。
+fn listing_side_markup(lang: Lang, id: &str) -> Value {
+    serde_json::json!({
+        "inline_keyboard": [
+            [
+                {
+                    "text": pick(lang, "做多", "Long"),
+                    "callback_data": format!("listing:side:{id}:long"),
+                },
+                {
+                    "text": pick(lang, "做空", "Short"),
+                    "callback_data": format!("listing:side:{id}:short"),
+                },
+            ],
+            [{
+                "text": pick(lang, "取消", "Cancel"),
+                "callback_data": "listing:abort",
+            }],
+        ],
+    })
+}
+
+/// 上币引导第 3 步：交易所按钮，每行两个。
+fn listing_venue_markup(lang: Lang, id: &str, venues: &[String]) -> Value {
+    let mut rows: Vec<Vec<Value>> = venues
+        .chunks(2)
+        .map(|chunk| {
+            chunk
+                .iter()
+                .map(|venue| {
+                    serde_json::json!({
+                        "text": venue_label(venue),
+                        "callback_data": format!("listing:venue:{id}:{venue}"),
+                    })
+                })
+                .collect()
+        })
+        .collect();
+    rows.push(vec![serde_json::json!({
+        "text": pick(lang, "取消", "Cancel"),
+        "callback_data": "listing:abort",
+    })]);
+    serde_json::json!({ "inline_keyboard": rows })
+}
+
 async fn listing_status_text(lang: Lang, state: &AppState) -> String {
-    let rules = listing::running_strategies(state).await;
     let trades = state.listing.open_trades();
     let mut lines = Vec::new();
-    if rules.is_empty() {
-        lines.push(listing_no_running_text(lang).to_string());
+    // 策略规则与空仓计数不再回显，只在有持仓时列出可平仓的单子。
+    if !trades.is_empty() {
+        lines.push(match lang {
+            Lang::Zh => format!("持仓 {} 笔", trades.len()),
+            Lang::En => format!("Open trades: {}", trades.len()),
+        });
     }
-    for (_, name, settings) in &rules {
-        for (index, rule) in settings.rules.iter().enumerate() {
-            // 每条规则独立选择真实或模拟下单，状态里逐条标注模拟模式。
-            let mode_suffix = if rule.execution_mode == StrategyExecutionMode::Paper {
-                pick(lang, "（模拟）", " (paper)")
-            } else {
-                ""
-            };
-            let rule_name = if rule.name.is_empty() {
-                format!("{} {}", pick(lang, "规则", "Rule"), index + 1)
-            } else {
-                rule.name.clone()
-            };
-            // 单独关掉的规则仍列出来，但标注为已关闭，避免误以为还在跟随。
-            let rule_name = if rule.enabled {
-                rule_name
-            } else {
-                format!("{rule_name}（{}）", pick(lang, "已关闭", "off"))
-            };
-            let watch = if rule.watch_venues.is_empty() {
-                pick(lang, "全部来源", "all sources").to_string()
-            } else {
-                rule.watch_venues.join("/")
-            };
-            lines.push(match lang {
-                Lang::Zh => format!(
-                    "{name} · {rule_name}（{watch}）{mode_suffix}：{notional} USD · 杠杆 {leverage}x · 止盈 {tp} · 止损 {sl}",
-                    notional = rule.notional_usd.round_dp(2),
-                    leverage = rule.leverage.round_dp(2),
-                    tp = pct_label(lang, rule.take_profit_pct),
-                    sl = pct_label(lang, rule.stop_loss_pct),
-                ),
-                Lang::En => format!(
-                    "{name} · {rule_name} ({watch}){mode_suffix}: {notional} USD · leverage {leverage}x · TP {tp} · SL {sl}",
-                    notional = rule.notional_usd.round_dp(2),
-                    leverage = rule.leverage.round_dp(2),
-                    tp = pct_label(lang, rule.take_profit_pct),
-                    sl = pct_label(lang, rule.stop_loss_pct),
-                ),
-            });
-        }
-    }
-    lines.push(match lang {
-        Lang::Zh => format!("持仓 {} 笔", trades.len()),
-        Lang::En => format!("Open trades: {}", trades.len()),
-    });
     for trade in trades.iter().take(10) {
         lines.push(match lang {
             Lang::Zh => format!(
                 "#{} {} {} 入场 {}（止盈 {} / 止损 {}）",
                 short_id(trade.id),
                 trade.symbol,
-                trade.venue,
+                venue_label(&trade.venue),
                 trade.entry_price.round_dp(6),
                 pct_label(lang, trade.take_profit_pct),
                 pct_label(lang, trade.stop_loss_pct),
@@ -1965,29 +2955,25 @@ async fn listing_status_text(lang: Lang, state: &AppState) -> String {
                 "#{} {} {} entry {} (TP {} / SL {})",
                 short_id(trade.id),
                 trade.symbol,
-                trade.venue,
+                venue_label(&trade.venue),
                 trade.entry_price.round_dp(6),
                 pct_label(lang, trade.take_profit_pct),
                 pct_label(lang, trade.stop_loss_pct),
             ),
         });
     }
-    lines.push(String::new());
+    if !lines.is_empty() {
+        lines.push(String::new());
+    }
     lines.extend(
         match lang {
             Lang::Zh => [
-                "/listing amount 100 设置单笔金额",
-                "/listing leverage 1 设置杠杆（默认取风控杠杆上限）",
-                "/listing tp 20 / sl 10 设置止盈止损，0 关闭",
-                "/listing open <代币> <交易所> [交易对] 手动发起",
-                "/listing close <编号前缀> 手动平仓",
+                "/listing 查看上币持仓",
+                "/listing open 进入下单引导（首次设置金额/杠杆/止盈止损，之后复用）",
             ],
             Lang::En => [
-                "/listing amount 100 sets the order size",
-                "/listing leverage 1 sets leverage (defaults to the risk leverage cap)",
-                "/listing tp 20 / sl 10 sets TP/SL, 0 disables",
-                "/listing open <token> <venue> [symbol] starts one manually",
-                "/listing close <id prefix> closes manually",
+                "/listing shows listing trades",
+                "/listing open starts the entry guide (set size/leverage/TP/SL once, then reused)",
             ],
         }
         .iter()
@@ -1999,10 +2985,11 @@ async fn listing_status_text(lang: Lang, state: &AppState) -> String {
 fn listing_opened_text(lang: Lang, trade: &ListingTrade) -> String {
     match lang {
         Lang::Zh => format!(
-            "已开仓 #{}\n{} {} @ {}\n金额 {} USD · 杠杆 {}x\n止盈 {} · 止损 {}",
+            "已开仓 #{}\n{} {} {} @ {}\n金额 {} USD · 杠杆 {}x\n止盈 {} · 止损 {}",
             short_id(trade.id),
             trade.symbol,
-            trade.venue,
+            venue_label(&trade.venue),
+            side_label(lang, trade.side),
             trade.entry_price.round_dp(6),
             trade.notional_usd.round_dp(2),
             trade.leverage.round_dp(2),
@@ -2010,10 +2997,11 @@ fn listing_opened_text(lang: Lang, trade: &ListingTrade) -> String {
             pct_label(lang, trade.stop_loss_pct),
         ),
         Lang::En => format!(
-            "Opened #{}\n{} {} @ {}\n{} USD · leverage {}x\nTP {} · SL {}",
+            "Opened #{}\n{} {} {} @ {}\n{} USD · leverage {}x\nTP {} · SL {}",
             short_id(trade.id),
             trade.symbol,
-            trade.venue,
+            venue_label(&trade.venue),
+            side_label(lang, trade.side),
             trade.entry_price.round_dp(6),
             trade.notional_usd.round_dp(2),
             trade.leverage.round_dp(2),
@@ -2030,7 +3018,7 @@ fn listing_closed_text(lang: Lang, trade: &ListingTrade) -> String {
             "已平仓 #{}\n{} {} @ {}（入场 {}）",
             short_id(trade.id),
             trade.symbol,
-            trade.venue,
+            venue_label(&trade.venue),
             price.round_dp(6),
             trade.entry_price.round_dp(6),
         ),
@@ -2038,7 +3026,7 @@ fn listing_closed_text(lang: Lang, trade: &ListingTrade) -> String {
             "Closed #{}\n{} {} @ {} (entry {})",
             short_id(trade.id),
             trade.symbol,
-            trade.venue,
+            venue_label(&trade.venue),
             price.round_dp(6),
             trade.entry_price.round_dp(6),
         ),
@@ -2061,28 +3049,21 @@ fn listing_permission_text(lang: Lang) -> &'static str {
     )
 }
 
-fn listing_usage_text(lang: Lang) -> &'static str {
+/// 上币引导里代币代码格式不正确。
+fn token_error_text(lang: Lang) -> &'static str {
     pick(
         lang,
-        "用法：/listing open <代币> <交易所> [交易对]，例如 /listing open XYZ bitget XYZUSDT。",
-        "Usage: /listing open <token> <venue> [symbol], e.g. /listing open XYZ bitget XYZUSDT.",
+        "代币代码格式不正确，请发送 2–12 位字母数字，例如 XYZ。",
+        "Invalid token code. Send 2–12 alphanumeric characters, e.g. XYZ.",
     )
 }
 
-fn listing_number_error_text(lang: Lang) -> &'static str {
+/// 没有可用于上币下单的交易所账户。
+fn listing_no_venue_text(lang: Lang) -> &'static str {
     pick(
         lang,
-        "数值不正确：金额与杠杆需大于 0，止盈止损可为 0 表示关闭。",
-        "Invalid value: amount and leverage must be positive; TP/SL accept 0 to disable.",
-    )
-}
-
-/// 没有运行中的上币公告跟随策略时的提示。
-fn listing_no_running_text(lang: Lang) -> &'static str {
-    pick(
-        lang,
-        "当前没有运行中的上币公告跟随策略，请先在桌面端策略页启动。",
-        "No listing-follow strategy is running; start one on the desktop strategy page first.",
+        "还没有可交易的上币下单交易所，请先在桌面端「账户」导入 API Key。",
+        "No tradable venue for listing entries yet. Import API keys from Accounts in the desktop app first.",
     )
 }
 
@@ -2094,10 +3075,10 @@ fn command_menu(lang: Lang) -> Value {
             ("positions", "当前仓位"),
             ("orders", "最近订单"),
             ("news", "最新上币公告"),
-            ("pause", "暂停开仓"),
-            ("resume", "恢复开仓"),
-            ("open", "发起双腿开仓（需二次确认）"),
-            ("listing", "上币单腿交易设置与持仓"),
+            ("open", "发起开仓：单腿或双腿，需二次确认"),
+            ("listing", "上币单腿交易：持仓与引导下单"),
+            ("closeall", "一键平仓（需二次确认）"),
+            ("close", "平掉单个仓位"),
             ("lang", "切换机器人语言"),
             ("unbind", "解除绑定"),
         ],
@@ -2106,10 +3087,13 @@ fn command_menu(lang: Lang) -> Value {
             ("positions", "Current positions"),
             ("orders", "Recent orders"),
             ("news", "Latest listing announcements"),
-            ("pause", "Pause entries"),
-            ("resume", "Resume entries"),
-            ("open", "Prepare a hedged entry (needs confirmation)"),
-            ("listing", "Listing single-leg settings and trades"),
+            (
+                "open",
+                "Prepare an entry: single or hedged, needs confirmation",
+            ),
+            ("listing", "Listing single-leg trades: positions and guided entry"),
+            ("closeall", "Close everything (needs confirmation)"),
+            ("close", "Close one position"),
             ("lang", "Switch the bot language"),
             ("unbind", "Unlink this account"),
         ],
@@ -2150,6 +3134,16 @@ fn status_text(lang: Lang, state: &AppState) -> String {
     }
 }
 
+/// 仓位方向的中英文标签。
+fn side_label(lang: Lang, side: Side) -> &'static str {
+    match (lang, side) {
+        (Lang::Zh, Side::Buy) => "多",
+        (Lang::Zh, Side::Sell) => "空",
+        (Lang::En, Side::Buy) => "Long",
+        (Lang::En, Side::Sell) => "Short",
+    }
+}
+
 fn positions_text(lang: Lang, state: &AppState) -> String {
     let positions = state.positions.read().expect("仓位锁不可用");
     if positions.is_empty() {
@@ -2161,26 +3155,23 @@ fn positions_text(lang: Lang, state: &AppState) -> String {
     }];
     for position in positions.iter().take(10) {
         lines.push(format!(
-            "{} {} {} {} @ {}",
+            "#{} {} {} {} {} @ {}",
+            short_id(position.id),
             position.symbol,
-            position.venue,
-            pick(
-                lang,
-                if matches!(position.side, arb_core::Side::Buy) {
-                    "多"
-                } else {
-                    "空"
-                },
-                if matches!(position.side, arb_core::Side::Buy) {
-                    "Long"
-                } else {
-                    "Short"
-                },
-            ),
+            venue_label(&position.venue),
+            side_label(lang, position.side),
             position.quantity,
             position.entry_price
         ));
     }
+    lines.push(
+        pick(
+            lang,
+            "用 /close <编号> 平掉单个仓位，/closeall 全部平仓。",
+            "Use /close <id> to close one position, or /closeall for everything.",
+        )
+        .to_string(),
+    );
     lines.join("\n")
 }
 
@@ -2246,20 +3237,44 @@ fn parse_callback(data: &str) -> Option<Callback> {
         "open" => match value {
             "cancel" => Some(Callback::Open(OpenStep::Cancel)),
             _ => {
-                let (step, venue) = value.split_once(':')?;
-                if venue.is_empty() {
+                let (step, choice) = value.split_once(':')?;
+                if choice.is_empty() {
                     return None;
                 }
                 match step {
-                    "long" => Some(Callback::Open(OpenStep::Long(venue.to_string()))),
-                    "short" => Some(Callback::Open(OpenStep::Short(venue.to_string()))),
+                    "mode" => match choice {
+                        "hedge" => Some(Callback::Open(OpenStep::Mode(OpenMode::Hedge))),
+                        "long" => Some(Callback::Open(OpenStep::Mode(OpenMode::LongOnly))),
+                        "short" => Some(Callback::Open(OpenStep::Mode(OpenMode::ShortOnly))),
+                        _ => None,
+                    },
+                    "long" => Some(Callback::Open(OpenStep::Long(choice.to_string()))),
+                    "short" => Some(Callback::Open(OpenStep::Short(choice.to_string()))),
                     _ => None,
                 }
             }
         },
         "listing" => {
+            if value == "abort" {
+                return Some(Callback::Listing(ListingStep::Abort));
+            }
             let (step, rest) = value.split_once(':')?;
             match step {
+                "side" => {
+                    let (id, side) = rest.split_once(':')?;
+                    if id.is_empty() {
+                        return None;
+                    }
+                    let side = match side {
+                        "long" => Side::Buy,
+                        "short" => Side::Sell,
+                        _ => return None,
+                    };
+                    Some(Callback::Listing(ListingStep::Side {
+                        id: id.to_string(),
+                        side,
+                    }))
+                }
                 "venue" => {
                     let (id, venue) = rest.split_once(':')?;
                     if id.is_empty() || venue.is_empty() {
@@ -2270,10 +3285,26 @@ fn parse_callback(data: &str) -> Option<Callback> {
                         venue: venue.to_string(),
                     }))
                 }
+                "params" => Some(Callback::Listing(ListingStep::Params(rest.to_string()))),
                 "confirm" => Some(Callback::Listing(ListingStep::Confirm(rest.to_string()))),
                 "cancel" => Some(Callback::Listing(ListingStep::Cancel(rest.to_string()))),
                 _ => None,
             }
+        }
+        "closeall" => {
+            let (step, token) = value.split_once(':')?;
+            if token.is_empty() {
+                return None;
+            }
+            let confirm = match step {
+                "confirm" => true,
+                "cancel" => false,
+                _ => return None,
+            };
+            Some(Callback::CloseAll {
+                token: token.to_string(),
+                confirm,
+            })
         }
         _ => None,
     }
@@ -2354,8 +3385,8 @@ mod tests {
     fn help_lists_trade_commands() {
         let text = help_text(Lang::Zh, true);
         assert!(!text.contains("/menu"));
-        assert!(text.contains("/pause"));
-        assert!(text.contains("/resume"));
+        assert!(!text.contains("/pause"));
+        assert!(!text.contains("/resume"));
         assert!(text.contains("/open"));
         assert!(text.contains("确认按钮"));
         assert!(!text.contains("/confirm"));
@@ -2371,8 +3402,8 @@ mod tests {
             let commands = menu.as_array().expect("命令菜单应为数组");
             assert!(!commands.iter().any(|item| item["command"] == "menu"));
             assert!(commands.iter().any(|item| item["command"] == "open"));
-            assert!(commands.iter().any(|item| item["command"] == "pause"));
-            assert!(commands.iter().any(|item| item["command"] == "resume"));
+            assert!(!commands.iter().any(|item| item["command"] == "pause"));
+            assert!(!commands.iter().any(|item| item["command"] == "resume"));
             assert!(commands
                 .iter()
                 .all(|item| item["description"].as_str().is_some()));
@@ -2399,6 +3430,18 @@ mod tests {
     #[test]
     fn parses_open_callbacks() {
         assert_eq!(
+            parse_callback("open:mode:hedge"),
+            Some(Callback::Open(OpenStep::Mode(OpenMode::Hedge)))
+        );
+        assert_eq!(
+            parse_callback("open:mode:long"),
+            Some(Callback::Open(OpenStep::Mode(OpenMode::LongOnly)))
+        );
+        assert_eq!(
+            parse_callback("open:mode:short"),
+            Some(Callback::Open(OpenStep::Mode(OpenMode::ShortOnly)))
+        );
+        assert_eq!(
             parse_callback("open:long:binance"),
             Some(Callback::Open(OpenStep::Long("binance".to_string())))
         );
@@ -2411,17 +3454,86 @@ mod tests {
             Some(Callback::Open(OpenStep::Cancel))
         );
         assert_eq!(parse_callback("open:long:"), None);
+        assert_eq!(parse_callback("open:mode:"), None);
+        assert_eq!(parse_callback("open:mode:other"), None);
         assert_eq!(parse_callback("open:side:binance"), None);
     }
 
     #[test]
+    fn mode_markup_links_open_modes() {
+        let markup = mode_markup(Lang::En);
+        let rows = markup["inline_keyboard"]
+            .as_array()
+            .expect("内联键盘应为数组");
+        assert_eq!(rows[0][0]["callback_data"], "open:mode:hedge");
+        assert_eq!(rows[0][1]["callback_data"], "open:mode:long");
+        assert_eq!(rows[0][2]["callback_data"], "open:mode:short");
+        assert_eq!(rows[1][0]["callback_data"], "open:cancel");
+    }
+
+    #[test]
+    fn drafts_single_or_hedged_legs() {
+        let mut draft = OpenDraft {
+            symbol: Some("BTCUSDT".to_string()),
+            mode: Some(OpenMode::LongOnly),
+            long_venue: Some("binance".to_string()),
+            short_venue: None,
+            stage: OpenStage::Amount,
+            expires_at: draft_expiry(),
+        };
+        let legs = draft_legs(&draft).expect("单腿做多应有下单腿");
+        assert_eq!(legs.len(), 1);
+        assert_eq!(legs[0].venue, "binance");
+        assert_eq!(legs[0].side, Side::Buy);
+        assert_eq!(draft_legs_summary(Lang::Zh, &draft), "多头 Binance（单腿）");
+
+        draft.mode = Some(OpenMode::ShortOnly);
+        draft.long_venue = None;
+        draft.short_venue = Some("okx".to_string());
+        let legs = draft_legs(&draft).expect("单腿做空应有下单腿");
+        assert_eq!(legs.len(), 1);
+        assert_eq!(legs[0].venue, "okx");
+        assert_eq!(legs[0].side, Side::Sell);
+
+        draft.mode = Some(OpenMode::Hedge);
+        draft.long_venue = Some("binance".to_string());
+        let legs = draft_legs(&draft).expect("双腿应有两条腿");
+        assert_eq!(legs.len(), 2);
+        assert_eq!(legs[0].side, Side::Buy);
+        assert_eq!(legs[1].side, Side::Sell);
+        assert_eq!(pending_legs_label(Lang::Zh, &legs), "Binance 多 / Okx 空");
+    }
+
+    #[test]
     fn parses_listing_callbacks() {
+        assert_eq!(
+            parse_callback("listing:abort"),
+            Some(Callback::Listing(ListingStep::Abort))
+        );
+        assert_eq!(
+            parse_callback("listing:side:ABC123:long"),
+            Some(Callback::Listing(ListingStep::Side {
+                id: "ABC123".to_string(),
+                side: Side::Buy,
+            }))
+        );
+        assert_eq!(
+            parse_callback("listing:side:ABC123:short"),
+            Some(Callback::Listing(ListingStep::Side {
+                id: "ABC123".to_string(),
+                side: Side::Sell,
+            }))
+        );
         assert_eq!(
             parse_callback("listing:venue:ABC123:bitget"),
             Some(Callback::Listing(ListingStep::Venue {
                 id: "ABC123".to_string(),
                 venue: "bitget".to_string(),
             }))
+        );
+        assert_eq!(
+            parse_callback("listing:params:ABC123"),
+            Some(Callback::Listing(ListingStep::Params("ABC123".to_string())))
         );
         assert_eq!(
             parse_callback("listing:confirm:ABC123"),
@@ -2433,9 +3545,84 @@ mod tests {
             parse_callback("listing:cancel:ABC123"),
             Some(Callback::Listing(ListingStep::Cancel("ABC123".to_string())))
         );
+        assert_eq!(parse_callback("listing:side:ABC123:other"), None);
+        assert_eq!(parse_callback("listing:side::long"), None);
         assert_eq!(parse_callback("listing:venue:ABC123"), None);
         assert_eq!(parse_callback("listing:venue::bitget"), None);
         assert_eq!(parse_callback("listing:unknown:ABC123"), None);
+    }
+
+    #[test]
+    fn parses_listing_tokens() {
+        assert_eq!(parse_token("xyz"), Some("XYZ".to_string()));
+        assert_eq!(parse_token(" XYZ "), Some("XYZ".to_string()));
+        assert_eq!(parse_token("X"), None);
+        assert_eq!(parse_token("XYZ-USD"), None);
+        assert_eq!(parse_token(""), None);
+    }
+
+    #[test]
+    fn parses_listing_params_inputs() {
+        let current = ListingRule {
+            notional_usd: Decimal::from(100),
+            leverage: Decimal::from(2),
+            take_profit_pct: Decimal::from(20),
+            stop_loss_pct: Decimal::from(10),
+            ..ListingRule::default()
+        };
+        assert_eq!(
+            parse_listing_params("300 1 30 5", &current),
+            Some((
+                Decimal::from(300),
+                Decimal::from(1),
+                Decimal::from(30),
+                Decimal::from(5),
+            ))
+        );
+        // 省略的尾部沿用上次设置。
+        assert_eq!(
+            parse_listing_params("50", &current),
+            Some((
+                Decimal::from(50),
+                Decimal::from(2),
+                Decimal::from(20),
+                Decimal::from(10),
+            ))
+        );
+        assert_eq!(
+            parse_listing_params("50 3 0 0", &current),
+            Some((
+                Decimal::from(50),
+                Decimal::from(3),
+                Decimal::ZERO,
+                Decimal::ZERO,
+            ))
+        );
+        assert_eq!(parse_listing_params("0 1 20 10", &current), None);
+        assert_eq!(parse_listing_params("100 0 20 10", &current), None);
+        assert_eq!(parse_listing_params("100 1 -1 10", &current), None);
+        assert_eq!(parse_listing_params("100 1 20 10 5", &current), None);
+        assert_eq!(parse_listing_params("abc", &current), None);
+    }
+
+    #[test]
+    fn parses_close_all_callbacks() {
+        assert_eq!(
+            parse_callback("closeall:confirm:ABC123"),
+            Some(Callback::CloseAll {
+                token: "ABC123".to_string(),
+                confirm: true,
+            })
+        );
+        assert_eq!(
+            parse_callback("closeall:cancel:ABC123"),
+            Some(Callback::CloseAll {
+                token: "ABC123".to_string(),
+                confirm: false,
+            })
+        );
+        assert_eq!(parse_callback("closeall:confirm:"), None);
+        assert_eq!(parse_callback("closeall:other:ABC123"), None);
     }
 
     #[test]
@@ -2459,6 +3646,15 @@ mod tests {
     }
 
     #[test]
+    fn parses_side_inputs() {
+        assert_eq!(parse_side("long"), Some(Side::Buy));
+        assert_eq!(parse_side("多"), Some(Side::Buy));
+        assert_eq!(parse_side("short"), Some(Side::Sell));
+        assert_eq!(parse_side(" 空 "), Some(Side::Sell));
+        assert_eq!(parse_side("btcusdt"), None);
+    }
+
+    #[test]
     fn venue_markup_links_open_steps() {
         let venues = vec![
             "binance".to_string(),
@@ -2471,8 +3667,19 @@ mod tests {
             .expect("内联键盘应为数组");
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0][0]["callback_data"], "open:long:binance");
-        assert_eq!(rows[1][0]["text"], "bybit");
+        assert_eq!(rows[0][0]["text"], "Binance");
+        assert_eq!(rows[0][1]["text"], "Okx");
+        assert_eq!(rows[1][0]["text"], "Bybit");
         assert_eq!(rows[2][0]["callback_data"], "open:cancel");
+    }
+
+    #[test]
+    fn venue_labels_capitalize_first_letter() {
+        assert_eq!(venue_label("gate"), "Gate");
+        assert_eq!(venue_label("binance"), "Binance");
+        assert_eq!(venue_label("okx"), "Okx");
+        assert_eq!(venue_label("Gate"), "Gate");
+        assert_eq!(venue_label(""), "");
     }
 
     #[test]

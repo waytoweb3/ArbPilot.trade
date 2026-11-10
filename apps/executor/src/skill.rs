@@ -731,40 +731,6 @@ pub fn listing_settings_for(state: &AppState, record: &StrategyRecord) -> listin
     }
 }
 
-/// 电报 `/listing amount|leverage|tp|sl`：把数值写到运行中上币策略的每条技能规则。
-///
-/// 返回 false 表示该策略仍由旧的上币监听设置驱动，调用方按原来的方式更新。
-pub async fn update_listing_number(
-    state: &AppState,
-    strategy_id: Uuid,
-    field: &str,
-    number: Decimal,
-) -> bool {
-    let record = state
-        .strategies
-        .read()
-        .expect("策略锁不可用")
-        .iter()
-        .find(|record| record.id == strategy_id)
-        .cloned();
-    let Some(record) = record.filter(manages) else {
-        return false;
-    };
-    let mut settings = settings_for(state, &record);
-    for rule in &mut settings.rules {
-        match field {
-            "amount" => rule.business.notional_usd = number,
-            "leverage" => rule.business.leverage = number,
-            "tp" => rule.business.take_profit_pct = number,
-            "sl" => rule.business.stop_loss_pct = number,
-            _ => {}
-        }
-    }
-    state.skill.update_settings(strategy_id, settings).await;
-    crate::routes::strategies::refresh_run_note(state, strategy_id).await;
-    true
-}
-
 /// 正在运行的技能策略：由模板标识识别，避免误接管用户自定义策略。
 async fn running_strategies(state: &AppState) -> Vec<SkillStrategy> {
     let records: Vec<StrategyRecord> = state
