@@ -237,9 +237,7 @@ fn set_leverage_blocking(
     let base = symbol
         .strip_suffix("USDT")
         .filter(|base| !base.is_empty())
-        .ok_or_else(|| {
-            ExchangeError::Unsupported(format!("仅支持 USDT 本位永续: {symbol}"))
-        })?;
+        .ok_or_else(|| ExchangeError::Unsupported(format!("仅支持 USDT 本位永续: {symbol}")))?;
     match venue {
         "binance" => binance_leverage(http, &endpoints.binance, credentials, &symbol, leverage),
         "aster" => aster_leverage(http, &endpoints.aster, credentials, &symbol, leverage),
@@ -303,10 +301,7 @@ fn binance_current_leverage(
 ) -> Result<Option<Decimal>, ExchangeError> {
     let (key, secret) = key_pair(credentials)?;
     let base_url = base_url.trim_end_matches('/');
-    let params = format!(
-        "symbol={symbol}&recvWindow=5000&timestamp={}",
-        now_millis()
-    );
+    let params = format!("symbol={symbol}&recvWindow=5000&timestamp={}", now_millis());
     let signature = hmac_hex(secret, &params)?;
     let value = http
         .get_json_with_headers(
@@ -434,7 +429,9 @@ fn bitget_current_leverage(
         .as_deref()
         .ok_or_else(|| ExchangeError::Credentials("Bitget 需要 Passphrase".to_string()))?;
     let base_url = base_url.trim_end_matches('/');
-    let path = format!("/api/v2/mix/account/account?symbol={symbol}&productType=USDT-FUTURES&marginCoin=USDT");
+    let path = format!(
+        "/api/v2/mix/account/account?symbol={symbol}&productType=USDT-FUTURES&marginCoin=USDT"
+    );
     let timestamp = now_millis().to_string();
     let signature = hmac_base64(secret, &format!("{timestamp}GET{path}"))?;
     let headers = [
@@ -455,7 +452,9 @@ fn bitget_current_leverage(
         .and_then(|rows| rows.first())
         .cloned()
         .or_else(|| value["data"].is_object().then(|| value["data"].clone()));
-    let Some(row) = row else { return Ok(None); };
+    let Some(row) = row else {
+        return Ok(None);
+    };
     let isolated = row["marginMode"]
         .as_str()
         .map(|mode| mode.contains("isolated"))
@@ -481,14 +480,7 @@ fn gate_current_leverage(
     let contract = format!("{base}_USDT");
     let path = format!("/api/v4/futures/usdt/positions/{contract}");
     let timestamp = Utc::now().timestamp().to_string();
-    let signature = gate_sign(
-        &credentials.api_secret,
-        "GET",
-        &path,
-        "",
-        "",
-        &timestamp,
-    )?;
+    let signature = gate_sign(&credentials.api_secret, "GET", &path, "", "", &timestamp)?;
     let headers = [
         ("KEY", credentials.api_key.as_str()),
         ("SIGN", signature.as_str()),
@@ -551,9 +543,7 @@ fn bingx_current_leverage(
     let data = &value["data"];
     Ok(decimal(&data["longLeverage"])
         .filter(|leverage| *leverage > Decimal::ZERO)
-        .or_else(|| {
-            decimal(&data["shortLeverage"]).filter(|leverage| *leverage > Decimal::ZERO)
-        }))
+        .or_else(|| decimal(&data["shortLeverage"]).filter(|leverage| *leverage > Decimal::ZERO)))
 }
 
 /// Hyperliquid 只在有持仓时返回该合约的杠杆。
@@ -648,7 +638,14 @@ fn binance_leverage(
         .post_with_headers(&url, &[("X-MBX-APIKEY", key)])
         .map_err(transport)?;
     reject_binance_style("Binance", &value)?;
-    ensure_binance_style_cross(http, base_url, credentials, "Binance", "/fapi/v1/marginType", symbol)
+    ensure_binance_style_cross(
+        http,
+        base_url,
+        credentials,
+        "Binance",
+        "/fapi/v1/marginType",
+        symbol,
+    )
 }
 
 /// Binance 系的保证金模式接口：-4046 表示已经是全仓，视为成功。
@@ -749,7 +746,10 @@ fn okx_leverage(
     })
     .to_string();
     let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
-    let signature = hmac_base64(secret, &format!("{timestamp}POST/api/v5/account/set-leverage{body}"))?;
+    let signature = hmac_base64(
+        secret,
+        &format!("{timestamp}POST/api/v5/account/set-leverage{body}"),
+    )?;
     let headers = [
         ("OK-ACCESS-KEY", key),
         ("OK-ACCESS-SIGN", signature.as_str()),
@@ -757,7 +757,11 @@ fn okx_leverage(
         ("OK-ACCESS-PASSPHRASE", passphrase),
     ];
     let value = http
-        .post_body_with_headers(&format!("{base_url}/api/v5/account/set-leverage"), &headers, &body)
+        .post_body_with_headers(
+            &format!("{base_url}/api/v5/account/set-leverage"),
+            &headers,
+            &body,
+        )
         .map_err(transport)?;
     let data = &value["data"][0];
     if data["sCode"].as_str().unwrap_or("0") != "0" {
@@ -797,7 +801,11 @@ fn bybit_leverage(
         ("X-BAPI-RECV-WINDOW", recv_window),
     ];
     let value = http
-        .post_body_with_headers(&format!("{base_url}/v5/position/set-leverage"), &headers, &body)
+        .post_body_with_headers(
+            &format!("{base_url}/v5/position/set-leverage"),
+            &headers,
+            &body,
+        )
         .map_err(transport)?;
     let code = value["retCode"].as_i64().unwrap_or(0);
     // 110043 表示杠杆与当前一致，视为成功。
@@ -875,7 +883,11 @@ fn bitget_leverage(
     Ok(())
 }
 
-/// Gate 永续设置逐合约杠杆。
+/// Gate 永续设置逐合约杠杆，优先按全仓设置。
+///
+/// 旧接口用 `leverage=0` 表示全仓，但 Gate 会把 0 当成「缺少 leverage」直接拒单，
+/// 所以先用新接口把保证金模式显式传进去；新接口不可用时退回旧接口的逐仓杠杆，
+/// 至少不让下单被杠杆设置卡死。
 fn gate_leverage(
     http: &HttpClient,
     base_url: &str,
@@ -885,12 +897,38 @@ fn gate_leverage(
 ) -> Result<(), ExchangeError> {
     let base_url = base_url.trim_end_matches('/');
     let contract = format!("{base}_USDT");
-    let path = format!("/api/v4/futures/usdt/positions/{contract}/leverage");
-    // Gate 用 leverage=0 表示全仓，全仓杠杆上限放在 cross_leverage_limit；
-    // 默认走全仓，避免单一仓位占用全部保证金后很快触发强平预警。
-    let query = format!("leverage=0&cross_leverage_limit={}", num(leverage));
+    let leverage = num(leverage);
+    match gate_leverage_request(
+        http,
+        base_url,
+        credentials,
+        &format!("/api/v4/futures/usdt/positions/{contract}/set_leverage"),
+        &format!("leverage={leverage}&margin_mode=cross"),
+    ) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            tracing::warn!(%error, "Gate 全仓杠杆设置失败，退回逐仓杠杆");
+            gate_leverage_request(
+                http,
+                base_url,
+                credentials,
+                &format!("/api/v4/futures/usdt/positions/{contract}/leverage"),
+                &format!("leverage={leverage}"),
+            )
+        }
+    }
+}
+
+/// 调 Gate 杠杆接口：参数走查询串并参与签名。
+fn gate_leverage_request(
+    http: &HttpClient,
+    base_url: &str,
+    credentials: &AccountCredentials,
+    path: &str,
+    query: &str,
+) -> Result<(), ExchangeError> {
     let timestamp = Utc::now().timestamp().to_string();
-    let signature = gate_sign(&credentials.api_secret, "POST", &path, &query, "", &timestamp)?;
+    let signature = gate_sign(&credentials.api_secret, "POST", path, query, "", &timestamp)?;
     let headers = [
         ("KEY", credentials.api_key.as_str()),
         ("SIGN", signature.as_str()),
@@ -973,9 +1011,7 @@ fn hyperliquid_leverage(
     leverage: Decimal,
 ) -> Result<(), ExchangeError> {
     let private_key = credentials.signer_key.as_deref().ok_or_else(|| {
-        ExchangeError::Credentials(
-            "Hyperliquid 设置杠杆需要 API Wallet（Agent）私钥".to_string(),
-        )
+        ExchangeError::Credentials("Hyperliquid 设置杠杆需要 API Wallet（Agent）私钥".to_string())
     })?;
     let base_url = base_url.trim_end_matches('/');
     let leverage = leverage_integer(coin, leverage)?
@@ -1108,7 +1144,11 @@ fn lighter_leverage(
     )
     .map_err(|error| ExchangeError::Credentials(error.to_string()))?;
 
-    let form = format!("tx_type={}&tx_info={}", signed.tx_type, pct(&signed.tx_info));
+    let form = format!(
+        "tx_type={}&tx_info={}",
+        signed.tx_type,
+        pct(&signed.tx_info)
+    );
     let value = http
         .post_body_with_headers(
             &format!("{base_url}/api/v1/sendTx"),
@@ -1147,7 +1187,6 @@ fn reject_binance_style(venue: &str, value: &Value) -> Result<(), ExchangeError>
     }
     Ok(())
 }
-
 
 /// Binance USDT 本位永续下单，签名参数直接拼在 URL 上。
 fn binance_place(
@@ -1333,7 +1372,11 @@ fn okx_place(
     });
     if okx_position_mode(http, base_url, key, secret, passphrase)? == "long_short_mode" {
         let pos_side = if request.reduce_only {
-            if request.side == Side::Buy { "short" } else { "long" }
+            if request.side == Side::Buy {
+                "short"
+            } else {
+                "long"
+            }
         } else if request.side == Side::Buy {
             "long"
         } else {
@@ -1426,15 +1469,15 @@ fn bitget_position_mode(
         "/api/v2/mix/account/account?symbol={symbol}&productType=USDT-FUTURES&marginCoin=USDT"
     );
     let timestamp = now_millis().to_string();
-    let signature = hmac_base64(
-        &credentials.api_secret,
-        &format!("{timestamp}GET{path}"),
-    )?;
+    let signature = hmac_base64(&credentials.api_secret, &format!("{timestamp}GET{path}"))?;
     let headers = [
         ("ACCESS-KEY", credentials.api_key.as_str()),
         ("ACCESS-SIGN", signature.as_str()),
         ("ACCESS-TIMESTAMP", timestamp.as_str()),
-        ("ACCESS-PASSPHRASE", credentials.passphrase.as_deref().unwrap_or("")),
+        (
+            "ACCESS-PASSPHRASE",
+            credentials.passphrase.as_deref().unwrap_or(""),
+        ),
         ("locale", "zh-CN"),
     ];
     let value = http
@@ -1478,7 +1521,11 @@ fn bitget_place(
         // 双向持仓下 `side` 表示持仓方向（buy=多、sell=空），开平由 tradeSide 表达；
         // 平多要发 side=buy + tradeSide=close，否则会报 22002「暂无仓位可平」。
         let hold_side = if request.reduce_only {
-            if request.side == Side::Buy { "short" } else { "long" }
+            if request.side == Side::Buy {
+                "short"
+            } else {
+                "long"
+            }
         } else if request.side == Side::Buy {
             "long"
         } else {
