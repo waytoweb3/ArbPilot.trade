@@ -627,7 +627,7 @@ fn lighter_current_leverage(
     Ok(leverage.filter(|value| *value > Decimal::ZERO))
 }
 
-/// Binance USDT 本位永续设置杠杆；保证金模式保持账户当前设置。
+/// Binance USDT 本位永续设置杠杆，并强制切到全仓模式。
 fn binance_leverage(
     http: &HttpClient,
     base_url: &str,
@@ -647,7 +647,35 @@ fn binance_leverage(
     let value = http
         .post_with_headers(&url, &[("X-MBX-APIKEY", key)])
         .map_err(transport)?;
-    reject_binance_style("Binance", &value)
+    reject_binance_style("Binance", &value)?;
+    ensure_binance_style_cross(http, base_url, credentials, "Binance", "/fapi/v1/marginType", symbol)
+}
+
+/// Binance 系的保证金模式接口：-4046 表示已经是全仓，视为成功。
+fn ensure_binance_style_cross(
+    http: &HttpClient,
+    base_url: &str,
+    credentials: &AccountCredentials,
+    venue: &str,
+    path: &str,
+    symbol: &str,
+) -> Result<(), ExchangeError> {
+    let (key, secret) = key_pair(credentials)?;
+    let base_url = base_url.trim_end_matches('/');
+    let params = format!(
+        "symbol={symbol}&marginType=CROSSED&recvWindow=5000&timestamp={}",
+        now_millis(),
+    );
+    let signature = hmac_hex(secret, &params)?;
+    let url = format!("{base_url}{path}?{params}&signature={signature}");
+    let value = http
+        .post_with_headers(&url, &[("X-MBX-APIKEY", key)])
+        .map_err(transport)?;
+    match reject_binance_style(venue, &value) {
+        Ok(()) => Ok(()),
+        Err(error) if error.to_string().contains("-4046") => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 /// Aster V3 与 Binance 同构，只是签名换成 API 钱包。
@@ -680,7 +708,24 @@ fn aster_leverage(
         ],
     )
     .map_err(transport)?;
-    reject_binance_style("Aster", &value)
+    reject_binance_style("Aster", &value)?;
+    let value = aster::request(
+        http,
+        "POST",
+        base_url,
+        "/fapi/v3/marginType",
+        &signer,
+        &[
+            ("symbol", symbol.to_string()),
+            ("marginType", "CROSSED".to_string()),
+        ],
+    )
+    .map_err(transport)?;
+    match reject_binance_style("Aster", &value) {
+        Ok(()) => Ok(()),
+        Err(error) if error.to_string().contains("-4046") => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 /// OKX 设置全仓杠杆。
@@ -762,6 +807,22 @@ fn bybit_leverage(
             value["retMsg"].as_str().unwrap_or("未知错误")
         )));
     }
+    // 全仓是 Bybit 的默认模式；显式切换一次，失败（例如组合保证金账户）不影响下单。
+    let body = json!({ "setMarginMode": "REGULAR_MARGIN" }).to_string();
+    let timestamp = now_millis().to_string();
+    let recv_window = "5000";
+    let signature = hmac_hex(secret, &format!("{timestamp}{key}{recv_window}{body}"))?;
+    let headers = [
+        ("X-BAPI-API-KEY", key),
+        ("X-BAPI-TIMESTAMP", timestamp.as_str()),
+        ("X-BAPI-SIGN", signature.as_str()),
+        ("X-BAPI-RECV-WINDOW", recv_window),
+    ];
+    let _ = http.post_body_with_headers(
+        &format!("{base_url}/v5/account/set-margin-mode"),
+        &headers,
+        &body,
+    );
     Ok(())
 }
 
@@ -825,7 +886,9 @@ fn gate_leverage(
     let base_url = base_url.trim_end_matches('/');
     let contract = format!("{base}_USDT");
     let path = format!("/api/v4/futures/usdt/positions/{contract}/leverage");
-    let query = format!("leverage={}", num(leverage));
+    // Gate 用 leverage=0 表示全仓，全仓杠杆上限放在 cross_leverage_limit；
+    // 默认走全仓，避免单一仓位占用全部保证金后很快触发强平预警。
+    let query = format!("leverage=0&cross_leverage_limit={}", num(leverage));
     let timestamp = Utc::now().timestamp().to_string();
     let signature = gate_sign(&credentials.api_secret, "POST", &path, &query, "", &timestamp)?;
     let headers = [
