@@ -22,6 +22,7 @@ import {
   X,
 } from "lucide-react";
 
+import { PositionsOrdersPanel } from "../components/PositionsOrdersPanel";
 import { Badge } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "../components/ui/card";
@@ -42,6 +43,7 @@ import {
   useMarketAuthors,
   useMarketConfig,
   useOrders,
+  usePositions,
   usePublicationPerformance,
   usePublications,
   useRollbackStrategy,
@@ -65,8 +67,6 @@ import {
   formatNumber,
   formatPercentValue,
   formatUsd,
-  orderStatusLabel,
-  orderStatusTone,
   strategyStatusLabel,
 } from "../lib/format";
 import { fmt, useI18n } from "../lib/i18n";
@@ -3077,11 +3077,15 @@ function StrategyRuntimeCard({
   const runsQuery = useStrategyRuns(record.id);
   const clearRuns = useClearStrategyRuns(record.id);
   const ordersQuery = useOrders();
+  const positionsQuery = usePositions();
 
   // 只看这个策略触发的订单：手动下单与其它策略的互不干扰。
   const strategyOrders = [...(ordersQuery.data ?? [])]
     .filter((order) => order.intent.strategy_id === record.id)
     .sort((left, right) => right.created_at.localeCompare(left.created_at));
+  const strategyPositions = (positionsQuery.data ?? []).filter(
+    (position) => position.strategy_id === record.id,
+  );
 
   const runs = runsQuery.data?.runs ?? [];
   const finishedRuns = runs.filter((run) => run.status !== "running");
@@ -3160,47 +3164,7 @@ function StrategyRuntimeCard({
             </div>
           </>
         ) : (
-          <div>
-            <p className="text-[11px] text-muted">{copy.ordersBlock}</p>
-            {strategyOrders.length === 0 ? (
-              <p className="mt-1 text-[11px] text-muted">{t.positions.ordersEmpty}</p>
-            ) : (
-              <div className="mt-1">
-                <p className="mb-1 text-[11px] text-subtle">{copy.orderHistory}</p>
-                <ul className="space-y-1">
-                  {strategyOrders.slice(0, 10).map((order) => {
-                    const leg = order.legs[0];
-                    return (
-                      <li
-                        key={order.id}
-                        className="flex flex-wrap items-center gap-2 rounded-md border border-line bg-panel-soft px-2 py-1 text-[11px]"
-                      >
-                        <span className="font-mono text-body">
-                          {leg ? `${leg.intent.venue} · ${leg.intent.symbol}` : "—"}
-                        </span>
-                        <Badge tone={orderStatusTone[order.status]}>
-                          {orderStatusLabel(order.status)}
-                        </Badge>
-                        {leg && (
-                          <span className="text-muted">
-                            {leg.intent.side === "buy" ? copy.orderLong : copy.orderShort}{" "}
-                            {formatNumber(leg.filled_quantity)}
-                          </span>
-                        )}
-                        {leg?.average_price && (
-                          <span className="text-muted">
-                            @ {formatNumber(leg.average_price)}
-                          </span>
-                        )}
-                        {order.note && <span className="text-warning">{order.note}</span>}
-                        <span className="text-subtle">{formatDateTime(order.created_at)}</span>
-                      </li>
-                    );
-                  })}
-                </ul>
-              </div>
-            )}
-          </div>
+          <PositionsOrdersPanel positions={strategyPositions} orders={strategyOrders} />
         )}
 
         {!eventDriven && (
