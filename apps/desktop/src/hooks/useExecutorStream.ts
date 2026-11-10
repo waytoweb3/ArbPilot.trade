@@ -2,6 +2,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useEffect } from "react";
 
 import { api } from "../lib/api";
+import { notifySystem } from "../lib/desktopNotify";
 import type { Position } from "../lib/types";
 import { useExecutorStore } from "../state/executor";
 
@@ -54,6 +55,8 @@ export function useExecutorStream() {
               message: payload.message,
               at: payload.at ?? new Date().toISOString(),
             });
+            // 同时发系统通知，App 在后台或窗口被遮挡时也能收到。
+            void notifySystem(payload.title, payload.message);
           }
           if (type === "order_updated") {
             queryClient.invalidateQueries({ queryKey: ["orders"] });
