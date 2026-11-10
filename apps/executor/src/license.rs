@@ -382,9 +382,13 @@ pub fn required_plan(method: &str, path: &str) -> Option<&'static str> {
             }
             return None;
         }
-        // 订阅/导入他人的策略属于“使用策略”，免费策略不要求套餐；
+        // 订阅/导入/退订他人的策略属于“使用策略”，不要求套餐；
         // 付费订阅仍只是生成待支付记录，实际授权由支付回调开通。
-        if path.ends_with("/subscribe") || path.ends_with("/import") {
+        // 退订必须放行：免费账号也能订阅免费策略，取消时不能反被附加包拦住。
+        if path.ends_with("/subscribe")
+            || path.ends_with("/import")
+            || (method == "DELETE" && path.starts_with("/market/subscriptions"))
+        {
             return None;
         }
         return Some("strategy");
@@ -623,6 +627,10 @@ mod tests {
         );
         assert_eq!(
             required_plan("POST", "/api/v1/market/publications/import"),
+            None
+        );
+        assert_eq!(
+            required_plan("DELETE", "/api/v1/market/subscriptions/abc"),
             None
         );
         assert_eq!(
