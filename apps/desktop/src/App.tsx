@@ -11,6 +11,7 @@ import NewsPage from "./pages/News";
 import OverviewPage from "./pages/Overview";
 import PositionsPage from "./pages/Positions";
 import SettingsPage from "./pages/Settings";
+import SkillsPage from "./pages/Skills";
 import StrategiesPage from "./pages/Strategies";
 import TradePage from "./pages/Trade";
 
@@ -33,6 +34,7 @@ export default function App() {
         <Route path="news" element={<NewsPage />} />
         <Route path="positions" element={<PositionsPage />} />
         <Route path="strategies" element={<StrategiesPage />} />
+        <Route path="skills" element={<SkillsPage />} />
         <Route path="market" element={<MarketPage />} />
         <Route path="settings" element={<SettingsPage />} />
       </Route>

@@ -469,7 +469,10 @@ mod tests {
     fn closing_order_ignores_venue_minimum() {
         let now = Utc::now();
         let mut intent = intent(now);
-        intent.legs.iter_mut().for_each(|leg| leg.reduce_only = true);
+        intent
+            .legs
+            .iter_mut()
+            .for_each(|leg| leg.reduce_only = true);
         intent.legs[0].venue = "lighter".into();
         intent.legs[0].quantity = dec!(0.001);
         intent.legs[0].limit_price = dec!(3000);

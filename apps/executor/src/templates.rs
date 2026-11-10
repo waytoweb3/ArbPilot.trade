@@ -14,8 +14,14 @@ use arb_core::{
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
-use crate::state::AppState;
+use crate::{
+    skill,
+    skill_check::{self, Costs},
+    skill_library::{self, Skill, SkillVersion},
+    state::AppState,
+};
 
 /// 一个可直接实例化的内置策略模板。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,6 +39,28 @@ pub struct StrategyTemplate {
 pub const OFFICIAL_TEMPLATE_KEYS: [&str; 4] =
     ["turtle-breakout", "ma-trend", "grid", "listing-follow"];
 
+/// 官方内置资源使用稳定 UUID，重复启动不会产生新记录。
+pub(crate) fn official_uuid(name: &str) -> Uuid {
+    Uuid::new_v5(&Uuid::NAMESPACE_URL, name.as_bytes())
+}
+
+pub(crate) fn official_author_id() -> Uuid {
+    official_uuid("https://arbpilot.trade/market/author/official")
+}
+
+/// 内置模板在技能库里的稳定 ID。
+pub fn builtin_skill_id(key: &str) -> Uuid {
+    official_uuid(&format!("https://arbpilot.trade/skill/{key}"))
+}
+
+/// 内置模板的 v1 版本；版本不可变，后续调整只能追加新版本。
+pub async fn builtin_version(state: &AppState, key: &str) -> Option<SkillVersion> {
+    if !OFFICIAL_TEMPLATE_KEYS.contains(&key) {
+        return None;
+    }
+    state.store.skill_version(builtin_skill_id(key), 1).await
+}
+
 /// 五个内置模板的默认集合。
 pub fn builtin() -> Vec<StrategyTemplate> {
     let now = Utc::now();
@@ -40,10 +68,11 @@ pub fn builtin() -> Vec<StrategyTemplate> {
         StrategyTemplate {
             key: "turtle-breakout".to_string(),
             name: "海龟突破".to_string(),
-            description: "价格突破唐奇安通道入场，反向突破或 2 倍 ATR 止损离场。".to_string(),
+            description: "系统一 20/10、系统二 55/20 唐奇安通道突破，按 N 计算 Unit 并金字塔加仓。"
+                .to_string(),
             definition: definition(
                 "海龟突破",
-                "空仓时突破前 N 根最高价做多、跌破最低价做空；持仓时反向突破或用 2 倍 ATR 止损。\
+                "系统一/系统二突破入场，0.5N 加仓、2N 止损；系统一盈利后跳过下一次信号。\
                  具体参数在策略详情的技能参数里配置。",
                 DataRules {
                     timeframe: "1h".to_string(),
@@ -80,11 +109,12 @@ pub fn builtin() -> Vec<StrategyTemplate> {
         StrategyTemplate {
             key: "grid".to_string(),
             name: "网格".to_string(),
-            description: "现价上下按固定间距布置档位，价格触及后下单，到达相邻档位止盈。".to_string(),
+            description: "在价格区间内按等差或等比布置档位，触及后下单，到达相邻档位止盈。"
+                .to_string(),
             definition: definition(
                 "网格",
-                "围绕锚定价在上下方各布置若干档位，价格触及档位时单腿开仓，到达相邻档位止盈。\
-                 具体参数在策略详情的技能参数里配置。",
+                "在价格区间内按等差或等比布置档位，价格触及档位时单腿开仓，到达相邻档位止盈；\
+                 支持触发价、区间上移/下移与整组止盈止损。具体参数在策略详情的技能参数里配置。",
                 DataRules {
                     timeframe: "5m".to_string(),
                     lookback: 200,
@@ -205,6 +235,81 @@ pub async fn seed(state: &AppState) {
     }
 
     rename_legacy_strategies(state, &all).await;
+    seed_skills(state).await;
+}
+
+/// 把官方内置模板补成技能库里的 Skill + v1 版本。
+///
+/// 四个模板不再只靠模板标识特例识别：它们和用户创建的技能共用同一条
+/// 「技能 → 版本 → 发布 → 订阅 → 导入 → 规则实例」链路，发布与导入都用
+/// 这里的版本哈希校验。版本一旦写入就不再覆盖，调整默认参数只能追加新版本。
+///
+/// 每个实例都会补齐：官方实例据此发布，用户实例也能在技能库里看到并复用同一份版本。
+pub async fn seed_skills(state: &AppState) {
+    let templates: Vec<StrategyTemplate> = builtin()
+        .into_iter()
+        .filter(|template| OFFICIAL_TEMPLATE_KEYS.contains(&template.key.as_str()))
+        .collect();
+
+    let skills = state.store.skills().await;
+    let limits = state.risk_limits();
+    let candles: Vec<arb_core::SandboxCandle> = Vec::new();
+    for template in templates {
+        let Some(kind) = skill::kind_from_template(&template.key) else {
+            continue;
+        };
+        let id = builtin_skill_id(&template.key);
+        let existing = skills.iter().find(|item| item.id == id);
+        // 已存在 v1 且技能信息一致时保持原样：版本不可变，也不重复写库。
+        if matches!(existing, Some(skill) if skill.latest_version >= 1 && skill.name == template.name)
+            && state.store.skill_version(id, 1).await.is_some()
+        {
+            continue;
+        }
+        let mut skill = match existing {
+            Some(existing) => existing.clone(),
+            None => {
+                let mut skill = Skill::new(
+                    official_author_id(),
+                    template.name.clone(),
+                    template.description.clone(),
+                );
+                skill.id = id;
+                skill
+            }
+        };
+
+        // 已存在同号版本时保留历史冻结规则，只把技能实体补到 v1。
+        if state.store.skill_version(id, 1).await.is_none() {
+            let mut settings =
+                skill::default_settings(kind, template.definition.execution.leverage);
+            skill_library::tag_rules(&mut settings, id, 1);
+            let mut report = skill_check::Report::default();
+            for rule in &settings.rules {
+                for issue in
+                    skill_check::evaluate_rule(rule, &limits, &candles, Costs::default()).issues
+                {
+                    report.push(issue);
+                }
+            }
+            let view = report.view();
+            let version = SkillVersion::new(
+                id,
+                1,
+                settings,
+                serde_json::to_value(&view).unwrap_or_default(),
+                view.passed,
+                "官方内置模板",
+            );
+            state.store.save_skill_version(&version).await;
+        }
+
+        skill.latest_version = skill.latest_version.max(1);
+        skill.name = template.name.clone();
+        skill.description = template.description.clone();
+        skill.updated_at = Utc::now();
+        state.store.save_skill(&skill).await;
+    }
 }
 
 /// 旧版本把带「 · BTCUSDT」的模板默认名复制进了已创建的策略。
@@ -264,6 +369,38 @@ mod tests {
                 crate::skill::kind_from_template(&template.key).is_some(),
                 "{} 没有对应的技能触发方式",
                 template.key
+            );
+        }
+    }
+
+    /// 内置模板补成技能库版本后必须可发布，且导入端重新打标得到同一份哈希。
+    #[test]
+    fn builtin_skill_versions_are_publishable() {
+        let limits = arb_core::RiskLimits::default();
+        let mut ids = std::collections::HashSet::new();
+        for key in OFFICIAL_TEMPLATE_KEYS {
+            let id = builtin_skill_id(key);
+            assert!(ids.insert(id), "{key} 的技能 ID 与其他模板冲突");
+
+            let kind = crate::skill::kind_from_template(key).expect("有对应触发方式");
+            let mut settings = crate::skill::default_settings(kind, Decimal::ONE);
+            skill_library::tag_rules(&mut settings, id, 1);
+
+            let mut report = skill_check::Report::default();
+            for rule in &settings.rules {
+                for issue in skill_check::evaluate_rule(rule, &limits, &[], Costs::default()).issues
+                {
+                    report.push(issue);
+                }
+            }
+            assert!(report.view().passed, "{key} 的默认参数未通过校验");
+
+            let mut imported = settings.clone();
+            skill_library::tag_rules(&mut imported, id, 1);
+            assert_eq!(
+                skill_library::hash_settings(&settings),
+                skill_library::hash_settings(&imported),
+                "{key} 发布与导入的规则哈希不一致"
             );
         }
     }

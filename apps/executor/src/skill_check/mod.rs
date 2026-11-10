@@ -321,9 +321,14 @@ business:
   leverage: 2
   take_profit_pct: 0
   stop_loss_pct: 0
-  grid_levels: 3
+  grid_count: 10
   grid_spacing_pct: 0.5
-  grid_share_pct: 25
+  grid_lower_price: 0
+  grid_upper_price: 0
+  grid_spacing_mode: arithmetic
+  grid_trigger_price: 0
+  grid_shift: none
+  grid_close_on_fail: false
 output:
   action: open_long
   notify: true

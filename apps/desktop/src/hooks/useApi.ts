@@ -10,7 +10,14 @@ import type {
   ListingSettings,
   Position,
   SettlementStatus,
+  Skill,
+  SkillBinding,
+  SkillDetail,
+  SkillRule,
   SkillSettings,
+  SkillValidationReport,
+  SkillVersion,
+  RuleDiff,
   StrategyDefinition,
   StrategyExecutionMode,
   StrategyStatus,
@@ -286,6 +293,126 @@ export function useUpdateSkillSettings() {
   });
 }
 
+/** 技能库：作者自己的 Skill 列表。 */
+export function useSkills(authorId?: string) {
+  return useQuery({
+    queryKey: ["skills", authorId ?? "all"],
+    queryFn: () => api.skills(authorId),
+    staleTime: 15_000,
+  });
+}
+
+export function useSkillDetail(skillId: string | null) {
+  return useQuery({
+    queryKey: ["skill", skillId],
+    queryFn: () => api.skill(skillId!),
+    enabled: Boolean(skillId),
+  });
+}
+
+export function useSkillVersions(skillId: string | null) {
+  return useQuery({
+    queryKey: ["skill-versions", skillId],
+    queryFn: () => api.skillVersions(skillId!),
+    enabled: Boolean(skillId),
+  });
+}
+
+export function useCreateSkill() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: api.createSkill,
+    onSuccess: (data: SkillDetail) => {
+      queryClient.invalidateQueries({ queryKey: ["skills"] });
+      queryClient.setQueryData(["skill", data.skill.id], data);
+    },
+  });
+}
+
+export function useCreateSkillVersion() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      skillId,
+      ...body
+    }: {
+      skillId: string;
+      settings?: SkillSettings;
+      markdown?: string;
+      changelog?: string;
+    }) => api.createSkillVersion(skillId, body),
+    onSuccess: (data: SkillVersion) => {
+      queryClient.invalidateQueries({ queryKey: ["skills"] });
+      queryClient.invalidateQueries({ queryKey: ["skill-versions", data.skill_id] });
+      queryClient.invalidateQueries({ queryKey: ["skill", data.skill_id] });
+    },
+  });
+}
+
+export function useValidateSkill() {
+  return useMutation({
+    mutationFn: ({
+      skillId,
+      ...body
+    }: {
+      skillId: string;
+      settings?: SkillSettings;
+      markdown?: string;
+      version?: number;
+    }) => api.validateSkill(skillId, body),
+  });
+}
+
+export function useSkillDiff(skillId: string | null, from: number, to: number) {
+  return useQuery({
+    queryKey: ["skill-diff", skillId, from, to],
+    queryFn: () => api.skillDiff(skillId!, from, to),
+    enabled: Boolean(skillId) && from > 0 && to > 0 && from !== to,
+  });
+}
+
+export function useStrategySkillDiff(strategyId: string, version: number) {
+  return useQuery({
+    queryKey: ["strategy-skill-diff", strategyId, version],
+    queryFn: () => api.strategySkillDiff(strategyId, version),
+    enabled: version > 0,
+  });
+}
+
+export function useUpgradeStrategySkill() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ strategyId, version }: { strategyId: string; version: number }) =>
+      api.upgradeStrategySkill(strategyId, version),
+    onSuccess: (_data, variables) => {
+      queryClient.invalidateQueries({ queryKey: ["strategies"] });
+      queryClient.invalidateQueries({ queryKey: ["skill-settings", variables.strategyId] });
+    },
+  });
+}
+
+export function useUpdateStrategySkillRule() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      strategyId,
+      ruleId,
+      ...body
+    }: {
+      strategyId: string;
+      ruleId: string;
+      enabled?: boolean;
+      rule?: SkillRule;
+    }) => api.updateStrategySkillRule(strategyId, ruleId, body),
+    onSuccess: (_data, variables) => {
+      queryClient.invalidateQueries({ queryKey: ["skill-settings", variables.strategyId] });
+      queryClient.invalidateQueries({ queryKey: ["strategies"] });
+    },
+  });
+}
+
+export type { RuleDiff, Skill, SkillDetail, SkillValidationReport, SkillVersion };
+
 /** 各交易所资金费率采集器状态：入库条数、最近一次采集结果与各交易对最新费率。 */
 export function useFundingStatus() {
   return useQuery({
@@ -531,6 +658,7 @@ export function useCreateStrategy() {
       definition?: StrategyDefinition;
       name?: string;
       source?: "manual" | "ai";
+      skill?: SkillBinding;
     }) => api.createStrategy(body),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["strategies"] }),
   });

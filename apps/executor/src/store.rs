@@ -13,8 +13,13 @@ use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 use uuid::Uuid;
 
 use crate::{
-    conditional::ConditionalOrder, exchange::FundingRate, listing::ListingSettings,
-    listing::ListingTrade, skill::SkillSettings, sqlite_store::SqliteStore,
+    conditional::ConditionalOrder,
+    exchange::FundingRate,
+    listing::ListingSettings,
+    listing::ListingTrade,
+    skill::SkillSettings,
+    skill_library::{Skill, SkillVersion},
+    sqlite_store::SqliteStore,
     templates::StrategyTemplate,
 };
 
@@ -245,6 +250,10 @@ pub struct Store {
     listing_trades: RwLock<Vec<ListingTrade>>,
     /// 内存降级时的技能策略设置，键为策略 ID。
     skill_settings: RwLock<BTreeMap<String, SkillSettings>>,
+    /// 内存降级时的技能库实体。
+    skills: RwLock<Vec<Skill>>,
+    /// 内存降级时的技能版本。
+    skill_versions: RwLock<Vec<SkillVersion>>,
 }
 
 impl Store {
@@ -334,6 +343,8 @@ impl Store {
             listing_settings: RwLock::new(BTreeMap::new()),
             listing_trades: RwLock::new(Vec::new()),
             skill_settings: RwLock::new(BTreeMap::new()),
+            skills: RwLock::new(Vec::new()),
+            skill_versions: RwLock::new(Vec::new()),
         }
     }
 
@@ -2115,6 +2126,197 @@ impl Store {
         {
             tracing::error!(%error, "写入技能策略设置失败");
         }
+    }
+
+    /// 技能库实体列表。
+    pub async fn skills(&self) -> Vec<Skill> {
+        sqlite_branch!(self, db => db.skills().await);
+        if let Some(pool) = &self.pool {
+            match sqlx::query("select payload from skills order by updated_at desc")
+                .fetch_all(pool)
+                .await
+            {
+                Ok(rows) => {
+                    return rows
+                        .into_iter()
+                        .filter_map(|row| {
+                            let payload: serde_json::Value = row.get("payload");
+                            serde_json::from_value(payload)
+                                .map_err(|error| {
+                                    tracing::error!(%error, "技能载荷解析失败");
+                                    error
+                                })
+                                .ok()
+                        })
+                        .collect();
+                }
+                Err(error) => {
+                    tracing::error!(%error, "读取技能列表失败");
+                    return Vec::new();
+                }
+            }
+        }
+        let mut skills = self.skills.read().expect("技能库锁不可用").clone();
+        skills.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+        skills
+    }
+
+    pub async fn save_skill(&self, skill: &Skill) {
+        sqlite_branch!(self, db => db.save_skill(skill).await);
+        if let Some(pool) = &self.pool {
+            let payload = match serde_json::to_value(skill) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    tracing::error!(%error, "技能序列化失败");
+                    return;
+                }
+            };
+            if let Err(error) = sqlx::query(
+                r#"
+                insert into skills (id, author_id, payload, updated_at)
+                values ($1, $2, $3, now())
+                on conflict (id) do update
+                    set author_id = excluded.author_id,
+                        payload = excluded.payload,
+                        updated_at = now()
+                "#,
+            )
+            .bind(skill.id)
+            .bind(skill.author_id)
+            .bind(payload)
+            .execute(pool)
+            .await
+            {
+                tracing::error!(%error, skill_id = %skill.id, "写入技能失败");
+            }
+            return;
+        }
+        let mut skills = self.skills.write().expect("技能库锁不可用");
+        match skills.iter_mut().find(|existing| existing.id == skill.id) {
+            Some(existing) => *existing = skill.clone(),
+            None => skills.push(skill.clone()),
+        }
+    }
+
+    pub async fn skill_versions(&self, skill_id: Uuid) -> Vec<SkillVersion> {
+        sqlite_branch!(self, db => db.skill_versions(skill_id).await);
+        if let Some(pool) = &self.pool {
+            match sqlx::query(
+                "select payload from skill_versions where skill_id = $1 order by version asc",
+            )
+            .bind(skill_id)
+            .fetch_all(pool)
+            .await
+            {
+                Ok(rows) => {
+                    return rows
+                        .into_iter()
+                        .filter_map(|row| {
+                            let payload: serde_json::Value = row.get("payload");
+                            serde_json::from_value(payload)
+                                .map_err(|error| {
+                                    tracing::error!(%error, %skill_id, "技能版本载荷解析失败");
+                                    error
+                                })
+                                .ok()
+                        })
+                        .collect();
+                }
+                Err(error) => {
+                    tracing::error!(%error, %skill_id, "读取技能版本失败");
+                    return Vec::new();
+                }
+            }
+        }
+        let mut versions: Vec<SkillVersion> = self
+            .skill_versions
+            .read()
+            .expect("技能版本锁不可用")
+            .iter()
+            .filter(|version| version.skill_id == skill_id)
+            .cloned()
+            .collect();
+        versions.sort_by_key(|version| version.version);
+        versions
+    }
+
+    pub async fn skill_version(&self, skill_id: Uuid, version: u32) -> Option<SkillVersion> {
+        sqlite_branch!(self, db => db.skill_version(skill_id, version).await);
+        if let Some(pool) = &self.pool {
+            let row = match sqlx::query(
+                "select payload from skill_versions where skill_id = $1 and version = $2",
+            )
+            .bind(skill_id)
+            .bind(version as i32)
+            .fetch_optional(pool)
+            .await
+            {
+                Ok(row) => row,
+                Err(error) => {
+                    tracing::error!(%error, %skill_id, version, "读取技能版本失败");
+                    return None;
+                }
+            };
+            return row.and_then(|row| {
+                let payload: serde_json::Value = row.get("payload");
+                serde_json::from_value(payload)
+                    .map_err(|error| {
+                        tracing::error!(%error, %skill_id, version, "技能版本载荷解析失败");
+                        error
+                    })
+                    .ok()
+            });
+        }
+        self.skill_versions
+            .read()
+            .expect("技能版本锁不可用")
+            .iter()
+            .find(|item| item.skill_id == skill_id && item.version == version)
+            .cloned()
+    }
+
+    pub async fn save_skill_version(&self, version: &SkillVersion) {
+        sqlite_branch!(self, db => db.save_skill_version(version).await);
+        if let Some(pool) = &self.pool {
+            let payload = match serde_json::to_value(version) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    tracing::error!(%error, "技能版本序列化失败");
+                    return;
+                }
+            };
+            // 版本不可变：已存在时不做覆盖。
+            if let Err(error) = sqlx::query(
+                r#"
+                insert into skill_versions (skill_id, version, payload)
+                values ($1, $2, $3)
+                on conflict (skill_id, version) do nothing
+                "#,
+            )
+            .bind(version.skill_id)
+            .bind(version.version as i32)
+            .bind(payload)
+            .execute(pool)
+            .await
+            {
+                tracing::error!(
+                    %error,
+                    skill_id = %version.skill_id,
+                    version = version.version,
+                    "写入技能版本失败"
+                );
+            }
+            return;
+        }
+        let mut versions = self.skill_versions.write().expect("技能版本锁不可用");
+        // 版本不可变：内存模式同样不覆盖已存在的同号版本。
+        if versions
+            .iter()
+            .any(|item| item.skill_id == version.skill_id && item.version == version.version)
+        {
+            return;
+        }
+        versions.push(version.clone());
     }
 
     /// 读取全部上币单腿交易记录，排序由调用方负责。

@@ -138,11 +138,17 @@ pub fn check(rule: &SkillRule, candles: &[SandboxCandle], costs: Costs) -> Vec<I
 /// 指标全部可用的最少 K 线根数，与回测预热口径保持一致。
 fn warmup_bars(rule: &SkillRule) -> usize {
     let trigger = &rule.trigger;
-    trigger
-        .slow
+    let longest_ma = trigger
+        .ma_periods
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(0)
+        .max(trigger.fast)
+        .max(trigger.slow);
+    longest_ma
         .max(trigger.channel.saturating_add(1))
         .max(trigger.atr.saturating_add(1))
-        .max(trigger.fast)
         .max(3) as usize
 }
 

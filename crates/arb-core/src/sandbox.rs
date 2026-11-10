@@ -148,10 +148,7 @@ impl SandboxLimits {
         };
 
         if self.max_fuel == 0 || self.max_fuel > Self::HARD_MAX_FUEL {
-            issues.push(error(
-                "max_fuel",
-                "燃料上限必须在 1 到 5000 万之间",
-            ));
+            issues.push(error("max_fuel", "燃料上限必须在 1 到 5000 万之间"));
         }
         if self.max_memory_bytes == 0 || self.max_memory_bytes > Self::HARD_MAX_MEMORY_BYTES {
             issues.push(error(
@@ -289,6 +286,9 @@ pub struct SandboxIndicators {
     pub sma_slow: Option<Decimal>,
     pub ema_fast: Option<Decimal>,
     pub ema_slow: Option<Decimal>,
+    /// 按周期索引的简单均线：指标层只算配置里出现的周期。
+    #[serde(default)]
+    pub sma_by_period: std::collections::BTreeMap<u32, Decimal>,
     /// 平均真实波幅。
     pub atr: Option<Decimal>,
     /// 唐奇安通道上轨（前 N 根最高价）。
@@ -298,6 +298,11 @@ pub struct SandboxIndicators {
 }
 
 impl SandboxIndicators {
+    /// 取指定周期的简单均线；未计算或数据不足时返回 `None`。
+    pub fn sma(&self, period: u32) -> Option<Decimal> {
+        self.sma_by_period.get(&period).copied()
+    }
+
     /// 按 `SANDBOX_INDICATOR_*` 编号取值；缺数据返回 0。
     pub fn by_id(&self, id: i32) -> f64 {
         let value = match id {

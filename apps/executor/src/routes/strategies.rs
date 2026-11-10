@@ -1,7 +1,8 @@
 use arb_core::{
     BacktestReport, CostAssumptions, DataRules, EntryRules, ExecutionRules, ExitRules,
-    FundingSample, Instrument, StrategyDefinition, StrategyEventLevel, StrategyExecutionMode,
-    StrategyKind, StrategyRecord, StrategyRisk, StrategySource, StrategyStatus, StrategyUniverse,
+    FundingSample, Instrument, SkillBinding, StrategyDefinition, StrategyEventLevel,
+    StrategyExecutionMode, StrategyKind, StrategyRecord, StrategyRisk, StrategySource,
+    StrategyStatus, StrategyUniverse,
 };
 use axum::{
     extract::{Path, State},
@@ -55,6 +56,9 @@ pub struct CreateStrategyRequest {
     pub name: Option<String>,
     /// 来源：AI 生成或用户手写，默认按用户手写记录。
     pub source: Option<StrategySource>,
+    /// 绑定技能库版本；提供时以该版本冻结规则作为策略运行载体。
+    #[serde(default)]
+    pub skill: Option<SkillBinding>,
 }
 
 pub async fn create(
@@ -75,6 +79,38 @@ pub async fn create(
         body.source.unwrap_or(StrategySource::Manual),
         StrategyStatus::Draft,
     );
+    let mut frozen_skill_settings = None;
+    if let Some(mut binding) = body.skill {
+        if let (Some(skill_id), Some(version_no)) = (binding.skill_id, binding.skill_version) {
+            let version = state
+                .store
+                .skill_version(skill_id, version_no)
+                .await
+                .ok_or_else(|| {
+                    ApiError::NotFound(format!("技能 {skill_id} 的版本 v{version_no} 不存在"))
+                })?;
+            if !version.passed {
+                return Err(ApiError::Conflict(
+                    "技能版本未通过校验，不能用于创建策略".to_string(),
+                ));
+            }
+            binding.settings = Some(
+                serde_json::to_value(&version.settings)
+                    .map_err(|error| ApiError::Internal(error.to_string()))?,
+            );
+            binding.skill_sha256 = Some(version.settings_sha256.clone());
+            frozen_skill_settings = Some(version.settings);
+        } else if let Some(value) = binding.settings.clone() {
+            frozen_skill_settings = Some(
+                serde_json::from_value(value)
+                    .map_err(|error| ApiError::BadRequest(format!("技能参数无法解析: {error}")))?,
+            );
+        }
+        if binding.template_key.trim().is_empty() {
+            binding.template_key = "skill".to_string();
+        }
+        record.skill = Some(binding);
+    }
     record.validation = record.definition.validate(&state.risk_limits());
 
     {
@@ -82,6 +118,9 @@ pub async fn create(
         strategies.push(record.clone());
     }
     persist(&state, &record).await;
+    if let Some(settings) = frozen_skill_settings {
+        state.skill.update_settings(record.id, settings).await;
+    }
 
     Ok((StatusCode::CREATED, Json(record)))
 }
@@ -178,6 +217,14 @@ pub async fn update(
             return Err(ApiError::Conflict(
                 "请先部署策略代码或配置技能参数再启动".to_string(),
             ));
+        }
+        if crate::skill::manages(&record) {
+            let settings = crate::skill::settings_for(&state, &record);
+            if !settings.rules.iter().any(|rule| rule.enabled) {
+                return Err(ApiError::Conflict(
+                    "请至少启用一条技能规则再启动".to_string(),
+                ));
+            }
         }
         record.validation = record.definition.validate(&state.risk_limits());
         if record.validation.has_errors() {
@@ -648,17 +695,36 @@ pub(crate) async fn listing_note(state: &AppState, record: &StrategyRecord) -> O
                     "{} · 通道 {} · ATR {}×",
                     rule.trigger.timeframe, rule.trigger.channel, rule.trigger.atr_multiple
                 ),
-                crate::skill::SkillKind::MaTrend => format!(
-                    "{} · 均线 {}/{}",
-                    rule.trigger.timeframe, rule.trigger.fast, rule.trigger.slow
-                ),
-                crate::skill::SkillKind::Grid => format!(
-                    "{} · {} 档 · 间距 {}% · 每档 {}%",
-                    rule.trigger.timeframe,
-                    rule.business.grid_levels,
-                    rule.business.grid_spacing_pct,
-                    rule.business.grid_share_pct
-                ),
+                crate::skill::SkillKind::MaTrend => {
+                    let periods = crate::skill::resolved_ma_periods(&rule.trigger)
+                        .iter()
+                        .map(|period| format!("MA{period}"))
+                        .collect::<Vec<_>>()
+                        .join("/");
+                    format!("{} · {periods}", rule.trigger.timeframe)
+                }
+                crate::skill::SkillKind::Grid => {
+                    let mode = match rule.business.grid_spacing_mode {
+                        crate::skill::GridSpacingMode::Arithmetic => "等差",
+                        crate::skill::GridSpacingMode::Geometric => "等比",
+                    };
+                    let range = if rule.business.grid_lower_price > rust_decimal::Decimal::ZERO
+                        && rule.business.grid_upper_price > rule.business.grid_lower_price
+                    {
+                        format!(
+                            "{}-{}",
+                            rule.business.grid_lower_price, rule.business.grid_upper_price
+                        )
+                    } else {
+                        "自动区间".to_string()
+                    };
+                    format!(
+                        "{} · {range} · {} 格 · {mode} · 间距 {}%",
+                        rule.trigger.timeframe,
+                        rule.business.grid_count(),
+                        rule.business.grid_spacing_pct
+                    )
+                }
             };
             match rule.name.trim() {
                 "" => format!("{condition} → {execution}"),

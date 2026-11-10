@@ -47,9 +47,9 @@ fn check_rule(rule: &SkillRule, limits: &RiskLimits, issues: &mut Vec<Issue>) {
         let Some(minimum) = venue_min_notional_usd(venue) else {
             continue;
         };
-        // 网格每档只使用下单金额的一部分，按每档金额判断更有意义。
+        // 网格把下单金额按档位数均分，按每档金额判断更有意义。
         let per_order = if rule.kind == SkillKind::Grid {
-            notional * rule.business.grid_share_pct / Decimal::from(100)
+            notional * rule.business.grid_share()
         } else {
             notional
         };
@@ -309,7 +309,7 @@ mod tests {
         rule.kind = SkillKind::Grid;
         rule.steps.execution_venues = vec!["lighter".to_string()];
         rule.business.notional_usd = dec!(20);
-        rule.business.grid_share_pct = dec!(10);
+        rule.business.grid_count = 10;
         rule.cautions.max_notional_usd = Decimal::ZERO;
         let issues = check(&rule, &RiskLimits::default());
         assert!(issues

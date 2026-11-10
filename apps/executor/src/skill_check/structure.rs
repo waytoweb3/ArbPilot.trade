@@ -10,8 +10,9 @@ use uuid::Uuid;
 
 use super::{Dimension, Issue};
 use crate::skill::{
-    SkillAction, SkillBusinessRules, SkillCautions, SkillDirection, SkillKind, SkillOutput,
-    SkillRule, SkillSteps, SkillTrigger,
+    GridShift, GridSpacingMode, MaEntry, MaExit, SkillAction, SkillBusinessRules, SkillCautions,
+    SkillDirection, SkillKind, SkillOrderType, SkillOutput, SkillRule, SkillSteps, SkillTrigger,
+    TurtleSystems,
 };
 
 /// 当前支持的 SKILL.md 版本。
@@ -29,22 +30,51 @@ const TRIGGER_FIELDS: &[&str] = &[
     "lookback",
     "fast",
     "slow",
+    "ma_periods",
+    "entries",
+    "exits",
     "atr",
     "channel",
     "atr_multiple",
+    "turtle",
 ];
-const STEPS_FIELDS: &[&str] = &["execution_mode", "execution_venues", "direction"];
+const STEPS_FIELDS: &[&str] = &[
+    "execution_mode",
+    "execution_venues",
+    "direction",
+    "order_type",
+];
 const BUSINESS_FIELDS: &[&str] = &[
     "notional_usd",
     "leverage",
+    "risk_reward",
     "take_profit_pct",
     "stop_loss_pct",
     "grid_levels",
     "grid_spacing_pct",
     "grid_share_pct",
+    "grid_count",
+    "grid_lower_price",
+    "grid_upper_price",
+    "grid_spacing_mode",
+    "grid_trigger_price",
+    "grid_shift",
+    "grid_close_on_fail",
+    "max_units",
+    "pyramid_step_n",
+    "max_pyramid_adds",
+    "max_symbols",
+    "max_leverage",
+    "max_hold_hours",
 ];
 const OUTPUT_FIELDS: &[&str] = &["action", "notify"];
-const CAUTIONS_FIELDS: &[&str] = &["max_notional_usd", "max_daily_opens"];
+const CAUTIONS_FIELDS: &[&str] = &[
+    "max_notional_usd",
+    "max_daily_opens",
+    "risk_pct",
+    "max_positions",
+    "cooldown_hours",
+];
 
 /// 解析结果：只有整份文档没有 `Error` 时才返回可执行的规则。
 pub struct Parsed {
@@ -122,6 +152,9 @@ pub fn parse(text: &str) -> Parsed {
         business,
         output,
         cautions,
+        source_skill_id: None,
+        source_skill_version: None,
+        source_rule_id: None,
     };
     let failed = issues
         .iter()
@@ -186,8 +219,60 @@ fn build_trigger(map: &Mapping, issues: &mut Vec<Issue>) -> (SkillKind, SkillTri
             default.atr_multiple,
             issues,
         ),
+        // 均线周期集合与入场/出场规则由结构化编辑维护；文本里省略时回落到旧逻辑。
+        ma_periods: optional_u32_list(map, "ma_periods", "skill.trigger", issues),
+        entries: optional_ma_entries(map, "entries", "skill.trigger", issues),
+        exits: optional_ma_exits(map, "exits", "skill.trigger", issues),
+        turtle: build_turtle(map, &default.turtle, issues),
     };
     (kind, trigger)
+}
+
+fn build_turtle(map: &Mapping, default: &TurtleSystems, issues: &mut Vec<Issue>) -> TurtleSystems {
+    let path = "skill.trigger.turtle";
+    let Some(Value::Mapping(inner)) = lookup(map, "turtle") else {
+        issues.push(Issue::info(
+            Dimension::Structure,
+            "structure.default_applied",
+            format!("{path} 未填写，使用默认的双系统参数"),
+        ));
+        return default.clone();
+    };
+    unknown_fields(
+        inner,
+        &[
+            "system1_enabled",
+            "system2_enabled",
+            "entry1",
+            "exit1",
+            "entry2",
+            "exit2",
+            "profit_filter",
+        ],
+        path,
+        issues,
+    );
+    TurtleSystems {
+        system1_enabled: optional_bool(
+            inner,
+            "system1_enabled",
+            path,
+            default.system1_enabled,
+            issues,
+        ),
+        system2_enabled: optional_bool(
+            inner,
+            "system2_enabled",
+            path,
+            default.system2_enabled,
+            issues,
+        ),
+        entry1: optional_u32(inner, "entry1", path, default.entry1, issues),
+        exit1: optional_u32(inner, "exit1", path, default.exit1, issues),
+        entry2: optional_u32(inner, "entry2", path, default.entry2, issues),
+        exit2: optional_u32(inner, "exit2", path, default.exit2, issues),
+        profit_filter: optional_bool(inner, "profit_filter", path, default.profit_filter, issues),
+    }
 }
 
 fn build_steps(map: &Mapping, issues: &mut Vec<Issue>) -> SkillSteps {
@@ -216,6 +301,11 @@ fn build_steps(map: &Mapping, issues: &mut Vec<Issue>) -> SkillSteps {
                 default.direction
             }
         },
+        order_type: match lookup(map, "order_type") {
+            Some(value) => parse_order_type(value, "skill.steps.order_type", issues)
+                .unwrap_or(default.order_type),
+            None => default.order_type,
+        },
     }
 }
 
@@ -226,6 +316,13 @@ fn build_business(map: &Mapping, issues: &mut Vec<Issue>) -> SkillBusinessRules 
             .unwrap_or(default.notional_usd),
         leverage: required_decimal(map, "leverage", "skill.business", issues)
             .unwrap_or(default.leverage),
+        risk_reward: optional_decimal(
+            map,
+            "risk_reward",
+            "skill.business",
+            default.risk_reward,
+            issues,
+        ),
         take_profit_pct: optional_decimal(
             map,
             "take_profit_pct",
@@ -261,6 +358,145 @@ fn build_business(map: &Mapping, issues: &mut Vec<Issue>) -> SkillBusinessRules 
             default.grid_share_pct,
             issues,
         ),
+        grid_count: optional_u32(
+            map,
+            "grid_count",
+            "skill.business",
+            default.grid_count,
+            issues,
+        ),
+        grid_lower_price: optional_decimal(
+            map,
+            "grid_lower_price",
+            "skill.business",
+            default.grid_lower_price,
+            issues,
+        ),
+        grid_upper_price: optional_decimal(
+            map,
+            "grid_upper_price",
+            "skill.business",
+            default.grid_upper_price,
+            issues,
+        ),
+        grid_spacing_mode: optional_spacing_mode(map, default.grid_spacing_mode, issues),
+        grid_trigger_price: optional_decimal(
+            map,
+            "grid_trigger_price",
+            "skill.business",
+            default.grid_trigger_price,
+            issues,
+        ),
+        grid_shift: optional_grid_shift(map, default.grid_shift, issues),
+        grid_close_on_fail: optional_bool(
+            map,
+            "grid_close_on_fail",
+            "skill.business",
+            default.grid_close_on_fail,
+            issues,
+        ),
+        max_units: optional_u32(
+            map,
+            "max_units",
+            "skill.business",
+            default.max_units,
+            issues,
+        ),
+        pyramid_step_n: optional_decimal(
+            map,
+            "pyramid_step_n",
+            "skill.business",
+            default.pyramid_step_n,
+            issues,
+        ),
+        max_pyramid_adds: optional_u32(
+            map,
+            "max_pyramid_adds",
+            "skill.business",
+            default.max_pyramid_adds,
+            issues,
+        ),
+        max_symbols: optional_u32(
+            map,
+            "max_symbols",
+            "skill.business",
+            default.max_symbols,
+            issues,
+        ),
+        max_leverage: optional_decimal(
+            map,
+            "max_leverage",
+            "skill.business",
+            default.max_leverage,
+            issues,
+        ),
+        max_hold_hours: optional_decimal(
+            map,
+            "max_hold_hours",
+            "skill.business",
+            default.max_hold_hours,
+            issues,
+        ),
+    }
+}
+
+fn optional_spacing_mode(
+    map: &Mapping,
+    default: GridSpacingMode,
+    issues: &mut Vec<Issue>,
+) -> GridSpacingMode {
+    let path = "skill.business.grid_spacing_mode";
+    match lookup(map, "grid_spacing_mode") {
+        Some(value) => {
+            let Some(text) = as_string(value, path, issues) else {
+                return default;
+            };
+            match text.trim().to_ascii_lowercase().as_str() {
+                "arithmetic" => GridSpacingMode::Arithmetic,
+                "geometric" => GridSpacingMode::Geometric,
+                other => {
+                    issues.push(Issue::error(
+                        Dimension::Structure,
+                        "structure.invalid_enum",
+                        format!("{path} 的值 `{other}` 非法；允许 arithmetic / geometric"),
+                    ));
+                    default
+                }
+            }
+        }
+        None => {
+            default_applied("skill.business", "grid_spacing_mode", "arithmetic", issues);
+            default
+        }
+    }
+}
+
+fn optional_grid_shift(map: &Mapping, default: GridShift, issues: &mut Vec<Issue>) -> GridShift {
+    let path = "skill.business.grid_shift";
+    match lookup(map, "grid_shift") {
+        Some(value) => {
+            let Some(text) = as_string(value, path, issues) else {
+                return default;
+            };
+            match text.trim().to_ascii_lowercase().as_str() {
+                "none" => GridShift::None,
+                "up" => GridShift::Up,
+                "down" => GridShift::Down,
+                "both" => GridShift::Both,
+                other => {
+                    issues.push(Issue::error(
+                        Dimension::Structure,
+                        "structure.invalid_enum",
+                        format!("{path} 的值 `{other}` 非法；允许 none / up / down / both"),
+                    ));
+                    default
+                }
+            }
+        }
+        None => {
+            default_applied("skill.business", "grid_shift", "none", issues);
+            default
+        }
     }
 }
 
@@ -299,6 +535,21 @@ fn build_cautions(map: &Mapping, issues: &mut Vec<Issue>) -> SkillCautions {
             "max_daily_opens",
             "skill.cautions",
             default.max_daily_opens,
+            issues,
+        ),
+        risk_pct: optional_decimal(map, "risk_pct", "skill.cautions", default.risk_pct, issues),
+        max_positions: optional_u32(
+            map,
+            "max_positions",
+            "skill.cautions",
+            default.max_positions,
+            issues,
+        ),
+        cooldown_hours: optional_decimal(
+            map,
+            "cooldown_hours",
+            "skill.cautions",
+            default.cooldown_hours,
             issues,
         ),
     }
@@ -549,6 +800,82 @@ fn optional_string_list(
         .collect()
 }
 
+fn optional_u32_list(map: &Mapping, name: &str, path: &str, issues: &mut Vec<Issue>) -> Vec<u32> {
+    let Some(value) = lookup(map, name) else {
+        default_applied(path, name, "[]", issues);
+        return Vec::new();
+    };
+    let Some(items) = value.as_sequence() else {
+        issues.push(Issue::error(
+            Dimension::Structure,
+            "structure.type_mismatch",
+            format!("{path}.{name} 必须是整数数组"),
+        ));
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            as_u64(item, &format!("{path}.{name}"), issues).and_then(|number| {
+                u32::try_from(number).ok().or_else(|| {
+                    issues.push(Issue::error(
+                        Dimension::Structure,
+                        "structure.out_of_range",
+                        format!("{path}.{name} 存在超出 u32 范围的周期"),
+                    ));
+                    None
+                })
+            })
+        })
+        .collect()
+}
+
+fn optional_ma_entries(
+    map: &Mapping,
+    name: &str,
+    path: &str,
+    issues: &mut Vec<Issue>,
+) -> Vec<MaEntry> {
+    let Some(value) = lookup(map, name) else {
+        default_applied(path, name, "[]", issues);
+        return Vec::new();
+    };
+    match serde_yaml::from_value::<Vec<MaEntry>>(value.clone()) {
+        Ok(entries) => entries,
+        Err(error) => {
+            issues.push(Issue::error(
+                Dimension::Structure,
+                "structure.type_mismatch",
+                format!("{path}.{name} 无法解析为均线入场条件：{error}"),
+            ));
+            Vec::new()
+        }
+    }
+}
+
+fn optional_ma_exits(
+    map: &Mapping,
+    name: &str,
+    path: &str,
+    issues: &mut Vec<Issue>,
+) -> Vec<MaExit> {
+    let Some(value) = lookup(map, name) else {
+        default_applied(path, name, "[]", issues);
+        return Vec::new();
+    };
+    match serde_yaml::from_value::<Vec<MaExit>>(value.clone()) {
+        Ok(exits) => exits,
+        Err(error) => {
+            issues.push(Issue::error(
+                Dimension::Structure,
+                "structure.type_mismatch",
+                format!("{path}.{name} 无法解析为均线出场条件：{error}"),
+            ));
+            Vec::new()
+        }
+    }
+}
+
 fn default_applied<T: std::fmt::Display + ?Sized>(
     path: &str,
     name: &str,
@@ -673,6 +1000,22 @@ fn parse_execution_mode(
                 Dimension::Structure,
                 "structure.invalid_enum",
                 format!("{path} 的值 `{other}` 非法；允许 real / paper"),
+            ));
+            None
+        }
+    }
+}
+
+fn parse_order_type(value: &Value, path: &str, issues: &mut Vec<Issue>) -> Option<SkillOrderType> {
+    let text = as_string(value, path, issues)?;
+    match text.trim().to_ascii_lowercase().as_str() {
+        "market" => Some(SkillOrderType::Market),
+        "limit" => Some(SkillOrderType::Limit),
+        other => {
+            issues.push(Issue::error(
+                Dimension::Structure,
+                "structure.invalid_enum",
+                format!("{path} 的值 `{other}` 非法；允许 market / limit"),
             ));
             None
         }

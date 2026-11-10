@@ -113,6 +113,30 @@ pub fn build(state: AppState) -> Router {
         )
         .route("/templates", get(templates::list))
         .route("/templates/{key}/instantiate", post(templates::instantiate))
+        .route("/skills", get(skill::list_skills).post(skill::create_skill))
+        .route("/skills/{id}", get(skill::skill_detail))
+        .route(
+            "/skills/{id}/versions",
+            get(skill::skill_versions).post(skill::create_skill_version),
+        )
+        .route("/skills/{id}/validate", post(skill::validate_skill))
+        .route("/skills/{id}/diff", get(skill::diff_skill_versions))
+        .route(
+            "/strategies/{id}/skill/rules",
+            get(skill::strategy_rules).post(skill::create_strategy_rule),
+        )
+        .route(
+            "/strategies/{id}/skill/rules/{rule_id}",
+            patch(skill::update_strategy_rule),
+        )
+        .route(
+            "/strategies/{id}/skill/diff",
+            get(skill::diff_strategy_skill),
+        )
+        .route(
+            "/strategies/{id}/skill/upgrade",
+            post(skill::upgrade_strategy_skill),
+        )
         .route(
             "/market/authors",
             get(market::list_authors).post(market::create_author),

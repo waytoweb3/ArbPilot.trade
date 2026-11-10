@@ -18,6 +18,7 @@ use crate::{
     exchange::FundingRate,
     listing::{ListingSettings, ListingTrade},
     skill::SkillSettings,
+    skill_library::{Skill, SkillVersion, SKILLS_COLLECTION, SKILL_VERSIONS_COLLECTION},
     store::{
         EquityPoint, ExchangeVenueConfig, FundingSummary, MarketSnapshot, NotificationSettings,
         PositionGroupMember, StrategyRun, StrategyRunEvent, StrategyVersion, TradableSymbolConfig,
@@ -816,6 +817,52 @@ impl SqliteStore {
     pub async fn save_skill_settings(&self, settings: &BTreeMap<String, SkillSettings>) {
         if let Err(error) = self.put_doc("settings", "skill", settings).await {
             tracing::error!(%error, "写入技能策略设置失败");
+        }
+    }
+
+    pub async fn skills(&self) -> Vec<Skill> {
+        let mut skills: Vec<Skill> = self.docs(SKILLS_COLLECTION).await;
+        skills.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+        skills
+    }
+
+    pub async fn save_skill(&self, skill: &Skill) {
+        if let Err(error) = self
+            .put_doc(SKILLS_COLLECTION, &skill.id.to_string(), skill)
+            .await
+        {
+            tracing::error!(%error, skill_id = %skill.id, "写入技能失败");
+        }
+    }
+
+    pub async fn skill_versions(&self, skill_id: Uuid) -> Vec<SkillVersion> {
+        let mut versions: Vec<SkillVersion> = self
+            .docs::<SkillVersion>(SKILL_VERSIONS_COLLECTION)
+            .await
+            .into_iter()
+            .filter(|version| version.skill_id == skill_id)
+            .collect();
+        versions.sort_by_key(|version| version.version);
+        versions
+    }
+
+    pub async fn skill_version(&self, skill_id: Uuid, version: u32) -> Option<SkillVersion> {
+        self.get_doc(SKILL_VERSIONS_COLLECTION, &format!("{skill_id}:{version}"))
+            .await
+    }
+
+    pub async fn save_skill_version(&self, version: &SkillVersion) {
+        let id = format!("{}:{}", version.skill_id, version.version);
+        // 版本不可变：已落库的同号版本不再覆盖。
+        if self
+            .get_doc::<SkillVersion>(SKILL_VERSIONS_COLLECTION, &id)
+            .await
+            .is_some()
+        {
+            return;
+        }
+        if let Err(error) = self.put_doc(SKILL_VERSIONS_COLLECTION, &id, version).await {
+            tracing::error!(%error, skill_id = %version.skill_id, version = version.version, "写入技能版本失败");
         }
     }
 

@@ -204,6 +204,15 @@ pub struct StrategyPublication {
     /// 发布时冻结的技能参数绑定；存在时订阅者无需沙箱模块即可运行。
     #[serde(default)]
     pub skill: Option<SkillBinding>,
+    /// 技能库里的 Skill ID；独立版本化发布时写入。
+    #[serde(default)]
+    pub skill_id: Option<Uuid>,
+    /// 发布绑定的 Skill 版本号。
+    #[serde(default)]
+    pub skill_version: Option<u32>,
+    /// 冻结规则哈希，导入时校验交付物。
+    #[serde(default)]
+    pub skill_sha256: Option<String>,
     /// 发布时冻结的策略定义；订阅者导入时直接使用，不受作者后续修改影响。
     #[serde(default)]
     pub definition: Option<StrategyDefinition>,
@@ -218,7 +227,11 @@ impl StrategyPublication {
         let mut issues = Vec::new();
 
         if self.title.trim().is_empty() {
-            issues.push(issue(ValidationSeverity::Error, "title", "策略标题不能为空"));
+            issues.push(issue(
+                ValidationSeverity::Error,
+                "title",
+                "策略标题不能为空",
+            ));
         } else if self.title.chars().count() > 80 {
             issues.push(issue(
                 ValidationSeverity::Error,
@@ -595,9 +608,8 @@ impl StrategySubscription {
         payment_ref: Option<String>,
         now: DateTime<Utc>,
     ) -> Self {
-        let trial_ends_at = (publication.pricing.trial_days > 0).then(|| {
-            now + chrono::Duration::days(publication.pricing.trial_days as i64)
-        });
+        let trial_ends_at = (publication.pricing.trial_days > 0)
+            .then(|| now + chrono::Duration::days(publication.pricing.trial_days as i64));
         let (status, current_period_end) = if publication.pricing.model == PricingModel::Free {
             (SubscriptionStatus::Active, None)
         } else if trial_ends_at.is_some() {
@@ -852,6 +864,9 @@ mod tests {
             status: PublicationStatus::Published,
             artifact_sha256: Some("a".repeat(64)),
             skill: None,
+            skill_id: None,
+            skill_version: None,
+            skill_sha256: None,
             definition: None,
             changelog: vec![StrategyChangelogEntry {
                 version: 3,

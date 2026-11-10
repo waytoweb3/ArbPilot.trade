@@ -9,7 +9,7 @@ use chrono::{TimeZone, Utc};
 use rust_decimal::Decimal;
 
 use super::{Dimension, Issue};
-use crate::skill::{self, SkillDirection, SkillRule};
+use crate::skill::{self, GridSpacingMode, SkillDirection, SkillRule};
 
 /// 指标比对允许的误差：均线与 ATR 都涉及除法，保留 8 位小数后比对。
 fn tolerance() -> Decimal {
@@ -273,35 +273,54 @@ fn check_signals(issues: &mut Vec<Issue>) {
     }
 }
 
-/// 网格档位比对：锚定 100、3 档、0.5% 间距应为 99.5/99/98.5 与 100.5/101/101.5。
+/// 网格档位比对：区间 100-110、3 档等差应为 100/105/110；
+/// 等比档位首尾与区间一致且严格单调。
 fn check_grid(issues: &mut Vec<Issue>) {
-    let (buys, sells) = skill::grid_levels(Decimal::from(100), 3, Decimal::new(5, 1));
-    let expected_buys = [
-        Decimal::from(995) / Decimal::from(10),
-        Decimal::from(99),
-        Decimal::new(985, 1),
-    ];
-    let expected_sells = [
-        Decimal::from(1005) / Decimal::from(10),
-        Decimal::from(101),
-        Decimal::new(1015, 1),
-    ];
-    if buys != expected_buys || sells != expected_sells {
+    let arithmetic = skill::grid_price_levels(
+        Decimal::from(100),
+        Decimal::from(110),
+        3,
+        GridSpacingMode::Arithmetic,
+    );
+    let expected = [Decimal::from(100), Decimal::from(105), Decimal::from(110)];
+    if arithmetic != expected {
         issues.push(Issue::error(
             Dimension::Math,
             "math.grid_levels_mismatch",
-            format!(
-                "网格档位与独立实现不一致：运行期买 {buys:?} / 卖 {sells:?}，独立实现买 {expected_buys:?} / 卖 {expected_sells:?}"
-            ),
+            format!("网格档位与独立实现不一致：运行期 {arithmetic:?}，独立实现 {expected:?}"),
         ));
     }
 
-    let (zero_buys, zero_sells) = skill::grid_levels(Decimal::from(100), 3, Decimal::ZERO);
-    if !zero_buys.is_empty() || !zero_sells.is_empty() {
+    let geometric = skill::grid_price_levels(
+        Decimal::from(100),
+        Decimal::from(110),
+        3,
+        GridSpacingMode::Geometric,
+    );
+    let geometric_ok = geometric.len() == 3
+        && geometric[0] == Decimal::from(100)
+        && geometric[2] == Decimal::from(110)
+        && geometric[0] < geometric[1]
+        && geometric[1] < geometric[2];
+    if !geometric_ok {
         issues.push(Issue::error(
             Dimension::Math,
-            "math.grid_zero_spacing",
-            "间距为 0 时不应产生任何档位".to_string(),
+            "math.grid_geometric_invalid",
+            format!("等比网格未按区间生成严格升序档位：{geometric:?}"),
+        ));
+    }
+
+    let invalid = skill::grid_price_levels(
+        Decimal::from(110),
+        Decimal::from(100),
+        3,
+        GridSpacingMode::Arithmetic,
+    );
+    if !invalid.is_empty() {
+        issues.push(Issue::error(
+            Dimension::Math,
+            "math.grid_invalid_range",
+            "上限低于下限时不应产生任何档位".to_string(),
         ));
     }
 }
@@ -568,11 +587,10 @@ mod tests {
 
     #[test]
     fn grid_levels_match_manual_calculation() {
-        let (buys, sells) = skill::grid_levels(dec!(100), 3, dec!(0.5));
-        assert_eq!(buys, vec![dec!(99.5), dec!(99), dec!(98.5)]);
-        assert_eq!(sells, vec![dec!(100.5), dec!(101), dec!(101.5)]);
-        let (buys, sells) = skill::grid_levels(dec!(100), 3, Decimal::ZERO);
-        assert!(buys.is_empty() && sells.is_empty());
+        let levels = skill::grid_price_levels(dec!(100), dec!(110), 3, GridSpacingMode::Arithmetic);
+        assert_eq!(levels, vec![dec!(100), dec!(105), dec!(110)]);
+        let levels = skill::grid_price_levels(dec!(110), dec!(100), 3, GridSpacingMode::Arithmetic);
+        assert!(levels.is_empty());
     }
 
     #[test]

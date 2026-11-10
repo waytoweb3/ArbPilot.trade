@@ -4,7 +4,7 @@
 //! 因此不能走 `wasm_backtest`。这里用与运行期一致的规则做历史回放：
 //!
 //! - 突破 / 均线：每根 K 线只用「当前及之前」的窗口计算指标，收盘价成交；
-//! - 网格：锚定价按现价展开，K 线高低点触及档位即成交，到相邻档位止盈；
+//! - 网格：在价格区间内按等差或等比布置档位，K 线高低点触及档位即成交，到相邻档位止盈；
 //! - 公告类：历史公告不可回放，直接跳过并在假设里标注 `NoEventReplay`。
 //!
 //! 费用与滑点按开平仓两次计入，口径与 `wasm_backtest` 保持一致：
@@ -15,10 +15,12 @@ use arb_core::{
     SandboxIndicators, Side, StrategyRecord,
 };
 use chrono::{DateTime, Utc};
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 
 use crate::{
-    skill::{self, SkillDirection, SkillKind, SkillRule, MAX_GRID_LEVELS},
+    skill::{self, GridShift, SkillDirection, SkillKind, SkillRule},
+    skill_turtle,
     state::AppState,
 };
 
@@ -106,9 +108,223 @@ pub fn replay(
     match rule.kind {
         SkillKind::Event => Vec::new(),
         SkillKind::Grid => replay_grid(rule, symbol, candles, notional, costs),
-        SkillKind::Breakout | SkillKind::MaTrend => {
-            replay_signal(rule, symbol, candles, notional, costs)
+        SkillKind::Breakout => replay_turtle(
+            rule,
+            symbol,
+            candles,
+            notional * Decimal::from(10),
+            notional,
+            costs,
+        ),
+        SkillKind::MaTrend => replay_signal(rule, symbol, candles, notional, costs),
+    }
+}
+
+/// 海龟组的单个 Unit。
+struct TurtleUnit {
+    side: Side,
+    system: u8,
+    entry_price: Decimal,
+    quantity: Decimal,
+    notional: Decimal,
+    n: Decimal,
+    opened_at: DateTime<Utc>,
+}
+
+/// 按经典海龟规则回放：双系统、Unit 风险定仓、金字塔加仓与整组止损。
+fn replay_turtle(
+    rule: &SkillRule,
+    symbol: &str,
+    candles: &[SandboxCandle],
+    equity: Decimal,
+    notional_cap: Decimal,
+    costs: Costs,
+) -> Vec<ReplayTrade> {
+    let atr_multiple = rule.trigger.atr_multiple;
+    let turtle = &rule.trigger.turtle;
+    let warmup = warmup_bars(rule).max(
+        turtle
+            .entry1
+            .max(turtle.entry2)
+            .max(turtle.exit1)
+            .max(turtle.exit2) as usize
+            + 1,
+    );
+    if candles.len() <= warmup || equity <= Decimal::ZERO {
+        return Vec::new();
+    }
+    let data = data_rules(rule);
+    let mut trades = Vec::new();
+    let mut group: Vec<TurtleUnit> = Vec::new();
+    let mut last_open_at: Option<DateTime<Utc>> = None;
+    let mut last_s1_win: Option<bool> = None;
+
+    for index in warmup..candles.len() {
+        let candle = &candles[index];
+        let last = candle.close;
+        if last <= Decimal::ZERO {
+            continue;
         }
+        let window = &candles[..=index];
+        let indicators = indicators::compute(window, &data);
+        let channels = turtle_channels(window, rule);
+        let atr = indicators.atr.filter(|value| *value > Decimal::ZERO);
+
+        if !group.is_empty() {
+            let latest = group.last().expect("组内至少一个 Unit");
+            let stopped =
+                skill_turtle::group_stop(latest.side, latest.entry_price, latest.n, atr_multiple)
+                    .map(|stop| skill_turtle::stop_hit(latest.side, last, stop))
+                    .unwrap_or(false);
+            if stopped || skill_turtle::exit_signal(latest.side, latest.system, last, &channels) {
+                let system = latest.system;
+                let mut group_pnl = Decimal::ZERO;
+                for unit in group.drain(..) {
+                    let trade = close_turtle_unit(unit, symbol, candle, last, costs);
+                    group_pnl += trade.pnl;
+                    trades.push(trade);
+                }
+                if system == 1 {
+                    last_s1_win = Some(group_pnl > Decimal::ZERO);
+                }
+                continue;
+            }
+            let Some(atr) = atr else {
+                continue;
+            };
+            let latest = group.last().expect("组内至少一个 Unit");
+            let units = group.len() as u32;
+            let adds = units.saturating_sub(1);
+            if skill_turtle::should_add(
+                latest.side,
+                last,
+                latest.entry_price,
+                atr,
+                units,
+                adds,
+                rule.business.max_units,
+                rule.business.max_pyramid_adds,
+                rule.business.pyramid_step_n,
+            ) {
+                let used: Decimal = group.iter().map(|unit| unit.notional).sum();
+                let size = turtle_unit_notional(rule, equity, last, atr, notional_cap);
+                let cap = equity * rule.business.max_leverage.max(Decimal::ONE);
+                if size > Decimal::ZERO && used + size <= cap {
+                    group.push(TurtleUnit {
+                        side: latest.side,
+                        system: latest.system,
+                        entry_price: last,
+                        quantity: size / last,
+                        notional: size,
+                        n: atr,
+                        opened_at: candle.open_time,
+                    });
+                }
+            }
+            continue;
+        }
+
+        let Some((side, system)) =
+            skill_turtle::entry_signal(last, &channels, rule.steps.direction, turtle)
+        else {
+            continue;
+        };
+        if system == 1 && turtle.profit_filter && last_s1_win == Some(true) {
+            continue;
+        }
+        if in_cooldown(rule, last_open_at, candle.open_time) {
+            continue;
+        }
+        let Some(atr) = atr else {
+            continue;
+        };
+        let size = turtle_unit_notional(rule, equity, last, atr, notional_cap);
+        if size <= Decimal::ZERO {
+            continue;
+        }
+        group.push(TurtleUnit {
+            side,
+            system,
+            entry_price: last,
+            quantity: size / last,
+            notional: size,
+            n: atr,
+            opened_at: candle.open_time,
+        });
+        last_open_at = Some(candle.open_time);
+    }
+
+    if !group.is_empty() {
+        let candle = candles.last().expect("K 线非空");
+        for unit in group.drain(..) {
+            trades.push(close_turtle_unit(unit, symbol, candle, candle.close, costs));
+        }
+    }
+    trades
+}
+
+fn close_turtle_unit(
+    unit: TurtleUnit,
+    symbol: &str,
+    candle: &SandboxCandle,
+    exit_price: Decimal,
+    costs: Costs,
+) -> ReplayTrade {
+    close_position(
+        OpenPosition {
+            symbol: symbol.to_string(),
+            side: unit.side,
+            entry_price: unit.entry_price,
+            quantity: unit.quantity,
+            opened_at: unit.opened_at,
+            take_profit_pct: Decimal::ZERO,
+            stop_loss_pct: Decimal::ZERO,
+        },
+        candle,
+        exit_price,
+        costs,
+    )
+}
+
+/// Unit 名义价值：权益 × 单 Unit 风险 ÷ (止损 N 倍 × N / 价格)。
+fn turtle_unit_notional(
+    rule: &SkillRule,
+    equity: Decimal,
+    price: Decimal,
+    n: Decimal,
+    cap: Decimal,
+) -> Decimal {
+    if price <= Decimal::ZERO || n <= Decimal::ZERO {
+        return Decimal::ZERO;
+    }
+    let multiple = rule.trigger.atr_multiple.max(Decimal::ONE);
+    let risk_pct = rule.cautions.risk_pct;
+    if risk_pct <= Decimal::ZERO || equity <= Decimal::ZERO {
+        return cap;
+    }
+    let risk_usd = equity * risk_pct / Decimal::from(100);
+    let size = risk_usd * price / (n * multiple);
+    if cap > Decimal::ZERO {
+        size.min(cap)
+    } else {
+        size
+    }
+}
+
+fn turtle_channels(candles: &[SandboxCandle], rule: &SkillRule) -> skill_turtle::TurtleChannels {
+    let period = |value: u32| {
+        if value >= 2 {
+            indicators::donchian(candles, value)
+        } else {
+            None
+        }
+    };
+    let turtle = &rule.trigger.turtle;
+    skill_turtle::TurtleChannels {
+        entry1: period(turtle.entry1),
+        entry2: period(turtle.entry2),
+        exit1: period(turtle.exit1),
+        exit2: period(turtle.exit2),
     }
 }
 
@@ -126,6 +342,7 @@ fn replay_signal(
     }
     let mut trades = Vec::new();
     let mut position: Option<OpenPosition> = None;
+    let mut last_open_at: Option<DateTime<Utc>> = None;
 
     for index in warmup..candles.len() {
         let candle = &candles[index];
@@ -137,7 +354,17 @@ fn replay_signal(
         let indicators = indicators::compute(window, &data);
 
         if let Some(open) = position.take() {
-            if exit_by_signal(rule, &open, &indicators, last) || exit_by_risk(&open, last) {
+            let signal_exit = match rule.kind {
+                SkillKind::MaTrend => skill::ma_exit_hit(
+                    open.side,
+                    last,
+                    open.entry_price,
+                    &indicators,
+                    &rule.trigger,
+                ),
+                _ => exit_by_signal(rule, &open, &indicators, last),
+            };
+            if signal_exit || exit_by_risk(&open, last) {
                 trades.push(close_position(open, candle, last, costs));
             } else {
                 position = Some(open);
@@ -152,15 +379,14 @@ fn replay_signal(
                 }
                 _ => None,
             },
-            SkillKind::MaTrend => match (indicators.sma_fast, indicators.sma_slow) {
-                (Some(fast), Some(slow)) => {
-                    skill::ma_trend_signal(last, fast, slow, rule.steps.direction)
-                }
-                _ => None,
-            },
+            SkillKind::MaTrend => skill::ma_entry_signal(last, &indicators, &rule.trigger)
+                .filter(|side| skill::direction_allows(*side, rule.steps.direction)),
             _ => None,
         };
         if let Some(side) = signal {
+            if in_cooldown(rule, last_open_at, candle.open_time) {
+                continue;
+            }
             position = Some(open_position(
                 rule,
                 symbol,
@@ -168,8 +394,9 @@ fn replay_signal(
                 last,
                 notional,
                 candle.open_time,
-                rule.business.take_profit_pct,
+                take_profit_pct(rule, last, indicators.atr),
             ));
+            last_open_at = Some(candle.open_time);
         }
     }
 
@@ -180,6 +407,20 @@ fn replay_signal(
     trades
 }
 
+/// 回测里的冷却判断：与运行期一致，按同一交易对的上次开仓时间计算。
+fn in_cooldown(rule: &SkillRule, last_open_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
+    let Some(previous) = last_open_at else {
+        return false;
+    };
+    if rule.cautions.cooldown_hours <= Decimal::ZERO {
+        return false;
+    }
+    let seconds = (rule.cautions.cooldown_hours * Decimal::from(3_600))
+        .to_i64()
+        .unwrap_or(0);
+    (now - previous).num_seconds() < seconds
+}
+
 fn replay_grid(
     rule: &SkillRule,
     symbol: &str,
@@ -187,23 +428,61 @@ fn replay_grid(
     notional: Decimal,
     costs: Costs,
 ) -> Vec<ReplayTrade> {
-    let levels = rule.business.grid_levels.clamp(1, MAX_GRID_LEVELS) as usize;
-    let spacing = rule.business.grid_spacing_pct;
-    let share = rule.business.grid_share_pct / Decimal::from(100);
-    let per_level = notional * share;
-    if per_level <= Decimal::ZERO || spacing <= Decimal::ZERO {
+    let fallback_spacing = rule.business.grid_spacing_pct;
+    let per_level = notional * rule.business.grid_share();
+    let anchor = candles
+        .first()
+        .map(|candle| candle.close)
+        .unwrap_or_default();
+    if per_level <= Decimal::ZERO || fallback_spacing <= Decimal::ZERO || anchor <= Decimal::ZERO {
         return Vec::new();
     }
-    let mut anchor = candles[0].close;
-    if anchor <= Decimal::ZERO {
+    let Some((mut lower, mut upper)) = skill::grid_range(anchor, rule) else {
+        return Vec::new();
+    };
+    let (mut levels, mut sides) = grid_shape(rule, lower, upper, anchor);
+    if levels.len() < 2 {
         return Vec::new();
     }
-    let mut filled_buys = vec![false; levels];
-    let mut filled_sells = vec![false; levels];
+    let mut filled = grid_filled(&sides);
+    let mut armed = rule.business.grid_trigger_price <= Decimal::ZERO;
+    let trigger = rule.business.grid_trigger_price;
     let mut position: Option<OpenPosition> = None;
     let mut trades = Vec::new();
 
     for candle in candles.iter() {
+        // 触发价：到达后才开始挂档。
+        if !armed {
+            let reached = if trigger < anchor {
+                candle.low <= trigger
+            } else {
+                candle.high >= trigger
+            };
+            if !reached {
+                continue;
+            }
+            armed = true;
+        }
+        // 突破区间时按配置跟随，重建档位。
+        let up = matches!(rule.business.grid_shift, GridShift::Up | GridShift::Both)
+            && candle.close > upper;
+        let down = matches!(rule.business.grid_shift, GridShift::Down | GridShift::Both)
+            && candle.close < lower;
+        if up || down {
+            let delta = if up {
+                candle.close - upper
+            } else {
+                candle.close - lower
+            };
+            lower += delta;
+            upper += delta;
+            (levels, sides) = grid_shape(rule, lower, upper, candle.close);
+            filled = grid_filled(&sides);
+        }
+        if levels.len() < 2 {
+            return trades;
+        }
+
         if let Some(open) = position.take() {
             if grid_exit(&open, candle) || exit_by_risk(&open, candle.close) {
                 let exit = grid_exit_price(&open, candle);
@@ -214,28 +493,28 @@ fn replay_grid(
             continue;
         }
 
-        let (buys, sells) = skill::grid_levels(anchor, rule.business.grid_levels, spacing);
         let mut opened = None;
-        if rule.steps.direction != SkillDirection::Short {
-            for (level, filled) in buys.iter().zip(filled_buys.iter_mut()) {
-                if !*filled && candle.low <= *level {
-                    *filled = true;
-                    opened = Some((Side::Buy, *level));
-                    break;
-                }
+        for (index, level) in levels.iter().enumerate() {
+            if filled[index] {
+                continue;
             }
-        }
-        if opened.is_none() && rule.steps.direction != SkillDirection::Long {
-            for (level, filled) in sells.iter().zip(filled_sells.iter_mut()) {
-                if !*filled && candle.high >= *level {
-                    *filled = true;
-                    opened = Some((Side::Sell, *level));
-                    break;
-                }
+            let Some(side) = sides[index] else {
+                continue;
+            };
+            let hit = match side {
+                Side::Buy => candle.low <= *level,
+                Side::Sell => candle.high >= *level,
+            };
+            if !hit {
+                continue;
             }
+            filled[index] = true;
+            let take_profit = grid_take_profit(&levels, index, side, fallback_spacing);
+            opened = Some((side, *level, take_profit));
+            break;
         }
 
-        if let Some((side, price)) = opened {
+        if let Some((side, price, take_profit)) = opened {
             position = Some(open_position(
                 rule,
                 symbol,
@@ -243,15 +522,18 @@ fn replay_grid(
                 price,
                 per_level,
                 candle.open_time,
-                spacing,
+                take_profit,
             ));
         }
 
-        // 所有档位都成交后，按最新收盘价重建锚点，模拟运行期的网格滚动。
-        if filled_buys.iter().all(|filled| *filled) && filled_sells.iter().all(|filled| *filled) {
-            anchor = candle.close;
-            filled_buys = vec![false; levels];
-            filled_sells = vec![false; levels];
+        // 所有档位都成交后，按最新收盘价重建区间，模拟运行期的网格滚动。
+        if filled.iter().all(|filled| *filled) {
+            if let Some((next_lower, next_upper)) = skill::grid_range(candle.close, rule) {
+                lower = next_lower;
+                upper = next_upper;
+                (levels, sides) = grid_shape(rule, lower, upper, candle.close);
+                filled = grid_filled(&sides);
+            }
         }
     }
 
@@ -261,6 +543,73 @@ fn replay_grid(
         trades.push(close_position(open, candle, exit, costs));
     }
     trades
+}
+
+/// 按当前区间生成档位与方向：区间下方买入、上方卖出，方向设置会裁掉一侧。
+fn grid_shape(
+    rule: &SkillRule,
+    lower: Decimal,
+    upper: Decimal,
+    anchor: Decimal,
+) -> (Vec<Decimal>, Vec<Option<Side>>) {
+    let levels = skill::grid_price_levels(
+        lower,
+        upper,
+        rule.business.grid_count(),
+        rule.business.grid_spacing_mode,
+    );
+    let sides = levels
+        .iter()
+        .map(|level| {
+            if *level < anchor && rule.steps.direction != SkillDirection::Short {
+                Some(Side::Buy)
+            } else if *level > anchor && rule.steps.direction != SkillDirection::Long {
+                Some(Side::Sell)
+            } else {
+                None
+            }
+        })
+        .collect();
+    (levels, sides)
+}
+
+/// 不可交易的档位直接标记为已处理，保证「全部成交」判断能成立。
+fn grid_filled(sides: &[Option<Side>]) -> Vec<bool> {
+    sides.iter().map(|side| side.is_none()).collect()
+}
+
+/// 到相邻档位的止盈百分比，与运行期的网格止盈口径一致。
+fn grid_take_profit(levels: &[Decimal], index: usize, side: Side, fallback: Decimal) -> Decimal {
+    let target = match side {
+        Side::Buy => levels.get(index + 1),
+        Side::Sell => index.checked_sub(1).and_then(|prev| levels.get(prev)),
+    };
+    match (target, levels.get(index)) {
+        (Some(target), Some(level)) if *level > Decimal::ZERO => {
+            let change = if side == Side::Buy {
+                *target - *level
+            } else {
+                *level - *target
+            };
+            (change / *level * Decimal::from(100)).max(Decimal::ZERO)
+        }
+        _ => fallback,
+    }
+}
+
+/// 开仓时的止盈百分比：配置了风险回报比就按 ATR 止损距离 × 倍数推导。
+fn take_profit_pct(rule: &SkillRule, last: Decimal, atr: Option<Decimal>) -> Decimal {
+    let stop_pct = atr
+        .filter(|value| *value > Decimal::ZERO)
+        .filter(|_| rule.trigger.atr_multiple > Decimal::ZERO)
+        .filter(|_| last > Decimal::ZERO)
+        .map(|atr| atr * rule.trigger.atr_multiple / last * Decimal::from(100));
+    match stop_pct {
+        Some(stop_pct) if rule.business.risk_reward > Decimal::ZERO => {
+            stop_pct * rule.business.risk_reward
+        }
+        _ => rule.business.take_profit_pct,
+    }
 }
 
 fn open_position(
@@ -278,11 +627,7 @@ fn open_position(
         entry_price: price,
         quantity: notional / price,
         opened_at,
-        take_profit_pct: if rule.kind == SkillKind::Grid {
-            rule.business.grid_spacing_pct
-        } else {
-            take_profit_pct
-        },
+        take_profit_pct,
         stop_loss_pct: rule.business.stop_loss_pct,
     }
 }
@@ -308,16 +653,6 @@ fn exit_by_signal(
                     rule.trigger.atr_multiple,
                 )
         }
-        SkillKind::MaTrend => match (indicators.sma_fast, indicators.sma_slow) {
-            (Some(fast), Some(slow)) => {
-                if open.side == Side::Buy {
-                    fast < slow
-                } else {
-                    fast > slow
-                }
-            }
-            _ => false,
-        },
         _ => false,
     }
 }
@@ -394,6 +729,7 @@ fn data_rules(rule: &SkillRule) -> DataRules {
         lookback: rule.trigger.lookback.clamp(20, 1_000),
         fast: rule.trigger.fast.max(2),
         slow: rule.trigger.slow.max(2),
+        ma_periods: skill::resolved_ma_periods(&rule.trigger),
         atr: rule.trigger.atr.max(2),
         channel: rule.trigger.channel.max(2),
         ..DataRules::default()
@@ -403,11 +739,17 @@ fn data_rules(rule: &SkillRule) -> DataRules {
 /// 指标全部可用的最少 K 线根数。
 fn warmup_bars(rule: &SkillRule) -> usize {
     let trigger = &rule.trigger;
-    trigger
-        .slow
+    let longest_ma = trigger
+        .ma_periods
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(0)
+        .max(trigger.fast)
+        .max(trigger.slow);
+    longest_ma
         .max(trigger.channel.saturating_add(1))
         .max(trigger.atr.saturating_add(1))
-        .max(trigger.fast)
         .max(3) as usize
 }
 
@@ -531,6 +873,9 @@ pub async fn run(
     let mut sample_start: Option<DateTime<Utc>> = None;
     let mut sample_end: Option<DateTime<Utc>> = None;
     let mut notional = Decimal::ZERO;
+    // 海龟按账户权益计算 Unit，收益率分母也跟随权益，避免固定金额失真。
+    let account_equity = state.accounts.total_equity_usd();
+    let mut metric_base = Decimal::ZERO;
     let mut saw_event = false;
     let mut saw_grid = false;
 
@@ -594,7 +939,24 @@ pub async fn run(
             if rule.kind == SkillKind::Grid {
                 saw_grid = true;
             }
-            trades.extend(replay(rule, symbol, &snapshots, rule_notional, costs));
+            if rule.kind == SkillKind::Breakout {
+                let equity = if account_equity > Decimal::ZERO {
+                    account_equity
+                } else {
+                    rule_notional * Decimal::from(10)
+                };
+                metric_base = metric_base.max(equity).max(rule_notional);
+                trades.extend(replay_turtle(
+                    rule,
+                    symbol,
+                    &snapshots,
+                    equity,
+                    rule_notional,
+                    costs,
+                ));
+            } else {
+                trades.extend(replay(rule, symbol, &snapshots, rule_notional, costs));
+            }
         }
     }
 
@@ -606,7 +968,7 @@ pub async fn run(
     }
 
     trades.sort_by(|left, right| left.closed_at.cmp(&right.closed_at));
-    let metrics = summarize(&trades, notional, days);
+    let metrics = summarize(&trades, metric_base.max(notional), days);
     let split_at = match (sample_start, sample_end) {
         (Some(start), Some(end)) if end > start => {
             Some(start + chrono::Duration::seconds((end - start).num_seconds() * 7 / 10))
@@ -722,12 +1084,21 @@ mod tests {
                 atr: 2,
                 channel: 3,
                 atr_multiple: dec!(2),
+                turtle: crate::skill::TurtleSystems {
+                    system2_enabled: false,
+                    entry1: 3,
+                    exit1: 2,
+                    entry2: 0,
+                    exit2: 0,
+                    ..crate::skill::TurtleSystems::default()
+                },
                 ..SkillTrigger::default()
             },
             steps: SkillSteps {
                 execution_mode: arb_core::StrategyExecutionMode::Paper,
                 execution_venues: vec!["binance".to_string()],
                 direction: SkillDirection::Both,
+                ..SkillSteps::default()
             },
             business: SkillBusinessRules {
                 notional_usd: dec!(1000),
@@ -775,6 +1146,20 @@ mod tests {
     }
 
     #[test]
+    fn turtle_pyramids_up_to_max_units() {
+        let prices = [10, 10, 10, 10, 11, 12, 13, 14, 18];
+        let trades = replay_turtle(
+            &breakout_rule(),
+            "BTCUSDT",
+            &series(&prices),
+            dec!(10000),
+            dec!(1000),
+            Costs::default(),
+        );
+        assert_eq!(trades.len(), 4, "顺势应加仓到 4 个 Units：{trades:?}");
+    }
+
+    #[test]
     fn flat_market_never_triggers() {
         let prices = [10i64; 40];
         let trades = replay(
@@ -801,9 +1186,10 @@ mod tests {
         let mut rule = breakout_rule();
         rule.kind = SkillKind::Grid;
         rule.trigger.timeframe = "1h".to_string();
-        rule.business.grid_levels = 2;
+        rule.business.grid_count = 2;
         rule.business.grid_spacing_pct = dec!(1);
-        rule.business.grid_share_pct = dec!(50);
+        rule.business.grid_lower_price = dec!(99);
+        rule.business.grid_upper_price = dec!(101);
         let prices = [100, 100, 99, 99, 100, 100, 101, 101, 100];
         let trades = replay(
             &rule,
@@ -813,13 +1199,9 @@ mod tests {
             Costs::default(),
         );
         assert!(!trades.is_empty(), "触及网格档位应成交：{trades:?}");
-        // 锚定 100、间距 1%、两档：档位价只能是 99/98（买）或 101/102（卖）。
+        // 区间 99-101、两格：档位价只能是 99（买）或 101（卖）。
         assert!(trades.iter().all(|trade| {
-            matches!(
-                trade.entry_price,
-                price if price == dec!(99) || price == dec!(98)
-                    || price == dec!(101) || price == dec!(102)
-            )
+            matches!(trade.entry_price, price if price == dec!(99) || price == dec!(101))
         }));
     }
 

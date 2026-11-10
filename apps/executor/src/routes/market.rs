@@ -35,11 +35,11 @@ use super::strategies;
 
 /// 官方发布使用稳定的 UUID，重复启动不会产生新记录。
 fn official_uuid(name: &str) -> Uuid {
-    Uuid::new_v5(&Uuid::NAMESPACE_URL, name.as_bytes())
+    crate::templates::official_uuid(name)
 }
 
 fn official_author_id() -> Uuid {
-    official_uuid("https://arbpilot.trade/market/author/official")
+    crate::templates::official_author_id()
 }
 
 fn official_publication_id(key: &str) -> Uuid {
@@ -113,6 +113,15 @@ pub(crate) async fn seed_official(state: &AppState) {
         if suggested_max_notional_usd <= Decimal::ZERO {
             suggested_max_notional_usd = Decimal::from(100);
         }
+        // 内置模板已补成技能库版本：发布绑定该版本，订阅者导入时按同一份哈希校验。
+        let version = crate::templates::builtin_version(state, &template.key).await;
+        let frozen = version.as_ref().and_then(|version| {
+            serde_json::to_value(&version.settings)
+                .map_err(
+                    |error| tracing::error!(%error, key = %template.key, "内置技能参数序列化失败"),
+                )
+                .ok()
+        });
 
         let publication = StrategyPublication {
             id: official_publication_id(&template.key),
@@ -145,8 +154,18 @@ pub(crate) async fn seed_official(state: &AppState) {
             // 官方模板以技能参数交付，订阅者无需沙箱模块即可运行。
             skill: Some(SkillBinding {
                 template_key: template.key.clone(),
-                settings: None,
+                settings: frozen,
+                skill_id: version.as_ref().map(|version| version.skill_id),
+                skill_version: version.as_ref().map(|version| version.version),
+                skill_sha256: version
+                    .as_ref()
+                    .map(|version| version.settings_sha256.clone()),
             }),
+            skill_id: version.as_ref().map(|version| version.skill_id),
+            skill_version: version.as_ref().map(|version| version.version),
+            skill_sha256: version
+                .as_ref()
+                .map(|version| version.settings_sha256.clone()),
             definition: Some(definition),
             changelog: existing
                 .as_ref()
@@ -311,6 +330,11 @@ pub struct CreatePublicationRequest {
     pub source_visibility: SourceVisibility,
     pub visibility: MarketVisibility,
     pub pricing: StrategyPricing,
+    /// 技能库版本：提供时以该版本冻结规则发布，策略定义仍来自 `strategy_id`。
+    #[serde(default)]
+    pub skill_id: Option<Uuid>,
+    #[serde(default)]
+    pub skill_version: Option<u32>,
 }
 
 pub async fn create_publication(
@@ -328,6 +352,41 @@ pub async fn create_publication(
     if record.source_publication_id.is_some() {
         return Err(ApiError::Conflict("订阅导入的策略不能再次发布".to_string()));
     }
+    let skill_version = match (body.skill_id, body.skill_version) {
+        (Some(skill_id), Some(version)) => {
+            let skill = state
+                .store
+                .skills()
+                .await
+                .into_iter()
+                .find(|skill| skill.id == skill_id)
+                .ok_or_else(|| ApiError::NotFound(format!("技能 {skill_id} 不存在")))?;
+            if skill.author_id != body.author_id {
+                return Err(ApiError::Forbidden(
+                    "只能发布自己创建的技能版本".to_string(),
+                ));
+            }
+            let version = state
+                .store
+                .skill_version(skill_id, version)
+                .await
+                .ok_or_else(|| {
+                    ApiError::NotFound(format!("技能 {skill_id} 的版本 v{version} 不存在"))
+                })?;
+            if !version.passed {
+                return Err(ApiError::Conflict(
+                    "技能版本未通过校验，不能发布".to_string(),
+                ));
+            }
+            Some(version)
+        }
+        (None, None) => None,
+        _ => {
+            return Err(ApiError::BadRequest(
+                "skill_id 与 skill_version 必须同时提供".to_string(),
+            ))
+        }
+    };
 
     let now = Utc::now();
     let runtime = body.runtime.unwrap_or_else(|| {
@@ -374,7 +433,18 @@ pub async fn create_publication(
         // 新建发布始终是私有草稿，发布需要显式调用 publish。
         status: PublicationStatus::Private,
         artifact_sha256: None,
-        skill: None,
+        skill: skill_version.as_ref().map(|version| SkillBinding {
+            template_key: "skill".to_string(),
+            settings: serde_json::to_value(&version.settings).ok(),
+            skill_id: Some(version.skill_id),
+            skill_version: Some(version.version),
+            skill_sha256: Some(version.settings_sha256.clone()),
+        }),
+        skill_id: skill_version.as_ref().map(|version| version.skill_id),
+        skill_version: skill_version.as_ref().map(|version| version.version),
+        skill_sha256: skill_version
+            .as_ref()
+            .map(|version| version.settings_sha256.clone()),
         definition: None,
         changelog,
         created_at: now,
@@ -481,7 +551,42 @@ pub async fn update_publication(
                 .sandbox
                 .as_ref()
                 .map(|binding| binding.artifact_hash.clone());
-            publication.skill = record.skill.clone();
+            // 绑定技能库版本时，发布冻结的是该不可变版本，而不是策略当前参数。
+            if let Some(skill_id) = publication.skill_id {
+                let version_no = publication
+                    .skill_version
+                    .ok_or_else(|| ApiError::Conflict("发布记录缺少技能版本号".to_string()))?;
+                let version = state
+                    .store
+                    .skill_version(skill_id, version_no)
+                    .await
+                    .ok_or_else(|| {
+                        ApiError::NotFound(format!("技能 {skill_id} 的版本 v{version_no} 不存在"))
+                    })?;
+                if !version.passed {
+                    return Err(ApiError::Conflict(
+                        "技能版本未通过校验，不能发布".to_string(),
+                    ));
+                }
+                publication.skill_sha256 = Some(version.settings_sha256.clone());
+                publication.skill = Some(SkillBinding {
+                    template_key: "skill".to_string(),
+                    settings: serde_json::to_value(&version.settings).ok(),
+                    skill_id: Some(skill_id),
+                    skill_version: Some(version.version),
+                    skill_sha256: Some(version.settings_sha256.clone()),
+                });
+            } else {
+                // 路径 A：技能参数以作者当前生效的规则为准。
+                publication.skill = record.skill.clone().map(|mut binding| {
+                    if let Ok(value) =
+                        serde_json::to_value(crate::skill::settings_for(&state, &record))
+                    {
+                        binding.settings = Some(value);
+                    }
+                    binding
+                });
+            }
             if publication.artifact_sha256.is_none() && publication.skill.is_none() {
                 return Err(ApiError::Conflict(
                     "策略既未部署沙箱模块也未配置技能参数，无法发布".to_string(),
@@ -920,7 +1025,43 @@ async fn install_bundle(
     );
     record.source_publication_id = Some(publication_id);
     record.sandbox = sandbox;
+    let mut skill = skill;
+    // 技能参数以冻结快照交付；带哈希时先校验再落库，避免导入被篡改的规则。
+    let mut frozen_skill_settings = skill
+        .as_ref()
+        .and_then(|binding| binding.settings.clone())
+        .map(|value| {
+            serde_json::from_value::<crate::skill::SkillSettings>(value)
+                .map_err(|error| ApiError::BadRequest(format!("交付技能参数无法解析: {error}")))
+        })
+        .transpose()?;
+    if let (Some(settings), Some(binding)) = (frozen_skill_settings.as_mut(), skill.as_ref()) {
+        if let Some(skill_id) = binding.skill_id {
+            let expected = binding.skill_sha256.as_deref().ok_or_else(|| {
+                ApiError::Conflict("技能库版本缺少规则哈希，已拒绝导入".to_string())
+            })?;
+            crate::skill_library::tag_rules(settings, skill_id, binding.skill_version.unwrap_or(1));
+            let actual = crate::skill_library::hash_settings(settings);
+            if actual != expected {
+                return Err(ApiError::Conflict(
+                    "技能参数与发布哈希不一致，已拒绝导入".to_string(),
+                ));
+            }
+        }
+    }
+    if let (Some(settings), Some(binding)) = (frozen_skill_settings.as_ref(), skill.as_mut()) {
+        binding.settings = Some(
+            serde_json::to_value(settings)
+                .map_err(|error| ApiError::Internal(error.to_string()))?,
+        );
+    }
     record.skill = skill;
+    // 导入后的规则实例默认停用：订阅者逐条确认参数后再启用，启动门禁仍按「至少一条启用」判断。
+    if let Some(settings) = frozen_skill_settings.as_mut() {
+        for rule in &mut settings.rules {
+            rule.enabled = false;
+        }
+    }
     record
         .runtime
         .record(StrategyEventLevel::Info, format!("{note}：{title}"), None);
@@ -928,6 +1069,9 @@ async fn install_bundle(
 
     strategies::replace(state, &record);
     strategies::persist(state, &record).await;
+    if let Some(settings) = frozen_skill_settings {
+        state.skill.update_settings(record.id, settings).await;
+    }
     Ok(record)
 }
 

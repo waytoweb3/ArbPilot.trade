@@ -49,9 +49,11 @@ import {
   useRollbackStrategy,
   useSaveStrategyCode,
   useSkillSettings,
+  useSkillVersions,
   useStrategies,
   useStrategyCode,
   useStrategyRuns,
+  useStrategySkillDiff,
   useStrategyTemplates,
   useStrategyVersions,
   useUpdateListingSettings,
@@ -60,6 +62,7 @@ import {
   useUpdateStrategy,
   useUpdateStrategyExecutionMode,
   useUpdateStrategyScope,
+  useUpgradeStrategySkill,
 } from "../hooks/useApi";
 import { toNumber } from "../lib/api";
 import {
@@ -72,6 +75,10 @@ import {
 import { fmt, useI18n } from "../lib/i18n";
 import type {
   BacktestReport,
+  GridShift,
+  GridSpacingMode,
+  MaEntry,
+  MaExit,
   MarketVisibility,
   PerformanceSource,
   PricingModel,
@@ -80,7 +87,9 @@ import type {
   SkillAction,
   SkillDirection,
   SkillKind,
+  SkillOrderType,
   SkillRule,
+  SkillSettings,
   SourceVisibility,
   StrategyExecutionMode,
   StrategyRecord,
@@ -142,7 +151,16 @@ function skillBaseName(name: string): string {
 function skillKind(record: StrategyRecord): SkillKind | null {
   const key = record.skill?.template_key;
   if (key) {
-    return SKILL_KINDS_BY_TEMPLATE_KEY[key] ?? null;
+    const mapped = SKILL_KINDS_BY_TEMPLATE_KEY[key];
+    if (mapped) {
+      return mapped;
+    }
+  }
+  // 技能库版本用通用 `skill` 标识交付，触发方式以冻结规则为准。
+  const frozen = record.skill?.settings as SkillSettings | null | undefined;
+  const inferred = frozen?.rules?.[0]?.kind;
+  if (inferred) {
+    return inferred;
   }
   // 兼容未回填模板标识的历史记录。
   const name = skillBaseName(record.definition.name);
@@ -1415,19 +1433,54 @@ interface SkillRuleDraft {
   lookback: string;
   fast: string;
   slow: string;
+  /** 参与计算的均线周期，逗号分隔。 */
+  maPeriods: string;
+  /** 入场条件，只引用上面的均线周期。 */
+  entries: MaEntry[];
+  /** 出场条件，任一满足即离场。 */
+  exits: MaExit[];
   atr: string;
   channel: string;
   atrMultiple: string;
+  /** 海龟系统一/系统二开关与通道周期。 */
+  system1Enabled: boolean;
+  entry1: string;
+  exit1: string;
+  system2Enabled: boolean;
+  entry2: string;
+  exit2: string;
+  profitFilter: boolean;
+  /** 海龟 Unit 仓位与金字塔加仓。 */
+  maxUnits: string;
+  pyramidStepN: string;
+  maxAdds: string;
+  maxSymbols: string;
+  maxLeverage: string;
+  maxHoldHours: string;
+  orderType: SkillOrderType;
   direction: SkillDirection;
   executionMode: StrategyExecutionMode;
   executionVenues: string[];
   notional: string;
   leverage: string;
+  riskPct: string;
+  riskReward: string;
+  maxPositions: string;
+  cooldownHours: string;
   takeProfit: string;
   stopLoss: string;
+  /** 旧版单边档位数，仅用于迁移。 */
   gridLevels: string;
   gridSpacing: string;
+  /** 旧版每档占比，仅用于迁移。 */
   gridShare: string;
+  gridCount: string;
+  gridLower: string;
+  gridUpper: string;
+  gridMode: GridSpacingMode;
+  gridTrigger: string;
+  gridShift: GridShift;
+  gridCloseOnFail: boolean;
   action: SkillAction;
   notify: boolean;
   maxNotional: string;
@@ -1446,15 +1499,43 @@ function skillKindDefaults(kind: SkillKind): Partial<SkillRuleDraft> {
         atr: "20",
         channel: "20",
         atrMultiple: "2",
+        system1Enabled: true,
+        entry1: "20",
+        exit1: "10",
+        system2Enabled: true,
+        entry2: "55",
+        exit2: "20",
+        profitFilter: true,
+        maxUnits: "4",
+        pyramidStepN: "0.5",
+        maxAdds: "3",
+        maxSymbols: "3",
+        maxLeverage: "3",
+        maxHoldHours: "0",
+        orderType: "market",
+        riskPct: "0.5",
+        cooldownHours: "24",
         takeProfit: "0",
         stopLoss: "0",
       };
     case "ma_trend":
       return {
         timeframe: "1h",
-        lookback: "200",
-        fast: "20",
-        slow: "55",
+        lookback: "300",
+        fast: "5",
+        slow: "20",
+        maPeriods: "5,10,20,50",
+        entries: [
+          { type: "alignment", periods: [5, 10, 20, 50] },
+          { type: "price_above", ma: 20 },
+        ],
+        exits: [{ type: "break_ma", ma: 20 }, { type: "atr_stop" }],
+        atr: "14",
+        atrMultiple: "2",
+        riskPct: "1",
+        riskReward: "2",
+        maxPositions: "3",
+        cooldownHours: "4",
         takeProfit: "0",
         stopLoss: "0",
       };
@@ -1462,11 +1543,17 @@ function skillKindDefaults(kind: SkillKind): Partial<SkillRuleDraft> {
       return {
         timeframe: "5m",
         lookback: "200",
-        takeProfit: "0.5",
+        direction: "both",
+        takeProfit: "0",
         stopLoss: "0",
-        gridLevels: "3",
         gridSpacing: "0.5",
-        gridShare: "25",
+        gridCount: "10",
+        gridLower: "0",
+        gridUpper: "0",
+        gridMode: "arithmetic",
+        gridTrigger: "0",
+        gridShift: "none",
+        gridCloseOnFail: false,
       };
     default:
       return {};
@@ -1488,19 +1575,47 @@ function emptySkillRuleDraft(leverage: string, kind: SkillKind): SkillRuleDraft 
     lookback: "200",
     fast: "20",
     slow: "55",
+    maPeriods: "",
+    entries: [],
+    exits: [],
     atr: "20",
     channel: "20",
     atrMultiple: "2",
+    system1Enabled: true,
+    entry1: "20",
+    exit1: "10",
+    system2Enabled: true,
+    entry2: "55",
+    exit2: "20",
+    profitFilter: true,
+    maxUnits: "4",
+    pyramidStepN: "0.5",
+    maxAdds: "3",
+    maxSymbols: "3",
+    maxLeverage: "3",
+    maxHoldHours: "0",
+    orderType: "market",
     direction: "long",
     executionMode: "real",
     executionVenues: [],
     notional: "100",
     leverage,
+    riskPct: "0",
+    riskReward: "0",
+    maxPositions: "0",
+    cooldownHours: "0",
     takeProfit: "20",
     stopLoss: "10",
     gridLevels: "3",
     gridSpacing: "0.5",
     gridShare: "25",
+    gridCount: "10",
+    gridLower: "0",
+    gridUpper: "0",
+    gridMode: "arithmetic",
+    gridTrigger: "0",
+    gridShift: "none",
+    gridCloseOnFail: false,
     action: "open_long",
     notify: true,
     maxNotional: "0",
@@ -1512,6 +1627,10 @@ function emptySkillRuleDraft(leverage: string, kind: SkillKind): SkillRuleDraft 
 /** 已保存的技能规则转成编辑草稿。 */
 function skillDraftFrom(rule: SkillRule): SkillRuleDraft {
   const base = emptySkillRuleDraft(String(rule.business.leverage), rule.kind ?? "event");
+  // 旧配置没有 grid_count，用单边档位数 × 2 迁移成网格数量。
+  const legacyCount = (rule.business.grid_levels ?? 3) * 2;
+  const gridCount =
+    (rule.business.grid_count ?? 0) >= 2 ? rule.business.grid_count : legacyCount;
   return {
     ...base,
     key: rule.id ?? crypto.randomUUID(),
@@ -1526,19 +1645,52 @@ function skillDraftFrom(rule: SkillRule): SkillRuleDraft {
     lookback: String(rule.trigger.lookback ?? 200),
     fast: String(rule.trigger.fast ?? 20),
     slow: String(rule.trigger.slow ?? 55),
+    // 旧配置没有均线集合时，用快慢均线回填，避免界面出现空列表。
+    maPeriods: (
+      (rule.trigger.ma_periods ?? []).length > 0
+        ? rule.trigger.ma_periods
+        : [rule.trigger.fast ?? 20, rule.trigger.slow ?? 55]
+    ).join(","),
+    entries: rule.trigger.entries ?? [],
+    exits: rule.trigger.exits ?? [],
     atr: String(rule.trigger.atr ?? 20),
     channel: String(rule.trigger.channel ?? 20),
     atrMultiple: String(rule.trigger.atr_multiple ?? 2),
+    system1Enabled: rule.trigger.turtle?.system1_enabled ?? true,
+    entry1: String(rule.trigger.turtle?.entry1 ?? rule.trigger.channel ?? 20),
+    exit1: String(rule.trigger.turtle?.exit1 ?? 10),
+    system2Enabled: rule.trigger.turtle?.system2_enabled ?? true,
+    entry2: String(rule.trigger.turtle?.entry2 ?? 55),
+    exit2: String(rule.trigger.turtle?.exit2 ?? 20),
+    profitFilter: rule.trigger.turtle?.profit_filter ?? true,
+    maxUnits: String(rule.business.max_units ?? 4),
+    pyramidStepN: String(rule.business.pyramid_step_n ?? 0.5),
+    maxAdds: String(rule.business.max_pyramid_adds ?? 3),
+    maxSymbols: String(rule.business.max_symbols ?? 3),
+    maxLeverage: String(rule.business.max_leverage ?? rule.business.leverage ?? 3),
+    maxHoldHours: String(rule.business.max_hold_hours ?? 0),
+    orderType: rule.steps.order_type ?? "market",
     direction: rule.steps.direction ?? "both",
     executionMode: rule.steps.execution_mode ?? "real",
     executionVenues: rule.steps.execution_venues,
     notional: String(rule.business.notional_usd),
     leverage: String(rule.business.leverage),
+    riskPct: String(rule.cautions.risk_pct ?? 0),
+    riskReward: String(rule.business.risk_reward ?? 0),
+    maxPositions: String(rule.cautions.max_positions ?? 0),
+    cooldownHours: String(rule.cautions.cooldown_hours ?? 0),
     takeProfit: String(rule.business.take_profit_pct),
     stopLoss: String(rule.business.stop_loss_pct),
     gridLevels: String(rule.business.grid_levels ?? 3),
     gridSpacing: String(rule.business.grid_spacing_pct ?? 0.5),
     gridShare: String(rule.business.grid_share_pct ?? 25),
+    gridCount: String(gridCount),
+    gridLower: String(rule.business.grid_lower_price ?? 0),
+    gridUpper: String(rule.business.grid_upper_price ?? 0),
+    gridMode: rule.business.grid_spacing_mode ?? "arithmetic",
+    gridTrigger: String(rule.business.grid_trigger_price ?? 0),
+    gridShift: rule.business.grid_shift ?? "none",
+    gridCloseOnFail: rule.business.grid_close_on_fail ?? false,
     action: rule.output.action,
     notify: rule.output.notify,
     maxNotional: String(rule.cautions.max_notional_usd),
@@ -1554,6 +1706,36 @@ function parseKeywords(value: string): string[] {
     .filter((item) => item.length > 0);
 }
 
+/** 均线周期：支持逗号、分号与空格分隔，去重后升序。 */
+function parsePeriods(value: string): number[] {
+  const periods = value
+    .split(/[,，;；\s]+/)
+    .map((item) => Number(item))
+    .filter((item) => Number.isInteger(item) && item >= 2 && item <= 1_000);
+  return Array.from(new Set(periods)).sort((left, right) => left - right);
+}
+
+/** 入场/出场规则引用到的均线周期，用于提示「改规则前不要删均线」。 */
+function referencedPeriods(rule: SkillRuleDraft): Set<number> {
+  const used = new Set<number>();
+  for (const entry of rule.entries) {
+    if (entry.type === "alignment") {
+      entry.periods.forEach((period) => used.add(period));
+    } else {
+      used.add(entry.ma);
+    }
+  }
+  for (const exit of rule.exits) {
+    if (exit.type === "cross") {
+      used.add(exit.fast);
+      used.add(exit.slow);
+    } else if (exit.type === "break_ma") {
+      used.add(exit.ma);
+    }
+  }
+  return used;
+}
+
 /**
  * 技能策略参数卡片：把 SKILL.md 的六章内容（技能用途、什么时候调用、
  * 执行步骤、业务规则、输出格式、注意事项）逐条转成可配置参数。
@@ -1563,6 +1745,8 @@ function StrategySkillScopeCard({
   status,
   kind,
   purpose,
+  skillId,
+  boundVersion,
 }: {
   strategyId: string;
   /** 策略整体状态：规则能否触发事件取决于它。 */
@@ -1571,6 +1755,9 @@ function StrategySkillScopeCard({
   kind: SkillKind;
   /** 这条技能的用途：取模板名（如「上币公告跟随」），而不是写死的说明。 */
   purpose: string;
+  /** 绑定的技能库版本；存在时展示手动升级入口。 */
+  skillId?: string | null;
+  boundVersion?: number | null;
 }) {
   const { t } = useI18n();
   const settingsQuery = useSkillSettings(strategyId);
@@ -1586,6 +1773,13 @@ function StrategySkillScopeCard({
   const [notice, setNotice] = useState<{ tone: "ok" | "error"; text: string } | null>(null);
   const [editing, setEditing] = useState<Record<string, boolean>>({});
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
+  const [targetVersion, setTargetVersion] = useState(boundVersion ? boundVersion + 1 : 1);
+  const targetDiff = useStrategySkillDiff(strategyId, skillId ? targetVersion : 0);
+  const upgradeSkill = useUpgradeStrategySkill();
+
+  useEffect(() => {
+    setTargetVersion(boundVersion ? boundVersion + 1 : 1);
+  }, [boundVersion]);
 
   useEffect(() => {
     if (!current) {
@@ -1598,6 +1792,40 @@ function StrategySkillScopeCard({
     setRules((previous) =>
       previous.map((rule) => (rule.key === key ? { ...rule, ...changes } : rule)),
     );
+  };
+
+  /** 「添加均线」输入框的临时值。 */
+  const [maInput, setMaInput] = useState<Record<string, string>>({});
+
+  /** 添加一条均线周期；唯一性由 parsePeriods 保证。 */
+  const addMaPeriod = (key: string, current: string) => {
+    const value = Number(maInput[key]);
+    if (!Number.isInteger(value) || value < 2 || value > 1_000) {
+      return;
+    }
+    const next = parsePeriods(`${current},${value}`);
+    patchRule(key, { maPeriods: next.join(",") });
+    setMaInput((previous) => ({ ...previous, [key]: "" }));
+  };
+
+  /** 增删改均线入场/出场条件；`next` 为空表示删除该条。 */
+  const updateRuleItem = <T,>(
+    key: string,
+    field: "entries" | "exits",
+    index: number,
+    next: T | null,
+  ) => {
+    const rule = rules.find((item) => item.key === key);
+    if (!rule) {
+      return;
+    }
+    const list = [...rule[field]] as unknown as T[];
+    if (next === null) {
+      list.splice(index, 1);
+    } else {
+      list[index] = next;
+    }
+    patchRule(key, { [field]: list } as Partial<SkillRuleDraft>);
   };
 
   /** 输出格式文案：真实开仓或模拟开仓。 */
@@ -1716,9 +1944,70 @@ function StrategySkillScopeCard({
       const atr = Number(rule.atr);
       const channel = Number(rule.channel);
       const atrMultiple = Number(rule.atrMultiple);
-      const gridLevels = Number(rule.gridLevels);
       const gridSpacing = Number(rule.gridSpacing);
-      const gridShare = Number(rule.gridShare);
+      const gridCount = Number(rule.gridCount);
+      const gridLower = Number(rule.gridLower);
+      const gridUpper = Number(rule.gridUpper);
+      const gridTrigger = Number(rule.gridTrigger);
+      const riskPct = Number(rule.riskPct);
+      const riskReward = Number(rule.riskReward);
+      const maxPositions = Number(rule.maxPositions);
+      const cooldownHours = Number(rule.cooldownHours);
+      const entry1 = Number(rule.entry1);
+      const exit1 = Number(rule.exit1);
+      const entry2 = Number(rule.entry2);
+      const exit2 = Number(rule.exit2);
+      const maxUnits = Number(rule.maxUnits);
+      const pyramidStepN = Number(rule.pyramidStepN);
+      const maxAdds = Number(rule.maxAdds);
+      const maxSymbols = Number(rule.maxSymbols);
+      const maxLeverage = Number(rule.maxLeverage);
+      const maxHoldHours = Number(rule.maxHoldHours);
+      const turtlePeriod = (value: number) =>
+        Number.isInteger(value) && value >= 2 && value <= 1000;
+      const turtleValid =
+        rule.kind !== "breakout" ||
+        ((!rule.system1Enabled || (turtlePeriod(entry1) && turtlePeriod(exit1) && entry1 > exit1)) &&
+          (!rule.system2Enabled || (turtlePeriod(entry2) && turtlePeriod(exit2) && entry2 > exit2)) &&
+          Number.isInteger(maxUnits) &&
+          maxUnits >= 1 &&
+          maxUnits <= 20 &&
+          Number.isInteger(maxAdds) &&
+          maxAdds >= 0 &&
+          maxAdds < maxUnits &&
+          Number.isFinite(pyramidStepN) &&
+          pyramidStepN > 0 &&
+          Number.isInteger(maxSymbols) &&
+          maxSymbols >= 0 &&
+          Number.isFinite(maxLeverage) &&
+          maxLeverage > 0 &&
+          Number.isFinite(maxHoldHours) &&
+          maxHoldHours >= 0);
+      const maPeriods = parsePeriods(rule.maPeriods);
+      const longestMa = maPeriods.length > 0 ? Math.max(...maPeriods) : 0;
+      // 规则只能引用指标层声明过的均线，避免出现「引用了不存在的 MA」。
+      const entriesValid = rule.entries.every((entry) =>
+        entry.type === "alignment"
+          ? entry.periods.length >= 2 && entry.periods.every((period) => maPeriods.includes(period))
+          : maPeriods.includes(entry.ma),
+      );
+      const exitsValid = rule.exits.every((exit) => {
+        if (exit.type === "atr_stop") {
+          return true;
+        }
+        if (exit.type === "break_ma") {
+          return maPeriods.includes(exit.ma);
+        }
+        return exit.fast !== exit.slow && maPeriods.includes(exit.fast) && maPeriods.includes(exit.slow);
+      });
+      const maValid =
+        rule.kind !== "ma_trend" ||
+        (maPeriods.length >= 2 && longestMa <= lookback && entriesValid && exitsValid);
+      const gridRangeSet = gridLower > 0 || gridUpper > 0;
+      const gridRangeValid =
+        !gridRangeSet || (gridLower > 0 && gridUpper > gridLower);
+      // 自动区间时，间距 × 档位数的一半不能把最远买档推到 0 以下。
+      const gridAutoValid = gridRangeSet || gridSpacing * gridCount / 2 < 100;
       // 关掉的规则只保留配置，允许参数暂时不合法。
       if (
         rule.enabled &&
@@ -1729,10 +2018,21 @@ function StrategySkillScopeCard({
           amount <= 0 ||
           !Number.isFinite(lev) ||
           lev <= 0 ||
+          !Number.isFinite(riskPct) ||
+          riskPct < 0 ||
+          riskPct > 100 ||
+          !Number.isFinite(riskReward) ||
+          riskReward < 0 ||
+          !Number.isInteger(maxPositions) ||
+          maxPositions < 0 ||
+          !Number.isFinite(cooldownHours) ||
+          cooldownHours < 0 ||
           !Number.isFinite(tp) ||
           tp < 0 ||
           !Number.isFinite(sl) ||
           sl < 0 ||
+          !maValid ||
+          !turtleValid ||
           !Number.isFinite(maxNotional) ||
           maxNotional < 0 ||
           !Number.isFinite(maxDaily) ||
@@ -1749,14 +2049,21 @@ function StrategySkillScopeCard({
           channel < 2 ||
           !Number.isFinite(atrMultiple) ||
           atrMultiple < 0 ||
-          !Number.isFinite(gridLevels) ||
-          gridLevels < 1 ||
-          gridLevels > 20 ||
           !Number.isFinite(gridSpacing) ||
           gridSpacing <= 0 ||
-          !Number.isFinite(gridShare) ||
-          gridShare <= 0 ||
-          gridShare > 100)
+          gridSpacing >= 100 ||
+          !Number.isFinite(gridCount) ||
+          !Number.isInteger(gridCount) ||
+          gridCount < 2 ||
+          gridCount > 1000 ||
+          !Number.isFinite(gridLower) ||
+          gridLower < 0 ||
+          !Number.isFinite(gridUpper) ||
+          gridUpper < 0 ||
+          !gridRangeValid ||
+          !gridAutoValid ||
+          !Number.isFinite(gridTrigger) ||
+          gridTrigger < 0)
       ) {
         setNotice({ tone: "error", text: t.strategies.skillInvalid });
         return null;
@@ -1775,28 +2082,58 @@ function StrategySkillScopeCard({
           lookback,
           fast,
           slow,
+          ma_periods: maPeriods,
+          entries: rule.entries,
+          exits: rule.exits,
           atr,
           channel,
           atr_multiple: atrMultiple,
+          turtle: {
+            system1_enabled: rule.system1Enabled,
+            system2_enabled: rule.system2Enabled,
+            entry1,
+            exit1,
+            entry2,
+            exit2,
+            profit_filter: rule.profitFilter,
+          },
         },
         steps: {
           execution_mode: rule.executionMode,
           execution_venues: rule.executionVenues,
           direction: rule.direction,
+          order_type: rule.orderType,
         },
         business: {
           notional_usd: amount,
           leverage: lev,
+          risk_reward: riskReward,
           take_profit_pct: tp,
           stop_loss_pct: sl,
-          grid_levels: gridLevels,
+          grid_levels: Math.ceil(gridCount / 2),
           grid_spacing_pct: gridSpacing,
-          grid_share_pct: gridShare,
+          grid_share_pct: 100 / gridCount,
+          grid_count: gridCount,
+          grid_lower_price: gridLower,
+          grid_upper_price: gridUpper,
+          grid_spacing_mode: rule.gridMode,
+          grid_trigger_price: gridTrigger,
+          grid_shift: rule.gridShift,
+          grid_close_on_fail: rule.gridCloseOnFail,
+          max_units: maxUnits,
+          pyramid_step_n: pyramidStepN,
+          max_pyramid_adds: maxAdds,
+          max_symbols: maxSymbols,
+          max_leverage: maxLeverage,
+          max_hold_hours: maxHoldHours,
         },
         output: { action: rule.action, notify: rule.notify },
         cautions: {
           max_notional_usd: maxNotional,
           max_daily_opens: maxDaily,
+          risk_pct: riskPct,
+          max_positions: maxPositions,
+          cooldown_hours: cooldownHours,
         },
       });
     }
@@ -1868,6 +2205,66 @@ function StrategySkillScopeCard({
           <p className="text-[11px] text-danger">{errorText(settingsQuery.error)}</p>
         )}
 
+        {skillId ? (
+          <div className="space-y-2 rounded-lg border border-line bg-panel-soft/40 p-3">
+            <div className="flex items-center gap-2">
+              <span className="text-[11px] font-medium text-body">
+                {t.skillsLibrary.upgradeTitle}
+              </span>
+              <Badge tone="info">
+                {t.skillsLibrary.boundVersion} v{boundVersion ?? "—"}
+              </Badge>
+            </div>
+            <p className="text-[10px] text-muted">{t.skillsLibrary.upgradeDesc}</p>
+            <div className="flex flex-wrap items-center gap-2">
+              <label className="flex items-center gap-1 text-[11px] text-muted">
+                {t.skillsLibrary.targetVersion}
+                <input
+                  type="number"
+                  min={1}
+                  value={targetVersion}
+                  onChange={(event) => setTargetVersion(Math.max(1, Number(event.target.value)))}
+                  className="h-7 w-16 rounded border border-line bg-panel px-1 font-mono text-[11px]"
+                />
+              </label>
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => targetDiff.refetch()}
+                disabled={targetDiff.isFetching}
+              >
+                <History size={12} />
+                {t.skillsLibrary.preview}
+              </Button>
+              <Button
+                size="sm"
+                onClick={async () => {
+                  try {
+                    await upgradeSkill.mutateAsync({ strategyId, version: targetVersion });
+                    await settingsQuery.refetch();
+                    setNotice({ tone: "ok", text: t.skillsLibrary.validated });
+                  } catch (error) {
+                    setNotice({ tone: "error", text: errorText(error) });
+                  }
+                }}
+                disabled={upgradeSkill.isPending}
+              >
+                {t.skillsLibrary.upgrade}
+              </Button>
+            </div>
+            {targetDiff.data && (
+              <p className="text-[10px] text-muted">
+                {t.skillsLibrary.added} {targetDiff.data.added.length} ·{" "}
+                {t.skillsLibrary.removed} {targetDiff.data.removed.length} ·{" "}
+                {t.skillsLibrary.changed} {targetDiff.data.changed.length}
+              </p>
+            )}
+            {targetDiff.error && (
+              <p className="text-[10px] text-danger">{errorText(targetDiff.error)}</p>
+            )}
+          </div>
+        ) : null}
+
         {rules.map((rule, index) => {
           const editingRule = editing[rule.key] === true;
           const collapsedRule = !editingRule && collapsed[rule.key] !== false;
@@ -1880,6 +2277,9 @@ function StrategySkillScopeCard({
           const execution = rule.executionVenues.length
             ? rule.executionVenues.map(venueLabel).join(" / ")
             : t.strategies.listingAllVenues;
+          // 均线周期与规则引用：规则只能引用已声明的均线。
+          const maList = parsePeriods(rule.maPeriods);
+          const usedPeriods = referencedPeriods(rule);
           // 折叠时按触发方式给出摘要：公告看来源，指标看周期与参数，网格看档位。
           const condition =
             rule.kind === "event"
@@ -1887,12 +2287,17 @@ function StrategySkillScopeCard({
               : rule.kind === "grid"
                 ? `${rule.timeframe} · ${rule.gridLevels} 档 · ${rule.gridSpacing}%`
                 : rule.kind === "ma_trend"
-                  ? `${rule.timeframe} · MA ${rule.fast}/${rule.slow}`
-                  : `${rule.timeframe} · 通道 ${rule.channel} · ATR ${rule.atrMultiple}×`;
+                  ? `${rule.timeframe} · ${maList.map((period) => `MA${period}`).join("/")}`
+                  : `${rule.timeframe} · 系统一 ${rule.entry1}/${rule.exit1} · 系统二 ${rule.entry2}/${rule.exit2}`;
           const target =
             rule.kind === "grid"
               ? `${rule.notional} USD × ${rule.gridShare}%`
-              : `${rule.notional} USD · ${rule.leverage}x`;
+              : rule.kind === "breakout"
+                ? `${rule.maxUnits} Units · ${rule.maxLeverage}x`
+                : `${rule.notional} USD · ${rule.leverage}x`;
+          // 来源版本来自已保存规则；本地新增或编辑中的草稿不显示版本标记。
+          const sourceVersion = current?.rules.find((item) => item.id === rule.key)
+            ?.source_skill_version;
           return (
             <div
               key={rule.key}
@@ -1922,6 +2327,9 @@ function StrategySkillScopeCard({
                     )}
                   />
                   <span className="shrink-0 text-[11px] font-medium text-main">{title}</span>
+                  {sourceVersion ? (
+                    <Badge tone="info">v{sourceVersion}</Badge>
+                  ) : null}
                   {collapsedRule && (
                     <span className="truncate text-[11px] text-muted">
                       {condition} → {execution} · {outputLabel(rule)} · {target}
@@ -2076,91 +2484,691 @@ function StrategySkillScopeCard({
                           </label>
                         </div>
                         {rule.kind === "ma_trend" && (
-                          <div className="grid gap-2 sm:grid-cols-2">
-                            <label className="block space-y-1">
+                          <>
+                            {/* 指标层：只声明要算哪些均线，规则层再引用它们。 */}
+                            <div className="space-y-1">
                               <span className="text-[11px] text-muted">
-                                {t.strategies.skillFast}
+                                {t.strategies.skillMaPeriods}
                               </span>
-                              <input
-                                className={inputClass}
-                                type="number"
-                                min={2}
-                                step={1}
-                                value={rule.fast}
-                                disabled={!editingRule}
-                                onChange={(event) =>
-                                  patchRule(rule.key, { fast: event.target.value })
-                                }
-                              />
-                            </label>
-                            <label className="block space-y-1">
-                              <span className="text-[11px] text-muted">
-                                {t.strategies.skillSlow}
+                              <div className="flex flex-wrap gap-1.5">
+                                {maList.map((period) => {
+                                  const locked = usedPeriods.has(period);
+                                  return (
+                                    <span
+                                      key={period}
+                                      title={locked ? t.strategies.skillMaReferenced : undefined}
+                                      className="inline-flex items-center gap-1 rounded-full border border-line bg-panel-soft px-2 py-0.5 text-[11px] text-main"
+                                    >
+                                      MA{period}
+                                      <button
+                                        type="button"
+                                        disabled={!editingRule || locked}
+                                        onClick={() =>
+                                          patchRule(rule.key, {
+                                            maPeriods: maList
+                                              .filter((item) => item !== period)
+                                              .join(","),
+                                          })
+                                        }
+                                        className="text-muted disabled:opacity-30"
+                                      >
+                                        <X size={11} />
+                                      </button>
+                                    </span>
+                                  );
+                                })}
+                              </div>
+                              <div className="flex items-center gap-1.5">
+                                <input
+                                  className={inputClass}
+                                  type="number"
+                                  min={2}
+                                  max={1000}
+                                  step={1}
+                                  placeholder={t.strategies.skillMaPlaceholder}
+                                  value={maInput[rule.key] ?? ""}
+                                  disabled={!editingRule}
+                                  onChange={(event) =>
+                                    setMaInput((previous) => ({
+                                      ...previous,
+                                      [rule.key]: event.target.value,
+                                    }))
+                                  }
+                                />
+                                <Button
+                                  size="sm"
+                                  variant="secondary"
+                                  disabled={!editingRule}
+                                  onClick={() => addMaPeriod(rule.key, rule.maPeriods)}
+                                >
+                                  <Plus size={12} />
+                                  {t.strategies.skillMaAdd}
+                                </Button>
+                              </div>
+                              <p className="text-[11px] text-muted">
+                                {t.strategies.skillMaHint}
+                              </p>
+                            </div>
+
+                            {/* 入场条件：全部满足且方向一致才开仓。 */}
+                            <div className="space-y-1.5">
+                              <span className="text-[11px] font-medium text-main">
+                                {t.strategies.skillEntryTitle}
                               </span>
-                              <input
-                                className={inputClass}
-                                type="number"
-                                min={2}
-                                step={1}
-                                value={rule.slow}
-                                disabled={!editingRule}
-                                onChange={(event) =>
-                                  patchRule(rule.key, { slow: event.target.value })
-                                }
-                              />
-                            </label>
-                          </div>
+                              {rule.entries.map((entry, entryIndex) => (
+                                <div
+                                  key={`entry-${entryIndex}`}
+                                  className="flex items-center gap-1.5"
+                                >
+                                  <span className="w-28 shrink-0 text-[11px] text-main">
+                                    {entry.type === "alignment"
+                                      ? t.strategies.skillEntryAlignment
+                                      : entry.type === "price_above"
+                                        ? t.strategies.skillEntryPriceAbove
+                                        : t.strategies.skillEntryPullback}
+                                  </span>
+                                  {entry.type === "alignment" ? (
+                                    <input
+                                      className={inputClass}
+                                      value={entry.periods.join(",")}
+                                      disabled={!editingRule}
+                                      onChange={(event) =>
+                                        updateRuleItem<MaEntry>(
+                                          rule.key,
+                                          "entries",
+                                          entryIndex,
+                                          {
+                                            type: "alignment",
+                                            periods: parsePeriods(event.target.value),
+                                          },
+                                        )
+                                      }
+                                    />
+                                  ) : (
+                                    <select
+                                      className={inputClass}
+                                      value={entry.ma}
+                                      disabled={!editingRule}
+                                      onChange={(event) =>
+                                        updateRuleItem<MaEntry>(
+                                          rule.key,
+                                          "entries",
+                                          entryIndex,
+                                          {
+                                            type: entry.type,
+                                            ma: Number(event.target.value),
+                                          },
+                                        )
+                                      }
+                                    >
+                                      {maList.map((period) => (
+                                        <option key={period} value={period}>
+                                          MA{period}
+                                        </option>
+                                      ))}
+                                    </select>
+                                  )}
+                                  <button
+                                    type="button"
+                                    disabled={!editingRule}
+                                    onClick={() =>
+                                      updateRuleItem<MaEntry>(rule.key, "entries", entryIndex, null)
+                                    }
+                                    className="text-muted disabled:opacity-30"
+                                  >
+                                    <X size={12} />
+                                  </button>
+                                </div>
+                              ))}
+                              <div className="flex flex-wrap gap-1.5">
+                                <button
+                                  type="button"
+                                  disabled={!editingRule}
+                                  onClick={() =>
+                                    updateRuleItem<MaEntry>(
+                                      rule.key,
+                                      "entries",
+                                      rule.entries.length,
+                                      { type: "alignment", periods: maList },
+                                    )
+                                  }
+                                  className="rounded-full border border-line bg-panel-soft px-2 py-0.5 text-[11px] text-muted hover:border-accent/30 disabled:opacity-30"
+                                >
+                                  + {t.strategies.skillEntryAlignment}
+                                </button>
+                                {(["price_above", "pullback"] as const).map((type) => (
+                                  <button
+                                    key={type}
+                                    type="button"
+                                    disabled={!editingRule}
+                                    onClick={() =>
+                                      updateRuleItem<MaEntry>(
+                                        rule.key,
+                                        "entries",
+                                        rule.entries.length,
+                                        {
+                                          type,
+                                          ma:
+                                            maList.find((period) => period >= 20) ??
+                                            maList[0] ??
+                                            20,
+                                        },
+                                      )
+                                    }
+                                    className="rounded-full border border-line bg-panel-soft px-2 py-0.5 text-[11px] text-muted hover:border-accent/30 disabled:opacity-30"
+                                  >
+                                    +{" "}
+                                    {type === "price_above"
+                                      ? t.strategies.skillEntryPriceAbove
+                                      : t.strategies.skillEntryPullback}
+                                  </button>
+                                ))}
+                              </div>
+                              <p className="text-[11px] text-muted">
+                                {t.strategies.skillEntryHint}
+                              </p>
+                            </div>
+
+                            {/* 出场条件：任一满足即离场。 */}
+                            <div className="space-y-1.5">
+                              <span className="text-[11px] font-medium text-main">
+                                {t.strategies.skillExitTitle}
+                              </span>
+                              {rule.exits.map((exit, exitIndex) => (
+                                <div
+                                  key={`exit-${exitIndex}`}
+                                  className="flex items-center gap-1.5"
+                                >
+                                  <span className="w-28 shrink-0 text-[11px] text-main">
+                                    {exit.type === "break_ma"
+                                      ? t.strategies.skillExitBreakMa
+                                      : exit.type === "cross"
+                                        ? t.strategies.skillExitCross
+                                        : t.strategies.skillExitAtrStop}
+                                  </span>
+                                  {exit.type === "break_ma" && (
+                                    <select
+                                      className={inputClass}
+                                      value={exit.ma}
+                                      disabled={!editingRule}
+                                      onChange={(event) =>
+                                        updateRuleItem<MaExit>(
+                                          rule.key,
+                                          "exits",
+                                          exitIndex,
+                                          { type: "break_ma", ma: Number(event.target.value) },
+                                        )
+                                      }
+                                    >
+                                      {maList.map((period) => (
+                                        <option key={period} value={period}>
+                                          MA{period}
+                                        </option>
+                                      ))}
+                                    </select>
+                                  )}
+                                  {exit.type === "cross" && (
+                                    <div className="flex items-center gap-1">
+                                      <select
+                                        className={inputClass}
+                                        value={exit.fast}
+                                        disabled={!editingRule}
+                                        onChange={(event) =>
+                                          updateRuleItem<MaExit>(
+                                            rule.key,
+                                            "exits",
+                                            exitIndex,
+                                            { ...exit, fast: Number(event.target.value) },
+                                          )
+                                        }
+                                      >
+                                        {maList.map((period) => (
+                                          <option key={period} value={period}>
+                                            MA{period}
+                                          </option>
+                                        ))}
+                                      </select>
+                                      <select
+                                        className={inputClass}
+                                        value={exit.slow}
+                                        disabled={!editingRule}
+                                        onChange={(event) =>
+                                          updateRuleItem<MaExit>(
+                                            rule.key,
+                                            "exits",
+                                            exitIndex,
+                                            { ...exit, slow: Number(event.target.value) },
+                                          )
+                                        }
+                                      >
+                                        {maList.map((period) => (
+                                          <option key={period} value={period}>
+                                            MA{period}
+                                          </option>
+                                        ))}
+                                      </select>
+                                    </div>
+                                  )}
+                                  {exit.type === "atr_stop" && (
+                                    <span className="text-[11px] text-muted">
+                                      ATR {rule.atr} × {rule.atrMultiple}
+                                    </span>
+                                  )}
+                                  <button
+                                    type="button"
+                                    disabled={!editingRule}
+                                    onClick={() =>
+                                      updateRuleItem<MaExit>(rule.key, "exits", exitIndex, null)
+                                    }
+                                    className="text-muted disabled:opacity-30"
+                                  >
+                                    <X size={12} />
+                                  </button>
+                                </div>
+                              ))}
+                              <div className="flex flex-wrap gap-1.5">
+                                {(["break_ma", "cross", "atr_stop"] as const).map((type) => (
+                                  <button
+                                    key={type}
+                                    type="button"
+                                    disabled={!editingRule}
+                                    onClick={() => {
+                                      const ma =
+                                        maList.find((period) => period >= 20) ??
+                                        maList[0] ??
+                                        20;
+                                      const next: MaExit =
+                                        type === "break_ma"
+                                          ? { type, ma }
+                                          : type === "cross"
+                                            ? { type, fast: maList[0] ?? 5, slow: maList[maList.length - 1] ?? 20 }
+                                            : { type };
+                                      updateRuleItem<MaExit>(
+                                        rule.key,
+                                        "exits",
+                                        rule.exits.length,
+                                        next,
+                                      );
+                                    }}
+                                    className="rounded-full border border-line bg-panel-soft px-2 py-0.5 text-[11px] text-muted hover:border-accent/30 disabled:opacity-30"
+                                  >
+                                    +{" "}
+                                    {type === "break_ma"
+                                      ? t.strategies.skillExitBreakMa
+                                      : type === "cross"
+                                        ? t.strategies.skillExitCross
+                                        : t.strategies.skillExitAtrStop}
+                                  </button>
+                                ))}
+                              </div>
+                              <p className="text-[11px] text-muted">
+                                {t.strategies.skillExitHint}
+                              </p>
+                            </div>
+
+                            {/* ATR 周期与止损倍数由指标/风控共用。 */}
+                            <div className="grid gap-2 sm:grid-cols-2">
+                              <label className="block space-y-1">
+                                <span className="text-[11px] text-muted">
+                                  {t.strategies.skillAtr}
+                                </span>
+                                <input
+                                  className={inputClass}
+                                  type="number"
+                                  min={2}
+                                  step={1}
+                                  value={rule.atr}
+                                  disabled={!editingRule}
+                                  onChange={(event) =>
+                                    patchRule(rule.key, { atr: event.target.value })
+                                  }
+                                />
+                              </label>
+                              <label className="block space-y-1">
+                                <span className="text-[11px] text-muted">
+                                  {t.strategies.skillAtrMultiple}
+                                </span>
+                                <input
+                                  className={inputClass}
+                                  type="number"
+                                  min={0}
+                                  step="any"
+                                  value={rule.atrMultiple}
+                                  disabled={!editingRule}
+                                  onChange={(event) =>
+                                    patchRule(rule.key, { atrMultiple: event.target.value })
+                                  }
+                                />
+                              </label>
+                            </div>
+                          </>
                         )}
                         {rule.kind === "breakout" && (
-                          <div className="grid gap-2 sm:grid-cols-2">
-                            <label className="block space-y-1">
-                              <span className="text-[11px] text-muted">
-                                {t.strategies.skillChannel}
-                              </span>
-                              <input
-                                className={inputClass}
-                                type="number"
-                                min={2}
-                                step={1}
-                                value={rule.channel}
-                                disabled={!editingRule}
-                                onChange={(event) =>
-                                  patchRule(rule.key, { channel: event.target.value })
-                                }
-                              />
-                            </label>
-                            <label className="block space-y-1">
-                              <span className="text-[11px] text-muted">
-                                {t.strategies.skillAtr}
-                              </span>
-                              <input
-                                className={inputClass}
-                                type="number"
-                                min={2}
-                                step={1}
-                                value={rule.atr}
-                                disabled={!editingRule}
-                                onChange={(event) =>
-                                  patchRule(rule.key, { atr: event.target.value })
-                                }
-                              />
-                            </label>
-                            <label className="block space-y-1">
-                              <span className="text-[11px] text-muted">
-                                {t.strategies.skillAtrMultiple}
-                              </span>
-                              <input
-                                className={inputClass}
-                                type="number"
-                                min={0}
-                                step="any"
-                                value={rule.atrMultiple}
-                                disabled={!editingRule}
-                                onChange={(event) =>
-                                  patchRule(rule.key, { atrMultiple: event.target.value })
-                                }
-                              />
-                            </label>
+                          <div className="space-y-3">
+                            <div className="space-y-2 rounded-lg border border-line/60 bg-panel-soft/40 p-2.5">
+                              <div className="flex items-center gap-2">
+                                <span className="text-[11px] font-medium text-main">
+                                  {t.strategies.skillTurtleSystems}
+                                </span>
+                                <span className="rounded-full bg-accent/10 px-1.5 py-0.5 text-[10px] text-accent">
+                                  {t.strategies.skillTurtleCore}
+                                </span>
+                              </div>
+                              {[
+                                {
+                                  label: t.strategies.skillTurtleSystem1,
+                                  enabled: rule.system1Enabled,
+                                  entry: rule.entry1,
+                                  exit: rule.exit1,
+                                  entryKey: "entry1" as const,
+                                  exitKey: "exit1" as const,
+                                  enabledKey: "system1Enabled" as const,
+                                },
+                                {
+                                  label: t.strategies.skillTurtleSystem2,
+                                  enabled: rule.system2Enabled,
+                                  entry: rule.entry2,
+                                  exit: rule.exit2,
+                                  entryKey: "entry2" as const,
+                                  exitKey: "exit2" as const,
+                                  enabledKey: "system2Enabled" as const,
+                                },
+                              ].map((system) => (
+                                <div key={system.enabledKey} className="space-y-1.5">
+                                  <div className="flex items-center justify-between gap-2">
+                                    <span className="text-[11px] text-main">{system.label}</span>
+                                    <button
+                                      type="button"
+                                      disabled={!editingRule}
+                                      onClick={() =>
+                                        patchRule(rule.key, {
+                                          [system.enabledKey]: !system.enabled,
+                                        })
+                                      }
+                                      className={`rounded-full border px-2 py-0.5 text-[10px] disabled:opacity-40 ${
+                                        system.enabled
+                                          ? "border-accent/40 bg-accent/10 text-accent"
+                                          : "border-line bg-panel text-muted"
+                                      }`}
+                                    >
+                                      {system.enabled
+                                        ? t.strategies.skillTurtleOn
+                                        : t.strategies.skillTurtleOff}
+                                    </button>
+                                  </div>
+                                  <div className="grid gap-2 sm:grid-cols-2">
+                                    <label className="block space-y-1">
+                                      <span className="text-[10px] text-muted">
+                                        {t.strategies.skillTurtleEntry}
+                                      </span>
+                                      <input
+                                        className={inputClass}
+                                        type="number"
+                                        min={2}
+                                        step={1}
+                                        value={system.entry}
+                                        disabled={!editingRule || !system.enabled}
+                                        onChange={(event) =>
+                                          patchRule(rule.key, {
+                                            [system.entryKey]: event.target.value,
+                                          })
+                                        }
+                                      />
+                                    </label>
+                                    <label className="block space-y-1">
+                                      <span className="text-[10px] text-muted">
+                                        {t.strategies.skillTurtleExit}
+                                      </span>
+                                      <input
+                                        className={inputClass}
+                                        type="number"
+                                        min={2}
+                                        step={1}
+                                        value={system.exit}
+                                        disabled={!editingRule || !system.enabled}
+                                        onChange={(event) =>
+                                          patchRule(rule.key, {
+                                            [system.exitKey]: event.target.value,
+                                          })
+                                        }
+                                      />
+                                    </label>
+                                  </div>
+                                </div>
+                              ))}
+                              <div className="flex items-center justify-between gap-2 border-t border-line/60 pt-2">
+                                <div>
+                                  <span className="text-[11px] text-main">
+                                    {t.strategies.skillTurtleProfitFilter}
+                                  </span>
+                                  <p className="mt-0.5 text-[10px] text-muted">
+                                    {t.strategies.skillTurtleProfitFilterHint}
+                                  </p>
+                                </div>
+                                <button
+                                  type="button"
+                                  disabled={!editingRule}
+                                  onClick={() =>
+                                    patchRule(rule.key, { profitFilter: !rule.profitFilter })
+                                  }
+                                  className={`shrink-0 rounded-full border px-2 py-0.5 text-[10px] disabled:opacity-40 ${
+                                    rule.profitFilter
+                                      ? "border-accent/40 bg-accent/10 text-accent"
+                                      : "border-line bg-panel text-muted"
+                                  }`}
+                                >
+                                  {rule.profitFilter
+                                    ? t.strategies.skillTurtleOn
+                                    : t.strategies.skillTurtleOff}
+                                </button>
+                              </div>
+                            </div>
+
+                            <div className="space-y-2 rounded-lg border border-line/60 bg-panel-soft/40 p-2.5">
+                              <div className="flex items-center gap-2">
+                                <span className="text-[11px] font-medium text-main">
+                                  {t.strategies.skillTurtleVolatility}
+                                </span>
+                                <span className="rounded-full bg-accent/10 px-1.5 py-0.5 text-[10px] text-accent">
+                                  {t.strategies.skillTurtleCore}
+                                </span>
+                              </div>
+                              <div className="grid gap-2 sm:grid-cols-2">
+                                <label className="block space-y-1">
+                                  <span className="text-[10px] text-muted">
+                                    {t.strategies.skillTurtleN}
+                                  </span>
+                                  <input
+                                    className={inputClass}
+                                    type="number"
+                                    min={2}
+                                    step={1}
+                                    value={rule.atr}
+                                    disabled={!editingRule}
+                                    onChange={(event) =>
+                                      patchRule(rule.key, { atr: event.target.value })
+                                    }
+                                  />
+                                </label>
+                                <label className="block space-y-1">
+                                  <span className="text-[10px] text-muted">
+                                    {t.strategies.skillTurtleStopMultiple}
+                                  </span>
+                                  <input
+                                    className={inputClass}
+                                    type="number"
+                                    min={0}
+                                    step="any"
+                                    value={rule.atrMultiple}
+                                    disabled={!editingRule}
+                                    onChange={(event) =>
+                                      patchRule(rule.key, { atrMultiple: event.target.value })
+                                    }
+                                  />
+                                </label>
+                                <label className="block space-y-1">
+                                  <span className="text-[10px] text-muted">
+                                    {t.strategies.skillTurtleUnitRisk}
+                                  </span>
+                                  <input
+                                    className={inputClass}
+                                    type="number"
+                                    min={0}
+                                    step="any"
+                                    value={rule.riskPct}
+                                    disabled={!editingRule}
+                                    onChange={(event) =>
+                                      patchRule(rule.key, { riskPct: event.target.value })
+                                    }
+                                  />
+                                </label>
+                                <label className="block space-y-1">
+                                  <span className="text-[10px] text-muted">
+                                    {t.strategies.skillTurtleMaxUnits}
+                                  </span>
+                                  <input
+                                    className={inputClass}
+                                    type="number"
+                                    min={1}
+                                    max={20}
+                                    step={1}
+                                    value={rule.maxUnits}
+                                    disabled={!editingRule}
+                                    onChange={(event) =>
+                                      patchRule(rule.key, { maxUnits: event.target.value })
+                                    }
+                                  />
+                                </label>
+                              </div>
+                            </div>
+
+                            <div className="space-y-2 rounded-lg border border-line/60 bg-panel-soft/40 p-2.5">
+                              <div className="flex items-center gap-2">
+                                <span className="text-[11px] font-medium text-main">
+                                  {t.strategies.skillTurtlePyramid}
+                                </span>
+                                <span className="rounded-full bg-accent/10 px-1.5 py-0.5 text-[10px] text-accent">
+                                  {t.strategies.skillTurtleAdvanced}
+                                </span>
+                              </div>
+                              <div className="grid gap-2 sm:grid-cols-2">
+                                <label className="block space-y-1">
+                                  <span className="text-[10px] text-muted">
+                                    {t.strategies.skillTurtleStep}
+                                  </span>
+                                  <input
+                                    className={inputClass}
+                                    type="number"
+                                    min={0}
+                                    step="any"
+                                    value={rule.pyramidStepN}
+                                    disabled={!editingRule}
+                                    onChange={(event) =>
+                                      patchRule(rule.key, { pyramidStepN: event.target.value })
+                                    }
+                                  />
+                                </label>
+                                <label className="block space-y-1">
+                                  <span className="text-[10px] text-muted">
+                                    {t.strategies.skillTurtleMaxAdds}
+                                  </span>
+                                  <input
+                                    className={inputClass}
+                                    type="number"
+                                    min={0}
+                                    max={19}
+                                    step={1}
+                                    value={rule.maxAdds}
+                                    disabled={!editingRule}
+                                    onChange={(event) =>
+                                      patchRule(rule.key, { maxAdds: event.target.value })
+                                    }
+                                  />
+                                </label>
+                              </div>
+                              <p className="text-[10px] text-muted">
+                                {t.strategies.skillTurtleAutoAdd} · {rule.maxAdds} /{" "}
+                                {t.strategies.skillTurtleMaxAdds}
+                              </p>
+                              <TurtleSimPanel stepN={rule.pyramidStepN} maxUnits={rule.maxUnits} />
+                            </div>
+
+                            <div className="space-y-2 rounded-lg border border-line/60 bg-panel-soft/40 p-2.5">
+                              <div className="flex items-center gap-2">
+                                <span className="text-[11px] font-medium text-main">
+                                  {t.strategies.skillTurtleRisk}
+                                </span>
+                                <span className="rounded-full bg-warn/10 px-1.5 py-0.5 text-[10px] text-warn">
+                                  {t.strategies.skillTurtleRiskTag}
+                                </span>
+                              </div>
+                              <div className="grid gap-2 sm:grid-cols-3">
+                                <label className="block space-y-1">
+                                  <span className="text-[10px] text-muted">
+                                    {t.strategies.skillTurtleMaxLeverage}
+                                  </span>
+                                  <input
+                                    className={inputClass}
+                                    type="number"
+                                    min={1}
+                                    step="any"
+                                    value={rule.maxLeverage}
+                                    disabled={!editingRule}
+                                    onChange={(event) =>
+                                      patchRule(rule.key, { maxLeverage: event.target.value })
+                                    }
+                                  />
+                                </label>
+                                <label className="block space-y-1">
+                                  <span className="text-[10px] text-muted">
+                                    {t.strategies.skillTurtleMaxSymbols}
+                                  </span>
+                                  <input
+                                    className={inputClass}
+                                    type="number"
+                                    min={0}
+                                    step={1}
+                                    value={rule.maxSymbols}
+                                    disabled={!editingRule}
+                                    onChange={(event) =>
+                                      patchRule(rule.key, { maxSymbols: event.target.value })
+                                    }
+                                  />
+                                </label>
+                                <label className="block space-y-1">
+                                  <span className="text-[10px] text-muted">
+                                    {t.strategies.skillCooldownHours}
+                                  </span>
+                                  <input
+                                    className={inputClass}
+                                    type="number"
+                                    min={0}
+                                    step="any"
+                                    value={rule.cooldownHours}
+                                    disabled={!editingRule}
+                                    onChange={(event) =>
+                                      patchRule(rule.key, { cooldownHours: event.target.value })
+                                    }
+                                  />
+                                </label>
+                                <label className="block space-y-1">
+                                  <span className="text-[10px] text-muted">
+                                    {t.strategies.skillTurtleMaxHold}
+                                  </span>
+                                  <input
+                                    className={inputClass}
+                                    type="number"
+                                    min={0}
+                                    step="any"
+                                    value={rule.maxHoldHours}
+                                    disabled={!editingRule}
+                                    onChange={(event) =>
+                                      patchRule(rule.key, { maxHoldHours: event.target.value })
+                                    }
+                                  />
+                                </label>
+                              </div>
+                            </div>
                           </div>
                         )}
                         <p className="text-[11px] text-muted">
@@ -2253,6 +3261,7 @@ function StrategySkillScopeCard({
                       <div className="flex flex-wrap gap-1.5">
                         {(
                           [
+                            ["both", t.strategies.skillDirectionBoth],
                             ["long", t.strategies.skillDirectionLong],
                             ["short", t.strategies.skillDirectionShort],
                           ] as const
@@ -2278,6 +3287,40 @@ function StrategySkillScopeCard({
                       </div>
                       <p className="text-[11px] text-muted">{t.strategies.skillDirectionHint}</p>
                     </div>
+
+                    {rule.kind === "breakout" && (
+                      <div className="space-y-1">
+                        <span className="text-[11px] text-muted">
+                          {t.strategies.skillTurtleOrderType}
+                        </span>
+                        <div className="flex flex-wrap gap-1.5">
+                          {(["market", "limit"] as SkillOrderType[]).map((type) => {
+                            const active = rule.orderType === type;
+                            return (
+                              <button
+                                key={type}
+                                type="button"
+                                disabled={!editingRule}
+                                onClick={() => patchRule(rule.key, { orderType: type })}
+                                className={cn(
+                                  "rounded-full border px-2 py-0.5 text-[11px] transition-colors",
+                                  active
+                                    ? "border-accent/50 bg-accent/15 text-accent"
+                                    : "border-line bg-panel-soft text-muted hover:border-accent/30",
+                                )}
+                              >
+                                {type === "market"
+                                  ? t.strategies.skillTurtleOrderMarket
+                                  : t.strategies.skillTurtleOrderLimit}
+                              </button>
+                            );
+                          })}
+                        </div>
+                        <p className="text-[11px] text-muted">
+                          {t.strategies.skillTurtleOrderHint}
+                        </p>
+                      </div>
+                    )}
                   </div>
 
                   {/* 3. 业务规则 */}
@@ -2285,6 +3328,11 @@ function StrategySkillScopeCard({
                     <span className="text-[11px] font-medium text-main">
                       {t.strategies.skillBusinessTitle}
                     </span>
+                    {rule.kind === "breakout" ? (
+                      <p className="rounded-md border border-line/60 bg-panel-soft/40 px-2 py-1.5 text-[11px] text-muted">
+                        {t.strategies.skillTurtleSizingHint}
+                      </p>
+                    ) : (
                     <div className="grid gap-2 sm:grid-cols-4">
                       <label className="block space-y-1">
                         <span className="text-[11px] text-muted">
@@ -2320,7 +3368,9 @@ function StrategySkillScopeCard({
                       </label>
                       <label className="block space-y-1">
                         <span className="text-[11px] text-muted">
-                          {t.strategies.listingTakeProfit}
+                          {rule.kind === "grid"
+                            ? t.strategies.skillGridTakeProfit
+                            : t.strategies.listingTakeProfit}
                         </span>
                         <input
                           className={inputClass}
@@ -2336,7 +3386,9 @@ function StrategySkillScopeCard({
                       </label>
                       <label className="block space-y-1">
                         <span className="text-[11px] text-muted">
-                          {t.strategies.listingStopLoss}
+                          {rule.kind === "grid"
+                            ? t.strategies.skillGridStopLoss
+                            : t.strategies.listingStopLoss}
                         </span>
                         <input
                           className={inputClass}
@@ -2350,24 +3402,75 @@ function StrategySkillScopeCard({
                           }
                         />
                       </label>
+                      {rule.kind !== "event" && rule.kind !== "grid" && (
+                        <label className="block space-y-1">
+                          <span className="text-[11px] text-muted">
+                            {t.strategies.skillRiskReward}
+                          </span>
+                          <input
+                            className={inputClass}
+                            type="number"
+                            min={0}
+                            step="any"
+                            value={rule.riskReward}
+                            disabled={!editingRule}
+                            onChange={(event) =>
+                              patchRule(rule.key, { riskReward: event.target.value })
+                            }
+                          />
+                        </label>
+                      )}
                     </div>
+                    )}
                     {rule.kind === "grid" && (
-                      <div className="space-y-1">
-                        <div className="grid gap-2 sm:grid-cols-3">
+                      <div className="space-y-2">
+                        <div className="grid gap-2 sm:grid-cols-4">
                           <label className="block space-y-1">
                             <span className="text-[11px] text-muted">
-                              {t.strategies.skillGridLevels}
+                              {t.strategies.skillGridLower}
                             </span>
                             <input
                               className={inputClass}
                               type="number"
-                              min={1}
-                              max={20}
-                              step={1}
-                              value={rule.gridLevels}
+                              min={0}
+                              step="any"
+                              value={rule.gridLower}
                               disabled={!editingRule}
                               onChange={(event) =>
-                                patchRule(rule.key, { gridLevels: event.target.value })
+                                patchRule(rule.key, { gridLower: event.target.value })
+                              }
+                            />
+                          </label>
+                          <label className="block space-y-1">
+                            <span className="text-[11px] text-muted">
+                              {t.strategies.skillGridUpper}
+                            </span>
+                            <input
+                              className={inputClass}
+                              type="number"
+                              min={0}
+                              step="any"
+                              value={rule.gridUpper}
+                              disabled={!editingRule}
+                              onChange={(event) =>
+                                patchRule(rule.key, { gridUpper: event.target.value })
+                              }
+                            />
+                          </label>
+                          <label className="block space-y-1">
+                            <span className="text-[11px] text-muted">
+                              {t.strategies.skillGridCount}
+                            </span>
+                            <input
+                              className={inputClass}
+                              type="number"
+                              min={2}
+                              max={1000}
+                              step={1}
+                              value={rule.gridCount}
+                              disabled={!editingRule}
+                              onChange={(event) =>
+                                patchRule(rule.key, { gridCount: event.target.value })
                               }
                             />
                           </label>
@@ -2387,24 +3490,75 @@ function StrategySkillScopeCard({
                               }
                             />
                           </label>
+                        </div>
+                        <div className="grid gap-2 sm:grid-cols-3">
                           <label className="block space-y-1">
                             <span className="text-[11px] text-muted">
-                              {t.strategies.skillGridShare}
+                              {t.strategies.skillGridMode}
+                            </span>
+                            <select
+                              className={inputClass}
+                              value={rule.gridMode}
+                              disabled={!editingRule}
+                              onChange={(event) =>
+                                patchRule(rule.key, {
+                                  gridMode: event.target.value as GridSpacingMode,
+                                })
+                              }
+                            >
+                              <option value="arithmetic">{t.strategies.skillGridModeArithmetic}</option>
+                              <option value="geometric">{t.strategies.skillGridModeGeometric}</option>
+                            </select>
+                          </label>
+                          <label className="block space-y-1">
+                            <span className="text-[11px] text-muted">
+                              {t.strategies.skillGridTrigger}
                             </span>
                             <input
                               className={inputClass}
                               type="number"
                               min={0}
-                              max={100}
                               step="any"
-                              value={rule.gridShare}
+                              value={rule.gridTrigger}
                               disabled={!editingRule}
                               onChange={(event) =>
-                                patchRule(rule.key, { gridShare: event.target.value })
+                                patchRule(rule.key, { gridTrigger: event.target.value })
                               }
                             />
                           </label>
+                          <label className="block space-y-1">
+                            <span className="text-[11px] text-muted">
+                              {t.strategies.skillGridShift}
+                            </span>
+                            <select
+                              className={inputClass}
+                              value={rule.gridShift}
+                              disabled={!editingRule}
+                              onChange={(event) =>
+                                patchRule(rule.key, {
+                                  gridShift: event.target.value as GridShift,
+                                })
+                              }
+                            >
+                              <option value="none">{t.strategies.skillGridShiftNone}</option>
+                              <option value="up">{t.strategies.skillGridShiftUp}</option>
+                              <option value="down">{t.strategies.skillGridShiftDown}</option>
+                              <option value="both">{t.strategies.skillGridShiftBoth}</option>
+                            </select>
+                          </label>
                         </div>
+                        <label className="flex items-start gap-2 text-[11px] text-muted">
+                          <input
+                            type="checkbox"
+                            className="mt-0.5 h-4 w-4 shrink-0 cursor-pointer accent-accent"
+                            checked={rule.gridCloseOnFail}
+                            disabled={!editingRule}
+                            onChange={(event) =>
+                              patchRule(rule.key, { gridCloseOnFail: event.target.checked })
+                            }
+                          />
+                          <span>{t.strategies.skillGridCloseOnFail}</span>
+                        </label>
                         <p className="text-[11px] text-muted">{t.strategies.skillGridHint}</p>
                       </div>
                     )}
@@ -2439,6 +3593,103 @@ function StrategySkillScopeCard({
                         );
                       })}
                     </div>
+                  </div>
+
+                  {/* 5. 注意事项 */}
+                  <div className="space-y-2">
+                    <span className="text-[11px] font-medium text-main">
+                      {t.strategies.skillCautionsTitle}
+                    </span>
+                    <div className="grid gap-2 sm:grid-cols-5">
+                      <label className="block space-y-1">
+                        <span className="text-[11px] text-muted">
+                          {t.strategies.skillMaxNotional}
+                        </span>
+                        <input
+                          className={inputClass}
+                          type="number"
+                          min={0}
+                          step="any"
+                          value={rule.maxNotional}
+                          disabled={!editingRule}
+                          onChange={(event) =>
+                            patchRule(rule.key, { maxNotional: event.target.value })
+                          }
+                        />
+                      </label>
+                      <label className="block space-y-1">
+                        <span className="text-[11px] text-muted">
+                          {t.strategies.skillMaxDailyOpens}
+                        </span>
+                        <input
+                          className={inputClass}
+                          type="number"
+                          min={0}
+                          step={1}
+                          value={rule.maxDailyOpens}
+                          disabled={!editingRule}
+                          onChange={(event) =>
+                            patchRule(rule.key, { maxDailyOpens: event.target.value })
+                          }
+                        />
+                      </label>
+                      {rule.kind !== "event" &&
+                        rule.kind !== "grid" &&
+                        rule.kind !== "breakout" && (
+                        <>
+                          <label className="block space-y-1">
+                            <span className="text-[11px] text-muted">
+                              {t.strategies.skillRiskPct}
+                            </span>
+                            <input
+                              className={inputClass}
+                              type="number"
+                              min={0}
+                              max={100}
+                              step="any"
+                              value={rule.riskPct}
+                              disabled={!editingRule}
+                              onChange={(event) =>
+                                patchRule(rule.key, { riskPct: event.target.value })
+                              }
+                            />
+                          </label>
+                          <label className="block space-y-1">
+                            <span className="text-[11px] text-muted">
+                              {t.strategies.skillMaxPositions}
+                            </span>
+                            <input
+                              className={inputClass}
+                              type="number"
+                              min={0}
+                              step={1}
+                              value={rule.maxPositions}
+                              disabled={!editingRule}
+                              onChange={(event) =>
+                                patchRule(rule.key, { maxPositions: event.target.value })
+                              }
+                            />
+                          </label>
+                          <label className="block space-y-1">
+                            <span className="text-[11px] text-muted">
+                              {t.strategies.skillCooldownHours}
+                            </span>
+                            <input
+                              className={inputClass}
+                              type="number"
+                              min={0}
+                              step="any"
+                              value={rule.cooldownHours}
+                              disabled={!editingRule}
+                              onChange={(event) =>
+                                patchRule(rule.key, { cooldownHours: event.target.value })
+                              }
+                            />
+                          </label>
+                        </>
+                      )}
+                    </div>
+                    <p className="text-[11px] text-muted">{t.strategies.skillCautionsHint}</p>
                   </div>
 
                   {editingRule && (
@@ -2489,6 +3740,10 @@ function StrategyPublishCard({ record }: { record: StrategyRecord }) {
   const createPublication = useCreatePublication();
   const updatePublication = useUpdatePublication();
   const createPerformance = useCreatePerformance();
+  const skillVersionQuery = useSkillVersions(record.skill?.skill_id ?? null);
+  const [skillVersion, setSkillVersion] = useState(
+    record.skill?.skill_version ? String(record.skill.skill_version) : "",
+  );
 
   const own = (publications.data ?? []).filter((item) => item.strategy_id === record.id);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -2692,6 +3947,24 @@ function StrategyPublishCard({ record }: { record: StrategyRecord }) {
                 />
               </label>
             </div>
+            {record.skill?.skill_id ? (
+              <label className="block text-[11px] text-muted">
+                {t.skillsLibrary.versions}
+                <select
+                  className={inputClass}
+                  value={skillVersion}
+                  onChange={(event) => setSkillVersion(event.target.value)}
+                >
+                  <option value="">—</option>
+                  {(skillVersionQuery.data ?? []).map((version) => (
+                    <option key={version.version} value={version.version}>
+                      v{version.version}
+                      {version.passed ? "" : ` · ${t.skillsLibrary.failed}`}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            ) : null}
             <Button
               size="sm"
               disabled={
@@ -2723,6 +3996,12 @@ function StrategyPublishCard({ record }: { record: StrategyRecord }) {
                         draft.pricing === "free" ? 0 : Number(draft.price) || 0,
                       trial_days: draft.pricing === "free" ? 0 : Number(draft.trial) || 0,
                     },
+                    ...(record.skill?.skill_id && skillVersion
+                      ? {
+                          skill_id: record.skill.skill_id,
+                          skill_version: Number(skillVersion),
+                        }
+                      : {}),
                   },
                   {
                     onSuccess: (publication) => {
@@ -2990,17 +4269,36 @@ function RunRuleList({
         : keywords.length === 1
           ? keywords[0]
           : `${keywords[0]} 等 ${keywords.length} 个关键词`;
+    if (rule.kind === "grid") {
+      const count =
+        (rule.business.grid_count ?? 0) >= 2
+          ? rule.business.grid_count
+          : (rule.business.grid_levels ?? 3) * 2;
+      const lower = Number(rule.business.grid_lower_price);
+      const upper = Number(rule.business.grid_upper_price);
+      const range =
+        lower > 0 && upper > lower
+          ? `${formatNumber(rule.business.grid_lower_price)}-${formatNumber(rule.business.grid_upper_price)}`
+          : "自动区间";
+      const mode =
+        rule.business.grid_spacing_mode === "geometric" ? "等比" : "等差";
+      return `${rule.trigger.timeframe} · ${range} · ${count} 格 · ${mode} · 间距 ${rule.business.grid_spacing_pct}%`;
+    }
     return rule.kind === "event"
       ? `${
           rule.trigger.event_sources.length
             ? rule.trigger.event_sources.map(venueLabel).join(" / ")
             : t.strategies.skillAllSources
         }（${keywordLabel}）`
-      : rule.kind === "grid"
-        ? `${rule.trigger.timeframe} · ${rule.business.grid_levels} 档 · 间距 ${rule.business.grid_spacing_pct}%`
-        : rule.kind === "ma_trend"
-          ? `${rule.trigger.timeframe} · 均线 ${rule.trigger.fast}/${rule.trigger.slow}`
-          : `${rule.trigger.timeframe} · 通道 ${rule.trigger.channel} · ATR ${rule.trigger.atr_multiple}×`;
+      : rule.kind === "ma_trend"
+        ? `${rule.trigger.timeframe} · ${(
+            rule.trigger.ma_periods.length > 0
+              ? rule.trigger.ma_periods
+              : [rule.trigger.fast, rule.trigger.slow]
+          )
+            .map((period) => `MA${period}`)
+            .join("/")}`
+        : `${rule.trigger.timeframe} · 通道 ${rule.trigger.channel} · ATR ${rule.trigger.atr_multiple}×`;
   };
 
   /** 折叠摘要：条件 → 执行交易所 · 输出方式 · 金额/杠杆 · 止盈止损。 */
@@ -3012,13 +4310,17 @@ function RunRuleList({
       rule.steps.execution_mode === "real"
         ? t.strategies.skillOutputReal
         : t.strategies.skillOutputPaper;
+    const count =
+      (rule.business.grid_count ?? 0) >= 2
+        ? rule.business.grid_count
+        : (rule.business.grid_levels ?? 3) * 2;
     const target =
       rule.kind === "grid"
-        ? `${formatNumber(rule.business.notional_usd)} USD × ${formatNumber(rule.business.grid_share_pct)}%`
+        ? `${formatNumber(rule.business.notional_usd)} USD ÷ ${count} 格`
         : `${formatNumber(rule.business.notional_usd)} USD · ${formatNumber(rule.business.leverage)}x`;
     const risk =
       rule.kind === "grid"
-        ? ""
+        ? ` · 整组 TP ${formatNumber(rule.business.take_profit_pct)}% · SL ${formatNumber(rule.business.stop_loss_pct)}%`
         : ` · TP ${formatNumber(rule.business.take_profit_pct)}% · SL ${formatNumber(rule.business.stop_loss_pct)}%`;
     return `${conditionOf(rule)} → ${execution} · ${output} · ${target}${risk}`;
   };
@@ -3191,6 +4493,76 @@ function StrategyRuntimeCard({
         )}
       </CardContent>
     </Card>
+  );
+}
+
+/** 海龟金字塔仓位的本地模拟：只演示加仓价与整组止损。 */
+function TurtleSimPanel({ stepN, maxUnits }: { stepN: string; maxUnits: string }) {
+  const { t } = useI18n();
+  const [entry, setEntry] = useState("100");
+  const [n, setN] = useState("5");
+  const step = Math.max(0, Number(stepN) || 0);
+  const units = Math.max(1, Math.min(20, Math.floor(Number(maxUnits) || 1)));
+  const base = Number(entry) || 0;
+  const nValue = Number(n) || 0;
+  const distance = nValue * step;
+  const rows = Array.from({ length: units }, (_, index) => ({
+    unit: index + 1,
+    price: base + distance * index,
+  }));
+  const stop = base + distance * (units - 1) - 2 * nValue;
+  const format = (value: number) => (Number.isFinite(value) ? value.toFixed(2) : "—");
+
+  return (
+    <div className="rounded-md border border-line/60 bg-panel/60 p-2">
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-[11px] font-medium text-main">
+          {t.strategies.skillTurtleSimTitle}
+        </span>
+        <span className="text-[10px] text-muted">
+          {t.strategies.skillTurtleSimUnit} {units}
+        </span>
+      </div>
+      <div className="mt-2 grid gap-2 sm:grid-cols-2">
+        <label className="block space-y-1">
+          <span className="text-[10px] text-muted">{t.strategies.skillTurtleSimEntry}</span>
+          <input
+            className={inputClass}
+            type="number"
+            step="any"
+            value={entry}
+            onChange={(event) => setEntry(event.target.value)}
+          />
+        </label>
+        <label className="block space-y-1">
+          <span className="text-[10px] text-muted">{t.strategies.skillTurtleSimN}</span>
+          <input
+            className={inputClass}
+            type="number"
+            step="any"
+            value={n}
+            onChange={(event) => setN(event.target.value)}
+          />
+        </label>
+      </div>
+      <div className="mt-2 space-y-1">
+        {rows.map((row) => (
+          <div key={row.unit} className="flex items-center justify-between text-[10px]">
+            <span className="text-muted">
+              {t.strategies.skillTurtleSimUnit} {row.unit}
+            </span>
+            <span className="text-main">{format(row.price)}</span>
+          </div>
+        ))}
+      </div>
+      <div className="mt-1 flex items-center justify-between border-t border-line/60 pt-1 text-[10px]">
+        <span className="text-muted">{t.strategies.skillTurtleSimStop}</span>
+        <span className="text-warn">{format(stop)}</span>
+      </div>
+      <p className="mt-1 text-[10px] leading-relaxed text-muted">
+        {t.strategies.skillTurtleSimHint}
+      </p>
+    </div>
   );
 }
 
@@ -3713,6 +5085,8 @@ function StrategyDetail({
           status={record.status}
           kind={skillKind}
           purpose={skillBaseName(record.definition.name)}
+          skillId={record.skill?.skill_id ?? null}
+          boundVersion={record.skill?.skill_version ?? null}
         />
       ) : listing ? (
         <StrategyListingScopeCard strategyId={record.id} status={record.status} />

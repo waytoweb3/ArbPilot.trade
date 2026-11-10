@@ -73,11 +73,27 @@ pub async fn instantiate(
 
     let mut record =
         StrategyRecord::new(definition, StrategySource::BuiltIn, StrategyStatus::Draft);
-    // 技能参数运行时：用稳定模板标识识别，无需沙箱源码或编译产物。
-    record.skill = Some(SkillBinding {
-        template_key: template.key.clone(),
-        settings: None,
-    });
+    // 内置模板同样以技能库版本交付：绑定具体版本与规则哈希，运行时按冻结规则执行。
+    record.skill = Some(
+        match crate::templates::builtin_version(&state, &template.key).await {
+            Some(version) => SkillBinding {
+                template_key: template.key.clone(),
+                // 上币公告跟随继续跟随本机监听设置，这里只登记来源版本。
+                settings: if template.key == "listing-follow" {
+                    None
+                } else {
+                    serde_json::to_value(&version.settings).ok()
+                },
+                skill_id: Some(version.skill_id),
+                skill_version: Some(version.version),
+                skill_sha256: Some(version.settings_sha256),
+            },
+            None => SkillBinding {
+                template_key: template.key.clone(),
+                ..SkillBinding::default()
+            },
+        },
+    );
     record.runtime.record(
         arb_core::StrategyEventLevel::Info,
         format!("由模板「{}」创建，已启用技能参数运行时", template.name),

@@ -268,8 +268,14 @@ struct ListingWizard {
 enum ListingStep {
     /// 放弃当前上币引导。
     Abort,
-    Side { id: String, side: Side },
-    Venue { id: String, venue: String },
+    Side {
+        id: String,
+        side: Side,
+    },
+    Venue {
+        id: String,
+        venue: String,
+    },
     Params(String),
     Confirm(String),
     Cancel(String),
@@ -964,7 +970,10 @@ impl TelegramBot {
             if state.market.quote(&leg.venue, symbol).is_none() {
                 return BotReply::text(match lang {
                     Lang::Zh => {
-                        format!("{symbol} 在 {} 没有可用行情，无法下单。", venue_label(&leg.venue))
+                        format!(
+                            "{symbol} 在 {} 没有可用行情，无法下单。",
+                            venue_label(&leg.venue)
+                        )
                     }
                     Lang::En => {
                         format!(
@@ -1342,11 +1351,7 @@ impl TelegramBot {
                     .legs
                     .iter()
                     .map(|leg| {
-                        format!(
-                            "{} {}",
-                            venue_label(&leg.venue),
-                            side_label(lang, leg.side)
-                        )
+                        format!("{} {}", venue_label(&leg.venue), side_label(lang, leg.side))
                     })
                     .collect::<Vec<_>>()
                     .join(" / ");
@@ -1865,7 +1870,9 @@ impl TelegramBot {
             return BotReply::text(unknown_venue_text(lang, &venue));
         }
         if state.listing.manual_rule().is_some() {
-            return self.listing_preview(state, user_id, lang, &id, &venue).await;
+            return self
+                .listing_preview(state, user_id, lang, &id, &venue)
+                .await;
         }
         let wizard = ListingWizard {
             token: None,
@@ -1949,6 +1956,10 @@ impl TelegramBot {
             strategy_id: None,
             rule_id: None,
             rule_name: None,
+            system: None,
+            group_id: None,
+            unit_index: 0,
+            n_at_entry: None,
             // 电报里手动确认的下单是真实委托，不受规则下单模式影响。
             paper: false,
             skill: false,
@@ -2235,7 +2246,9 @@ impl TelegramBot {
                 if let Some(venue) = venue {
                     let id = listing_card_id();
                     self.insert_listing_card(&id, &token, symbol, side, lang);
-                    return self.listing_after_venue(state, user_id, lang, &id, &venue).await;
+                    return self
+                        .listing_after_venue(state, user_id, lang, &id, &venue)
+                        .await;
                 }
 
                 // 交易所未给出：继续用按钮引导选择方向与交易所。
@@ -2519,10 +2532,7 @@ fn parse_listing_params(
     }
     let amount = numbers[0];
     let leverage = numbers.get(1).copied().unwrap_or(current.leverage);
-    let take_profit = numbers
-        .get(2)
-        .copied()
-        .unwrap_or(current.take_profit_pct);
+    let take_profit = numbers.get(2).copied().unwrap_or(current.take_profit_pct);
     let stop_loss = numbers.get(3).copied().unwrap_or(current.stop_loss_pct);
     if amount <= Decimal::ZERO
         || leverage <= Decimal::ZERO
@@ -3091,7 +3101,10 @@ fn command_menu(lang: Lang) -> Value {
                 "open",
                 "Prepare an entry: single or hedged, needs confirmation",
             ),
-            ("listing", "Listing single-leg trades: positions and guided entry"),
+            (
+                "listing",
+                "Listing single-leg trades: positions and guided entry",
+            ),
             ("closeall", "Close everything (needs confirmation)"),
             ("close", "Close one position"),
             ("lang", "Switch the bot language"),

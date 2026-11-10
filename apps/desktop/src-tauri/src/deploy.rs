@@ -151,7 +151,10 @@ fn connect(server: &ServerConfig) -> Result<Session, String> {
                 &server.username,
                 None,
                 key,
-                server.passphrase.as_deref().filter(|value| !value.is_empty()),
+                server
+                    .passphrase
+                    .as_deref()
+                    .filter(|value| !value.is_empty()),
             )
             .map_err(|error| format!("私钥认证失败：{error}"))?;
     } else {
@@ -243,10 +246,7 @@ pub async fn server_probe(server: ServerConfig) -> Result<ProbeResult, String> {
     .map_err(|error| format!("探测任务失败：{error}"))?
 }
 
-fn deploy_script(
-    server: &ServerConfig,
-    plan: &DeployPlan,
-) -> Result<String, String> {
+fn deploy_script(server: &ServerConfig, plan: &DeployPlan) -> Result<String, String> {
     validate_plan(plan)?;
     let dir = install_dir(server)?;
     let pass_b64 = BASE64.encode(server.password.clone().unwrap_or_default());

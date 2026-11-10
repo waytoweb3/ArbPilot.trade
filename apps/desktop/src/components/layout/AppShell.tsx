@@ -11,6 +11,7 @@ import {
   Percent,
   Radar,
   Settings as SettingsIcon,
+  Sparkles,
   Store,
   Sun,
   Wallet,
@@ -88,6 +89,7 @@ export function AppShell() {
     { to: "/basis", label: t.nav.basis, icon: CalendarClock },
     { to: "/news", label: t.nav.news, icon: Newspaper, badge: unread },
     { to: "/strategies", label: t.nav.strategies, icon: Bot },
+    { to: "/skills", label: t.nav.skills, icon: Sparkles },
     { to: "/market", label: t.nav.market, icon: Store },
     { to: "/settings", label: t.nav.settings, icon: SettingsIcon },
   ];

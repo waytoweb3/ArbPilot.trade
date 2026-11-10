@@ -127,6 +127,29 @@ export type SkillKind = "event" | "breakout" | "ma_trend" | "grid";
 /** 指标类技能允许的开仓方向。 */
 export type SkillDirection = "both" | "long" | "short";
 
+/** 均线入场条件：只引用指标周期。 */
+export type MaEntry =
+  | { type: "alignment"; periods: number[] }
+  | { type: "price_above"; ma: number }
+  | { type: "pullback"; ma: number };
+
+/** 均线出场条件：任一满足即离场。 */
+export type MaExit =
+  | { type: "cross"; fast: number; slow: number }
+  | { type: "break_ma"; ma: number }
+  | { type: "atr_stop" };
+
+/** 海龟双系统：系统一 20/10、系统二 55/20。 */
+export interface TurtleSystems {
+  system1_enabled: boolean;
+  system2_enabled: boolean;
+  entry1: number;
+  exit1: number;
+  entry2: number;
+  exit2: number;
+  profit_filter: boolean;
+}
+
 /** 什么时候调用：公告条件与指标参数。 */
 export interface SkillTrigger {
   event_sources: string[];
@@ -136,38 +159,82 @@ export interface SkillTrigger {
   timeframe: string;
   /** 拉取的 K 线根数。 */
   lookback: number;
-  /** 快均线周期。 */
+  /** 快均线周期（未配置 ma_periods 时生效）。 */
   fast: number;
-  /** 慢均线周期。 */
+  /** 慢均线周期（未配置 ma_periods 时生效）。 */
   slow: number;
+  /** 参与计算的均线周期（去重升序）；为空时沿用 fast / slow。 */
+  ma_periods: number[];
+  /** 入场条件；全部满足才开仓，为空时沿用旧的快慢均线金叉逻辑。 */
+  entries: MaEntry[];
+  /** 出场条件；任一满足即离场，为空时沿用旧的均线反转逻辑。 */
+  exits: MaExit[];
   /** ATR 周期。 */
   atr: number;
   /** 唐奇安通道周期。 */
   channel: number;
   /** 止损距离 = ATR × 该倍数；0 表示不启用。 */
   atr_multiple: Decimal;
+  /** 海龟双系统参数；仅 breakout 使用。 */
+  turtle?: TurtleSystems;
 }
+
+/** 订单类型；limit 当前只保存配置，执行仍按市价。 */
+export type SkillOrderType = "market" | "limit";
 
 /** 执行步骤：下单模式、执行交易所优先级与允许方向。 */
 export interface SkillSteps {
   execution_mode: StrategyExecutionMode;
   execution_venues: string[];
   direction: SkillDirection;
+  order_type?: SkillOrderType;
 }
 
-/** 业务规则：金额、杠杆、止盈止损、最长持有、冷却与网格档位。 */
+/** 业务规则：金额、杠杆、止盈止损、风险回报与网格档位。 */
 export interface SkillBusinessRules {
   notional_usd: Decimal;
   leverage: Decimal;
+  /** 风险回报比（1:2 时填 2）；0 表示不按 ATR 止损距离推导止盈。 */
+  risk_reward: Decimal;
   take_profit_pct: Decimal;
   stop_loss_pct: Decimal;
-  /** 网格单边档位数。 */
+  /** 旧版网格单边档位数，仅用于迁移。 */
   grid_levels: number;
   /** 网格相邻档位间距（百分比，0.5 表示 0.5%）。 */
   grid_spacing_pct: Decimal;
-  /** 网格每档使用下单金额的百分比。 */
+  /** 旧版每档金额占比，仅用于迁移。 */
   grid_share_pct: Decimal;
+  /** 网格数量（区间内档位数，2..=1000）；0 表示沿用旧配置。 */
+  grid_count: number;
+  /** 网格区间下限；0 表示按现价自动推导。 */
+  grid_lower_price: Decimal;
+  /** 网格区间上限；0 表示按现价自动推导。 */
+  grid_upper_price: Decimal;
+  /** 档位间距方式。 */
+  grid_spacing_mode: GridSpacingMode;
+  /** 网格触发价；0 表示立即启动。 */
+  grid_trigger_price: Decimal;
+  /** 价格突破区间后的跟随方式。 */
+  grid_shift: GridShift;
+  /** 触发风控或下单失败时平掉该网格已有仓位。 */
+  grid_close_on_fail: boolean;
+  /** 同一币种双系统共享的最大 Unit 数。 */
+  max_units: number;
+  /** 金字塔加仓间距（N 的倍数）。 */
+  pyramid_step_n: Decimal;
+  /** 最大加仓次数。 */
+  max_pyramid_adds: number;
+  /** 同一规则最大持仓币种数；0 表示不限。 */
+  max_symbols: number;
+  /** 海龟有效杠杆上限。 */
+  max_leverage: Decimal;
+  /** 最长持有小时；0 表示不启用。 */
+  max_hold_hours: Decimal;
 }
+
+export type GridSpacingMode = "arithmetic" | "geometric";
+
+export type GridShift = "none" | "up" | "down" | "both";
 
 /** 输出格式：触发后做什么、是否发送通知。 */
 export interface SkillOutput {
@@ -179,6 +246,12 @@ export interface SkillOutput {
 export interface SkillCautions {
   max_notional_usd: Decimal;
   max_daily_opens: number;
+  /** 单笔风险占账户权益的百分比（1 表示 1%）；0 表示按 notional_usd 下单。 */
+  risk_pct: Decimal;
+  /** 同一规则最多同时持有的仓位数；0 表示不限。 */
+  max_positions: number;
+  /** 同一规则同一交易对的冷却小时数；0 表示不冷却。 */
+  cooldown_hours: Decimal;
 }
 
 /** 一条技能规则，对应一份 SKILL.md 的六个章节。 */
@@ -195,6 +268,12 @@ export interface SkillRule {
   business: SkillBusinessRules;
   output: SkillOutput;
   cautions: SkillCautions;
+  /** 来源技能库 ID；从技能库发布或导入时写入。 */
+  source_skill_id?: string | null;
+  /** 来源技能版本号。 */
+  source_skill_version?: number | null;
+  /** 来源版本里的原始规则 ID，用于升级时对齐并保留本地启停状态。 */
+  source_rule_id?: string | null;
 }
 
 export interface SkillSettings {
@@ -400,10 +479,102 @@ export interface StrategyRunsResponse {
 
 /** 技能参数运行时绑定：按稳定模板标识识别，无需沙箱模块。 */
 export interface SkillBinding {
-  /** 内置模板标识，如 `turtle-breakout`。 */
+  /** 内置模板标识，如 `turtle-breakout`；技能库版本为 `skill`。 */
   template_key: string;
   /** 冻结的技能参数；为空表示按模板补默认值。 */
   settings?: unknown | null;
+  /** 技能库版本溯源。 */
+  skill_id?: string | null;
+  skill_version?: number | null;
+  skill_sha256?: string | null;
+}
+
+/** 技能库实体：作者侧唯一事实来源。 */
+export interface Skill {
+  id: string;
+  author_id: string;
+  name: string;
+  description: string;
+  latest_version: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface SkillValidationIssue {
+  dimension: string;
+  code: string;
+  severity: "info" | "warning" | "error";
+  message: string;
+}
+
+export interface SkillValidationDimension {
+  dimension: string;
+  label: string;
+  passed: boolean;
+  errors: number;
+  warnings: number;
+  issues: SkillValidationIssue[];
+}
+
+export interface SkillValidationReport {
+  passed: boolean;
+  errors: number;
+  warnings: number;
+  summary: string;
+  dimensions: SkillValidationDimension[];
+}
+
+/** 单条规则的回测快照，随校验结果一起返回。 */
+export interface RuleBacktest {
+  rule_id: string;
+  name: string;
+  symbol: string;
+  trades: number;
+  wins: number;
+  losses: number;
+  win_rate_pct: Decimal;
+  net_pnl_usd: Decimal;
+  return_pct: Decimal;
+  max_drawdown_pct: Decimal;
+  fees_usd: Decimal;
+  slippage_usd: Decimal;
+  trades_per_day: Decimal;
+}
+
+/** 校验结果：六维报告 + 本次回测快照。 */
+export interface SkillValidationResult extends SkillValidationReport {
+  backtests: RuleBacktest[];
+}
+
+/** 不可变的技能版本。 */
+export interface SkillVersion {
+  skill_id: string;
+  version: number;
+  settings: SkillSettings;
+  settings_sha256: string;
+  validation: SkillValidationReport;
+  passed: boolean;
+  changelog: string;
+  created_at: string;
+}
+
+export interface SkillDetail {
+  skill: Skill;
+  version: SkillVersion | null;
+}
+
+export interface RuleChange {
+  rule_id: string;
+  name: string;
+  changed_fields: string[];
+  before: SkillRule;
+  after: SkillRule;
+}
+
+export interface RuleDiff {
+  added: SkillRule[];
+  removed: SkillRule[];
+  changed: RuleChange[];
 }
 
 export interface StrategyRecord {
@@ -998,6 +1169,10 @@ export interface StrategyPublication {
   artifact_sha256: string | null;
   /** 发布时冻结的技能参数绑定；存在时订阅者无需沙箱模块即可运行。 */
   skill?: SkillBinding | null;
+  /** 技能库版本溯源。 */
+  skill_id?: string | null;
+  skill_version?: number | null;
+  skill_sha256?: string | null;
   /** 发布时冻结的策略定义，订阅者导入时直接使用。 */
   definition: StrategyDefinition | null;
   changelog: StrategyChangelogEntry[];
@@ -1179,6 +1354,9 @@ export interface CreatePublicationRequest {
   source_visibility: SourceVisibility;
   visibility: MarketVisibility;
   pricing: StrategyPricing;
+  /** 绑定技能库版本发布；同一 Skill 可发布多条不同定义的策略。 */
+  skill_id?: string | null;
+  skill_version?: number | null;
 }
 
 export interface UpdatePublicationRequest {

@@ -191,6 +191,18 @@ pub struct ListingTrade {
     /// 触发这笔交易的规则名称，便于在仓位里说明来源。
     #[serde(default)]
     pub source: Option<String>,
+    /// 海龟系统编号：1 或 2；其他策略为空。
+    #[serde(default)]
+    pub system: Option<u8>,
+    /// 同一组金字塔 Units 共用的分组标识。
+    #[serde(default)]
+    pub group_id: Option<Uuid>,
+    /// 组内 Unit 序号，0 表示首仓。
+    #[serde(default)]
+    pub unit_index: u32,
+    /// 开仓时的 N 值（ATR），用于整组止损跟随最新 Unit。
+    #[serde(default)]
+    pub n_at_entry: Option<Decimal>,
     pub note: Option<String>,
     pub opened_at: DateTime<Utc>,
     pub closed_at: Option<DateTime<Utc>>,
@@ -269,6 +281,14 @@ pub struct OpenListingRequest {
     pub rule_id: Option<Uuid>,
     /// 触发开仓的规则名称，用于在仓位与交易记录里说明来源。
     pub rule_name: Option<String>,
+    /// 海龟系统编号：1 或 2；其他策略为空。
+    pub system: Option<u8>,
+    /// 同一组金字塔 Units 共用的分组标识。
+    pub group_id: Option<Uuid>,
+    /// 组内 Unit 序号，0 表示首仓。
+    pub unit_index: u32,
+    /// 开仓时的 N 值（ATR），用于整组止损跟随最新 Unit。
+    pub n_at_entry: Option<Decimal>,
     /// 模拟下单：按盘口中间价假装成交，不提交交易所。
     pub paper: bool,
     /// 技能策略触发：沿用同一套单腿交易记录，但告警按技能文案展示。
@@ -391,6 +411,11 @@ impl ListingDesk {
             .filter(|trade| trade.status.is_open())
             .cloned()
             .collect()
+    }
+
+    /// 全部交易记录，含已平仓，用于系统一盈利过滤等历史判断。
+    pub fn all_trades(&self) -> Vec<ListingTrade> {
+        self.trades.read().expect("上币交易锁不可用").clone()
     }
 
     /// 按 ID 前缀查找持仓中的交易，供电报里输入短编号。
@@ -583,6 +608,10 @@ pub async fn open_position(
         strategy_id: request.strategy_id,
         rule_id: request.rule_id,
         source: request.rule_name.clone(),
+        system: request.system,
+        group_id: request.group_id,
+        unit_index: request.unit_index,
+        n_at_entry: request.n_at_entry,
         note,
         opened_at: now,
         closed_at: None,
@@ -1015,6 +1044,10 @@ async fn auto_open(
             strategy_id: Some(strategy_id),
             rule_id: Some(rule.id),
             rule_name: Some(rule.name.clone()),
+            system: None,
+            group_id: None,
+            unit_index: 0,
+            n_at_entry: None,
             paper,
             skill: false,
             max_hold_secs: 0,
@@ -1484,6 +1517,10 @@ mod tests {
             strategy_id: None,
             rule_id: None,
             source: None,
+            system: None,
+            group_id: None,
+            unit_index: 0,
+            n_at_entry: None,
             note: None,
             opened_at: Utc::now(),
             closed_at: None,

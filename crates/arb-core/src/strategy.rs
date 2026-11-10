@@ -197,6 +197,11 @@ pub struct DataRules {
     /// 慢均线周期。
     #[serde(default = "default_slow")]
     pub slow: u32,
+    /// 参与计算的均线周期集合（去重升序）；为空表示只用 `fast` 与 `slow`。
+    ///
+    /// 指标层只负责算出这些均线，具体哪条均线参与入场/出场由策略规则决定。
+    #[serde(default)]
+    pub ma_periods: Vec<u32>,
     /// ATR 周期。
     #[serde(default = "default_atr")]
     pub atr: u32,
@@ -255,6 +260,7 @@ impl Default for DataRules {
             lookback: default_lookback(),
             fast: default_fast(),
             slow: default_slow(),
+            ma_periods: Vec::new(),
             atr: default_atr(),
             channel: default_channel(),
             event_sources: Vec::new(),
@@ -449,7 +455,10 @@ impl StrategyDefinition {
                     );
                 }
                 if !(20..=1_000).contains(&self.data.lookback) {
-                    error("data.lookback", "K 线根数必须在 20 到 1000 之间".to_string());
+                    error(
+                        "data.lookback",
+                        "K 线根数必须在 20 到 1000 之间".to_string(),
+                    );
                 }
                 if !(60..=604_800).contains(&self.data.event_window_secs) {
                     error(
@@ -467,6 +476,16 @@ impl StrategyDefinition {
                         error(path, "指标周期必须在 2 到 200 之间".to_string());
                     } else if window > self.data.lookback {
                         error(path, "指标周期不能超过 K 线根数".to_string());
+                    }
+                }
+                for period in &self.data.ma_periods {
+                    if !(2..=1_000).contains(period) {
+                        error(
+                            "data.ma_periods",
+                            "均线周期必须在 2 到 1000 之间".to_string(),
+                        );
+                    } else if *period > self.data.lookback {
+                        error("data.ma_periods", "均线周期不能超过 K 线根数".to_string());
                     }
                 }
 
@@ -1056,12 +1075,21 @@ impl StrategyRuntime {
 ///
 /// `settings` 是发布或导入时冻结的技能参数；为空表示按模板补默认值，
 /// 因此模板实例无需再编译沙箱模块。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SkillBinding {
-    /// 内置模板标识，如 `turtle-breakout`。
+    /// 内置模板标识，如 `turtle-breakout`；来自技能库时写 `skill`。
     pub template_key: String,
     #[serde(default)]
     pub settings: Option<serde_json::Value>,
+    /// 技能库里的 Skill ID；仅新版发布/导入携带。
+    #[serde(default)]
+    pub skill_id: Option<Uuid>,
+    /// 绑定的 Skill 版本号。
+    #[serde(default)]
+    pub skill_version: Option<u32>,
+    /// 冻结规则的哈希，导入时据此校验交付物未被篡改。
+    #[serde(default)]
+    pub skill_sha256: Option<String>,
 }
 
 /// 策略记录：定义 + 版本 + 校验结果 + 最近回测 + 运行时状态。
@@ -1414,10 +1442,7 @@ mod tests {
 
     #[test]
     fn strategy_code_rejects_oversized_source() {
-        let source = format!(
-            "(module {})",
-            "a".repeat(StrategyCode::MAX_SOURCE_BYTES)
-        );
+        let source = format!("(module {})", "a".repeat(StrategyCode::MAX_SOURCE_BYTES));
         let code = StrategyCode::new(Uuid::new_v4(), source, StrategyCodeOrigin::User);
         assert!(code.has_errors());
     }

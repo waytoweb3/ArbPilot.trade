@@ -26,6 +26,13 @@ import type {
   SettlementStatus,
   SkillSettings,
   SkillSettingsResponse,
+  SkillRule,
+  Skill,
+  SkillBinding,
+  SkillDetail,
+  SkillValidationResult,
+  SkillVersion,
+  RuleDiff,
   StrategyAuthorCard,
   StrategyPerformanceRecord,
   StrategyPublication,
@@ -416,6 +423,7 @@ export const api = {
     definition?: StrategyDefinition;
     name?: string;
     source?: StrategySource;
+    skill?: SkillBinding;
   }) =>
     request<StrategyRecord>("/api/v1/strategies", {
       method: "POST",
@@ -682,6 +690,91 @@ export const api = {
     request<SkillSettingsResponse>("/api/v1/skill/settings", {
       method: "PUT",
       body: JSON.stringify(settings),
+    }),
+
+  /** 技能库：作者侧 Skill 与不可变版本。 */
+  skills: (authorId?: string) =>
+    request<Skill[]>(
+      `/api/v1/skills${authorId ? `?author_id=${encodeURIComponent(authorId)}` : ""}`,
+    ),
+
+  createSkill: (body: {
+    author_id: string;
+    name: string;
+    description?: string;
+    settings?: SkillSettings;
+    markdown?: string;
+    changelog?: string;
+  }) =>
+    request<SkillDetail>("/api/v1/skills", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+
+  skill: (skillId: string) => request<SkillDetail>(`/api/v1/skills/${skillId}`),
+
+  skillVersions: (skillId: string) =>
+    request<SkillVersion[]>(`/api/v1/skills/${skillId}/versions`),
+
+  createSkillVersion: (
+    skillId: string,
+    body: {
+      settings?: SkillSettings;
+      markdown?: string;
+      changelog?: string;
+    },
+  ) =>
+    request<SkillVersion>(`/api/v1/skills/${skillId}/versions`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+
+  validateSkill: (
+    skillId: string,
+    body: { settings?: SkillSettings; markdown?: string; version?: number },
+  ) =>
+    request<SkillValidationResult>(`/api/v1/skills/${skillId}/validate`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+
+  skillDiff: (skillId: string, from: number, to: number) =>
+    request<RuleDiff>(
+      `/api/v1/skills/${skillId}/diff?from=${from}&to=${to}`,
+    ),
+
+  /** 规则实例：基于已导入策略创建、启停与升级。 */
+  strategySkillRules: (strategyId: string) =>
+    request<SkillSettings>(`/api/v1/strategies/${strategyId}/skill/rules`),
+
+  createStrategySkillRule: (strategyId: string, rule: SkillRule) =>
+    request<SkillSettings>(`/api/v1/strategies/${strategyId}/skill/rules`, {
+      method: "POST",
+      body: JSON.stringify({ rule }),
+    }),
+
+  updateStrategySkillRule: (
+    strategyId: string,
+    ruleId: string,
+    body: { enabled?: boolean; rule?: SkillRule },
+  ) =>
+    request<SkillSettings>(
+      `/api/v1/strategies/${strategyId}/skill/rules/${ruleId}`,
+      {
+        method: "PATCH",
+        body: JSON.stringify(body),
+      },
+    ),
+
+  strategySkillDiff: (strategyId: string, version: number) =>
+    request<RuleDiff>(
+      `/api/v1/strategies/${strategyId}/skill/diff?version=${version}`,
+    ),
+
+  upgradeStrategySkill: (strategyId: string, version: number) =>
+    request<SkillSettings>(`/api/v1/strategies/${strategyId}/skill/upgrade`, {
+      method: "POST",
+      body: JSON.stringify({ version }),
     }),
 
   updateRiskLimits: (limits: RiskLimits) =>

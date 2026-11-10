@@ -24,6 +24,8 @@ mod selftest;
 mod skill;
 mod skill_backtest;
 mod skill_check;
+mod skill_library;
+mod skill_turtle;
 mod sqlite_store;
 mod state;
 mod store;

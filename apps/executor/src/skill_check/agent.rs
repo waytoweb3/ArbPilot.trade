@@ -159,12 +159,8 @@ fn signal_hits(rule: &SkillRule, candles: &[SandboxCandle]) -> usize {
                 }
                 _ => None,
             },
-            SkillKind::MaTrend => match (values.sma_fast, values.sma_slow) {
-                (Some(fast), Some(slow)) => {
-                    skill::ma_trend_signal(last, fast, slow, rule.steps.direction)
-                }
-                _ => None,
-            },
+            SkillKind::MaTrend => skill::ma_entry_signal(last, &values, &rule.trigger)
+                .filter(|side| skill::direction_allows(*side, rule.steps.direction)),
             _ => None,
         };
         if signal.is_some() {
@@ -174,27 +170,35 @@ fn signal_hits(rule: &SkillRule, candles: &[SandboxCandle]) -> usize {
     hits
 }
 
-/// 网格按锚定价展开档位，统计至少触及一个允许方向档位的 K 线数量。
+/// 网格按区间展开档位，统计至少触及一个允许方向档位的 K 线数量。
 fn grid_hits(rule: &SkillRule, candles: &[SandboxCandle]) -> usize {
     let Some(anchor) = candles.first().map(|candle| candle.close) else {
         return 0;
     };
-    let (buys, sells) = skill::grid_levels(
-        anchor,
-        rule.business.grid_levels,
-        rule.business.grid_spacing_pct,
+    let Some((lower, upper)) = skill::grid_range(anchor, rule) else {
+        return 0;
+    };
+    let levels = skill::grid_price_levels(
+        lower,
+        upper,
+        rule.business.grid_count(),
+        rule.business.grid_spacing_mode,
     );
-    if buys.is_empty() && sells.is_empty() {
+    if levels.is_empty() {
         return 0;
     }
     candles
         .iter()
         .filter(|candle| {
-            let buy_hit = rule.steps.direction != SkillDirection::Short
-                && buys.iter().any(|level| candle.low <= *level);
-            let sell_hit = rule.steps.direction != SkillDirection::Long
-                && sells.iter().any(|level| candle.high >= *level);
-            buy_hit || sell_hit
+            levels.iter().any(|level| {
+                let buy_hit = *level < anchor
+                    && rule.steps.direction != SkillDirection::Short
+                    && candle.low <= *level;
+                let sell_hit = *level > anchor
+                    && rule.steps.direction != SkillDirection::Long
+                    && candle.high >= *level;
+                buy_hit || sell_hit
+            })
         })
         .count()
 }
@@ -205,6 +209,7 @@ fn data_rules(rule: &SkillRule) -> DataRules {
         lookback: rule.trigger.lookback.clamp(20, 1_000),
         fast: rule.trigger.fast.max(2),
         slow: rule.trigger.slow.max(2),
+        ma_periods: crate::skill::resolved_ma_periods(&rule.trigger),
         atr: rule.trigger.atr.max(2),
         channel: rule.trigger.channel.max(2),
         ..DataRules::default()
@@ -213,11 +218,17 @@ fn data_rules(rule: &SkillRule) -> DataRules {
 
 fn warmup_bars(rule: &SkillRule) -> usize {
     let trigger = &rule.trigger;
-    trigger
-        .slow
+    let longest_ma = trigger
+        .ma_periods
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(0)
+        .max(trigger.fast)
+        .max(trigger.slow);
+    longest_ma
         .max(trigger.channel.saturating_add(1))
         .max(trigger.atr.saturating_add(1))
-        .max(trigger.fast)
         .max(3) as usize
 }
 
@@ -260,6 +271,7 @@ mod tests {
                 execution_mode: StrategyExecutionMode::Paper,
                 execution_venues: vec!["binance".to_string()],
                 direction,
+                ..SkillSteps::default()
             },
             business: SkillBusinessRules {
                 notional_usd: rust_decimal_macros::dec!(100),
@@ -323,7 +335,7 @@ mod tests {
     fn grid_rule_touches_levels() {
         let mut rule = breakout_rule(SkillDirection::Both);
         rule.kind = SkillKind::Grid;
-        rule.business.grid_levels = 2;
+        rule.business.grid_count = 4;
         rule.business.grid_spacing_pct = rust_decimal_macros::dec!(1);
         let issues = check(&rule);
         assert!(!issues

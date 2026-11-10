@@ -11,11 +11,19 @@ use crate::{
 pub fn compute(candles: &[SandboxCandle], rules: &DataRules) -> SandboxIndicators {
     let closes: Vec<Decimal> = candles.iter().map(|candle| candle.close).collect();
     let channel = donchian(candles, rules.channel);
+    // 指标层只算配置里出现的均线周期；规则层再按周期引用它们。
+    let mut sma_by_period = std::collections::BTreeMap::new();
+    for period in &rules.ma_periods {
+        if let Some(value) = sma(&closes, *period) {
+            sma_by_period.insert(*period, value);
+        }
+    }
     SandboxIndicators {
         sma_fast: sma(&closes, rules.fast),
         sma_slow: sma(&closes, rules.slow),
         ema_fast: ema(&closes, rules.fast),
         ema_slow: ema(&closes, rules.slow),
+        sma_by_period,
         atr: atr(candles, rules.atr),
         channel_high: channel.map(|(high, _)| high),
         channel_low: channel.map(|(_, low)| low),
@@ -73,7 +81,7 @@ fn true_range(candle: &SandboxCandle, previous_close: Decimal) -> Decimal {
 /// 唐奇安通道：取最新一根之前 `period` 根的最高价与最低价。
 ///
 /// 排除最新一根，避免当前 K 线用自身的高点触发突破信号。
-fn donchian(candles: &[SandboxCandle], period: u32) -> Option<(Decimal, Decimal)> {
+pub fn donchian(candles: &[SandboxCandle], period: u32) -> Option<(Decimal, Decimal)> {
     if period < 2 {
         return None;
     }

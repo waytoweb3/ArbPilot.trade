@@ -24,13 +24,14 @@ use arb_core::{
     StrategyStatus,
 };
 use chrono::Utc;
-use rust_decimal::Decimal;
+use rust_decimal::{prelude::ToPrimitive, Decimal};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
     events::{AlertLevel, ExecutorEvent},
     listing::{self, CloseReason, OpenListingRequest},
+    skill_turtle,
     state::AppState,
     store::Store,
 };
@@ -45,8 +46,8 @@ const NEWS_SCAN_LIMIT: usize = 40;
 /// 事件窗口的合法范围，与 `DataRules.event_window_secs` 保持一致。
 pub const MIN_EVENT_WINDOW_SECS: i64 = 60;
 pub const MAX_EVENT_WINDOW_SECS: i64 = 7 * 24 * 60 * 60;
-/// 网格档位数量上限，避免配置失误一次性挂出过多档位。
-pub const MAX_GRID_LEVELS: u32 = 20;
+/// 网格档位数量上限，与交易所网格的数量范围保持一致。
+pub const MAX_GRID_LEVELS: u32 = 1_000;
 
 /// 公告类技能的内置触发关键词。
 ///
@@ -109,6 +110,73 @@ pub enum SkillDirection {
     Short,
 }
 
+/// 海龟双系统参数：系统一 20/10、系统二 55/20，可分别启停。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TurtleSystems {
+    pub system1_enabled: bool,
+    pub system2_enabled: bool,
+    /// 系统一入场突破周期。
+    pub entry1: u32,
+    /// 系统一退出突破周期。
+    pub exit1: u32,
+    /// 系统二入场突破周期。
+    pub entry2: u32,
+    /// 系统二退出突破周期。
+    pub exit2: u32,
+    /// 系统一上一笔盈利后跳过下一次入场信号。
+    pub profit_filter: bool,
+}
+
+impl Default for TurtleSystems {
+    fn default() -> Self {
+        Self {
+            system1_enabled: true,
+            system2_enabled: true,
+            entry1: 20,
+            exit1: 10,
+            entry2: 55,
+            exit2: 20,
+            profit_filter: true,
+        }
+    }
+}
+
+/// 订单类型；限价单当前只持久化，执行链路仍按市价成交。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillOrderType {
+    #[default]
+    Market,
+    Limit,
+}
+
+/// 网格档位的间距方式，对应交易所的「等差 / 等比」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GridSpacingMode {
+    /// 等差：相邻档位的价差相同。
+    #[default]
+    Arithmetic,
+    /// 等比：相邻档位的涨跌幅相同。
+    Geometric,
+}
+
+/// 价格突破网格区间后的跟随方式，对应交易所的「上移 / 下移」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GridShift {
+    /// 区间固定，突破后不再跟随。
+    #[default]
+    None,
+    /// 价格向上突破时整体上移区间。
+    Up,
+    /// 价格向下突破时整体下移区间。
+    Down,
+    /// 向上、向下都跟随。
+    Both,
+}
+
 /// 「什么时候调用」：公告条件与指标参数都放在这一章。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -127,12 +195,46 @@ pub struct SkillTrigger {
     pub fast: u32,
     /// 慢均线周期。
     pub slow: u32,
+    /// 参与计算的均线周期集合（去重升序）；为空时沿用 `fast` 与 `slow`。
+    ///
+    /// 这里只声明「要算哪几条均线」，哪条均线用于入场/出场由 `entries` / `exits` 决定。
+    pub ma_periods: Vec<u32>,
+    /// 均线入场条件；全部满足才开仓，为空时沿用旧的快慢均线金叉逻辑。
+    pub entries: Vec<MaEntry>,
+    /// 均线出场条件；任一满足即离场，为空时沿用旧的均线反转逻辑。
+    pub exits: Vec<MaExit>,
     /// ATR 周期。
     pub atr: u32,
     /// 唐奇安通道周期。
     pub channel: u32,
     /// 止损距离 = ATR × 该倍数；0 表示不启用 ATR 止损。
     pub atr_multiple: Decimal,
+    /// 海龟双系统参数；仅 `breakout` 使用。
+    pub turtle: TurtleSystems,
+}
+
+/// 均线入场条件：只引用指标周期，不重复实现指标算法。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum MaEntry {
+    /// 多头/空头排列：按周期从短到长，短均线依次高于长均线做多，反之做空。
+    Alignment { periods: Vec<u32> },
+    /// 价格站上/跌破指定均线。
+    PriceAbove { ma: u32 },
+    /// 回踩指定均线：价格距均线不超过 1 倍 ATR 时顺势入场。
+    Pullback { ma: u32 },
+}
+
+/// 均线出场条件：任一满足即离场。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum MaExit {
+    /// 快慢均线反向（死叉/金叉）。
+    Cross { fast: u32, slow: u32 },
+    /// 收盘价跌破/升破指定均线。
+    BreakMa { ma: u32 },
+    /// ATR 止损，倍数取 `trigger.atr_multiple`。
+    AtrStop,
 }
 
 impl Default for SkillTrigger {
@@ -145,11 +247,32 @@ impl Default for SkillTrigger {
             lookback: 200,
             fast: 20,
             slow: 55,
+            ma_periods: Vec::new(),
+            entries: Vec::new(),
+            exits: Vec::new(),
             atr: 20,
             channel: 20,
             atr_multiple: Decimal::from(2),
+            turtle: TurtleSystems::default(),
         }
     }
+}
+
+/// 实际参与计算的均线周期：去重升序；旧配置没有新字段时回落到 `fast` / `slow`。
+pub fn resolved_ma_periods(trigger: &SkillTrigger) -> Vec<u32> {
+    let mut periods: Vec<u32> = trigger
+        .ma_periods
+        .iter()
+        .copied()
+        .filter(|period| *period >= 2)
+        .collect();
+    if periods.is_empty() {
+        periods.push(trigger.fast.max(2));
+        periods.push(trigger.slow.max(2));
+    }
+    periods.sort_unstable();
+    periods.dedup();
+    periods
 }
 
 /// 「执行步骤」：下单模式、执行交易所优先级与允许方向。
@@ -162,6 +285,8 @@ pub struct SkillSteps {
     pub execution_venues: Vec<String>,
     /// 指标类技能允许的开仓方向；公告类技能固定做多。
     pub direction: SkillDirection,
+    /// 订单类型；限价单当前只保存配置，实际仍按市价执行。
+    pub order_type: SkillOrderType,
 }
 
 impl Default for SkillSteps {
@@ -170,26 +295,55 @@ impl Default for SkillSteps {
             execution_mode: StrategyExecutionMode::Real,
             execution_venues: Vec::new(),
             direction: SkillDirection::Long,
+            order_type: SkillOrderType::Market,
         }
     }
 }
 
-/// 「业务规则」：金额、杠杆、止盈止损与网格档位。
+/// 「业务规则」：金额、杠杆、止盈止损、风险回报与网格档位。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SkillBusinessRules {
     pub notional_usd: Decimal,
     pub leverage: Decimal,
+    /// 风险回报比（1:2 时填 2）；0 表示不按 ATR 止损距离推导止盈。
+    pub risk_reward: Decimal,
     /// 止盈百分比（20 表示 +20%）；0 表示不启用。
     pub take_profit_pct: Decimal,
     /// 止损百分比（10 表示 -10%）；0 表示不启用。
     pub stop_loss_pct: Decimal,
-    /// 网格单边档位数。
+    /// 旧版网格单边档位数；`grid_count` 为空时按 `grid_levels × 2` 迁移。
     pub grid_levels: u32,
-    /// 网格相邻档位间距（百分比，0.5 表示 0.5%）。
+    /// 网格相邻档位间距（百分比，0.5 表示 0.5%）；未配置价格区间时用它推导区间。
     pub grid_spacing_pct: Decimal,
-    /// 网格每档使用下单金额的百分比（25 表示 25%）。
+    /// 旧版每档金额占比；现在按网格数量自动均分，仅保留字段兼容历史配置。
     pub grid_share_pct: Decimal,
+    /// 网格数量（区间内的档位数，2..=MAX_GRID_LEVELS）；0 表示沿用旧配置。
+    pub grid_count: u32,
+    /// 网格区间下限；为 0 时按现价与档位间距自动推导。
+    pub grid_lower_price: Decimal,
+    /// 网格区间上限；为 0 时按现价与档位间距自动推导。
+    pub grid_upper_price: Decimal,
+    /// 档位间距方式：等差或等比。
+    pub grid_spacing_mode: GridSpacingMode,
+    /// 网格触发价；为 0 表示立即启动。
+    pub grid_trigger_price: Decimal,
+    /// 价格突破区间后的跟随方式。
+    pub grid_shift: GridShift,
+    /// 触发风控或下单失败时，平掉该网格已有的仓位。
+    pub grid_close_on_fail: bool,
+    /// 同一币种双系统共享的最大 Unit 数。
+    pub max_units: u32,
+    /// 金字塔加仓间距（N 的倍数）。
+    pub pyramid_step_n: Decimal,
+    /// 最大加仓次数。
+    pub max_pyramid_adds: u32,
+    /// 同一规则最大持仓币种数；0 表示不限。
+    pub max_symbols: u32,
+    /// 海龟有效杠杆上限。
+    pub max_leverage: Decimal,
+    /// 最长持有小时；0 表示不启用。
+    pub max_hold_hours: Decimal,
 }
 
 impl Default for SkillBusinessRules {
@@ -197,12 +351,43 @@ impl Default for SkillBusinessRules {
         Self {
             notional_usd: Decimal::from(100),
             leverage: Decimal::ONE,
+            risk_reward: Decimal::ZERO,
             take_profit_pct: Decimal::from(20),
             stop_loss_pct: Decimal::from(10),
             grid_levels: 3,
             grid_spacing_pct: Decimal::new(5, 1),
             grid_share_pct: Decimal::from(25),
+            grid_count: 0,
+            grid_lower_price: Decimal::ZERO,
+            grid_upper_price: Decimal::ZERO,
+            grid_spacing_mode: GridSpacingMode::Arithmetic,
+            grid_trigger_price: Decimal::ZERO,
+            grid_shift: GridShift::None,
+            grid_close_on_fail: false,
+            max_units: 4,
+            pyramid_step_n: Decimal::new(5, 1),
+            max_pyramid_adds: 3,
+            max_symbols: 3,
+            max_leverage: Decimal::from(3),
+            max_hold_hours: Decimal::ZERO,
         }
+    }
+}
+
+impl SkillBusinessRules {
+    /// 网格实际档位数：新配置用 `grid_count`，旧配置回落到 `grid_levels × 2`。
+    pub fn grid_count(&self) -> u32 {
+        let count = if self.grid_count >= 2 {
+            self.grid_count
+        } else {
+            self.grid_levels.saturating_mul(2).max(2)
+        };
+        count.clamp(2, MAX_GRID_LEVELS)
+    }
+
+    /// 每档名义金额占比：总投资额按档位数均分。
+    pub fn grid_share(&self) -> Decimal {
+        Decimal::ONE / Decimal::from(self.grid_count())
     }
 }
 
@@ -231,6 +416,12 @@ pub struct SkillCautions {
     pub max_notional_usd: Decimal,
     /// 每条规则每天最多开仓次数；0 表示不限。
     pub max_daily_opens: u32,
+    /// 单笔风险占账户权益的百分比（1 表示 1%）；0 表示按 `notional_usd` 下单。
+    pub risk_pct: Decimal,
+    /// 同一规则最多同时持有的仓位数；0 表示不限。
+    pub max_positions: u32,
+    /// 同一规则同一交易对的冷却小时数；0 表示不冷却。
+    pub cooldown_hours: Decimal,
 }
 
 impl Default for SkillCautions {
@@ -238,6 +429,9 @@ impl Default for SkillCautions {
         Self {
             max_notional_usd: Decimal::ZERO,
             max_daily_opens: 0,
+            risk_pct: Decimal::ZERO,
+            max_positions: 0,
+            cooldown_hours: Decimal::ZERO,
         }
     }
 }
@@ -264,6 +458,15 @@ pub struct SkillRule {
     pub output: SkillOutput,
     /// 注意事项。
     pub cautions: SkillCautions,
+    /// 来源 Skill；从技能库发布或导入时写入，本地新建规则为空。
+    #[serde(default)]
+    pub source_skill_id: Option<Uuid>,
+    /// 来源 Skill 版本号。
+    #[serde(default)]
+    pub source_skill_version: Option<u32>,
+    /// 来源版本里的原始规则 ID，用于升级时对齐规则并保留本地启用状态。
+    #[serde(default)]
+    pub source_rule_id: Option<Uuid>,
 }
 
 impl Default for SkillRule {
@@ -279,6 +482,9 @@ impl Default for SkillRule {
             business: SkillBusinessRules::default(),
             output: SkillOutput::default(),
             cautions: SkillCautions::default(),
+            source_skill_id: None,
+            source_skill_version: None,
+            source_rule_id: None,
         }
     }
 }
@@ -315,6 +521,39 @@ impl SkillSettings {
                     .all(|keyword| keyword.trim().is_empty())
             {
                 rule.trigger.event_keywords = default_event_keywords();
+            }
+            // 均线周期以指标集合为准：去重升序，旧配置回落到 fast/slow。
+            if rule.kind == SkillKind::MaTrend {
+                rule.trigger.ma_periods = resolved_ma_periods(&rule.trigger);
+            }
+            // 海龟参数兜底：周期、Unit 与加仓次数保持可用。
+            if rule.kind == SkillKind::Breakout {
+                let turtle = &mut rule.trigger.turtle;
+                if turtle.entry1 < 2 {
+                    turtle.entry1 = 20;
+                }
+                if turtle.exit1 < 2 {
+                    turtle.exit1 = 10;
+                }
+                if turtle.entry2 < 2 {
+                    turtle.entry2 = 55;
+                }
+                if turtle.exit2 < 2 {
+                    turtle.exit2 = 20;
+                }
+                if rule.business.max_units < 1 {
+                    rule.business.max_units = 4;
+                }
+                let max_adds = rule.business.max_units.saturating_sub(1);
+                if rule.business.max_pyramid_adds > max_adds {
+                    rule.business.max_pyramid_adds = max_adds;
+                }
+                if rule.business.pyramid_step_n <= Decimal::ZERO {
+                    rule.business.pyramid_step_n = Decimal::new(5, 1);
+                }
+                if rule.business.max_leverage <= Decimal::ZERO {
+                    rule.business.max_leverage = rule.business.leverage.max(Decimal::ONE);
+                }
             }
             // 「只通知不下单」已从输出格式移除，迁移为模拟开仓：
             // 既不会真实下单，也不会出现界面显示开仓而运行期不下单。
@@ -369,6 +608,19 @@ pub fn kind_from_name(name: &str) -> Option<SkillKind> {
 
 /// 记录的技能触发方式：优先模板标识，兼容未回填的历史记录。
 fn kind_for(record: &StrategyRecord) -> Option<SkillKind> {
+    // 技能库版本使用通用 `skill` 标识，真实触发方式写在冻结规则里。
+    let from_library = record
+        .skill
+        .as_ref()
+        .map(|skill| skill.skill_id.is_some() || skill.template_key == "skill")
+        .unwrap_or(false);
+    if from_library {
+        if let Some(kind) = frozen_settings(record)
+            .and_then(|settings| settings.rules.first().map(|rule| rule.kind))
+        {
+            return Some(kind);
+        }
+    }
     record
         .skill
         .as_ref()
@@ -376,9 +628,24 @@ fn kind_for(record: &StrategyRecord) -> Option<SkillKind> {
         .or_else(|| kind_from_name(&record.definition.name))
 }
 
+/// 发布时冻结在绑定里的技能参数；没有参数或参数为空时返回 None。
+///
+/// 第三方技能没有内置模板标识，执行时完全以这份冻结参数为准。
+fn frozen_settings(record: &StrategyRecord) -> Option<SkillSettings> {
+    record
+        .skill
+        .as_ref()
+        .and_then(|skill| skill.settings.clone())
+        .and_then(|value| serde_json::from_value::<SkillSettings>(value).ok())
+        .filter(|settings| !settings.rules.is_empty())
+}
+
 /// 是否是技能运行时接管的策略；沙箱模块对它们不参与运行。
+///
+/// 除内置模板外，任何携带冻结规则参数的技能绑定都由技能运行时接管，
+/// 这样第三方技能无需新增模板标识即可执行。
 pub fn manages(record: &StrategyRecord) -> bool {
-    kind_for(record).is_some()
+    frozen_settings(record).is_some() || kind_for(record).is_some()
 }
 
 /// 按触发方式生成一条默认规则，参数与改造前的内置模板保持一致。
@@ -408,28 +675,58 @@ pub fn default_settings(kind: SkillKind, leverage: Decimal) -> SkillSettings {
             rule.trigger.atr_multiple = Decimal::from(2);
             rule.business.take_profit_pct = Decimal::ZERO;
             rule.business.stop_loss_pct = Decimal::ZERO;
+            rule.business.max_units = 4;
+            rule.business.pyramid_step_n = Decimal::new(5, 1);
+            rule.business.max_pyramid_adds = 3;
+            rule.business.max_symbols = 3;
+            rule.business.max_leverage = Decimal::from(3);
+            rule.business.max_hold_hours = Decimal::ZERO;
+            rule.cautions.risk_pct = Decimal::new(5, 1);
+            rule.cautions.cooldown_hours = Decimal::from(24);
         }
         SkillKind::MaTrend => {
             rule.name = "均线趋势".to_string();
-            rule.purpose = "快慢均线多头排列做多、空头排列做空，均线反转离场。".to_string();
+            rule.purpose =
+                "均线多头排列且回踩 MA20 做多、空头排列同理做空，跌破 MA20 或 ATR 止损离场。"
+                    .to_string();
             rule.trigger.timeframe = "1h".to_string();
-            rule.trigger.lookback = 200;
-            rule.trigger.fast = 20;
-            rule.trigger.slow = 55;
+            rule.trigger.lookback = 300;
+            rule.trigger.fast = 5;
+            rule.trigger.slow = 20;
+            rule.trigger.atr = 14;
+            rule.trigger.atr_multiple = Decimal::from(2);
+            rule.trigger.ma_periods = vec![5, 10, 20, 50];
+            rule.trigger.entries = vec![
+                MaEntry::Alignment {
+                    periods: vec![5, 10, 20, 50],
+                },
+                MaEntry::PriceAbove { ma: 20 },
+                MaEntry::Pullback { ma: 20 },
+            ];
+            rule.trigger.exits = vec![MaExit::BreakMa { ma: 20 }, MaExit::AtrStop];
+            rule.cautions.risk_pct = Decimal::ONE;
+            rule.business.risk_reward = Decimal::from(2);
+            rule.cautions.max_positions = 3;
+            rule.cautions.cooldown_hours = Decimal::from(4);
             rule.business.take_profit_pct = Decimal::ZERO;
             rule.business.stop_loss_pct = Decimal::ZERO;
         }
         SkillKind::Grid => {
             rule.name = "网格".to_string();
             rule.purpose =
-                "现价上下按固定间距布置档位，价格触及后单腿开仓，到达下一档止盈。".to_string();
+                "在价格区间内按等差或等比布置档位，价格触及后单腿开仓，到达相邻档位止盈。"
+                    .to_string();
             rule.trigger.timeframe = "5m".to_string();
             rule.trigger.lookback = 200;
-            rule.business.take_profit_pct = Decimal::new(5, 1);
+            // 网格默认中性：区间下方买入、上方卖出。
+            rule.steps.direction = SkillDirection::Both;
+            rule.business.take_profit_pct = Decimal::ZERO;
             rule.business.stop_loss_pct = Decimal::ZERO;
-            rule.business.grid_levels = 3;
+            rule.business.grid_count = 10;
+            rule.business.grid_levels = 5;
             rule.business.grid_spacing_pct = Decimal::new(5, 1);
-            rule.business.grid_share_pct = Decimal::from(25);
+            rule.business.grid_share_pct = Decimal::from(10);
+            rule.business.grid_spacing_mode = GridSpacingMode::Arithmetic;
         }
     }
     SkillSettings { rules: vec![rule] }
@@ -457,6 +754,7 @@ fn from_listing(settings: &listing::ListingSettings) -> SkillSettings {
                     execution_mode: rule.execution_mode,
                     execution_venues: rule.execution_venues.clone(),
                     direction: SkillDirection::Long,
+                    ..SkillSteps::default()
                 },
                 business: SkillBusinessRules {
                     notional_usd: rule.notional_usd,
@@ -467,25 +765,128 @@ fn from_listing(settings: &listing::ListingSettings) -> SkillSettings {
                 },
                 output: SkillOutput::default(),
                 cautions: SkillCautions::default(),
+                source_skill_id: None,
+                source_skill_version: None,
+                source_rule_id: None,
             })
             .collect(),
     }
 }
 
-/// 网格档位状态：锚定价与两侧成交标记。
+/// 网格档位状态：区间、档位方向与成交标记。
 struct GridState {
-    anchor: Decimal,
-    buys: Vec<bool>,
-    sells: Vec<bool>,
+    /// 当前生效的档位数，配置变化时据此重建。
+    count: u32,
+    lower: Decimal,
+    upper: Decimal,
+    /// 跟随突破后锁定的区间；重启或档位数变化时清空。
+    range_override: Option<(Decimal, Decimal)>,
+    /// 升序档位价。
+    levels: Vec<Decimal>,
+    /// 每个档位的开仓方向；`None` 表示该档位在当前方向设置下不交易。
+    sides: Vec<Option<Side>>,
+    filled: Vec<bool>,
+    /// 是否已到达触发价。
+    armed: bool,
+    /// 到达触发价前的等待方向：Buy 等价格跌到触发价，Sell 等涨到。
+    arm_on: Option<Side>,
 }
 
 impl GridState {
-    fn new(anchor: Decimal, levels: usize) -> Self {
-        Self {
-            anchor,
-            buys: vec![false; levels],
-            sells: vec![false; levels],
+    /// 首次评估：按配置决定是否等待触发价，未等待时立即布置档位。
+    fn new(rule: &SkillRule, price: Decimal) -> Self {
+        let trigger = rule.business.grid_trigger_price;
+        let (armed, arm_on) = if trigger > Decimal::ZERO {
+            if trigger < price {
+                (false, Some(Side::Buy))
+            } else if trigger > price {
+                (false, Some(Side::Sell))
+            } else {
+                (true, None)
+            }
+        } else {
+            (true, None)
+        };
+        let mut state = Self {
+            count: rule.business.grid_count(),
+            lower: Decimal::ZERO,
+            upper: Decimal::ZERO,
+            range_override: None,
+            levels: Vec::new(),
+            sides: Vec::new(),
+            filled: Vec::new(),
+            armed,
+            arm_on,
+        };
+        if armed {
+            state.fill(rule, price);
         }
+        state
+    }
+
+    /// 按配置区间（缺失时按现价推导）重新布置档位，并清空成交标记。
+    fn fill(&mut self, rule: &SkillRule, price: Decimal) {
+        let range = self.range_override.or_else(|| grid_range(price, rule));
+        let Some((lower, upper)) = range else {
+            self.levels.clear();
+            self.sides.clear();
+            self.filled.clear();
+            return;
+        };
+        self.apply(rule, lower, upper, price);
+    }
+
+    /// 用给定区间重建档位；价格上涨/下跌跟随也走这条路径。
+    fn apply(&mut self, rule: &SkillRule, lower: Decimal, upper: Decimal, price: Decimal) {
+        self.lower = lower;
+        self.upper = upper;
+        self.count = rule.business.grid_count();
+        self.levels = grid_price_levels(lower, upper, self.count, rule.business.grid_spacing_mode);
+        self.sides = self
+            .levels
+            .iter()
+            .map(|level| {
+                if *level < price && rule.steps.direction != SkillDirection::Short {
+                    Some(Side::Buy)
+                } else if *level > price && rule.steps.direction != SkillDirection::Long {
+                    Some(Side::Sell)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        // 不可交易的档位直接视为已处理，避免「全部成交」判断永远不成立。
+        self.filled = self.sides.iter().map(|side| side.is_none()).collect();
+    }
+
+    /// 到达触发价：立即按当前价布置档位。
+    fn arm(&mut self, rule: &SkillRule, price: Decimal) {
+        self.armed = true;
+        self.arm_on = None;
+        self.fill(rule, price);
+    }
+
+    /// 价格突破区间时按方向整体平移，保留区间宽度与档位数。
+    fn follow(&mut self, rule: &SkillRule, price: Decimal) {
+        if self.levels.is_empty() {
+            return;
+        }
+        let up = matches!(rule.business.grid_shift, GridShift::Up | GridShift::Both)
+            && price > self.upper;
+        let down = matches!(rule.business.grid_shift, GridShift::Down | GridShift::Both)
+            && price < self.lower;
+        if !up && !down {
+            return;
+        }
+        let delta = if up {
+            price - self.upper
+        } else {
+            price - self.lower
+        };
+        let lower = self.lower + delta;
+        let upper = self.upper + delta;
+        self.range_override = Some((lower, upper));
+        self.apply(rule, lower, upper, price);
     }
 }
 
@@ -499,6 +900,8 @@ pub struct SkillDesk {
     seen: Mutex<HashSet<String>>,
     /// 每条规则当天的开仓次数。
     daily: Mutex<HashMap<String, (String, u32)>>,
+    /// 冷却时间：键为「策略 + 规则 + 交易对」，值为上次开仓时间。
+    cooldown: Mutex<HashMap<String, chrono::DateTime<Utc>>>,
     /// 网格档位：键为「策略 + 规则 + 交易对」。
     grids: Mutex<HashMap<String, GridState>>,
 }
@@ -519,6 +922,7 @@ impl SkillDesk {
             default_leverage,
             seen: Mutex::new(HashSet::new()),
             daily: Mutex::new(HashMap::new()),
+            cooldown: Mutex::new(HashMap::new()),
             grids: Mutex::new(HashMap::new()),
         })
     }
@@ -587,82 +991,179 @@ impl SkillDesk {
         true
     }
 
-    /// 计算本轮触发的网格档位；首次或全部档位成交后按现价重建。
-    fn grid_triggers(&self, key: &str, price: Decimal, rule: &SkillRule) -> Vec<(Side, Decimal)> {
-        let levels = rule.business.grid_levels.clamp(1, MAX_GRID_LEVELS) as usize;
-        let step = rule.business.grid_spacing_pct / Decimal::from(100);
-        if step <= Decimal::ZERO || price <= Decimal::ZERO {
+    /// 是否仍在冷却时间内：`hours` 为 0 表示不冷却。
+    fn in_cooldown(&self, key: &str, hours: Decimal) -> bool {
+        if hours <= Decimal::ZERO {
+            return false;
+        }
+        let Some(minutes) = (hours * Decimal::from(60)).to_i64() else {
+            return false;
+        };
+        if minutes <= 0 {
+            return false;
+        }
+        let cooldown = self.cooldown.lock().expect("技能冷却锁不可用");
+        cooldown
+            .get(key)
+            .is_some_and(|last| Utc::now().signed_duration_since(*last).num_minutes() < minutes)
+    }
+
+    /// 记录一次成功开仓，用于计算冷却时间。
+    fn mark_open(&self, key: &str) {
+        self.cooldown
+            .lock()
+            .expect("技能冷却锁不可用")
+            .insert(key.to_string(), Utc::now());
+    }
+
+    /// 计算本轮触发的网格档位：返回（方向、档位价、到相邻档位的止盈百分比）。
+    ///
+    /// 一轮最多触发一个档位，避免单次价格跳变时同时打出大量市价单。
+    fn grid_triggers(
+        &self,
+        key: &str,
+        price: Decimal,
+        rule: &SkillRule,
+    ) -> Vec<(Side, Decimal, Decimal)> {
+        if price <= Decimal::ZERO {
             return Vec::new();
         }
+        let count = rule.business.grid_count();
         let mut grids = self.grids.lock().expect("技能网格状态锁不可用");
         let state = grids
             .entry(key.to_string())
-            .or_insert_with(|| GridState::new(price, levels));
-        if state.buys.len() != levels {
-            *state = GridState::new(price, levels);
+            .or_insert_with(|| GridState::new(rule, price));
+        if state.count != count {
+            *state = GridState::new(rule, price);
         }
-        if state.buys.iter().all(|filled| *filled) && state.sells.iter().all(|filled| *filled) {
-            *state = GridState::new(price, levels);
+        // 等待触发价：未到达前不布置档位。
+        if !state.armed {
+            let reached = match state.arm_on {
+                Some(Side::Buy) => price <= rule.business.grid_trigger_price,
+                Some(Side::Sell) => price >= rule.business.grid_trigger_price,
+                None => true,
+            };
+            if !reached {
+                return Vec::new();
+            }
+            state.arm(rule, price);
         }
-        let anchor = state.anchor;
-        let (buy_levels, sell_levels) = grid_levels(
-            anchor,
-            rule.business.grid_levels,
-            rule.business.grid_spacing_pct,
-        );
-        let mut hits = Vec::new();
-        if rule.steps.direction != SkillDirection::Short {
-            for (index, filled) in state.buys.iter_mut().enumerate() {
-                if *filled {
-                    continue;
-                }
-                let Some(level) = buy_levels.get(index).copied() else {
-                    continue;
-                };
-                if price <= level {
-                    *filled = true;
-                    hits.push((Side::Buy, level));
-                }
+        // 价格突破区间时按配置跟随。
+        state.follow(rule, price);
+        // 全部档位成交后按现价重建，让网格继续滚动。
+        if state.filled.iter().all(|filled| *filled) {
+            state.arm(rule, price);
+        }
+        if state.levels.is_empty() {
+            return Vec::new();
+        }
+        let mut best: Option<(usize, Side, Decimal, Decimal)> = None;
+        for (index, level) in state.levels.iter().enumerate() {
+            if state.filled[index] {
+                continue;
+            }
+            let Some(side) = state.sides[index] else {
+                continue;
+            };
+            let hit = match side {
+                Side::Buy => price <= *level,
+                Side::Sell => price >= *level,
+            };
+            if !hit {
+                continue;
+            }
+            let take_profit = grid_take_profit(rule, &state.levels, index, side);
+            let distance = (*level - price).abs();
+            if best.is_none_or(|(_, _, _, best_distance)| distance < best_distance) {
+                best = Some((index, side, *level, take_profit));
             }
         }
-        if rule.steps.direction != SkillDirection::Long {
-            for (index, filled) in state.sells.iter_mut().enumerate() {
-                if *filled {
-                    continue;
-                }
-                let Some(level) = sell_levels.get(index).copied() else {
-                    continue;
-                };
-                if price >= level {
-                    *filled = true;
-                    hits.push((Side::Sell, level));
-                }
-            }
-        }
-        hits
+        let Some((index, side, level, take_profit)) = best else {
+            return Vec::new();
+        };
+        state.filled[index] = true;
+        vec![(side, level, take_profit)]
     }
 }
 
-/// 网格档位价：围绕锚定价按固定百分比间距展开，返回（买档、卖档），都由近到远。
+/// 到相邻档位的止盈百分比：买档看上一档，卖档看下一档。
+fn grid_take_profit(rule: &SkillRule, levels: &[Decimal], index: usize, side: Side) -> Decimal {
+    let target = match side {
+        Side::Buy => levels.get(index + 1),
+        Side::Sell => index.checked_sub(1).and_then(|prev| levels.get(prev)),
+    };
+    match (target, levels.get(index)) {
+        (Some(target), Some(level)) if *level > Decimal::ZERO => {
+            let change = if side == Side::Buy {
+                *target - *level
+            } else {
+                *level - *target
+            };
+            (change / *level * Decimal::from(100)).max(Decimal::ZERO)
+        }
+        _ => rule.business.grid_spacing_pct,
+    }
+}
+
+/// 网格区间：配置了上下限就用配置值，否则按现价与档位间距推导。
+pub fn grid_range(price: Decimal, rule: &SkillRule) -> Option<(Decimal, Decimal)> {
+    let business = &rule.business;
+    if business.grid_lower_price > Decimal::ZERO
+        && business.grid_upper_price > business.grid_lower_price
+    {
+        return Some((business.grid_lower_price, business.grid_upper_price));
+    }
+    if price <= Decimal::ZERO {
+        return None;
+    }
+    let step = business.grid_spacing_pct / Decimal::from(100);
+    if step <= Decimal::ZERO {
+        return None;
+    }
+    let half = step * Decimal::from(business.grid_count()) / Decimal::from(2);
+    let lower = price * (Decimal::ONE - half);
+    let upper = price * (Decimal::ONE + half);
+    (lower > Decimal::ZERO && upper > lower).then_some((lower, upper))
+}
+
+/// 在区间内按等差或等比生成升序档位。
 ///
 /// 抽成纯函数便于校验器用固定输入核对档位计算，不必启动行情与下单链路。
-pub fn grid_levels(
-    anchor: Decimal,
-    levels: u32,
-    spacing_pct: Decimal,
-) -> (Vec<Decimal>, Vec<Decimal>) {
-    let levels = levels.clamp(1, MAX_GRID_LEVELS);
-    let step = spacing_pct / Decimal::from(100);
-    if step <= Decimal::ZERO || anchor <= Decimal::ZERO {
-        return (Vec::new(), Vec::new());
+pub fn grid_price_levels(
+    lower: Decimal,
+    upper: Decimal,
+    count: u32,
+    mode: GridSpacingMode,
+) -> Vec<Decimal> {
+    if lower <= Decimal::ZERO || upper <= lower {
+        return Vec::new();
     }
-    let buys = (1..=levels)
-        .map(|index| anchor * (Decimal::ONE - step * Decimal::from(index)))
-        .collect();
-    let sells = (1..=levels)
-        .map(|index| anchor * (Decimal::ONE + step * Decimal::from(index)))
-        .collect();
-    (buys, sells)
+    let count = count.clamp(2, MAX_GRID_LEVELS) as usize;
+    let span = upper - lower;
+    let slots = Decimal::from(count - 1);
+    match mode {
+        GridSpacingMode::Arithmetic => (0..count)
+            .map(|index| lower + span * Decimal::from(index) / slots)
+            .collect(),
+        GridSpacingMode::Geometric => {
+            // 等比档位用浮点求公比，再逐档复利；首尾强制等于区间端点。
+            let lower_f64 = lower.to_f64().unwrap_or(1.0);
+            let upper_f64 = upper.to_f64().unwrap_or(1.0);
+            let ratio = Decimal::try_from((upper_f64 / lower_f64).powf(1.0 / (count - 1) as f64))
+                .unwrap_or(Decimal::ONE);
+            let mut levels = Vec::with_capacity(count);
+            let mut value = lower;
+            for index in 0..count {
+                if index == count - 1 {
+                    levels.push(upper);
+                } else {
+                    levels.push(value);
+                    value *= ratio;
+                }
+            }
+            levels
+        }
+    }
 }
 
 /// 正在运行的技能策略快照。
@@ -674,7 +1175,13 @@ struct SkillStrategy {
 }
 
 /// 策略没有保存过技能参数时，按触发方式给出一份默认设置。
+///
+/// 导入的策略没有本地保存过参数，此时必须使用发布时冻结的那份，
+/// 否则订阅者会按默认参数而不是作者发布的规则运行。
 fn fallback_settings(state: &AppState, record: &StrategyRecord) -> SkillSettings {
+    if let Some(settings) = frozen_settings(record) {
+        return settings;
+    }
     let leverage = if record.definition.execution.leverage > Decimal::ZERO {
         record.definition.execution.leverage
     } else {
@@ -898,6 +1405,10 @@ async fn auto_open(
             strategy_id: Some(strategy.id),
             rule_id: Some(rule.id),
             rule_name: Some(rule.name.clone()),
+            system: None,
+            group_id: None,
+            unit_index: 0,
+            n_at_entry: None,
             paper,
             skill: true,
             max_hold_secs: 0,
@@ -1006,6 +1517,7 @@ async fn evaluate_indicator(
         lookback: rule.trigger.lookback.clamp(3, 1_000),
         fast: rule.trigger.fast.max(2),
         slow: rule.trigger.slow.max(2),
+        ma_periods: resolved_ma_periods(&rule.trigger),
         atr: rule.trigger.atr.max(2),
         channel: rule.trigger.channel.max(2),
         ..DataRules::default()
@@ -1050,6 +1562,7 @@ async fn evaluate_indicator(
 
     match rule.kind {
         SkillKind::Breakout => {
+            let channels = turtle_channels(&snapshots, rule);
             evaluate_breakout(
                 state,
                 strategy,
@@ -1058,6 +1571,7 @@ async fn evaluate_indicator(
                 symbol,
                 last,
                 &indicators,
+                &channels,
                 &open,
             )
             .await
@@ -1117,7 +1631,164 @@ pub fn ma_trend_signal(
     }
 }
 
-/// 海龟突破：突破上轨做多、跌破下轨做空；反向突破或 ATR 止损离场。
+/// 方向设置是否允许该信号。
+pub(crate) fn direction_allows(side: Side, direction: SkillDirection) -> bool {
+    match side {
+        Side::Buy => direction != SkillDirection::Short,
+        Side::Sell => direction != SkillDirection::Long,
+    }
+}
+
+/// 取已计算的均线；缺失或非正数视作不可用。
+fn ma_value(indicators: &arb_core::SandboxIndicators, period: u32) -> Option<Decimal> {
+    indicators
+        .sma(period)
+        .filter(|value| *value > Decimal::ZERO)
+}
+
+/// 均线排列方向：周期从短到长，短均线依次更高且价格站上最短均线做多，反之做空。
+fn alignment_side(
+    indicators: &arb_core::SandboxIndicators,
+    periods: &[u32],
+    last: Decimal,
+) -> Option<Side> {
+    let mut ordered: Vec<u32> = periods
+        .iter()
+        .copied()
+        .filter(|period| *period >= 2)
+        .collect();
+    ordered.sort_unstable();
+    ordered.dedup();
+    if ordered.len() < 2 {
+        return None;
+    }
+    let values: Vec<Decimal> = ordered
+        .iter()
+        .map(|period| ma_value(indicators, *period))
+        .collect::<Option<_>>()?;
+    let descending = values.windows(2).all(|pair| pair[0] > pair[1]);
+    let ascending = values.windows(2).all(|pair| pair[0] < pair[1]);
+    if descending && last > values[0] {
+        Some(Side::Buy)
+    } else if ascending && last < values[0] {
+        Some(Side::Sell)
+    } else {
+        None
+    }
+}
+
+/// 均线入场信号：所有入场条件必须指向同一方向。
+///
+/// 条件为空时回落到旧的「快线在慢线上方 + 价格站上快线」逻辑，保证历史配置不变。
+pub fn ma_entry_signal(
+    last: Decimal,
+    indicators: &arb_core::SandboxIndicators,
+    trigger: &SkillTrigger,
+) -> Option<Side> {
+    if trigger.entries.is_empty() {
+        let (Some(fast), Some(slow)) = (indicators.sma_fast, indicators.sma_slow) else {
+            return None;
+        };
+        return ma_trend_signal(last, fast, slow, SkillDirection::Both);
+    }
+    let mut side: Option<Side> = None;
+    for entry in &trigger.entries {
+        let current = match entry {
+            MaEntry::Alignment { periods } => alignment_side(indicators, periods, last),
+            MaEntry::PriceAbove { ma } => {
+                let value = ma_value(indicators, *ma)?;
+                if last > value {
+                    Some(Side::Buy)
+                } else if last < value {
+                    Some(Side::Sell)
+                } else {
+                    None
+                }
+            }
+            MaEntry::Pullback { ma } => {
+                let value = ma_value(indicators, *ma)?;
+                let atr = indicators.atr.filter(|atr| *atr > Decimal::ZERO)?;
+                if (last - value).abs() > atr {
+                    return None;
+                }
+                if last >= value {
+                    Some(Side::Buy)
+                } else {
+                    Some(Side::Sell)
+                }
+            }
+        };
+        let Some(current) = current else {
+            return None;
+        };
+        match side {
+            None => side = Some(current),
+            Some(existing) if existing == current => {}
+            Some(_) => return None,
+        }
+    }
+    side
+}
+
+/// 均线出场条件：任一条件满足即离场。
+///
+/// 条件为空时回落到旧的「均线反转」判断。
+pub fn ma_exit_hit(
+    side: Side,
+    last: Decimal,
+    entry: Decimal,
+    indicators: &arb_core::SandboxIndicators,
+    trigger: &SkillTrigger,
+) -> bool {
+    if trigger.exits.is_empty() {
+        return match (indicators.sma_fast, indicators.sma_slow) {
+            (Some(fast), Some(slow)) => {
+                if side == Side::Buy {
+                    fast < slow
+                } else {
+                    fast > slow
+                }
+            }
+            _ => false,
+        };
+    }
+    trigger.exits.iter().any(|exit| match exit {
+        MaExit::Cross { fast, slow } => {
+            match (ma_value(indicators, *fast), ma_value(indicators, *slow)) {
+                (Some(fast), Some(slow)) => {
+                    if side == Side::Buy {
+                        fast < slow
+                    } else {
+                        fast > slow
+                    }
+                }
+                _ => false,
+            }
+        }
+        MaExit::BreakMa { ma } => match ma_value(indicators, *ma) {
+            Some(value) => {
+                if side == Side::Buy {
+                    last < value
+                } else {
+                    last > value
+                }
+            }
+            None => false,
+        },
+        MaExit::AtrStop => atr_stop_hit(side, entry, last, indicators.atr, trigger.atr_multiple),
+    })
+}
+
+/// 海龟开仓的附加信息：系统、组标识与 Unit 序号。
+#[derive(Debug, Clone, Copy)]
+struct TurtlePlacement {
+    system: u8,
+    group_id: Option<Uuid>,
+    unit_index: u32,
+    is_add: bool,
+}
+
+/// 海龟突破：双系统通道突破入场，金字塔加仓，反向退出通道或整组 2N 止损离场。
 async fn evaluate_breakout(
     state: &AppState,
     strategy: &SkillStrategy,
@@ -1126,34 +1797,148 @@ async fn evaluate_breakout(
     symbol: &str,
     last: Decimal,
     indicators: &arb_core::SandboxIndicators,
+    channels: &skill_turtle::TurtleChannels,
     open: &[listing::ListingTrade],
 ) -> Result<(), String> {
-    let (Some(high), Some(low)) = (indicators.channel_high, indicators.channel_low) else {
-        return Ok(());
-    };
+    let turtle = &rule.trigger.turtle;
     if open.is_empty() {
-        match breakout_signal(last, high, low, rule.steps.direction) {
-            Some(Side::Buy) => {
-                try_open(state, strategy, rule, venue, symbol, Side::Buy, last).await
+        let Some((side, system)) =
+            skill_turtle::entry_signal(last, channels, rule.steps.direction, turtle)
+        else {
+            return Ok(());
+        };
+        if system == 1 && turtle.profit_filter {
+            let trades = state.listing.all_trades();
+            if skill_turtle::last_closed_system1_win(&trades, rule.id, symbol) == Some(true) {
+                tracing::info!(
+                    %symbol,
+                    rule = %rule.name,
+                    "系统一上一笔盈利，跳过本次入场信号"
+                );
+                return Ok(());
             }
-            Some(Side::Sell) => {
-                try_open(state, strategy, rule, venue, symbol, Side::Sell, last).await
-            }
-            None => {}
         }
+        if max_symbols_reached(state, strategy, rule) {
+            return Ok(());
+        }
+        // Unit 仓位必须依赖 N（ATR），指标尚未预热时不入场。
+        if indicators.atr.unwrap_or(Decimal::ZERO) <= Decimal::ZERO {
+            return Ok(());
+        }
+        try_open(
+            state,
+            strategy,
+            rule,
+            venue,
+            symbol,
+            side,
+            last,
+            indicators.atr,
+            None,
+            Some(TurtlePlacement {
+                system,
+                group_id: None,
+                unit_index: 0,
+                is_add: false,
+            }),
+        )
+        .await;
         return Ok(());
     }
-    for trade in open {
-        let exit = if trade.side == Side::Buy {
-            last < low || atr_stopped(trade, last, indicators.atr, rule.trigger.atr_multiple)
-        } else {
-            last > high || atr_stopped(trade, last, indicators.atr, rule.trigger.atr_multiple)
-        };
-        if exit {
+
+    let side = open[0].side;
+    let system = open[0].system.unwrap_or(1);
+    let group_id = open[0].group_id;
+    let latest = skill_turtle::latest_unit(open).unwrap_or(&open[0]);
+    let n = latest
+        .n_at_entry
+        .or(indicators.atr)
+        .unwrap_or(Decimal::ZERO);
+    let stop = skill_turtle::group_stop(side, latest.entry_price, n, rule.trigger.atr_multiple);
+    let stopped = stop
+        .map(|stop| skill_turtle::stop_hit(side, last, stop))
+        .unwrap_or(false);
+    if stopped || skill_turtle::exit_signal(side, system, last, channels) {
+        for trade in open {
             close_signal(state, trade.id).await;
         }
+        return Ok(());
+    }
+    let units = open.len() as u32;
+    let adds = units.saturating_sub(1);
+    if skill_turtle::should_add(
+        side,
+        last,
+        latest.entry_price,
+        n,
+        units,
+        adds,
+        rule.business.max_units,
+        rule.business.max_pyramid_adds,
+        rule.business.pyramid_step_n,
+    ) {
+        try_open(
+            state,
+            strategy,
+            rule,
+            venue,
+            symbol,
+            side,
+            last,
+            indicators.atr,
+            None,
+            Some(TurtlePlacement {
+                system,
+                group_id,
+                unit_index: latest.unit_index.saturating_add(1),
+                is_add: true,
+            }),
+        )
+        .await;
     }
     Ok(())
+}
+
+/// 海龟规则的最大持仓币种数；0 表示不限制。
+fn max_symbols_reached(state: &AppState, strategy: &SkillStrategy, rule: &SkillRule) -> bool {
+    let limit = rule.business.max_symbols;
+    if limit == 0 {
+        return false;
+    }
+    let symbols: HashSet<String> = state
+        .listing
+        .open_trades()
+        .into_iter()
+        .filter(|trade| trade.strategy_id == Some(strategy.id) && trade.rule_id == Some(rule.id))
+        .map(|trade| trade.symbol.to_ascii_uppercase())
+        .collect();
+    if symbols.len() < limit as usize {
+        return false;
+    }
+    tracing::info!(
+        strategy_id = %strategy.id,
+        rule = %rule.name,
+        "海龟规则已达到最大持仓币种数，忽略本次信号"
+    );
+    true
+}
+
+/// 按规则周期计算四个唐奇安通道。
+fn turtle_channels(snapshots: &[SandboxCandle], rule: &SkillRule) -> skill_turtle::TurtleChannels {
+    let period = |value: u32| {
+        if value >= 2 {
+            indicators::donchian(snapshots, value)
+        } else {
+            None
+        }
+    };
+    let turtle = &rule.trigger.turtle;
+    skill_turtle::TurtleChannels {
+        entry1: period(turtle.entry1),
+        entry2: period(turtle.entry2),
+        exit1: period(turtle.exit1),
+        exit2: period(turtle.exit2),
+    }
 }
 
 /// 均线趋势：快线在慢线上方且价格站上快线做多，反之做空；均线反转离场。
@@ -1167,31 +1952,34 @@ async fn evaluate_ma_trend(
     indicators: &arb_core::SandboxIndicators,
     open: &[listing::ListingTrade],
 ) -> Result<(), String> {
-    let (Some(fast), Some(slow)) = (indicators.sma_fast, indicators.sma_slow) else {
-        return Ok(());
-    };
-    if fast <= Decimal::ZERO || slow <= Decimal::ZERO {
-        return Ok(());
-    }
     if open.is_empty() {
-        match ma_trend_signal(last, fast, slow, rule.steps.direction) {
-            Some(Side::Buy) => {
-                try_open(state, strategy, rule, venue, symbol, Side::Buy, last).await
+        if let Some(side) = ma_entry_signal(last, indicators, &rule.trigger) {
+            if direction_allows(side, rule.steps.direction) {
+                try_open(
+                    state,
+                    strategy,
+                    rule,
+                    venue,
+                    symbol,
+                    side,
+                    last,
+                    indicators.atr,
+                    None,
+                    None,
+                )
+                .await;
             }
-            Some(Side::Sell) => {
-                try_open(state, strategy, rule, venue, symbol, Side::Sell, last).await
-            }
-            None => {}
         }
         return Ok(());
     }
     for trade in open {
-        let exit = if trade.side == Side::Buy {
-            fast < slow
-        } else {
-            fast > slow
-        };
-        if exit {
+        if ma_exit_hit(
+            trade.side,
+            last,
+            trade.entry_price,
+            indicators,
+            &rule.trigger,
+        ) {
             close_signal(state, trade.id).await;
         }
     }
@@ -1199,6 +1987,9 @@ async fn evaluate_ma_trend(
 }
 
 /// 网格：价格触及档位时单腿开仓，止盈设在相邻档位。
+///
+/// `take_profit_pct` / `stop_loss_pct` 在网格里表示整组仓位的止盈止损：
+/// 按所有在持网格仓位的平均盈亏判断，触发后一起平仓。
 async fn evaluate_grid(
     state: &AppState,
     strategy: &SkillStrategy,
@@ -1208,17 +1999,57 @@ async fn evaluate_grid(
     last: Decimal,
     open: &[listing::ListingTrade],
 ) -> Result<(), String> {
-    let levels = rule.business.grid_levels.clamp(1, MAX_GRID_LEVELS) as usize;
-    // 网格同时持仓上限：单边档位全部成交后不再加仓，等待止盈释放。
-    if open.len() >= levels * 2 {
+    let count = rule.business.grid_count() as usize;
+    if open.len() >= count {
+        return Ok(());
+    }
+    if !open.is_empty() && grid_group_exit(rule, last, open) {
+        for trade in open {
+            close_signal(state, trade.id).await;
+        }
         return Ok(());
     }
     let key = format!("{}:{}:{symbol}", strategy.id, rule.id);
     let hits = state.skill.grid_triggers(&key, last, rule);
-    for (side, _level) in hits {
-        try_open(state, strategy, rule, venue, symbol, side, last).await;
+    for (side, _level, take_profit) in hits {
+        let opened = try_open(
+            state,
+            strategy,
+            rule,
+            venue,
+            symbol,
+            side,
+            last,
+            None,
+            Some(take_profit),
+            None,
+        )
+        .await;
+        if !opened && rule.business.grid_close_on_fail {
+            // 触发风控或下单失败：按配置平掉该网格已有仓位。
+            for trade in open {
+                close_signal(state, trade.id).await;
+            }
+            break;
+        }
     }
     Ok(())
+}
+
+/// 整组止盈止损：所有在持网格仓位的平均盈亏达到阈值时离场。
+fn grid_group_exit(rule: &SkillRule, last: Decimal, open: &[listing::ListingTrade]) -> bool {
+    let take_profit = rule.business.take_profit_pct;
+    let stop_loss = rule.business.stop_loss_pct;
+    if take_profit <= Decimal::ZERO && stop_loss <= Decimal::ZERO {
+        return false;
+    }
+    let total: Decimal = open
+        .iter()
+        .map(|trade| listing::pnl_pct(trade.side, trade.entry_price, last))
+        .sum();
+    let average = total / Decimal::from(open.len());
+    (take_profit > Decimal::ZERO && average >= take_profit)
+        || (stop_loss > Decimal::ZERO && average <= -stop_loss)
 }
 
 /// ATR 止损：浮亏超过「ATR × 倍数」时离场。
@@ -1245,15 +2076,6 @@ pub fn atr_stop_hit(
     }
 }
 
-fn atr_stopped(
-    trade: &listing::ListingTrade,
-    last: Decimal,
-    atr: Option<Decimal>,
-    multiple: Decimal,
-) -> bool {
-    atr_stop_hit(trade.side, trade.entry_price, last, atr, multiple)
-}
-
 /// 指标类技能开仓：遵守冷却、每日上限与单笔金额上限。
 async fn try_open(
     state: &AppState,
@@ -1263,27 +2085,109 @@ async fn try_open(
     symbol: &str,
     side: Side,
     last: Decimal,
-) {
+    atr: Option<Decimal>,
+    take_profit: Option<Decimal>,
+    placement: Option<TurtlePlacement>,
+) -> bool {
     let key = format!("{}:{}:{symbol}", strategy.id, rule.id);
-    if !state.skill.allow_daily(&key, rule.cautions.max_daily_opens) {
+    let is_add = placement.map(|p| p.is_add).unwrap_or(false);
+    // 持仓数量按「策略 + 规则」统计，不区分交易对；加仓不受此限制。
+    if !is_add && rule.cautions.max_positions > 0 {
+        let held = state
+            .listing
+            .open_trades()
+            .iter()
+            .filter(|trade| {
+                trade.strategy_id == Some(strategy.id) && trade.rule_id == Some(rule.id)
+            })
+            .count();
+        if held as u32 >= rule.cautions.max_positions {
+            tracing::info!(
+                strategy_id = %strategy.id,
+                %symbol,
+                rule = %rule.name,
+                "技能规则已达到最大持仓数量，忽略本次信号"
+            );
+            return false;
+        }
+    }
+    if !is_add && state.skill.in_cooldown(&key, rule.cautions.cooldown_hours) {
+        tracing::info!(
+            strategy_id = %strategy.id,
+            %symbol,
+            rule = %rule.name,
+            "技能规则仍在冷却时间内，忽略本次信号"
+        );
+        return false;
+    }
+    if !is_add && !state.skill.allow_daily(&key, rule.cautions.max_daily_opens) {
         tracing::info!(
             strategy_id = %strategy.id,
             %symbol,
             rule = %rule.name,
             "技能规则已达到当日开仓上限，忽略本次信号"
         );
-        return;
+        return false;
     }
     let paper = rule.steps.execution_mode == StrategyExecutionMode::Paper;
-    // 网格每档只使用下单金额的一部分，其余指标技能按整笔金额下单。
+    // ATR 止损距离换算成百分比，供单笔风险定仓与风险回报比止盈共用。
+    let atr_stop_pct = atr
+        .filter(|value| *value > Decimal::ZERO)
+        .filter(|_| rule.trigger.atr_multiple > Decimal::ZERO)
+        .filter(|_| last > Decimal::ZERO)
+        .map(|atr| atr * rule.trigger.atr_multiple / last * Decimal::from(100));
+    // 网格把总投资额按档位数量均分；其余指标技能按整笔金额下单。
     let notional = if rule.kind == SkillKind::Grid {
-        let share = rule.business.grid_share_pct / Decimal::from(100);
-        capped_notional(rule) * share
+        capped_notional(rule) * rule.business.grid_share()
+    } else if rule.cautions.risk_pct > Decimal::ZERO {
+        let equity = state.accounts.total_equity_usd();
+        match atr_stop_pct.filter(|pct| *pct > Decimal::ZERO) {
+            // 单笔风险 = 权益 × 风险比例，仓位名义价值 = 风险金额 ÷ 止损百分比。
+            Some(stop_pct) if equity > Decimal::ZERO => {
+                let risk_usd = equity * rule.cautions.risk_pct / Decimal::from(100);
+                let size = risk_usd * Decimal::from(100) / stop_pct;
+                if rule.kind != SkillKind::Breakout
+                    && rule.cautions.max_notional_usd > Decimal::ZERO
+                {
+                    size.min(rule.cautions.max_notional_usd)
+                } else {
+                    size
+                }
+            }
+            // 缺少 ATR 或权益时无法换算风险，回落到固定金额。
+            _ => capped_notional(rule),
+        }
     } else {
         capped_notional(rule)
     };
     if notional <= Decimal::ZERO {
-        return;
+        return false;
+    }
+    // 海龟按整组名义价值约束最大杠杆，避免加仓后超过配置上限。
+    if rule.kind == SkillKind::Breakout {
+        let equity = state.accounts.total_equity_usd();
+        let max_leverage = rule.business.max_leverage.max(Decimal::ONE);
+        if equity > Decimal::ZERO {
+            let held_notional: Decimal = state
+                .listing
+                .open_trades()
+                .into_iter()
+                .filter(|trade| {
+                    trade.strategy_id == Some(strategy.id)
+                        && trade.rule_id == Some(rule.id)
+                        && trade.symbol.eq_ignore_ascii_case(symbol)
+                })
+                .map(|trade| trade.notional_usd)
+                .sum();
+            if held_notional + notional > equity * max_leverage {
+                tracing::info!(
+                    %symbol,
+                    rule = %rule.name,
+                    "海龟整组名义价值将超过最大杠杆，忽略本次加仓"
+                );
+                return false;
+            }
+        }
     }
     let side_zh = if side == Side::Buy {
         "做多"
@@ -1295,11 +2199,38 @@ async fn try_open(
     } else {
         format!("{} · {side_zh}信号 {last}", rule.purpose.trim())
     };
-    let take_profit = if rule.kind == SkillKind::Grid {
-        rule.business.grid_spacing_pct
+    // 网格的止损按整组仓位判断，单笔止损交给相邻档位止盈逻辑；
+    // 海龟的止损同样按整组判断，单笔止损保持 0，避免旧 Unit 先被单独止损。
+    let stop_loss = if matches!(rule.kind, SkillKind::Grid | SkillKind::Breakout) {
+        Decimal::ZERO
     } else {
-        rule.business.take_profit_pct
+        rule.business.stop_loss_pct
     };
+    // 风险回报比以 ATR 止损距离为 1R 推导止盈；未配置时沿用固定止盈。
+    let take_profit_pct = take_profit.unwrap_or_else(|| {
+        if rule.business.risk_reward > Decimal::ZERO {
+            atr_stop_pct
+                .map(|stop_pct| stop_pct * rule.business.risk_reward)
+                .unwrap_or(rule.business.take_profit_pct)
+        } else {
+            rule.business.take_profit_pct
+        }
+    });
+    let leverage = if rule.kind == SkillKind::Breakout {
+        rule.business.max_leverage.max(Decimal::ONE)
+    } else {
+        rule.business.leverage
+    };
+    let max_hold_secs =
+        if rule.kind == SkillKind::Breakout && rule.business.max_hold_hours > Decimal::ZERO {
+            (rule.business.max_hold_hours * Decimal::from(3600))
+                .to_i64()
+                .unwrap_or(0)
+        } else {
+            0
+        };
+    // 首仓生成组标识，后续加仓沿用，便于整组平仓与系统一盈利过滤。
+    let group_id = placement.map(|p| p.group_id.unwrap_or_else(Uuid::new_v4));
     let request = OpenListingRequest {
         token: symbol.trim_end_matches("USDT").to_string(),
         headline,
@@ -1307,31 +2238,46 @@ async fn try_open(
         symbol: symbol.to_string(),
         side,
         notional_usd: notional,
-        leverage: rule.business.leverage,
-        take_profit_pct: take_profit,
-        stop_loss_pct: rule.business.stop_loss_pct,
+        leverage,
+        take_profit_pct,
+        stop_loss_pct: stop_loss,
         strategy_id: Some(strategy.id),
         rule_id: Some(rule.id),
         rule_name: Some(rule.name.clone()),
+        system: placement.map(|p| p.system),
+        group_id,
+        unit_index: placement.map(|p| p.unit_index).unwrap_or(0),
+        n_at_entry: if rule.kind == SkillKind::Breakout {
+            atr
+        } else {
+            None
+        },
         paper,
         skill: true,
-        max_hold_secs: 0,
+        max_hold_secs,
         notify: rule.output.notify,
     };
-    if let Err(error) = listing::open_position(state, request).await {
-        tracing::warn!(
-            %symbol,
-            %venue,
-            %error,
-            rule = %rule.name,
-            "技能指标信号开仓失败"
-        );
-        crate::strategy_runner::note_reject(
-            state,
-            strategy.id,
-            format!("技能开仓失败 {symbol}（{venue}）：{error}"),
-        )
-        .await;
+    match listing::open_position(state, request).await {
+        Ok(_) => {
+            state.skill.mark_open(&key);
+            true
+        }
+        Err(error) => {
+            tracing::warn!(
+                %symbol,
+                %venue,
+                %error,
+                rule = %rule.name,
+                "技能指标信号开仓失败"
+            );
+            crate::strategy_runner::note_reject(
+                state,
+                strategy.id,
+                format!("技能开仓失败 {symbol}（{venue}）：{error}"),
+            )
+            .await;
+            false
+        }
     }
 }
 
@@ -1518,6 +2464,10 @@ pub(crate) async fn test_event(
                 strategy_id: Some(record.id),
                 rule_id: Some(rule.id),
                 rule_name: Some(rule.name.clone()),
+                system: None,
+                group_id: None,
+                unit_index: 0,
+                n_at_entry: None,
                 paper: !live,
                 skill: true,
                 // 模拟试跑 5 分钟后自动离场；真实下单按规则止盈止损持有。
@@ -1567,7 +2517,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn skill_runtime_only_manages_known_templates() {
+    fn skill_runtime_manages_templates_and_frozen_settings() {
         let mut definition = crate::templates::builtin().remove(0).definition;
         definition.name = "自定义策略".to_string();
 
@@ -1579,17 +2529,96 @@ mod tests {
         );
         assert!(!manages(&custom));
 
-        // 绑定技能模板的策略由技能运行时接管。
+        // 绑定内置模板的策略由技能运行时接管。
         let mut bound = StrategyRecord::new(
-            definition,
+            definition.clone(),
             arb_core::StrategySource::Manual,
             StrategyStatus::Running,
         );
         bound.skill = Some(arb_core::SkillBinding {
             template_key: "grid".to_string(),
-            settings: None,
+            ..arb_core::SkillBinding::default()
         });
         assert!(manages(&bound));
+
+        // 未知模板标识但没有参数：无法确定触发方式，不接管。
+        let mut unknown = StrategyRecord::new(
+            definition.clone(),
+            arb_core::StrategySource::Manual,
+            StrategyStatus::Running,
+        );
+        unknown.skill = Some(arb_core::SkillBinding {
+            template_key: "third-party".to_string(),
+            ..arb_core::SkillBinding::default()
+        });
+        assert!(!manages(&unknown));
+
+        // 第三方技能携带冻结规则参数：无需新增模板标识即可接管。
+        let mut third_party = StrategyRecord::new(
+            definition,
+            arb_core::StrategySource::Manual,
+            StrategyStatus::Running,
+        );
+        third_party.skill = Some(arb_core::SkillBinding {
+            template_key: "third-party".to_string(),
+            settings: Some(serde_json::to_value(frozen_fixture()).expect("技能参数可序列化")),
+            ..arb_core::SkillBinding::default()
+        });
+        assert!(manages(&third_party));
+    }
+
+    #[test]
+    fn frozen_settings_roundtrip_keeps_authored_rules() {
+        let authored = frozen_fixture();
+        let mut definition = crate::templates::builtin().remove(0).definition;
+        definition.name = "第三方策略".to_string();
+        let mut record = StrategyRecord::new(
+            definition,
+            arb_core::StrategySource::Manual,
+            StrategyStatus::Running,
+        );
+        record.skill = Some(arb_core::SkillBinding {
+            template_key: "third-party-news".to_string(),
+            settings: Some(serde_json::to_value(&authored).expect("技能参数可序列化")),
+            ..arb_core::SkillBinding::default()
+        });
+
+        // 接管不依赖模板白名单；参数从绑定解析并补齐默认值。
+        assert!(manages(&record));
+        assert!(kind_for(&record).is_none());
+        let restored = frozen_settings(&record)
+            .expect("冻结参数可解析")
+            .normalized(Decimal::ONE);
+
+        let mut actual = restored;
+        let mut expected = authored.normalized(Decimal::ONE);
+        for rule in actual.rules.iter_mut().chain(expected.rules.iter_mut()) {
+            rule.id = Uuid::nil();
+        }
+        assert_eq!(
+            serde_json::to_value(&actual).expect("序列化"),
+            serde_json::to_value(&expected).expect("序列化")
+        );
+        // 启动后按规则自身的类型扫描，而不是模板标识。
+        let rule = actual.enabled_rules().next().expect("至少一条启用规则");
+        assert_eq!(rule.kind, SkillKind::Event);
+        assert_eq!(rule.trigger.event_keywords, vec!["will list".to_string()]);
+        assert_eq!(rule.business.notional_usd, Decimal::from(50));
+    }
+
+    fn frozen_fixture() -> SkillSettings {
+        serde_json::from_str(
+            r#"{"rules":[{
+                "name":"第三方公告",
+                "purpose":"上币公告后短线做多",
+                "trigger":{"event_sources":["binance"],"event_keywords":["will list"],"event_window_secs":900},
+                "steps":{"execution_mode":"paper","execution_venues":["okx"]},
+                "business":{"notional_usd":"50","leverage":"2","take_profit_pct":"15","stop_loss_pct":"8"},
+                "output":{"action":"open_long","notify":true},
+                "cautions":{"max_notional_usd":"40","max_daily_opens":3}
+            }]}"#,
+        )
+        .expect("技能参数 JSON 合法")
     }
 
     #[test]
@@ -1678,9 +2707,43 @@ mod tests {
 
         let grid = default_settings(SkillKind::Grid, Decimal::ONE);
         let rule = &grid.rules[0];
-        assert_eq!(rule.business.grid_levels, 3);
-        assert_eq!(rule.business.grid_spacing_pct, Decimal::new(5, 1));
-        assert_eq!(rule.business.grid_share_pct, Decimal::from(25));
+        assert_eq!(rule.business.grid_count, 10);
+        assert_eq!(rule.business.grid_count(), 10);
+        assert_eq!(rule.steps.direction, SkillDirection::Both);
+        assert_eq!(rule.business.grid_spacing_mode, GridSpacingMode::Arithmetic);
+    }
+
+    #[test]
+    fn legacy_grid_levels_migrate_to_grid_count() {
+        let mut rules = SkillBusinessRules::default();
+        rules.grid_count = 0;
+        rules.grid_levels = 3;
+        assert_eq!(rules.grid_count(), 6);
+        rules.grid_count = 12;
+        assert_eq!(rules.grid_count(), 12);
+    }
+
+    #[test]
+    fn grid_levels_follow_range_and_mode() {
+        let arithmetic = grid_price_levels(
+            Decimal::from(100),
+            Decimal::from(110),
+            3,
+            GridSpacingMode::Arithmetic,
+        );
+        assert_eq!(
+            arithmetic,
+            vec![Decimal::from(100), Decimal::from(105), Decimal::from(110)]
+        );
+        let geometric = grid_price_levels(
+            Decimal::from(100),
+            Decimal::from(110),
+            3,
+            GridSpacingMode::Geometric,
+        );
+        assert_eq!(geometric.first(), Some(&Decimal::from(100)));
+        assert_eq!(geometric.last(), Some(&Decimal::from(110)));
+        assert!(geometric[0] < geometric[1] && geometric[1] < geometric[2]);
     }
 
     #[test]
