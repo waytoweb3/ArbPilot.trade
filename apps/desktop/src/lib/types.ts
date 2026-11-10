@@ -80,6 +80,138 @@ export interface NotificationSettings {
   desktop_enabled: boolean;
 }
 
+/** 一条上币公告跟随规则：监听哪家公告、按优先级在哪下单。 */
+export interface ListingRule {
+  /** 规则 ID；新建时可为空，由执行器补齐。 */
+  id?: string;
+  /** 规则名，便于区分不同来源，例如「币安 → OKX」。 */
+  name: string;
+  /** 该规则是否参与扫描；默认启用，可单独关闭而不影响其它规则。 */
+  enabled: boolean;
+  /** 该规则的下单模式：real 真实提交交易所，paper 只记录模拟成交。 */
+  execution_mode: StrategyExecutionMode;
+  /** 单笔名义价值（美元）。 */
+  notional_usd: Decimal;
+  leverage: Decimal;
+  /** 监听上币公告的交易所来源；空列表表示全部来源。 */
+  watch_venues: string[];
+  /** 执行下单的交易所，按优先级从高到低排列；空列表表示全部可交易交易所。 */
+  execution_venues: string[];
+  /** 止盈百分比；0 表示不启用。 */
+  take_profit_pct: Decimal;
+  /** 止损百分比；0 表示不启用。 */
+  stop_loss_pct: Decimal;
+}
+
+export interface ListingSettings {
+  /** 多条规则可以同时跟随不同交易所的公告。 */
+  rules: ListingRule[];
+}
+
+export interface ListingSettingsResponse {
+  /** 该设置所属的策略实例。 */
+  strategy_id: string;
+  settings: ListingSettings;
+  /** 可监听的公告来源。 */
+  available_watch_venues: string[];
+  /** 当前具备下单凭证的交易所。 */
+  available_execution_venues: string[];
+}
+
+/** 技能被触发后输出什么。 */
+export type SkillAction = "open_long" | "notify_only";
+
+/** 技能的触发方式，对应「什么时候调用」这一章的具体形态。 */
+export type SkillKind = "event" | "breakout" | "ma_trend" | "grid";
+
+/** 指标类技能允许的开仓方向。 */
+export type SkillDirection = "both" | "long" | "short";
+
+/** 什么时候调用：公告条件与指标参数。 */
+export interface SkillTrigger {
+  event_sources: string[];
+  event_keywords: string[];
+  event_window_secs: number;
+  /** K 线周期，例如 1h。 */
+  timeframe: string;
+  /** 拉取的 K 线根数。 */
+  lookback: number;
+  /** 快均线周期。 */
+  fast: number;
+  /** 慢均线周期。 */
+  slow: number;
+  /** ATR 周期。 */
+  atr: number;
+  /** 唐奇安通道周期。 */
+  channel: number;
+  /** 止损距离 = ATR × 该倍数；0 表示不启用。 */
+  atr_multiple: Decimal;
+}
+
+/** 执行步骤：下单模式、执行交易所优先级与允许方向。 */
+export interface SkillSteps {
+  execution_mode: StrategyExecutionMode;
+  execution_venues: string[];
+  direction: SkillDirection;
+}
+
+/** 业务规则：金额、杠杆、止盈止损、最长持有、冷却与网格档位。 */
+export interface SkillBusinessRules {
+  notional_usd: Decimal;
+  leverage: Decimal;
+  take_profit_pct: Decimal;
+  stop_loss_pct: Decimal;
+  /** 网格单边档位数。 */
+  grid_levels: number;
+  /** 网格相邻档位间距（百分比，0.5 表示 0.5%）。 */
+  grid_spacing_pct: Decimal;
+  /** 网格每档使用下单金额的百分比。 */
+  grid_share_pct: Decimal;
+}
+
+/** 输出格式：触发后做什么、是否发送通知。 */
+export interface SkillOutput {
+  action: SkillAction;
+  notify: boolean;
+}
+
+/** 注意事项：额外的风控上限。 */
+export interface SkillCautions {
+  max_notional_usd: Decimal;
+  max_daily_opens: number;
+}
+
+/** 一条技能规则，对应一份 SKILL.md 的六个章节。 */
+export interface SkillRule {
+  id?: string;
+  name: string;
+  enabled: boolean;
+  /** 技能用途。 */
+  purpose: string;
+  /** 触发方式：公告、通道突破、均线趋势或网格。 */
+  kind: SkillKind;
+  trigger: SkillTrigger;
+  steps: SkillSteps;
+  business: SkillBusinessRules;
+  output: SkillOutput;
+  cautions: SkillCautions;
+}
+
+export interface SkillSettings {
+  rules: SkillRule[];
+}
+
+export interface SkillSettingsResponse {
+  strategy_id: string;
+  settings: SkillSettings;
+  /** 可监听的公告来源。 */
+  available_event_sources: string[];
+  /** 当前具备下单凭证的交易所。 */
+  available_execution_venues: string[];
+  /** 公告类技能的默认触发关键词，新增规则时作为初始值。 */
+  default_event_keywords: string[];
+}
+
 export interface EntryRules {
   /** 资金费率下限（小数，如 0.0003）。 */
   funding_spread_min: Decimal;
@@ -231,6 +363,9 @@ export interface StrategyRuntime {
 /** 策略运行位置：未发布跑在用户自己的执行器，发布后由平台托管执行器运行。 */
 export type StrategyRunScope = "platform" | "self_hosted";
 
+/** 下单模式：real 真实提交交易所，paper 只记录模拟成交。 */
+export type StrategyExecutionMode = "real" | "paper";
+
 /** 一次运行实例：策略在某个交易所组合上的运行。 */
 export interface StrategyRun {
   id: string;
@@ -241,6 +376,8 @@ export interface StrategyRun {
   long_venue: string;
   short_venue: string;
   symbols: string[];
+  /** 启动时的规则快照（上币公告跟随用），历史实例保留当时的配置。 */
+  note?: string | null;
   started_at: string;
   stopped_at: string | null;
   last_heartbeat_at: string | null;
@@ -261,6 +398,14 @@ export interface StrategyRunsResponse {
   events: StrategyRunEvent[];
 }
 
+/** 技能参数运行时绑定：按稳定模板标识识别，无需沙箱模块。 */
+export interface SkillBinding {
+  /** 内置模板标识，如 `turtle-breakout`。 */
+  template_key: string;
+  /** 冻结的技能参数；为空表示按模板补默认值。 */
+  settings?: unknown | null;
+}
+
 export interface StrategyRecord {
   id: string;
   status: StrategyStatus;
@@ -274,20 +419,23 @@ export interface StrategyRecord {
   runtime: StrategyRuntime;
   /** 可选 WASM 沙箱绑定；存在时由模块替代内置入场/出场判断。 */
   sandbox?: SandboxBinding | null;
+  /** 技能参数运行时绑定；存在时由技能运行时解释参数，不依赖沙箱模块。 */
+  skill?: SkillBinding | null;
   /** 运行位置，由发布 / 撤回自动切换。 */
   run_scope?: StrategyRunScope;
+  /** 下单模式：真实下单或模拟下单，默认真实。 */
+  execution_mode?: StrategyExecutionMode;
   last_heartbeat_at: string | null;
   created_at: string;
   updated_at: string;
 }
 
-/** 数据库中内置的策略模板：实例化只复制定义并绑定同一个沙箱模块。 */
+/** 数据库中内置的策略模板：实例化只复制定义并绑定技能参数运行时。 */
 export interface StrategyTemplateView {
   key: string;
   name: string;
   description: string;
   definition: StrategyDefinition;
-  artifact_id: string | null;
   updated_at: string;
 }
 
@@ -412,6 +560,8 @@ export interface Position {
   id: string;
   /** 来自策略的仓位记录来源策略，手动下单为 null。 */
   strategy_id?: string | null;
+  /** 触发该仓位的规则名称（如上币公告跟随的一条规则），用于说明来源。 */
+  source?: string | null;
   /** 同一次双腿下单产生的仓位共享该分组 ID，为空表示单腿仓位。 */
   group_id?: string | null;
   venue: string;
@@ -844,8 +994,10 @@ export interface StrategyPublication {
   visibility: MarketVisibility;
   pricing: StrategyPricing;
   status: PublicationStatus;
-  /** 发布时冻结的沙箱模块哈希；为空表示作者还没重新发布过。 */
+  /** 发布时冻结的沙箱模块哈希；技能参数交付时为空。 */
   artifact_sha256: string | null;
+  /** 发布时冻结的技能参数绑定；存在时订阅者无需沙箱模块即可运行。 */
+  skill?: SkillBinding | null;
   /** 发布时冻结的策略定义，订阅者导入时直接使用。 */
   definition: StrategyDefinition | null;
   changelog: StrategyChangelogEntry[];
@@ -853,13 +1005,17 @@ export interface StrategyPublication {
   updated_at: string;
 }
 
-/** 订阅可下载的策略交付物：冻结的定义 + 可执行的沙箱模块。 */
+/** 订阅可下载的策略交付物：冻结的定义 + 沙箱模块或技能参数。 */
 export interface PublicationBundle {
   publication_id: string;
   strategy_version: number;
   definition: StrategyDefinition;
-  artifact_sha256: string;
-  wasm_base64: string;
+  /** 沙箱模块哈希；技能参数交付时为空。 */
+  artifact_sha256?: string | null;
+  /** 沙箱模块字节（Base64）；技能参数交付时为空。 */
+  wasm_base64?: string | null;
+  /** 发布时冻结的技能参数；存在时无需沙箱模块即可运行。 */
+  skill?: SkillBinding | null;
 }
 
 /** 版本化表现记录，必须绑定策略版本、区间与成本假设。 */

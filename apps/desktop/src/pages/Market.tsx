@@ -102,9 +102,16 @@ export default function MarketPage() {
       if (strategy.source_publication_id) {
         return strategy.source_publication_id === subscription.publication_id;
       }
-      return Boolean(
-        publication?.artifact_sha256 &&
+      // 旧数据没有来源字段：沙箱发布按模块哈希匹配，技能发布按模板标识匹配。
+      if (publication?.artifact_sha256) {
+        return Boolean(
           strategy.sandbox?.artifact_hash === publication.artifact_sha256 &&
+            strategy.definition.name === subscription.publication_title,
+        );
+      }
+      return Boolean(
+        publication?.skill?.template_key &&
+          strategy.skill?.template_key === publication.skill.template_key &&
           strategy.definition.name === subscription.publication_title,
       );
     });
@@ -410,7 +417,9 @@ export default function MarketPage() {
                       </Badge>
                     )}
                     {entitled &&
-                      (publication && !publication.artifact_sha256 ? (
+                      (publication &&
+                      !publication.artifact_sha256 &&
+                      !publication.skill ? (
                         <span className="max-w-[190px] text-right text-[10.5px] leading-snug text-subtle">
                           {copy.importUnavailable}
                         </span>

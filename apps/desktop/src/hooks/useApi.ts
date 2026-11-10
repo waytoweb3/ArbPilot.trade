@@ -7,10 +7,12 @@ import type {
   CreatePerformanceRequest,
   CreatePublicationRequest,
   ImportAccountRequest,
+  ListingSettings,
   Position,
-  SandboxDryRunRequest,
   SettlementStatus,
+  SkillSettings,
   StrategyDefinition,
+  StrategyExecutionMode,
   StrategyStatus,
   UpdatePublicationRequest,
 } from "../lib/types";
@@ -237,6 +239,53 @@ export function useUpdateNotificationSettings() {
   });
 }
 
+/** 上币公告跟随的单腿交易设置：按策略实例读取监听来源、执行交易所、金额与止盈止损。 */
+export function useListingSettings(strategyId: string) {
+  return useQuery({
+    queryKey: ["listing-settings", strategyId],
+    queryFn: () => api.listingSettings(strategyId),
+    staleTime: 30_000,
+  });
+}
+
+/** 保存上币设置，执行器保存后立即对后续公告生效。 */
+export function useUpdateListingSettings() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (settings: ListingSettings & { strategy_id: string }) =>
+      api.updateListingSettings(settings),
+    onSuccess: (data) => {
+      queryClient.setQueryData(["listing-settings", data.strategy_id], data);
+      // 规则变更会刷新运行实例里的规则快照。
+      queryClient.invalidateQueries({ queryKey: ["strategy-runs"] });
+      queryClient.invalidateQueries({ queryKey: ["strategies"] });
+    },
+  });
+}
+
+/** 技能策略：按策略实例读取 SKILL.md 六章参数。 */
+export function useSkillSettings(strategyId: string) {
+  return useQuery({
+    queryKey: ["skill-settings", strategyId],
+    queryFn: () => api.skillSettings(strategyId),
+    staleTime: 30_000,
+  });
+}
+
+/** 保存技能参数，执行器保存后立即对后续公告生效。 */
+export function useUpdateSkillSettings() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (settings: SkillSettings & { strategy_id: string }) =>
+      api.updateSkillSettings(settings),
+    onSuccess: (data) => {
+      queryClient.setQueryData(["skill-settings", data.strategy_id], data);
+      queryClient.invalidateQueries({ queryKey: ["strategy-runs"] });
+      queryClient.invalidateQueries({ queryKey: ["strategies"] });
+    },
+  });
+}
+
 /** 各交易所资金费率采集器状态：入库条数、最近一次采集结果与各交易对最新费率。 */
 export function useFundingStatus() {
   return useQuery({
@@ -415,6 +464,19 @@ export function useUpdateStrategy() {
   });
 }
 
+/** 切换下单模式：真实下单会提交交易所，模拟下单只记录成交事件。 */
+export function useUpdateStrategyExecutionMode() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, mode }: { id: string; mode: StrategyExecutionMode }) =>
+      api.updateStrategyExecutionMode(id, mode),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["strategies"] });
+      queryClient.invalidateQueries({ queryKey: ["strategy-runs"] });
+    },
+  });
+}
+
 /** 策略版本历史，用于复现与回滚。 */
 export function useStrategyVersions(id: string | null) {
   return useQuery({
@@ -433,7 +495,18 @@ export function useStrategyRuns(id: string | null, enabled = true) {
   });
 }
 
-/** 数据库中的内置策略模板；启动时由执行器补齐并编译。 */
+/** 清空历史运行实例，运行中的实例保留。 */
+export function useClearStrategyRuns(id: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: () => api.clearStrategyRuns(id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["strategy-runs", id] });
+    },
+  });
+}
+
+/** 数据库中的内置策略模板；启动时由执行器补齐。 */
 export function useStrategyTemplates() {
   return useQuery({
     queryKey: ["strategy-templates"],
@@ -441,7 +514,7 @@ export function useStrategyTemplates() {
   });
 }
 
-/** 用模板创建一条草稿策略：复制定义并绑定模板编译出的沙箱模块。 */
+/** 用模板创建一条草稿策略：复制定义并绑定技能参数运行时。 */
 export function useInstantiateTemplate() {
   const queryClient = useQueryClient();
   return useMutation({
@@ -789,13 +862,3 @@ export function useUpdateSettlement() {
   });
 }
 
-// ---------------------------------------------------------------------------
-// 沙箱试运行
-// ---------------------------------------------------------------------------
-
-export function useSandboxDryRun() {
-  return useMutation({
-    mutationFn: ({ artifactId, body }: { artifactId: string; body: SandboxDryRunRequest }) =>
-      api.sandboxDryRun(artifactId, body),
-  });
-}

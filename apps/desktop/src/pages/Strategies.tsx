@@ -1,18 +1,25 @@
 import { useEffect, useState } from "react";
 import {
   Bot,
+  ChevronDown,
+  ChevronLeft,
+  ChevronRight,
+  ChevronUp,
   Code2,
   FlaskConical,
   History,
   Pause,
+  Pencil,
   Play,
   Plus,
   Rocket,
   Save,
   ShieldCheck,
   Sparkles,
+  Square,
   Store,
   Trash2,
+  X,
 } from "lucide-react";
 
 import { Badge } from "../components/ui/badge";
@@ -22,6 +29,7 @@ import { ConfirmDialog } from "../components/ui/confirm-dialog";
 import { useAccount } from "../hooks/useAccount";
 import {
   useBacktestStrategy,
+  useClearStrategyRuns,
   useCompileStrategyCode,
   useCreatePerformance,
   useCreatePublication,
@@ -30,22 +38,27 @@ import {
   useDeployStrategyCode,
   useGenerateStrategyCode,
   useInstantiateTemplate,
+  useListingSettings,
   useMarketAuthors,
   useMarketConfig,
+  useOrders,
+  usePositions,
   usePublicationPerformance,
   usePublications,
   useRollbackStrategy,
-  useSandboxDryRun,
   useSaveStrategyCode,
+  useSkillSettings,
   useStrategies,
   useStrategyCode,
   useStrategyRuns,
   useStrategyTemplates,
   useStrategyVersions,
+  useUpdateListingSettings,
+  useUpdateSkillSettings,
   useUpdatePublication,
   useUpdateStrategy,
+  useUpdateStrategyExecutionMode,
   useUpdateStrategyScope,
-  useValidateStrategy,
 } from "../hooks/useApi";
 import { toNumber } from "../lib/api";
 import {
@@ -53,6 +66,8 @@ import {
   formatNumber,
   formatPercentValue,
   formatUsd,
+  orderStatusLabel,
+  orderStatusTone,
   strategyStatusLabel,
 } from "../lib/format";
 import { fmt, useI18n } from "../lib/i18n";
@@ -63,12 +78,13 @@ import type {
   PricingModel,
   PublicationStatus,
   RiskLevel,
-  SandboxDecision,
-  SandboxRunStatus,
+  SkillAction,
+  SkillDirection,
+  SkillKind,
+  SkillRule,
   SourceVisibility,
-  StrategyEventLevel,
+  StrategyExecutionMode,
   StrategyRecord,
-  StrategySource,
   StrategyStatus,
 } from "../lib/types";
 import { cn } from "../lib/utils";
@@ -78,12 +94,6 @@ const statusTone: Record<StrategyStatus, "success" | "warning" | "neutral" | "da
   paused: "warning",
   draft: "neutral",
   stopped: "danger",
-};
-
-const eventTone: Record<StrategyEventLevel, string> = {
-  info: "bg-accent",
-  warning: "bg-warning",
-  error: "bg-danger",
 };
 
 const inputClass =
@@ -100,6 +110,65 @@ function withCurrent(values: string[], current: string): string[] {
     return values;
   }
   return [current, ...values];
+}
+
+/** 内置模板标识 → 技能触发方式，与后端 `skill::kind_from_template` 保持一致。 */
+const SKILL_KINDS_BY_TEMPLATE_KEY: Record<string, SkillKind> = {
+  "turtle-breakout": "breakout",
+  "ma-trend": "ma_trend",
+  grid: "grid",
+  "listing-follow": "event",
+  skill: "event",
+};
+
+/** 旧记录的模板名称 → 技能触发方式，仅用于升级前未回填模板标识的数据。 */
+const SKILL_KINDS_BY_NAME: Array<[string, SkillKind]> = [
+  ["海龟突破", "breakout"],
+  ["均线趋势", "ma_trend"],
+  ["网格", "grid"],
+  ["上币公告跟随", "event"],
+  ["技能策略（SKILL.md）", "event"],
+];
+
+/** 指标类技能可选的 K 线周期，与后端行情支持的周期保持一致。 */
+const SKILL_TIMEFRAMES = ["1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w"];
+
+/** 去掉模板实例名上的附加信息：重名自动编号与自定义后缀，与后端 `skill::base_name` 一致。 */
+function skillBaseName(name: string): string {
+  const head = name.trim().split(" · ")[0].trim();
+  return head.replace(/ \d+$/, "");
+}
+
+/** 识别策略属于哪种技能触发方式；非内置技能策略返回 null。 */
+function skillKind(record: StrategyRecord): SkillKind | null {
+  const key = record.skill?.template_key;
+  if (key) {
+    return SKILL_KINDS_BY_TEMPLATE_KEY[key] ?? null;
+  }
+  // 兼容未回填模板标识的历史记录。
+  const name = skillBaseName(record.definition.name);
+  const matched = SKILL_KINDS_BY_NAME.find(([base]) => name === base);
+  return matched?.[1] ?? null;
+}
+
+/**
+ * 上币公告跟随由内置模板驱动：代码、回测报告与版本历史不对外展示，
+ * 应用范围改为公告监听、交易所、金额与止盈止损设置。
+ */
+function isListingFollowStrategy(record: StrategyRecord): boolean {
+  if (record.skill?.template_key) {
+    return record.skill.template_key === "listing-follow";
+  }
+  return skillBaseName(record.definition.name) === "上币公告跟随";
+}
+
+/**
+ * 技能策略把 SKILL.md 的六章内容转成参数：四个内置策略（海龟突破、均线趋势、
+ * 网格、上币公告跟随）与技能策略模板都由 Rust 技能运行时执行，代码、回测报告与
+ * 版本历史不对外展示，改为六章参数卡片。
+ */
+function isSkillStrategy(record: StrategyRecord): boolean {
+  return skillKind(record) !== null;
 }
 
 interface ChatMessage {
@@ -399,7 +468,18 @@ function StrategyCodeCard({ record, running }: { record: StrategyRecord; running
   );
 }
 
-function StrategyScopeCard({ record, running }: { record: StrategyRecord; running: boolean }) {
+function StrategyScopeCard({
+  record,
+  running,
+  onToggle,
+  pendingToggle,
+}: {
+  record: StrategyRecord;
+  running: boolean;
+  /** 启动/暂停统一放在应用范围卡片里，顶部不再单独放按钮。 */
+  onToggle: () => void;
+  pendingToggle: boolean;
+}) {
   const { t } = useI18n();
   const config = useMarketConfig();
   const saveScope = useUpdateStrategyScope();
@@ -523,6 +603,15 @@ function StrategyScopeCard({ record, running }: { record: StrategyRecord; runnin
           <CardTitle>{t.strategies.scopeTitle}</CardTitle>
           <CardDescription>{t.strategies.scopeDesc}</CardDescription>
         </div>
+        <Button
+          size="sm"
+          variant={running ? "secondary" : "primary"}
+          disabled={pendingToggle}
+          onClick={onToggle}
+        >
+          {running ? <Pause size={13} /> : <Play size={13} />}
+          {running ? t.strategies.pause : t.strategies.start}
+        </Button>
       </CardHeader>
       <CardContent className="space-y-3">
         {config.data && spotOptions.length === 0 && perpOptions.length === 0 && (
@@ -664,6 +753,1731 @@ function StrategyScopeCard({ record, running }: { record: StrategyRecord; runnin
             </p>
           )}
         </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+/** 新闻来源/交易所 ID 的展示名。 */
+function venueLabel(venue: string): string {
+  const labels: Record<string, string> = {
+    binance: "Binance",
+    okx: "OKX",
+    bybit: "Bybit",
+    bitget: "Bitget",
+    gate: "Gate",
+    upbit: "Upbit",
+    aster: "Aster",
+    hyperliquid: "Hyperliquid",
+    lighter: "Lighter",
+  };
+  return labels[venue] ?? venue;
+}
+
+/** 编辑中的一条规则；`key` 同时作为规则 ID 持久化。 */
+interface ListingRuleDraft {
+  key: string;
+  name: string;
+  enabled: boolean;
+  executionMode: StrategyExecutionMode;
+  watchVenues: string[];
+  executionVenues: string[];
+  notional: string;
+  leverage: string;
+  takeProfit: string;
+  stopLoss: string;
+}
+
+/** 新增规则时的默认值；杠杆沿用上一条规则，避免出现空值。 */
+function emptyRuleDraft(leverage: string): ListingRuleDraft {
+  return {
+    key: crypto.randomUUID(),
+    name: "",
+    enabled: true,
+    executionMode: "real",
+    watchVenues: [],
+    executionVenues: [],
+    notional: "100",
+    leverage,
+    takeProfit: "20",
+    stopLoss: "10",
+  };
+}
+
+function StrategyListingScopeCard({
+  strategyId,
+  status,
+}: {
+  strategyId: string;
+  /** 策略整体状态：规则能否触发公告取决于它。 */
+  status: StrategyStatus;
+}) {
+  const { t } = useI18n();
+  const settingsQuery = useListingSettings(strategyId);
+  const saveSettings = useUpdateListingSettings();
+  const updateStrategy = useUpdateStrategy();
+  // 正在启停的规则，避免连点。
+  const [pendingRule, setPendingRule] = useState<string | null>(null);
+
+  const current = settingsQuery.data?.settings;
+  const watchOptions = settingsQuery.data?.available_watch_venues ?? [];
+  const executionOptions = settingsQuery.data?.available_execution_venues ?? [];
+
+  const [rules, setRules] = useState<ListingRuleDraft[]>([]);
+  const [notice, setNotice] = useState<{ tone: "ok" | "error"; text: string } | null>(null);
+  // 已保存的规则默认折叠且只读；点「编辑」才开始改，改完在这条规则上单独保存。
+  const [editing, setEditing] = useState<Record<string, boolean>>({});
+  const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
+
+  useEffect(() => {
+    if (!current) {
+      return;
+    }
+    setRules(
+      current.rules.map((rule) => ({
+        key: rule.id ?? crypto.randomUUID(),
+        name: rule.name,
+        enabled: rule.enabled ?? true,
+        executionMode: rule.execution_mode ?? "real",
+        watchVenues: rule.watch_venues,
+        executionVenues: rule.execution_venues,
+        notional: String(rule.notional_usd),
+        leverage: String(rule.leverage),
+        takeProfit: String(rule.take_profit_pct),
+        stopLoss: String(rule.stop_loss_pct),
+      })),
+    );
+  }, [current]);
+
+  const patchRule = (key: string, changes: Partial<ListingRuleDraft>) => {
+    setRules((previous) =>
+      previous.map((rule) => (rule.key === key ? { ...rule, ...changes } : rule)),
+    );
+  };
+
+  const addRule = () => {
+    const draft = emptyRuleDraft(rules[rules.length - 1]?.leverage ?? "");
+    setRules((previous) => [...previous, draft]);
+    // 新规则直接展开并进入编辑，填完保存即生效。
+    setEditing((previous) => ({ ...previous, [draft.key]: true }));
+    setCollapsed((previous) => ({ ...previous, [draft.key]: false }));
+  };
+
+  const startEdit = (key: string) => {
+    setEditing((previous) => ({ ...previous, [key]: true }));
+    setCollapsed((previous) => ({ ...previous, [key]: false }));
+  };
+
+  /** 取消编辑：已有规则恢复成已保存的值，尚未保存的新规则直接丢弃。 */
+  const cancelEdit = (key: string) => {
+    const saved = current?.rules.find((rule) => rule.id === key);
+    setRules((previous) => {
+      if (!saved) {
+        return previous.length <= 1 ? previous : previous.filter((rule) => rule.key !== key);
+      }
+      return previous.map((rule) =>
+        rule.key === key
+          ? {
+              ...rule,
+              name: saved.name,
+              enabled: saved.enabled ?? true,
+              executionMode: saved.execution_mode ?? "real",
+              watchVenues: saved.watch_venues,
+              executionVenues: saved.execution_venues,
+              notional: String(saved.notional_usd),
+              leverage: String(saved.leverage),
+              takeProfit: String(saved.take_profit_pct),
+              stopLoss: String(saved.stop_loss_pct),
+            }
+          : rule,
+      );
+    });
+    setEditing((previous) => ({ ...previous, [key]: false }));
+    setCollapsed((previous) => ({ ...previous, [key]: true }));
+  };
+
+  const removeRule = (key: string) => {
+    setRules((previous) =>
+      previous.length <= 1 ? previous : previous.filter((rule) => rule.key !== key),
+    );
+  };
+
+  const toggleWatch = (key: string, venue: string) => {
+    setRules((previous) =>
+      previous.map((rule) => {
+        if (rule.key !== key) {
+          return rule;
+        }
+        return {
+          ...rule,
+          watchVenues: rule.watchVenues.includes(venue)
+            ? rule.watchVenues.filter((item) => item !== venue)
+            : [...rule.watchVenues, venue],
+        };
+      }),
+    );
+  };
+
+  const addExecution = (key: string, venue: string) => {
+    setRules((previous) =>
+      previous.map((rule) =>
+        rule.key !== key || rule.executionVenues.includes(venue)
+          ? rule
+          : { ...rule, executionVenues: [...rule.executionVenues, venue] },
+      ),
+    );
+  };
+
+  const removeExecution = (key: string, venue: string) => {
+    setRules((previous) =>
+      previous.map((rule) =>
+        rule.key !== key
+          ? rule
+          : { ...rule, executionVenues: rule.executionVenues.filter((item) => item !== venue) },
+      ),
+    );
+  };
+
+  const moveExecution = (key: string, index: number, delta: number) => {
+    setRules((previous) =>
+      previous.map((rule) => {
+        if (rule.key !== key) {
+          return rule;
+        }
+        const target = index + delta;
+        if (target < 0 || target >= rule.executionVenues.length) {
+          return rule;
+        }
+        const next = [...rule.executionVenues];
+        [next[index], next[target]] = [next[target], next[index]];
+        return { ...rule, executionVenues: next };
+      }),
+    );
+  };
+
+  /** 组装提交体；参数不合法时给出提示并返回 null。 */
+  const buildPayload = (source: ListingRuleDraft[] = rules) => {
+    if (!source.length) {
+      setNotice({ tone: "error", text: t.strategies.listingRuleNeedOne });
+      return null;
+    }
+    const payload = [];
+    for (const rule of source) {
+      const amount = Number(rule.notional);
+      const lev = Number(rule.leverage);
+      const tp = Number(rule.takeProfit);
+      const sl = Number(rule.stopLoss);
+      // 关掉的规则只保留配置，允许参数暂时不合法。
+      if (
+        rule.enabled &&
+        (!Number.isFinite(amount) ||
+          amount <= 0 ||
+          !Number.isFinite(lev) ||
+          lev <= 0 ||
+          !Number.isFinite(tp) ||
+          tp < 0 ||
+          !Number.isFinite(sl) ||
+          sl < 0)
+      ) {
+        setNotice({ tone: "error", text: t.strategies.listingInvalid });
+        return null;
+      }
+      payload.push({
+        id: rule.key,
+        name: rule.name.trim(),
+        enabled: rule.enabled,
+        execution_mode: rule.executionMode,
+        notional_usd: amount,
+        leverage: lev,
+        watch_venues: rule.watchVenues,
+        execution_venues: rule.executionVenues,
+        take_profit_pct: tp,
+        stop_loss_pct: sl,
+      });
+    }
+    return payload;
+  };
+
+  /** 单条规则保存：保存成功后收起回到只读，其它规则保持原样。 */
+  const saveRule = (key: string) => {
+    const payload = buildPayload();
+    if (!payload) {
+      return;
+    }
+    setNotice(null);
+    saveSettings.mutate(
+      { strategy_id: strategyId, rules: payload },
+      {
+        onSuccess: () => {
+          setEditing((previous) => ({ ...previous, [key]: false }));
+          setCollapsed((previous) => ({ ...previous, [key]: true }));
+          setNotice({ tone: "ok", text: t.strategies.listingSaved });
+        },
+        onError: (error) => setNotice({ tone: "error", text: errorText(error) }),
+      },
+    );
+  };
+
+  /** 单条规则启停：启动会连带把策略切成运行中，停掉最后一条启用规则时把策略暂停。 */
+  const toggleRuleRunning = async (rule: ListingRuleDraft, start: boolean) => {
+    const next = rules.map((item) =>
+      item.key === rule.key ? { ...item, enabled: start } : item,
+    );
+    const payload = buildPayload(next);
+    if (!payload) {
+      return;
+    }
+    const previous = rules;
+    setNotice(null);
+    setPendingRule(rule.key);
+    setRules(next);
+    try {
+      await saveSettings.mutateAsync({ strategy_id: strategyId, rules: payload });
+      if (start) {
+        if (status !== "running") {
+          await updateStrategy.mutateAsync({ id: strategyId, status: "running" });
+        }
+      } else if (status === "running" && !next.some((item) => item.enabled)) {
+        await updateStrategy.mutateAsync({ id: strategyId, status: "paused" });
+      }
+    } catch (error) {
+      setRules(previous);
+      setNotice({ tone: "error", text: errorText(error) });
+    } finally {
+      setPendingRule(null);
+    }
+  };
+
+  return (
+    <Card>
+      <CardHeader>
+        <div>
+          <CardTitle>{t.strategies.scopeTitle}</CardTitle>
+          <CardDescription>{t.strategies.listingScopeDesc}</CardDescription>
+        </div>
+        <Button size="sm" variant="secondary" onClick={addRule}>
+          <Plus size={13} />
+          {t.strategies.listingRuleAdd}
+        </Button>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        <p className="text-[11px] text-muted">{t.strategies.listingRunningHint}</p>
+        <p className="text-[11px] text-muted">{t.strategies.listingRulesHint}</p>
+        <div className="flex flex-wrap gap-1">
+          <Badge tone="neutral">
+            {t.strategies.listingNews} · {t.strategies.listingAuto}
+          </Badge>
+          <Badge tone="neutral">
+            {t.strategies.listingToken} · {t.strategies.listingAuto}
+          </Badge>
+          <Badge tone="info">{t.strategies.listingSingleLegValue}</Badge>
+        </div>
+
+        {settingsQuery.error && (
+          <p className="text-[11px] text-danger">{errorText(settingsQuery.error)}</p>
+        )}
+
+        {rules.map((rule, index) => {
+          const editingRule = editing[rule.key] === true;
+          const collapsedRule = !editingRule && collapsed[rule.key] !== false;
+          // 规则真正在跑 = 自身启用 且 策略整体在运行。
+          const ruleRunning = rule.enabled && status === "running";
+          const title =
+            rule.name.trim() || fmt(t.strategies.listingRuleTitle, { index: index + 1 });
+          const watch = rule.watchVenues.length
+            ? rule.watchVenues.map(venueLabel).join(" / ")
+            : t.strategies.listingAllSources;
+          const execution = rule.executionVenues.length
+            ? rule.executionVenues.map(venueLabel).join(" / ")
+            : t.strategies.listingAllVenues;
+          return (
+          <div
+            key={rule.key}
+            className={cn(
+              "rounded-lg border border-line bg-panel-soft/40",
+              !rule.enabled && "opacity-60",
+            )}
+          >
+            <div className="flex items-center gap-2 p-2.5">
+              <button
+                type="button"
+                title={
+                  collapsedRule
+                    ? t.strategies.listingRuleExpand
+                    : t.strategies.listingRuleCollapse
+                }
+                onClick={() =>
+                  setCollapsed((previous) => ({ ...previous, [rule.key]: !collapsedRule }))
+                }
+                className="flex min-w-0 flex-1 items-center gap-1.5 text-left"
+              >
+                <ChevronDown
+                  size={13}
+                  className={cn(
+                    "shrink-0 text-muted transition-transform",
+                    collapsedRule && "-rotate-90",
+                  )}
+                />
+                <span className="shrink-0 text-[11px] font-medium text-main">{title}</span>
+                {collapsedRule && (
+                  <span className="truncate text-[11px] text-muted">
+                    {watch} → {execution} ·{" "}
+                    {rule.executionMode === "real"
+                      ? t.strategies.executionModeReal
+                      : t.strategies.executionModePaper}{" "}
+                    · {rule.notional} USD · {rule.leverage}x · TP {rule.takeProfit}% · SL{" "}
+                    {rule.stopLoss}%
+                  </span>
+                )}
+              </button>
+              <button
+                type="button"
+                disabled={pendingRule === rule.key}
+                onClick={() => toggleRuleRunning(rule, !ruleRunning)}
+                className={cn(
+                  "flex shrink-0 items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] transition-colors disabled:opacity-50",
+                  ruleRunning
+                    ? "border-danger/40 bg-danger/10 text-danger"
+                    : "border-accent/40 bg-accent/10 text-accent",
+                )}
+              >
+                {ruleRunning ? <Square size={10} /> : <Play size={10} />}
+                {ruleRunning
+                  ? t.strategies.listingRuleStop
+                  : t.strategies.listingRuleStart}
+              </button>
+              {!editingRule && (
+                <button
+                  type="button"
+                  title={t.strategies.listingRuleEdit}
+                  onClick={() => startEdit(rule.key)}
+                  className="flex shrink-0 items-center gap-1 text-[11px] text-muted hover:text-accent"
+                >
+                  <Pencil size={12} />
+                  {t.strategies.listingRuleEdit}
+                </button>
+              )}
+              <button
+                type="button"
+                title={t.strategies.listingRuleRemove}
+                disabled={rules.length <= 1}
+                onClick={() => removeRule(rule.key)}
+                className="text-muted disabled:opacity-30"
+              >
+                <Trash2 size={13} />
+              </button>
+            </div>
+
+            {!collapsedRule && (
+            <div className="space-y-2 border-t border-line p-3">
+            <label className="block space-y-1">
+              <span className="text-[11px] text-muted">{t.strategies.listingRuleName}</span>
+              <input
+                className={inputClass}
+                placeholder={t.strategies.listingRuleNamePlaceholder}
+                value={rule.name}
+                disabled={!editingRule}
+                onChange={(event) => patchRule(rule.key, { name: event.target.value })}
+              />
+            </label>
+
+            <div className="grid gap-2 sm:grid-cols-4">
+              <label className="block space-y-1">
+                <span className="text-[11px] text-muted">{t.strategies.listingNotional}</span>
+                <input
+                  className={inputClass}
+                  type="number"
+                  min={0}
+                  step="any"
+                  value={rule.notional}
+                  disabled={!editingRule}
+                  onChange={(event) => patchRule(rule.key, { notional: event.target.value })}
+                />
+              </label>
+              <label className="block space-y-1">
+                <span className="text-[11px] text-muted">{t.strategies.listingLeverage}</span>
+                <input
+                  className={inputClass}
+                  type="number"
+                  min={0}
+                  step="any"
+                  value={rule.leverage}
+                  disabled={!editingRule}
+                  onChange={(event) => patchRule(rule.key, { leverage: event.target.value })}
+                />
+              </label>
+              <label className="block space-y-1">
+                <span className="text-[11px] text-muted">{t.strategies.listingTakeProfit}</span>
+                <input
+                  className={inputClass}
+                  type="number"
+                  min={0}
+                  step="any"
+                  value={rule.takeProfit}
+                  disabled={!editingRule}
+                  onChange={(event) => patchRule(rule.key, { takeProfit: event.target.value })}
+                />
+              </label>
+              <label className="block space-y-1">
+                <span className="text-[11px] text-muted">{t.strategies.listingStopLoss}</span>
+                <input
+                  className={inputClass}
+                  type="number"
+                  min={0}
+                  step="any"
+                  value={rule.stopLoss}
+                  disabled={!editingRule}
+                  onChange={(event) => patchRule(rule.key, { stopLoss: event.target.value })}
+                />
+              </label>
+            </div>
+
+            <div className="space-y-1">
+              <span className="text-[11px] text-muted">{t.strategies.listingWatchVenues}</span>
+              <div className="flex flex-wrap gap-1.5">
+                {watchOptions.map((venue) => {
+                  const active = rule.watchVenues.includes(venue);
+                  return (
+                    <button
+                      key={venue}
+                      type="button"
+                      disabled={!editingRule}
+                      onClick={() => toggleWatch(rule.key, venue)}
+                      className={cn(
+                        "rounded-full border px-2 py-0.5 text-[11px] transition-colors",
+                        active
+                          ? "border-accent/50 bg-accent/15 text-accent"
+                          : "border-line bg-panel-soft text-muted hover:border-accent/30",
+                      )}
+                    >
+                      {venueLabel(venue)}
+                    </button>
+                  );
+                })}
+              </div>
+              <p className="text-[11px] text-muted">{t.strategies.listingWatchHint}</p>
+            </div>
+
+            <div className="space-y-1">
+              <span className="text-[11px] text-muted">{t.strategies.listingExecutionVenues}</span>
+              {executionOptions.length === 0 ? (
+                <p className="rounded-md border border-warning/30 bg-warning/10 px-2 py-1 text-[11px] text-warning">
+                  {t.strategies.listingVenuesEmpty}
+                </p>
+              ) : (
+                <>
+                  {rule.executionVenues.length > 0 && (
+                    <ol className="space-y-1">
+                      {rule.executionVenues.map((venue, venueIndex) => (
+                        <li
+                          key={venue}
+                          className="flex items-center justify-between rounded-md border border-line bg-panel-soft px-2 py-1"
+                        >
+                          <span className="text-[11px] text-main">
+                            {venueIndex + 1}. {venueLabel(venue)}
+                          </span>
+                          <span className="flex items-center gap-1 text-muted">
+                            <button
+                              type="button"
+                              title={t.strategies.listingMoveUp}
+                              disabled={!editingRule || venueIndex === 0}
+                              onClick={() => moveExecution(rule.key, venueIndex, -1)}
+                              className="disabled:opacity-30"
+                            >
+                              <ChevronUp size={12} />
+                            </button>
+                            <button
+                              type="button"
+                              title={t.strategies.listingMoveDown}
+                              disabled={
+                                !editingRule || venueIndex === rule.executionVenues.length - 1
+                              }
+                              onClick={() => moveExecution(rule.key, venueIndex, 1)}
+                              className="disabled:opacity-30"
+                            >
+                              <ChevronDown size={12} />
+                            </button>
+                            <button
+                              type="button"
+                              title={t.strategies.listingRemove}
+                              disabled={!editingRule}
+                              onClick={() => removeExecution(rule.key, venue)}
+                            >
+                              <X size={12} />
+                            </button>
+                          </span>
+                        </li>
+                      ))}
+                    </ol>
+                  )}
+                  <div className="flex flex-wrap gap-1.5">
+                    {executionOptions
+                      .filter((venue) => !rule.executionVenues.includes(venue))
+                      .map((venue) => (
+                        <button
+                          key={venue}
+                          type="button"
+                          disabled={!editingRule}
+                          onClick={() => addExecution(rule.key, venue)}
+                          className="rounded-full border border-line bg-panel-soft px-2 py-0.5 text-[11px] text-muted transition-colors hover:border-accent/30 disabled:opacity-40"
+                        >
+                          + {venueLabel(venue)}
+                        </button>
+                      ))}
+                  </div>
+                </>
+              )}
+              <p className="text-[11px] text-muted">{t.strategies.listingExecutionHint}</p>
+
+              <div className="space-y-1">
+                <span className="text-[11px] text-muted">{t.strategies.executionMode}</span>
+                <div className="flex flex-wrap gap-1.5">
+                  {(["real", "paper"] as const).map((mode) => {
+                    const active = rule.executionMode === mode;
+                    return (
+                      <button
+                        key={mode}
+                        type="button"
+                        disabled={!editingRule}
+                        onClick={() => patchRule(rule.key, { executionMode: mode })}
+                        className={cn(
+                          "rounded-full border px-2 py-0.5 text-[11px] transition-colors",
+                          active
+                            ? "border-accent/50 bg-accent/15 text-accent"
+                            : "border-line bg-panel-soft text-muted hover:border-accent/30",
+                        )}
+                      >
+                        {mode === "real"
+                          ? t.strategies.executionModeReal
+                          : t.strategies.executionModePaper}
+                      </button>
+                    );
+                  })}
+                </div>
+                <p className="text-[11px] text-muted">{t.strategies.listingExecutionModeHint}</p>
+              </div>
+
+              {editingRule && (
+                <div className="flex flex-wrap items-center gap-2">
+                  <Button
+                    size="sm"
+                    disabled={saveSettings.isPending}
+                    onClick={() => saveRule(rule.key)}
+                  >
+                    <Save size={13} />
+                    {saveSettings.isPending
+                      ? t.strategies.listingSaving
+                      : t.strategies.listingSave}
+                  </Button>
+                  <Button size="sm" variant="ghost" onClick={() => cancelEdit(rule.key)}>
+                    {t.strategies.listingRuleCancel}
+                  </Button>
+                </div>
+              )}
+            </div>
+            </div>
+            )}
+          </div>
+          );
+        })}
+        <p className="text-[11px] text-muted">{t.strategies.listingPctHint}</p>
+
+        {notice && (
+          <p
+            className={cn(
+              "rounded-md border px-2 py-1 text-[11px]",
+              notice.tone === "ok"
+                ? "border-accent/30 bg-accent/10 text-accent"
+                : "border-danger/30 bg-danger/10 text-danger",
+            )}
+          >
+            {notice.text}
+          </p>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+/** 编辑中的一条技能规则；`key` 同时作为规则 ID 持久化。 */
+interface SkillRuleDraft {
+  key: string;
+  name: string;
+  enabled: boolean;
+  /** 技能用途：这条技能负责识别什么、做什么。 */
+  purpose: string;
+  /** 触发方式：公告、通道突破、均线趋势或网格。 */
+  kind: SkillKind;
+  eventSources: string[];
+  /** 触发关键词，用逗号或空格分隔。 */
+  keywords: string;
+  eventWindow: string;
+  timeframe: string;
+  lookback: string;
+  fast: string;
+  slow: string;
+  atr: string;
+  channel: string;
+  atrMultiple: string;
+  direction: SkillDirection;
+  executionMode: StrategyExecutionMode;
+  executionVenues: string[];
+  notional: string;
+  leverage: string;
+  takeProfit: string;
+  stopLoss: string;
+  gridLevels: string;
+  gridSpacing: string;
+  gridShare: string;
+  action: SkillAction;
+  notify: boolean;
+  maxNotional: string;
+  maxDailyOpens: string;
+}
+
+/** 按触发方式给出指标与网格默认值，和改造前的内置模板保持一致。 */
+function skillKindDefaults(kind: SkillKind): Partial<SkillRuleDraft> {
+  switch (kind) {
+    case "breakout":
+      return {
+        timeframe: "1h",
+        lookback: "300",
+        fast: "20",
+        slow: "55",
+        atr: "20",
+        channel: "20",
+        atrMultiple: "2",
+        takeProfit: "0",
+        stopLoss: "0",
+      };
+    case "ma_trend":
+      return {
+        timeframe: "1h",
+        lookback: "200",
+        fast: "20",
+        slow: "55",
+        takeProfit: "0",
+        stopLoss: "0",
+      };
+    case "grid":
+      return {
+        timeframe: "5m",
+        lookback: "200",
+        takeProfit: "0.5",
+        stopLoss: "0",
+        gridLevels: "3",
+        gridSpacing: "0.5",
+        gridShare: "25",
+      };
+    default:
+      return {};
+  }
+}
+
+/** 新增技能规则时的默认值；杠杆沿用上一条规则，避免出现空值。 */
+function emptySkillRuleDraft(leverage: string, kind: SkillKind): SkillRuleDraft {
+  return {
+    key: crypto.randomUUID(),
+    name: "",
+    enabled: true,
+    purpose: "",
+    kind,
+    eventSources: [],
+    keywords: "",
+    eventWindow: "3600",
+    timeframe: "1h",
+    lookback: "200",
+    fast: "20",
+    slow: "55",
+    atr: "20",
+    channel: "20",
+    atrMultiple: "2",
+    direction: "long",
+    executionMode: "real",
+    executionVenues: [],
+    notional: "100",
+    leverage,
+    takeProfit: "20",
+    stopLoss: "10",
+    gridLevels: "3",
+    gridSpacing: "0.5",
+    gridShare: "25",
+    action: "open_long",
+    notify: true,
+    maxNotional: "0",
+    maxDailyOpens: "0",
+    ...skillKindDefaults(kind),
+  };
+}
+
+/** 已保存的技能规则转成编辑草稿。 */
+function skillDraftFrom(rule: SkillRule): SkillRuleDraft {
+  const base = emptySkillRuleDraft(String(rule.business.leverage), rule.kind ?? "event");
+  return {
+    ...base,
+    key: rule.id ?? crypto.randomUUID(),
+    name: rule.name,
+    enabled: rule.enabled ?? true,
+    purpose: rule.purpose,
+    kind: rule.kind ?? "event",
+    eventSources: rule.trigger.event_sources,
+    keywords: rule.trigger.event_keywords.join(", "),
+    eventWindow: String(rule.trigger.event_window_secs),
+    timeframe: rule.trigger.timeframe ?? "1h",
+    lookback: String(rule.trigger.lookback ?? 200),
+    fast: String(rule.trigger.fast ?? 20),
+    slow: String(rule.trigger.slow ?? 55),
+    atr: String(rule.trigger.atr ?? 20),
+    channel: String(rule.trigger.channel ?? 20),
+    atrMultiple: String(rule.trigger.atr_multiple ?? 2),
+    direction: rule.steps.direction ?? "both",
+    executionMode: rule.steps.execution_mode ?? "real",
+    executionVenues: rule.steps.execution_venues,
+    notional: String(rule.business.notional_usd),
+    leverage: String(rule.business.leverage),
+    takeProfit: String(rule.business.take_profit_pct),
+    stopLoss: String(rule.business.stop_loss_pct),
+    gridLevels: String(rule.business.grid_levels ?? 3),
+    gridSpacing: String(rule.business.grid_spacing_pct ?? 0.5),
+    gridShare: String(rule.business.grid_share_pct ?? 25),
+    action: rule.output.action,
+    notify: rule.output.notify,
+    maxNotional: String(rule.cautions.max_notional_usd),
+    maxDailyOpens: String(rule.cautions.max_daily_opens),
+  };
+}
+
+/** 关键词：支持中英文逗号、分号与换行分隔，保留 `will list` 这类多词短语。 */
+function parseKeywords(value: string): string[] {
+  return value
+    .split(/[,，;；\n]+/)
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0);
+}
+
+/**
+ * 技能策略参数卡片：把 SKILL.md 的六章内容（技能用途、什么时候调用、
+ * 执行步骤、业务规则、输出格式、注意事项）逐条转成可配置参数。
+ */
+function StrategySkillScopeCard({
+  strategyId,
+  status,
+  kind,
+  purpose,
+}: {
+  strategyId: string;
+  /** 策略整体状态：规则能否触发事件取决于它。 */
+  status: StrategyStatus;
+  /** 该内置策略的触发方式，决定「什么时候调用」展示哪些参数。 */
+  kind: SkillKind;
+  /** 这条技能的用途：取模板名（如「上币公告跟随」），而不是写死的说明。 */
+  purpose: string;
+}) {
+  const { t } = useI18n();
+  const settingsQuery = useSkillSettings(strategyId);
+  const saveSettings = useUpdateSkillSettings();
+  const updateStrategy = useUpdateStrategy();
+  const [pendingRule, setPendingRule] = useState<string | null>(null);
+
+  const current = settingsQuery.data?.settings;
+  const sourceOptions = settingsQuery.data?.available_event_sources ?? [];
+  const executionOptions = settingsQuery.data?.available_execution_venues ?? [];
+
+  const [rules, setRules] = useState<SkillRuleDraft[]>([]);
+  const [notice, setNotice] = useState<{ tone: "ok" | "error"; text: string } | null>(null);
+  const [editing, setEditing] = useState<Record<string, boolean>>({});
+  const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
+
+  useEffect(() => {
+    if (!current) {
+      return;
+    }
+    setRules(current.rules.map(skillDraftFrom));
+  }, [current]);
+
+  const patchRule = (key: string, changes: Partial<SkillRuleDraft>) => {
+    setRules((previous) =>
+      previous.map((rule) => (rule.key === key ? { ...rule, ...changes } : rule)),
+    );
+  };
+
+  /** 输出格式文案：真实开仓或模拟开仓。 */
+  const outputLabel = (rule: SkillRuleDraft) =>
+    rule.executionMode === "real"
+      ? t.strategies.skillOutputReal
+      : t.strategies.skillOutputPaper;
+
+  const addRule = () => {
+    const draft = emptySkillRuleDraft(rules[rules.length - 1]?.leverage ?? "", kind);
+    // 公告类规则的初始关键词由后端给出，用户可以在此基础上增删。
+    if (draft.kind === "event") {
+      draft.keywords = (settingsQuery.data?.default_event_keywords ?? []).join(", ");
+    }
+    setRules((previous) => [...previous, draft]);
+    setEditing((previous) => ({ ...previous, [draft.key]: true }));
+    setCollapsed((previous) => ({ ...previous, [draft.key]: false }));
+  };
+
+  const startEdit = (key: string) => {
+    setEditing((previous) => ({ ...previous, [key]: true }));
+    setCollapsed((previous) => ({ ...previous, [key]: false }));
+  };
+
+  /** 取消编辑：已有规则恢复成已保存的值，尚未保存的新规则直接丢弃。 */
+  const cancelEdit = (key: string) => {
+    const saved = current?.rules.find((rule) => rule.id === key);
+    setRules((previous) => {
+      if (!saved) {
+        return previous.length <= 1 ? previous : previous.filter((rule) => rule.key !== key);
+      }
+      return previous.map((rule) =>
+        rule.key === key ? { ...skillDraftFrom(saved), key } : rule,
+      );
+    });
+    setEditing((previous) => ({ ...previous, [key]: false }));
+    setCollapsed((previous) => ({ ...previous, [key]: true }));
+  };
+
+  const removeRule = (key: string) => {
+    setRules((previous) =>
+      previous.length <= 1 ? previous : previous.filter((rule) => rule.key !== key),
+    );
+  };
+
+  const toggleSource = (key: string, source: string) => {
+    setRules((previous) =>
+      previous.map((rule) =>
+        rule.key !== key
+          ? rule
+          : {
+              ...rule,
+              eventSources: rule.eventSources.includes(source)
+                ? rule.eventSources.filter((item) => item !== source)
+                : [...rule.eventSources, source],
+            },
+      ),
+    );
+  };
+
+  const addExecution = (key: string, venue: string) => {
+    setRules((previous) =>
+      previous.map((rule) =>
+        rule.key !== key || rule.executionVenues.includes(venue)
+          ? rule
+          : { ...rule, executionVenues: [...rule.executionVenues, venue] },
+      ),
+    );
+  };
+
+  const removeExecution = (key: string, venue: string) => {
+    setRules((previous) =>
+      previous.map((rule) =>
+        rule.key !== key
+          ? rule
+          : { ...rule, executionVenues: rule.executionVenues.filter((item) => item !== venue) },
+      ),
+    );
+  };
+
+  const moveExecution = (key: string, index: number, delta: number) => {
+    setRules((previous) =>
+      previous.map((rule) => {
+        if (rule.key !== key) {
+          return rule;
+        }
+        const target = index + delta;
+        if (target < 0 || target >= rule.executionVenues.length) {
+          return rule;
+        }
+        const next = [...rule.executionVenues];
+        [next[index], next[target]] = [next[target], next[index]];
+        return { ...rule, executionVenues: next };
+      }),
+    );
+  };
+
+  /** 组装提交体；参数不合法时给出提示并返回 null。 */
+  const buildPayload = (source: SkillRuleDraft[] = rules) => {
+    if (!source.length) {
+      setNotice({ tone: "error", text: t.strategies.skillRuleNeedOne });
+      return null;
+    }
+    const payload: SkillRule[] = [];
+    for (const rule of source) {
+      const window = Number(rule.eventWindow);
+      const amount = Number(rule.notional);
+      const lev = Number(rule.leverage);
+      const tp = Number(rule.takeProfit);
+      const sl = Number(rule.stopLoss);
+      const maxNotional = Number(rule.maxNotional);
+      const maxDaily = Number(rule.maxDailyOpens);
+      const lookback = Number(rule.lookback);
+      const fast = Number(rule.fast);
+      const slow = Number(rule.slow);
+      const atr = Number(rule.atr);
+      const channel = Number(rule.channel);
+      const atrMultiple = Number(rule.atrMultiple);
+      const gridLevels = Number(rule.gridLevels);
+      const gridSpacing = Number(rule.gridSpacing);
+      const gridShare = Number(rule.gridShare);
+      // 关掉的规则只保留配置，允许参数暂时不合法。
+      if (
+        rule.enabled &&
+        (!Number.isFinite(window) ||
+          window < 60 ||
+          window > 604800 ||
+          !Number.isFinite(amount) ||
+          amount <= 0 ||
+          !Number.isFinite(lev) ||
+          lev <= 0 ||
+          !Number.isFinite(tp) ||
+          tp < 0 ||
+          !Number.isFinite(sl) ||
+          sl < 0 ||
+          !Number.isFinite(maxNotional) ||
+          maxNotional < 0 ||
+          !Number.isFinite(maxDaily) ||
+          maxDaily < 0 ||
+          !Number.isFinite(lookback) ||
+          lookback < 3 ||
+          !Number.isFinite(fast) ||
+          fast < 2 ||
+          !Number.isFinite(slow) ||
+          slow < 2 ||
+          !Number.isFinite(atr) ||
+          atr < 2 ||
+          !Number.isFinite(channel) ||
+          channel < 2 ||
+          !Number.isFinite(atrMultiple) ||
+          atrMultiple < 0 ||
+          !Number.isFinite(gridLevels) ||
+          gridLevels < 1 ||
+          gridLevels > 20 ||
+          !Number.isFinite(gridSpacing) ||
+          gridSpacing <= 0 ||
+          !Number.isFinite(gridShare) ||
+          gridShare <= 0 ||
+          gridShare > 100)
+      ) {
+        setNotice({ tone: "error", text: t.strategies.skillInvalid });
+        return null;
+      }
+      payload.push({
+        id: rule.key,
+        name: rule.name.trim(),
+        enabled: rule.enabled,
+        purpose: rule.purpose.trim(),
+        kind: rule.kind,
+        trigger: {
+          event_sources: rule.eventSources,
+          event_keywords: parseKeywords(rule.keywords),
+          event_window_secs: window,
+          timeframe: rule.timeframe,
+          lookback,
+          fast,
+          slow,
+          atr,
+          channel,
+          atr_multiple: atrMultiple,
+        },
+        steps: {
+          execution_mode: rule.executionMode,
+          execution_venues: rule.executionVenues,
+          direction: rule.direction,
+        },
+        business: {
+          notional_usd: amount,
+          leverage: lev,
+          take_profit_pct: tp,
+          stop_loss_pct: sl,
+          grid_levels: gridLevels,
+          grid_spacing_pct: gridSpacing,
+          grid_share_pct: gridShare,
+        },
+        output: { action: rule.action, notify: rule.notify },
+        cautions: {
+          max_notional_usd: maxNotional,
+          max_daily_opens: maxDaily,
+        },
+      });
+    }
+    return payload;
+  };
+
+  const saveRule = (key: string) => {
+    const payload = buildPayload();
+    if (!payload) {
+      return;
+    }
+    setNotice(null);
+    saveSettings.mutate(
+      { strategy_id: strategyId, rules: payload },
+      {
+        onSuccess: () => {
+          setEditing((previous) => ({ ...previous, [key]: false }));
+          setCollapsed((previous) => ({ ...previous, [key]: true }));
+          setNotice({ tone: "ok", text: t.strategies.skillSaved });
+        },
+        onError: (error) => setNotice({ tone: "error", text: errorText(error) }),
+      },
+    );
+  };
+
+  /** 单条规则启停：启动会连带把策略切成运行中，停掉最后一条启用规则时把策略暂停。 */
+  const toggleRuleRunning = async (rule: SkillRuleDraft, start: boolean) => {
+    const next = rules.map((item) =>
+      item.key === rule.key ? { ...item, enabled: start } : item,
+    );
+    const payload = buildPayload(next);
+    if (!payload) {
+      return;
+    }
+    const previous = rules;
+    setNotice(null);
+    setPendingRule(rule.key);
+    setRules(next);
+    try {
+      await saveSettings.mutateAsync({ strategy_id: strategyId, rules: payload });
+      if (start) {
+        if (status !== "running") {
+          await updateStrategy.mutateAsync({ id: strategyId, status: "running" });
+        }
+      } else if (status === "running" && !next.some((item) => item.enabled)) {
+        await updateStrategy.mutateAsync({ id: strategyId, status: "paused" });
+      }
+    } catch (error) {
+      setRules(previous);
+      setNotice({ tone: "error", text: errorText(error) });
+    } finally {
+      setPendingRule(null);
+    }
+  };
+
+  return (
+    <Card>
+      <CardHeader>
+        <div>
+          <CardTitle>{t.strategies.scopeTitle}</CardTitle>
+          <CardDescription>{purpose || t.strategies.skillScopeDesc}</CardDescription>
+        </div>
+        <Button size="sm" variant="secondary" onClick={addRule}>
+          <Plus size={13} />
+          {t.strategies.skillRuleAdd}
+        </Button>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        {settingsQuery.error && (
+          <p className="text-[11px] text-danger">{errorText(settingsQuery.error)}</p>
+        )}
+
+        {rules.map((rule, index) => {
+          const editingRule = editing[rule.key] === true;
+          const collapsedRule = !editingRule && collapsed[rule.key] !== false;
+          const ruleRunning = rule.enabled && status === "running";
+          const title =
+            rule.name.trim() || fmt(t.strategies.skillRuleTitle, { index: index + 1 });
+          const sources = rule.eventSources.length
+            ? rule.eventSources.map(venueLabel).join(" / ")
+            : t.strategies.skillAllSources;
+          const execution = rule.executionVenues.length
+            ? rule.executionVenues.map(venueLabel).join(" / ")
+            : t.strategies.listingAllVenues;
+          // 折叠时按触发方式给出摘要：公告看来源，指标看周期与参数，网格看档位。
+          const condition =
+            rule.kind === "event"
+              ? sources
+              : rule.kind === "grid"
+                ? `${rule.timeframe} · ${rule.gridLevels} 档 · ${rule.gridSpacing}%`
+                : rule.kind === "ma_trend"
+                  ? `${rule.timeframe} · MA ${rule.fast}/${rule.slow}`
+                  : `${rule.timeframe} · 通道 ${rule.channel} · ATR ${rule.atrMultiple}×`;
+          const target =
+            rule.kind === "grid"
+              ? `${rule.notional} USD × ${rule.gridShare}%`
+              : `${rule.notional} USD · ${rule.leverage}x`;
+          return (
+            <div
+              key={rule.key}
+              className={cn(
+                "rounded-lg border border-line bg-panel-soft/40",
+                !rule.enabled && "opacity-60",
+              )}
+            >
+              <div className="flex items-center gap-2 p-2.5">
+                <button
+                  type="button"
+                  title={
+                    collapsedRule
+                      ? t.strategies.listingRuleExpand
+                      : t.strategies.listingRuleCollapse
+                  }
+                  onClick={() =>
+                    setCollapsed((previous) => ({ ...previous, [rule.key]: !collapsedRule }))
+                  }
+                  className="flex min-w-0 flex-1 items-center gap-1.5 text-left"
+                >
+                  <ChevronDown
+                    size={13}
+                    className={cn(
+                      "shrink-0 text-muted transition-transform",
+                      collapsedRule && "-rotate-90",
+                    )}
+                  />
+                  <span className="shrink-0 text-[11px] font-medium text-main">{title}</span>
+                  {collapsedRule && (
+                    <span className="truncate text-[11px] text-muted">
+                      {condition} → {execution} · {outputLabel(rule)} · {target}
+                      {rule.kind === "grid"
+                        ? ""
+                        : ` · TP ${rule.takeProfit}% · SL ${rule.stopLoss}%`}
+                    </span>
+                  )}
+                </button>
+                <button
+                  type="button"
+                  disabled={pendingRule === rule.key}
+                  onClick={() => toggleRuleRunning(rule, !ruleRunning)}
+                  className={cn(
+                    "flex shrink-0 items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] transition-colors disabled:opacity-50",
+                    ruleRunning
+                      ? "border-danger/40 bg-danger/10 text-danger"
+                      : "border-accent/40 bg-accent/10 text-accent",
+                  )}
+                >
+                  {ruleRunning ? <Square size={10} /> : <Play size={10} />}
+                  {ruleRunning
+                    ? t.strategies.listingRuleStop
+                    : t.strategies.listingRuleStart}
+                </button>
+                {!editingRule && (
+                  <button
+                    type="button"
+                    title={t.strategies.listingRuleEdit}
+                    onClick={() => startEdit(rule.key)}
+                    className="flex shrink-0 items-center gap-1 text-[11px] text-muted hover:text-accent"
+                  >
+                    <Pencil size={12} />
+                    {t.strategies.listingRuleEdit}
+                  </button>
+                )}
+                <button
+                  type="button"
+                  title={t.strategies.listingRuleRemove}
+                  disabled={rules.length <= 1}
+                  onClick={() => removeRule(rule.key)}
+                  className="text-muted disabled:opacity-30"
+                >
+                  <Trash2 size={13} />
+                </button>
+              </div>
+
+              {!collapsedRule && (
+                <div className="space-y-3 border-t border-line p-3">
+                  <label className="block space-y-1">
+                    <span className="text-[11px] text-muted">{t.strategies.listingRuleName}</span>
+                    <input
+                      className={inputClass}
+                      placeholder={t.strategies.skillRuleNamePlaceholder}
+                      value={rule.name}
+                      disabled={!editingRule}
+                      onChange={(event) => patchRule(rule.key, { name: event.target.value })}
+                    />
+                  </label>
+
+                  {/* 1. 什么时候调用 */}
+                  <div className="space-y-2">
+                    <span className="text-[11px] font-medium text-main">
+                      {t.strategies.skillTriggerTitle}
+                    </span>
+                    {rule.kind === "event" ? (
+                      <>
+                        <div className="space-y-1">
+                          <span className="text-[11px] text-muted">
+                            {t.strategies.listingWatchVenues}
+                          </span>
+                          <div className="flex flex-wrap gap-1.5">
+                            {sourceOptions.map((source) => {
+                              const active = rule.eventSources.includes(source);
+                              return (
+                                <button
+                                  key={source}
+                                  type="button"
+                                  disabled={!editingRule}
+                                  onClick={() => toggleSource(rule.key, source)}
+                                  className={cn(
+                                    "rounded-full border px-2 py-0.5 text-[11px] transition-colors",
+                                    active
+                                      ? "border-accent/50 bg-accent/15 text-accent"
+                                      : "border-line bg-panel-soft text-muted hover:border-accent/30",
+                                  )}
+                                >
+                                  {venueLabel(source)}
+                                </button>
+                              );
+                            })}
+                          </div>
+                          <p className="text-[11px] text-muted">
+                            {t.strategies.skillSourcesHint}
+                          </p>
+                        </div>
+                        <label className="block space-y-1">
+                          <span className="text-[11px] text-muted">
+                            {t.strategies.skillEventWindow}
+                          </span>
+                          <input
+                            className={inputClass}
+                            type="number"
+                            min={60}
+                            max={604800}
+                            step="any"
+                            value={rule.eventWindow}
+                            disabled={!editingRule}
+                            onChange={(event) =>
+                              patchRule(rule.key, { eventWindow: event.target.value })
+                            }
+                          />
+                        </label>
+                      </>
+                    ) : (
+                      <>
+                        <div className="grid gap-2 sm:grid-cols-2">
+                          <label className="block space-y-1">
+                            <span className="text-[11px] text-muted">
+                              {t.strategies.skillTimeframe}
+                            </span>
+                            <select
+                              className={inputClass}
+                              value={rule.timeframe}
+                              disabled={!editingRule}
+                              onChange={(event) =>
+                                patchRule(rule.key, { timeframe: event.target.value })
+                              }
+                            >
+                              {SKILL_TIMEFRAMES.map((timeframe) => (
+                                <option key={timeframe} value={timeframe}>
+                                  {timeframe}
+                                </option>
+                              ))}
+                            </select>
+                          </label>
+                          <label className="block space-y-1">
+                            <span className="text-[11px] text-muted">
+                              {t.strategies.skillLookback}
+                            </span>
+                            <input
+                              className={inputClass}
+                              type="number"
+                              min={3}
+                              step={1}
+                              value={rule.lookback}
+                              disabled={!editingRule}
+                              onChange={(event) =>
+                                patchRule(rule.key, { lookback: event.target.value })
+                              }
+                            />
+                          </label>
+                        </div>
+                        {rule.kind === "ma_trend" && (
+                          <div className="grid gap-2 sm:grid-cols-2">
+                            <label className="block space-y-1">
+                              <span className="text-[11px] text-muted">
+                                {t.strategies.skillFast}
+                              </span>
+                              <input
+                                className={inputClass}
+                                type="number"
+                                min={2}
+                                step={1}
+                                value={rule.fast}
+                                disabled={!editingRule}
+                                onChange={(event) =>
+                                  patchRule(rule.key, { fast: event.target.value })
+                                }
+                              />
+                            </label>
+                            <label className="block space-y-1">
+                              <span className="text-[11px] text-muted">
+                                {t.strategies.skillSlow}
+                              </span>
+                              <input
+                                className={inputClass}
+                                type="number"
+                                min={2}
+                                step={1}
+                                value={rule.slow}
+                                disabled={!editingRule}
+                                onChange={(event) =>
+                                  patchRule(rule.key, { slow: event.target.value })
+                                }
+                              />
+                            </label>
+                          </div>
+                        )}
+                        {rule.kind === "breakout" && (
+                          <div className="grid gap-2 sm:grid-cols-2">
+                            <label className="block space-y-1">
+                              <span className="text-[11px] text-muted">
+                                {t.strategies.skillChannel}
+                              </span>
+                              <input
+                                className={inputClass}
+                                type="number"
+                                min={2}
+                                step={1}
+                                value={rule.channel}
+                                disabled={!editingRule}
+                                onChange={(event) =>
+                                  patchRule(rule.key, { channel: event.target.value })
+                                }
+                              />
+                            </label>
+                            <label className="block space-y-1">
+                              <span className="text-[11px] text-muted">
+                                {t.strategies.skillAtr}
+                              </span>
+                              <input
+                                className={inputClass}
+                                type="number"
+                                min={2}
+                                step={1}
+                                value={rule.atr}
+                                disabled={!editingRule}
+                                onChange={(event) =>
+                                  patchRule(rule.key, { atr: event.target.value })
+                                }
+                              />
+                            </label>
+                            <label className="block space-y-1">
+                              <span className="text-[11px] text-muted">
+                                {t.strategies.skillAtrMultiple}
+                              </span>
+                              <input
+                                className={inputClass}
+                                type="number"
+                                min={0}
+                                step="any"
+                                value={rule.atrMultiple}
+                                disabled={!editingRule}
+                                onChange={(event) =>
+                                  patchRule(rule.key, { atrMultiple: event.target.value })
+                                }
+                              />
+                            </label>
+                          </div>
+                        )}
+                        <p className="text-[11px] text-muted">
+                          {t.strategies.skillIndicatorHint}
+                        </p>
+                      </>
+                    )}
+                  </div>
+
+                  {/* 2. 执行步骤 */}
+                  <div className="space-y-2">
+                    <span className="text-[11px] font-medium text-main">
+                      {t.strategies.skillStepsTitle}
+                    </span>
+                    <span className="block text-[11px] text-muted">
+                      {t.strategies.listingExecutionVenues}
+                    </span>
+                    {executionOptions.length === 0 ? (
+                      <p className="rounded-md border border-warning/30 bg-warning/10 px-2 py-1 text-[11px] text-warning">
+                        {t.strategies.listingVenuesEmpty}
+                      </p>
+                    ) : (
+                      <>
+                        {rule.executionVenues.length > 0 && (
+                          <ol className="space-y-1">
+                            {rule.executionVenues.map((venue, venueIndex) => (
+                              <li
+                                key={venue}
+                                className="flex items-center justify-between rounded-md border border-line bg-panel-soft px-2 py-1"
+                              >
+                                <span className="text-[11px] text-main">
+                                  {venueIndex + 1}. {venueLabel(venue)}
+                                </span>
+                                <span className="flex items-center gap-1 text-muted">
+                                  <button
+                                    type="button"
+                                    title={t.strategies.listingMoveUp}
+                                    disabled={!editingRule || venueIndex === 0}
+                                    onClick={() => moveExecution(rule.key, venueIndex, -1)}
+                                    className="disabled:opacity-30"
+                                  >
+                                    <ChevronUp size={12} />
+                                  </button>
+                                  <button
+                                    type="button"
+                                    title={t.strategies.listingMoveDown}
+                                    disabled={
+                                      !editingRule ||
+                                      venueIndex === rule.executionVenues.length - 1
+                                    }
+                                    onClick={() => moveExecution(rule.key, venueIndex, 1)}
+                                    className="disabled:opacity-30"
+                                  >
+                                    <ChevronDown size={12} />
+                                  </button>
+                                  <button
+                                    type="button"
+                                    title={t.strategies.listingRemove}
+                                    disabled={!editingRule}
+                                    onClick={() => removeExecution(rule.key, venue)}
+                                  >
+                                    <X size={12} />
+                                  </button>
+                                </span>
+                              </li>
+                            ))}
+                          </ol>
+                        )}
+                        <div className="flex flex-wrap gap-1.5">
+                          {executionOptions
+                            .filter((venue) => !rule.executionVenues.includes(venue))
+                            .map((venue) => (
+                              <button
+                                key={venue}
+                                type="button"
+                                disabled={!editingRule}
+                                onClick={() => addExecution(rule.key, venue)}
+                                className="rounded-full border border-line bg-panel-soft px-2 py-0.5 text-[11px] text-muted transition-colors hover:border-accent/30 disabled:opacity-40"
+                              >
+                                + {venueLabel(venue)}
+                              </button>
+                            ))}
+                        </div>
+                      </>
+                    )}
+                    <p className="text-[11px] text-muted">{t.strategies.listingExecutionHint}</p>
+
+                    <div className="space-y-1">
+                      <span className="text-[11px] text-muted">{t.strategies.skillDirection}</span>
+                      <div className="flex flex-wrap gap-1.5">
+                        {(
+                          [
+                            ["long", t.strategies.skillDirectionLong],
+                            ["short", t.strategies.skillDirectionShort],
+                          ] as const
+                        ).map(([direction, label]) => {
+                          const active = rule.direction === direction;
+                          return (
+                            <button
+                              key={direction}
+                              type="button"
+                              disabled={!editingRule}
+                              onClick={() => patchRule(rule.key, { direction })}
+                              className={cn(
+                                "rounded-full border px-2 py-0.5 text-[11px] transition-colors",
+                                active
+                                  ? "border-accent/50 bg-accent/15 text-accent"
+                                  : "border-line bg-panel-soft text-muted hover:border-accent/30",
+                              )}
+                            >
+                              {label}
+                            </button>
+                          );
+                        })}
+                      </div>
+                      <p className="text-[11px] text-muted">{t.strategies.skillDirectionHint}</p>
+                    </div>
+                  </div>
+
+                  {/* 3. 业务规则 */}
+                  <div className="space-y-2">
+                    <span className="text-[11px] font-medium text-main">
+                      {t.strategies.skillBusinessTitle}
+                    </span>
+                    <div className="grid gap-2 sm:grid-cols-4">
+                      <label className="block space-y-1">
+                        <span className="text-[11px] text-muted">
+                          {t.strategies.listingNotional}
+                        </span>
+                        <input
+                          className={inputClass}
+                          type="number"
+                          min={0}
+                          step="any"
+                          value={rule.notional}
+                          disabled={!editingRule}
+                          onChange={(event) =>
+                            patchRule(rule.key, { notional: event.target.value })
+                          }
+                        />
+                      </label>
+                      <label className="block space-y-1">
+                        <span className="text-[11px] text-muted">
+                          {t.strategies.listingLeverage}
+                        </span>
+                        <input
+                          className={inputClass}
+                          type="number"
+                          min={0}
+                          step="any"
+                          value={rule.leverage}
+                          disabled={!editingRule}
+                          onChange={(event) =>
+                            patchRule(rule.key, { leverage: event.target.value })
+                          }
+                        />
+                      </label>
+                      <label className="block space-y-1">
+                        <span className="text-[11px] text-muted">
+                          {t.strategies.listingTakeProfit}
+                        </span>
+                        <input
+                          className={inputClass}
+                          type="number"
+                          min={0}
+                          step="any"
+                          value={rule.takeProfit}
+                          disabled={!editingRule}
+                          onChange={(event) =>
+                            patchRule(rule.key, { takeProfit: event.target.value })
+                          }
+                        />
+                      </label>
+                      <label className="block space-y-1">
+                        <span className="text-[11px] text-muted">
+                          {t.strategies.listingStopLoss}
+                        </span>
+                        <input
+                          className={inputClass}
+                          type="number"
+                          min={0}
+                          step="any"
+                          value={rule.stopLoss}
+                          disabled={!editingRule}
+                          onChange={(event) =>
+                            patchRule(rule.key, { stopLoss: event.target.value })
+                          }
+                        />
+                      </label>
+                    </div>
+                    {rule.kind === "grid" && (
+                      <div className="space-y-1">
+                        <div className="grid gap-2 sm:grid-cols-3">
+                          <label className="block space-y-1">
+                            <span className="text-[11px] text-muted">
+                              {t.strategies.skillGridLevels}
+                            </span>
+                            <input
+                              className={inputClass}
+                              type="number"
+                              min={1}
+                              max={20}
+                              step={1}
+                              value={rule.gridLevels}
+                              disabled={!editingRule}
+                              onChange={(event) =>
+                                patchRule(rule.key, { gridLevels: event.target.value })
+                              }
+                            />
+                          </label>
+                          <label className="block space-y-1">
+                            <span className="text-[11px] text-muted">
+                              {t.strategies.skillGridSpacing}
+                            </span>
+                            <input
+                              className={inputClass}
+                              type="number"
+                              min={0}
+                              step="any"
+                              value={rule.gridSpacing}
+                              disabled={!editingRule}
+                              onChange={(event) =>
+                                patchRule(rule.key, { gridSpacing: event.target.value })
+                              }
+                            />
+                          </label>
+                          <label className="block space-y-1">
+                            <span className="text-[11px] text-muted">
+                              {t.strategies.skillGridShare}
+                            </span>
+                            <input
+                              className={inputClass}
+                              type="number"
+                              min={0}
+                              max={100}
+                              step="any"
+                              value={rule.gridShare}
+                              disabled={!editingRule}
+                              onChange={(event) =>
+                                patchRule(rule.key, { gridShare: event.target.value })
+                              }
+                            />
+                          </label>
+                        </div>
+                        <p className="text-[11px] text-muted">{t.strategies.skillGridHint}</p>
+                      </div>
+                    )}
+                    <p className="text-[11px] text-muted">{t.strategies.skillZeroHint}</p>
+                  </div>
+
+                  {/* 4. 输出格式 */}
+                  <div className="space-y-2">
+                    <span className="text-[11px] font-medium text-main">
+                      {t.strategies.skillOutputTitle}
+                    </span>
+                    <div className="flex flex-wrap gap-1.5">
+                      {(["real", "paper"] as const).map((mode) => {
+                        const active = rule.executionMode === mode;
+                        return (
+                          <button
+                            key={mode}
+                            type="button"
+                            disabled={!editingRule}
+                            onClick={() => patchRule(rule.key, { executionMode: mode })}
+                            className={cn(
+                              "rounded-full border px-2 py-0.5 text-[11px] transition-colors",
+                              active
+                                ? "border-accent/50 bg-accent/15 text-accent"
+                                : "border-line bg-panel-soft text-muted hover:border-accent/30",
+                            )}
+                          >
+                            {mode === "real"
+                              ? t.strategies.skillOutputReal
+                              : t.strategies.skillOutputPaper}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  {editingRule && (
+                    <div className="flex flex-wrap items-center gap-2">
+                      <Button
+                        size="sm"
+                        disabled={saveSettings.isPending}
+                        onClick={() => saveRule(rule.key)}
+                      >
+                        <Save size={13} />
+                        {saveSettings.isPending
+                          ? t.strategies.listingSaving
+                          : t.strategies.listingSave}
+                      </Button>
+                      <Button size="sm" variant="ghost" onClick={() => cancelEdit(rule.key)}>
+                        {t.strategies.listingRuleCancel}
+                      </Button>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          );
+        })}
+
+        {notice && (
+          <p
+            className={cn(
+              "whitespace-pre-line rounded-md border px-2 py-1 text-[11px]",
+              notice.tone === "ok"
+                ? "border-accent/30 bg-accent/10 text-accent"
+                : "border-danger/30 bg-danger/10 text-danger",
+            )}
+          >
+            {notice.text}
+          </p>
+        )}
       </CardContent>
     </Card>
   );
@@ -1141,63 +2955,143 @@ function Metric({ label, value }: { label: string; value: string }) {
   );
 }
 
-function SourceBadge({ source }: { source: StrategySource }) {
+/**
+ * 运行实例里的规则行：一条规则一行，只展示条件与当前状态。
+ *
+ * 运行中的实例读当前规则配置，规则的启停在技能参数卡片里操作；
+ * 历史实例保留启动时的规则快照。
+ */
+function RunRuleList({
+  strategyId,
+  status,
+  note,
+  live,
+}: {
+  strategyId: string;
+  status: StrategyStatus;
+  /** 启动时的规则快照，历史实例与配置未加载时用它兜底。 */
+  note?: string | null;
+  /** 实例是否仍在运行。 */
+  live: boolean;
+}) {
   const { t } = useI18n();
-  const label =
-    source === "built_in"
-      ? t.strategies.sourceBuiltIn
-      : source === "ai"
-        ? t.strategies.sourceAi
-        : t.strategies.sourceManual;
-  return <Badge tone="neutral">{label}</Badge>;
-}
+  const settingsQuery = useSkillSettings(strategyId);
 
-const dryRunTone: Record<SandboxRunStatus, "success" | "warning" | "danger"> = {
-  ok: "success",
-  invalid: "warning",
-  error: "danger",
-  timeout: "danger",
-};
+  const rules = settingsQuery.data?.settings.rules ?? [];
 
-function decisionText(decision: SandboxDecision): string {
-  switch (decision.action) {
-    case "open":
-      return `Open ${decision.symbol} · ${formatUsd(decision.notional_usd)}`;
-    case "close":
-      return `Close ${decision.symbol}`;
-    default:
-      return decision.reason ? `Hold · ${decision.reason}` : "Hold";
+  const snapshot = (note ?? "")
+    .split(/\n|；/)
+    .filter((line) => line.trim().length > 0);
+
+  /** 单条规则的触发条件，口径与应用范围卡片里的折叠行保持一致。 */
+  const conditionOf = (rule: SkillRule) => {
+    const keywords = rule.trigger.event_keywords;
+    const keywordLabel =
+      keywords.length === 0
+        ? "内置关键词"
+        : keywords.length === 1
+          ? keywords[0]
+          : `${keywords[0]} 等 ${keywords.length} 个关键词`;
+    return rule.kind === "event"
+      ? `${
+          rule.trigger.event_sources.length
+            ? rule.trigger.event_sources.map(venueLabel).join(" / ")
+            : t.strategies.skillAllSources
+        }（${keywordLabel}）`
+      : rule.kind === "grid"
+        ? `${rule.trigger.timeframe} · ${rule.business.grid_levels} 档 · 间距 ${rule.business.grid_spacing_pct}%`
+        : rule.kind === "ma_trend"
+          ? `${rule.trigger.timeframe} · 均线 ${rule.trigger.fast}/${rule.trigger.slow}`
+          : `${rule.trigger.timeframe} · 通道 ${rule.trigger.channel} · ATR ${rule.trigger.atr_multiple}×`;
+  };
+
+  /** 折叠摘要：条件 → 执行交易所 · 输出方式 · 金额/杠杆 · 止盈止损。 */
+  const summaryOf = (rule: SkillRule) => {
+    const execution = rule.steps.execution_venues.length
+      ? rule.steps.execution_venues.map(venueLabel).join(" / ")
+      : t.strategies.listingAllVenues;
+    const output =
+      rule.steps.execution_mode === "real"
+        ? t.strategies.skillOutputReal
+        : t.strategies.skillOutputPaper;
+    const target =
+      rule.kind === "grid"
+        ? `${formatNumber(rule.business.notional_usd)} USD × ${formatNumber(rule.business.grid_share_pct)}%`
+        : `${formatNumber(rule.business.notional_usd)} USD · ${formatNumber(rule.business.leverage)}x`;
+    const risk =
+      rule.kind === "grid"
+        ? ""
+        : ` · TP ${formatNumber(rule.business.take_profit_pct)}% · SL ${formatNumber(rule.business.stop_loss_pct)}%`;
+    return `${conditionOf(rule)} → ${execution} · ${output} · ${target}${risk}`;
+  };
+
+  // 运行实例只列正在跑的规则，停用的规则留在技能参数卡片里管理。
+  const runningRules = rules.filter((rule) => rule.enabled && status === "running");
+
+  if (!live || runningRules.length === 0) {
+    return snapshot.length === 0 ? null : (
+      <div className="flex w-full flex-col gap-0.5 text-body">
+        {snapshot.map((line, index) => (
+          <span key={`rule-${index}`}>{line}</span>
+        ))}
+      </div>
+    );
   }
+
+  return (
+    <div className="w-full space-y-2">
+      {runningRules.map((rule, index) => {
+        const title =
+          rule.name.trim() || fmt(t.strategies.skillRuleTitle, { index: index + 1 });
+        return (
+          <div
+            key={rule.id ?? rule.name}
+            className="flex items-center gap-2 rounded-lg border border-line bg-panel-soft/40 p-2.5"
+          >
+            <span className="shrink-0 text-[11px] font-medium text-main">{title}</span>
+            <span className="min-w-0 flex-1 truncate text-[11px] text-muted">
+              {summaryOf(rule)}
+            </span>
+            <span className="flex shrink-0 items-center gap-1.5 text-[11px] text-accent">
+              <span className="size-1.5 rounded-full bg-accent" />
+              {t.strategies.skillRuleRunning}
+            </span>
+          </div>
+        );
+      })}
+    </div>
+  );
 }
 
-/// 运行情况：跑在哪个交易所组合、托管在哪台执行器、最近事件与试运行结果。
-function StrategyRuntimeCard({ record }: { record: StrategyRecord }) {
+/// 运行情况：当前策略仓位、订单与各条规则的运行状态。
+function StrategyRuntimeCard({
+  record,
+  eventDriven,
+}: {
+  record: StrategyRecord;
+  /** 上币/技能等事件驱动策略用规则快照代替交易对与版本，且不提供执行模式切换。 */
+  eventDriven: boolean;
+}) {
   const { t } = useI18n();
   const copy = t.strategies;
+  const updateMode = useUpdateStrategyExecutionMode();
   const { runtime } = record;
   const runsQuery = useStrategyRuns(record.id);
-  const dryRun = useSandboxDryRun();
+  const clearRuns = useClearStrategyRuns(record.id);
+  const positionsQuery = usePositions();
+  const ordersQuery = useOrders();
+
+  // 只看这个策略触发的订单与仓位：手动下单与其它策略的互不干扰。
+  const strategyPositions = (positionsQuery.data ?? []).filter(
+    (position) => position.strategy_id === record.id,
+  );
+  const strategyOrders = [...(ordersQuery.data ?? [])]
+    .filter((order) => order.intent.strategy_id === record.id)
+    .sort((left, right) => right.created_at.localeCompare(left.created_at));
 
   const runs = runsQuery.data?.runs ?? [];
-  const runEvents = runsQuery.data?.events ?? [];
-  // 已入库的运行事件优先；老数据没有实例时回落到策略自身的运行事件。
-  const events = runEvents.length
-    ? [...runEvents].reverse().map((event) => ({
-        at: event.created_at,
-        level: event.level,
-        message: event.message,
-      }))
-    : [...runtime.events].reverse();
-  const artifactId = record.sandbox?.artifact_id ?? null;
-  const report = dryRun.data ?? null;
+  const finishedRuns = runs.filter((run) => run.status !== "running");
   const hosted = (record.run_scope ?? "self_hosted") === "platform";
-
-  const dryRunStatusLabel: Record<SandboxRunStatus, string> = {
-    ok: copy.dryRunOk,
-    invalid: copy.dryRunInvalid,
-    error: copy.dryRunError,
-    timeout: copy.dryRunTimeout,
-  };
 
   return (
     <Card>
@@ -1215,142 +3109,149 @@ function StrategyRuntimeCard({ record }: { record: StrategyRecord }) {
         </div>
       </CardHeader>
       <CardContent className="space-y-3 text-xs text-muted">
-        <p className="text-[11px] text-subtle">
-          {copy.runScope}：{copy.runScopeDesc}
-        </p>
-        <div className="grid gap-2 md:grid-cols-2">
-          <span>
-            {fmt(copy.lastEvaluated, {
-              value: formatDateTime(runtime.last_evaluated_at),
-            })}
-          </span>
-          <span>
-            {runtime.open ? (
-              <>
-                {copy.openPosition}：{runtime.open.symbol} ·{" "}
-                {runtime.open.long_venue && runtime.open.short_venue
-                  ? `${runtime.open.long_venue} / ${runtime.open.short_venue}`
-                  : runtime.open.venue ?? "—"}{" "}
-                · {formatUsd(runtime.open.notional_usd)}
-              </>
-            ) : (
-              copy.noOpenPosition
-            )}
-          </span>
-        </div>
+        {runtime.open && (
+          <p>
+            {copy.openPosition}：{runtime.open.symbol} ·{" "}
+            {runtime.open.long_venue && runtime.open.short_venue
+              ? `${runtime.open.long_venue} / ${runtime.open.short_venue}`
+              : runtime.open.venue ?? "—"}{" "}
+            · {formatUsd(runtime.open.notional_usd)}
+          </p>
+        )}
         {runtime.last_error && (
           <p className="text-danger">{fmt(copy.lastError, { message: runtime.last_error })}</p>
         )}
 
+        {(strategyPositions.length > 0 || strategyOrders.length > 0) && (
+          <div className="space-y-2">
+            <p className="text-[11px] text-muted">{copy.ordersBlock}</p>
+            {strategyPositions.length > 0 && (
+              <div>
+                <p className="mb-1 text-[11px] text-subtle">{copy.orderPositions}</p>
+                <ul className="space-y-1">
+                  {strategyPositions.map((position) => (
+                    <li
+                      key={position.id}
+                      className="flex flex-wrap items-center gap-2 rounded-md border border-line bg-panel-soft px-2 py-1 text-[11px]"
+                    >
+                      <span className="font-mono text-body">
+                        {position.venue} · {position.symbol}
+                      </span>
+                      <Badge tone={position.side === "buy" ? "success" : "danger"}>
+                        {position.side === "buy" ? copy.orderLong : copy.orderShort}
+                      </Badge>
+                      <span className="text-muted">
+                        {formatNumber(position.quantity)} @ {formatNumber(position.entry_price)}
+                      </span>
+                      <span
+                        className={
+                          toNumber(position.unrealized_pnl) >= 0 ? "text-accent" : "text-danger"
+                        }
+                      >
+                        {formatUsd(position.unrealized_pnl)}
+                      </span>
+                      {position.source && (
+                        <span className="text-subtle">{position.source}</span>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+            {strategyOrders.length > 0 && (
+              <div>
+                <p className="mb-1 text-[11px] text-subtle">{copy.orderHistory}</p>
+                <ul className="space-y-1">
+                  {strategyOrders.slice(0, 10).map((order) => {
+                    const leg = order.legs[0];
+                    return (
+                      <li
+                        key={order.id}
+                        className="flex flex-wrap items-center gap-2 rounded-md border border-line bg-panel-soft px-2 py-1 text-[11px]"
+                      >
+                        <span className="font-mono text-body">
+                          {leg ? `${leg.intent.venue} · ${leg.intent.symbol}` : "—"}
+                        </span>
+                        <Badge tone={orderStatusTone[order.status]}>
+                          {orderStatusLabel(order.status)}
+                        </Badge>
+                        {leg && (
+                          <span className="text-muted">
+                            {leg.intent.side === "buy" ? copy.orderLong : copy.orderShort}{" "}
+                            {formatNumber(leg.filled_quantity)}
+                          </span>
+                        )}
+                        {leg?.average_price && (
+                          <span className="text-muted">
+                            @ {formatNumber(leg.average_price)}
+                          </span>
+                        )}
+                        {order.note && <span className="text-warning">{order.note}</span>}
+                        <span className="text-subtle">{formatDateTime(order.created_at)}</span>
+                      </li>
+                    );
+                  })}
+                </ul>
+              </div>
+            )}
+          </div>
+        )}
+
         <div>
-          <p className="mb-1 text-[11px] text-muted">{copy.runsTitle}</p>
+          {finishedRuns.length > 0 && (
+            <div className="mb-1 flex items-center justify-end">
+              <button
+                type="button"
+                onClick={() => clearRuns.mutate()}
+                disabled={clearRuns.isPending}
+                className="text-[11px] text-muted transition-colors hover:text-danger disabled:opacity-50"
+              >
+                {copy.runsClear}
+              </button>
+            </div>
+          )}
           {runs.length === 0 ? (
             <p className="text-[11px] text-muted">{copy.runsEmpty}</p>
           ) : (
             <ul className="space-y-1">
               {runs.slice(0, 5).map((run) => (
-                <li
-                  key={run.id}
-                  className="flex flex-wrap items-center gap-2 rounded-md border border-line bg-panel-soft px-2 py-1 text-[11px]"
-                >
-                  <span className="font-mono text-body">
-                    {run.long_venue} / {run.short_venue}
-                  </span>
-                  <span className="text-muted">v{run.strategy_version}</span>
-                  <Badge tone={statusTone[run.status]}>{strategyStatusLabel(run.status)}</Badge>
-                  <Badge tone={run.scope === "platform" ? "info" : "neutral"}>
-                    {run.scope === "platform" ? copy.runScopePlatform : copy.runScopeSelfHosted}
-                  </Badge>
-                  <span className="text-muted">
-                    {fmt(copy.runStarted, { value: formatDateTime(run.started_at) })}
-                  </span>
-                  <span className="text-subtle">
-                    {run.stopped_at
-                      ? fmt(copy.runStopped, { value: formatDateTime(run.stopped_at) })
-                      : fmt(copy.runHeartbeat, { value: formatDateTime(run.last_heartbeat_at) })}
-                  </span>
-                </li>
-              ))}
-            </ul>
-          )}
-        </div>
-
-        <div>
-          <p className="mb-1 text-[11px] text-muted">{copy.events}</p>
-          {events.length === 0 ? (
-            <p className="text-[11px] text-muted">{copy.eventsEmpty}</p>
-          ) : (
-            <ul className="space-y-1">
-              {events.slice(0, 20).map((event, index) => (
-                <li
-                  key={`${event.at}-${index}`}
-                  className="flex items-start gap-2 rounded-md border border-line bg-panel-soft px-2 py-1 text-[11px]"
-                >
-                  <span
-                    className={cn("mt-1 h-1.5 w-1.5 shrink-0 rounded-full", eventTone[event.level])}
+                <li key={run.id} className="text-[11px]">
+                  {/* 规则行自带卡片样式，外层不再套边框，避免与应用范围卡片出现双层框。 */}
+                  {/* 运行实例只显示规则行与该规则当前状态。 */}
+                  <RunRuleList
+                    strategyId={record.id}
+                    status={record.status}
+                    note={run.note}
+                    live={run.status === "running"}
                   />
-                  <span className="font-mono text-muted">{formatDateTime(event.at)}</span>
-                  <span className="text-body">{event.message}</span>
                 </li>
               ))}
             </ul>
           )}
         </div>
 
-        <div className="space-y-2 border-t border-line pt-3">
-          <div className="flex flex-wrap items-center gap-2">
-            <Button
-              size="sm"
-              variant="secondary"
-              disabled={!artifactId || dryRun.isPending}
-              onClick={() => artifactId && dryRun.mutate({ artifactId, body: { strategy_id: record.id } })}
-            >
-              <FlaskConical size={13} />
-              {dryRun.isPending ? copy.dryRunning : copy.dryRun}
-            </Button>
-            <span className="text-[11px] text-subtle">
-              {artifactId ? copy.dryRunDesc : copy.dryRunNeedDeploy}
-            </span>
-          </div>
-          {report && (
-            <div className="space-y-1 rounded-lg border border-line bg-panel-soft p-2 text-[11px]">
-              <div className="flex items-center gap-2">
-                <span className="text-muted">{copy.dryRunStatus}</span>
-                <Badge tone={dryRunTone[report.status]}>{dryRunStatusLabel[report.status]}</Badge>
-                <span className="text-muted">
-                  {fmt(copy.dryRunFuel, {
-                    used: formatNumber(report.fuel_consumed, 0),
-                    limit: formatNumber(report.fuel_limit, 0),
-                  })}
-                </span>
-                <span className="text-muted">
-                  {fmt(copy.dryRunDuration, { value: report.duration_ms })}
-                </span>
-              </div>
-              {report.error && <p className="text-danger">{report.error}</p>}
-              <p className="font-medium text-fg">{copy.dryRunDecisions}</p>
-              {report.decisions.length ? (
-                <ul className="space-y-0.5 text-body">
-                  {report.decisions.map((decision, index) => (
-                    <li key={`${decision.action}-${index}`}>{decisionText(decision)}</li>
-                  ))}
-                </ul>
-              ) : (
-                <p className="text-muted">{copy.dryRunEmpty}</p>
-              )}
-              {report.logs.length > 0 && (
-                <>
-                  <p className="font-medium text-fg">{copy.dryRunLogs}</p>
-                  <ul className="max-h-28 space-y-0.5 overflow-y-auto font-mono text-subtle">
-                    {report.logs.map((line, index) => (
-                      <li key={`${index}-${line}`}>{line}</li>
-                    ))}
-                  </ul>
-                </>
-              )}
+        {!eventDriven && (
+          <div className="space-y-2 border-t border-line pt-3">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-[11px] text-muted">{copy.executionMode}</span>
+              {(["real", "paper"] as const).map((mode) => (
+                <Button
+                  key={mode}
+                  size="sm"
+                  variant={(record.execution_mode ?? "real") === mode ? "primary" : "secondary"}
+                  disabled={updateMode.isPending || record.status === "running"}
+                  onClick={() => updateMode.mutate({ id: record.id, mode })}
+                >
+                  {mode === "real" ? copy.executionModeReal : copy.executionModePaper}
+                </Button>
+              ))}
+              <span className="text-[11px] text-subtle">{copy.executionModeDesc}</span>
             </div>
-          )}
-        </div>
+            {updateMode.isError && (
+              <p className="text-[11px] text-danger">{errorText(updateMode.error)}</p>
+            )}
+          </div>
+        )}
       </CardContent>
     </Card>
   );
@@ -1369,13 +3270,16 @@ export default function StrategiesPage() {
   const instantiateTemplate = useInstantiateTemplate();
   const templates = useStrategyTemplates();
   const generateCode = useGenerateStrategyCode();
-  const validateStrategy = useValidateStrategy();
   const backtestStrategy = useBacktestStrategy();
   const rollbackStrategy = useRollbackStrategy();
   const deleteStrategy = useDeleteStrategy();
 
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
+  // 左侧列表可收成窄条，把宽度让给右侧详情；点某条策略时自动收起。
+  const [listCollapsed, setListCollapsed] = useState(false);
+  // 策略多了以后分页展示，默认每页 10 条。
+  const [listPage, setListPage] = useState(0);
   const [backtestDays, setBacktestDays] = useState(30);
   /** 删除/回滚的二次确认；Tauri 的 macOS WebView 不支持 window.confirm。 */
   const [confirmAction, setConfirmAction] = useState<{
@@ -1385,6 +3289,13 @@ export default function StrategiesPage() {
   } | null>(null);
 
   const list = strategies.data ?? [];
+  const listPageSize = 10;
+  const listPages = Math.max(1, Math.ceil(list.length / listPageSize));
+  const listPageCurrent = Math.min(listPage, listPages - 1);
+  const pagedList = list.slice(
+    listPageCurrent * listPageSize,
+    (listPageCurrent + 1) * listPageSize,
+  );
   const selected = creating ? null : (list.find((record) => record.id === selectedId) ?? list[0] ?? null);
 
   const actionError = [
@@ -1392,7 +3303,6 @@ export default function StrategiesPage() {
     createStrategy.error,
     instantiateTemplate.error,
     generateCode.error,
-    validateStrategy.error,
     backtestStrategy.error,
     rollbackStrategy.error,
     deleteStrategy.error,
@@ -1404,6 +3314,21 @@ export default function StrategiesPage() {
     }
     setCreating(true);
     setSelectedId(null);
+  };
+
+  const requestDelete = (record: StrategyRecord) => {
+    setConfirmAction({
+      message: t.strategies.deleteConfirm,
+      label: t.strategies.delete,
+      run: () =>
+        deleteStrategy.mutate(record.id, {
+          onSuccess: () => {
+            if (selectedId === record.id) {
+              setSelectedId(null);
+            }
+          },
+        }),
+    });
   };
 
   return (
@@ -1433,59 +3358,174 @@ export default function StrategiesPage() {
         </p>
       )}
 
-      <div className="grid gap-4 lg:grid-cols-[300px_minmax(0,1fr)]">
+      <div
+        className={cn(
+          "grid gap-4",
+          listCollapsed
+            ? "lg:grid-cols-[56px_minmax(0,1fr)]"
+            : "lg:grid-cols-[300px_minmax(0,1fr)]",
+        )}
+      >
         <Card className="h-fit">
-          <CardHeader>
-            <div>
-              <CardTitle>{t.strategies.listTitle}</CardTitle>
-              <CardDescription>{t.strategies.listDesc}</CardDescription>
-            </div>
+          <CardHeader className={cn(listCollapsed && "justify-center px-2 py-3")}>
+            {!listCollapsed && (
+              <div>
+                <CardTitle>{t.strategies.listTitle}</CardTitle>
+                <CardDescription>{t.strategies.listDesc}</CardDescription>
+              </div>
+            )}
+            <button
+              type="button"
+              title={
+                listCollapsed ? t.strategies.listExpand : t.strategies.listCollapse
+              }
+              onClick={() => setListCollapsed((previous) => !previous)}
+              className="text-muted transition-colors hover:text-accent"
+            >
+              {listCollapsed ? <ChevronRight size={14} /> : <ChevronLeft size={14} />}
+            </button>
           </CardHeader>
-          <CardContent className="space-y-2 p-2">
-            {list.length === 0 && (
+          <CardContent className={cn("space-y-2", listCollapsed ? "p-1.5" : "p-2")}>
+            {list.length === 0 && !listCollapsed && (
               <p className="px-2 py-6 text-center text-xs text-muted">{t.strategies.empty}</p>
             )}
-            {list.map((record) => {
+            {listCollapsed &&
+              pagedList.map((record) => {
+                const active = !creating && selected?.id === record.id;
+                return (
+                  <button
+                    key={record.id}
+                    type="button"
+                    title={record.definition.name}
+                    onClick={() => {
+                      setCreating(false);
+                      setSelectedId(record.id);
+                      setListCollapsed(false);
+                    }}
+                    className={cn(
+                      "mx-auto grid h-9 w-9 place-items-center rounded-md border transition-colors",
+                      active
+                        ? "border-accent/40 bg-accent/10 text-accent"
+                        : "border-line bg-panel-soft text-body hover:border-accent/30",
+                    )}
+                  >
+                    <Bot size={15} />
+                  </button>
+                );
+              })}
+            {!listCollapsed &&
+              pagedList.map((record) => {
               const active = !creating && selected?.id === record.id;
               return (
-                <button
+                <div
                   key={record.id}
-                  type="button"
-                  onClick={() => {
-                    setCreating(false);
-                    setSelectedId(record.id);
-                  }}
                   className={cn(
-                    "w-full space-y-2 rounded-lg border px-3 py-2 text-left transition-colors",
+                    "flex items-start gap-1 rounded-lg border transition-colors",
                     active
                       ? "border-accent/40 bg-accent/10"
                       : "border-line bg-panel-soft hover:border-accent/30",
                   )}
                 >
-                  <div className="flex items-center gap-2">
-                    <span className="grid h-7 w-7 shrink-0 place-items-center rounded-md bg-panel text-body">
-                      <Bot size={14} />
-                    </span>
-                    <span className="min-w-0 flex-1 truncate text-xs font-medium text-fg">
-                      {record.definition.name}
-                    </span>
-                  </div>
-                  <div className="flex flex-wrap items-center gap-1">
-                    <Badge tone={statusTone[record.status]}>
-                      {strategyStatusLabel(record.status)}
-                    </Badge>
-                    <span className="text-[11px] text-muted">
-                      {fmt(t.strategies.version, { version: record.version })}
-                    </span>
-                  </div>
-                  <p className="text-[11px] text-muted">
-                    {fmt(t.strategies.heartbeat, {
-                      value: formatDateTime(record.last_heartbeat_at),
-                    })}
-                  </p>
-                </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setCreating(false);
+                      setSelectedId(record.id);
+                    }}
+                    className="min-w-0 flex-1 space-y-2 px-3 py-2 text-left"
+                  >
+                    <div className="flex items-center gap-2">
+                      <span className="grid h-7 w-7 shrink-0 place-items-center rounded-md bg-panel text-body">
+                        <Bot size={14} />
+                      </span>
+                      <span className="min-w-0 flex-1 truncate text-xs font-medium text-fg">
+                        {record.definition.name}
+                      </span>
+                    </div>
+                    {!isListingFollowStrategy(record) &&
+                      !isSkillStrategy(record) && (
+                      <>
+                        <div className="flex flex-wrap items-center gap-1">
+                          <Badge tone={statusTone[record.status]}>
+                            {strategyStatusLabel(record.status)}
+                          </Badge>
+                          <span className="text-[11px] text-muted">
+                            {fmt(t.strategies.version, { version: record.version })}
+                          </span>
+                        </div>
+                        <p className="text-[11px] text-muted">
+                          {fmt(t.strategies.heartbeat, {
+                            value: formatDateTime(record.last_heartbeat_at),
+                          })}
+                        </p>
+                      </>
+                    )}
+                  </button>
+                  <button
+                    type="button"
+                    title={t.strategies.delete}
+                    disabled={deleteStrategy.isPending}
+                    onClick={() => requestDelete(record)}
+                    className="mr-1 mt-2 shrink-0 rounded-md p-1 text-muted transition-colors hover:bg-danger/10 hover:text-danger disabled:opacity-40"
+                  >
+                    <Trash2 size={13} />
+                  </button>
+                </div>
               );
             })}
+            {listCollapsed && listPages > 1 && (
+              <div className="flex flex-col items-center gap-0.5 pt-1 text-[10px] text-subtle">
+                <button
+                  type="button"
+                  disabled={listPageCurrent <= 0}
+                  onClick={() => setListPage(listPageCurrent - 1)}
+                  className="text-muted transition-colors hover:text-accent disabled:opacity-40"
+                >
+                  <ChevronLeft size={12} />
+                </button>
+                <span>
+                  {listPageCurrent + 1}/{listPages}
+                </span>
+                <button
+                  type="button"
+                  disabled={listPageCurrent >= listPages - 1}
+                  onClick={() => setListPage(listPageCurrent + 1)}
+                  className="text-muted transition-colors hover:text-accent disabled:opacity-40"
+                >
+                  <ChevronRight size={12} />
+                </button>
+              </div>
+            )}
+            {!listCollapsed && list.length > listPageSize && (
+              <div className="flex flex-wrap items-center justify-between gap-1 border-t border-line px-1 pt-2 text-[11px] text-subtle">
+                <span>
+                  {fmt(t.strategies.pageInfo, {
+                    page: listPageCurrent + 1,
+                    pages: listPages,
+                  })}
+                </span>
+                <div className="flex items-center gap-1">
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    disabled={listPageCurrent <= 0}
+                    onClick={() => setListPage(listPageCurrent - 1)}
+                  >
+                    <ChevronLeft size={13} />
+                    {t.strategies.prevPage}
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    disabled={listPageCurrent >= listPages - 1}
+                    onClick={() => setListPage(listPageCurrent + 1)}
+                  >
+                    {t.strategies.nextPage}
+                    <ChevronRight size={13} />
+                  </Button>
+                </div>
+              </div>
+            )}
           </CardContent>
         </Card>
 
@@ -1572,6 +3612,9 @@ export default function StrategiesPage() {
             <StrategyDetail
               key={selected.id}
               record={selected}
+              listing={isListingFollowStrategy(selected)}
+              skill={isSkillStrategy(selected)}
+              skillKind={skillKind(selected) ?? "event"}
               backtestDays={backtestDays}
               onBacktestDays={setBacktestDays}
               onToggle={() =>
@@ -1580,7 +3623,6 @@ export default function StrategiesPage() {
                   status: selected.status === "running" ? "paused" : "running",
                 })
               }
-              onValidate={() => validateStrategy.mutate(selected.id)}
               onBacktest={() =>
                 backtestStrategy.mutate({ id: selected.id, days: backtestDays })
               }
@@ -1591,22 +3633,10 @@ export default function StrategiesPage() {
                   run: () => rollbackStrategy.mutate({ id: selected.id, version }),
                 });
               }}
-              onDelete={() => {
-                setConfirmAction({
-                  message: t.strategies.deleteConfirm,
-                  label: t.strategies.delete,
-                  run: () =>
-                    deleteStrategy.mutate(selected.id, {
-                      onSuccess: () => setSelectedId(null),
-                    }),
-                });
-              }}
               pending={{
                 toggle: updateStrategy.isPending,
-                validate: validateStrategy.isPending,
                 backtest: backtestStrategy.isPending,
                 rollback: rollbackStrategy.isPending,
-                remove: deleteStrategy.isPending,
               }}
             />
           )}
@@ -1631,32 +3661,36 @@ export default function StrategiesPage() {
 
 function StrategyDetail({
   record,
+  listing,
+  skill,
+  skillKind,
   backtestDays,
   onBacktestDays,
   onToggle,
-  onValidate,
   onBacktest,
   onRollback,
-  onDelete,
   pending,
 }: {
   record: StrategyRecord;
+  listing: boolean;
+  skill: boolean;
+  skillKind: SkillKind;
   backtestDays: number;
   onBacktestDays: (days: number) => void;
   onToggle: () => void;
-  onValidate: () => void;
   onBacktest: () => void;
   onRollback: (version: number) => void;
-  onDelete: () => void;
   pending: {
     toggle: boolean;
-    validate: boolean;
     backtest: boolean;
     rollback: boolean;
-    remove: boolean;
   };
 }) {
   const { t } = useI18n();
+  // 事件驱动策略（上币公告跟随、技能策略）不展示代码、版本与执行模式。
+  const eventDriven = listing || skill;
+  // 技能策略按 SKILL.md 规则重放历史 K 线，可以回测；上币公告缺少历史公告样本，不回测。
+  const showBacktest = !listing;
   const { definition, validation, last_backtest: report } = record;
   const running = record.status === "running";
   const errors = validation.issues.filter((issue) => issue.severity === "error");
@@ -1667,9 +3701,9 @@ function StrategyDetail({
   const [versionsOpen, setVersionsOpen] = useState(false);
   const versions = useStrategyVersions(versionsOpen ? record.id : null);
 
-  // 与后端 publish_readiness 保持一致：校验通过且已部署沙箱代码即可发布；
-  // 回测只作为参考信息，事件驱动策略没有历史公告可回放。
-  const publishable = errors.length === 0 && !!record.sandbox;
+  // 与后端 publish_readiness 保持一致：校验通过且已部署沙箱代码或配置技能参数即可发布；
+  // 回测只作为参考信息，不是发布前置条件。
+  const publishable = errors.length === 0 && (!!record.sandbox || !!record.skill);
   // 发布不再改变运行位置，改为看是否已有对外发布记录；保留卡片便于撤回或更新。
   const publications = usePublications(true);
   const published = (publications.data ?? []).some(
@@ -1682,34 +3716,19 @@ function StrategyDetail({
         <CardHeader className="flex-wrap">
           <div className="space-y-1">
             <CardTitle>{definition.name}</CardTitle>
-            <div className="flex flex-wrap items-center gap-1">
-              <Badge tone={statusTone[record.status]}>{strategyStatusLabel(record.status)}</Badge>
-              <SourceBadge source={record.source} />
-              <span className="text-[11px] text-muted">
-                {fmt(t.strategies.version, { version: record.version })}
-              </span>
-            </div>
-            <CardDescription>
-              {definition.universe.venues.join(" / ")} · {definition.universe.symbols.join(" / ")}
-            </CardDescription>
+            {!eventDriven && (
+              <div className="flex flex-wrap items-center gap-1">
+                <Badge tone={statusTone[record.status]}>{strategyStatusLabel(record.status)}</Badge>
+              </div>
+            )}
           </div>
           <div className="flex flex-wrap items-center gap-2">
-            <Button size="sm" variant={running ? "secondary" : "primary"} disabled={pending.toggle} onClick={onToggle}>
-              {running ? <Pause size={13} /> : <Play size={13} />}
-              {running ? t.strategies.pause : t.strategies.start}
-            </Button>
-            <Button size="sm" variant="secondary" disabled={pending.validate} onClick={onValidate}>
-              <ShieldCheck size={13} />
-              {pending.validate ? t.strategies.validating : t.strategies.validate}
-            </Button>
-            <Button size="sm" variant="secondary" disabled={pending.backtest} onClick={onBacktest}>
-              <FlaskConical size={13} />
-              {pending.backtest ? t.strategies.backtesting : t.strategies.backtest}
-            </Button>
-            <Button size="sm" variant="danger" disabled={pending.remove} onClick={onDelete}>
-              <Trash2 size={13} />
-              {t.strategies.delete}
-            </Button>
+            {showBacktest && (
+              <Button size="sm" variant="secondary" disabled={pending.backtest} onClick={onBacktest}>
+                <FlaskConical size={13} />
+                {pending.backtest ? t.strategies.backtesting : t.strategies.backtest}
+              </Button>
+            )}
           </div>
         </CardHeader>
         <CardContent className="space-y-4">
@@ -1734,7 +3753,6 @@ function StrategyDetail({
                 })}
               </span>
             </div>
-            <p className="mb-2 text-[11px] text-muted">{t.strategies.validationDesc}</p>
             {validation.issues.length > 0 && (
               <ul className="space-y-1">
                 {validation.issues.map((issue, index) => (
@@ -1755,11 +3773,27 @@ function StrategyDetail({
         </CardContent>
       </Card>
 
-      <StrategyCodeCard record={record} running={running} />
+      {!eventDriven && <StrategyCodeCard record={record} running={running} />}
 
-      <StrategyScopeCard record={record} running={running} />
+      {skill ? (
+        <StrategySkillScopeCard
+          strategyId={record.id}
+          status={record.status}
+          kind={skillKind}
+          purpose={skillBaseName(record.definition.name)}
+        />
+      ) : listing ? (
+        <StrategyListingScopeCard strategyId={record.id} status={record.status} />
+      ) : (
+        <StrategyScopeCard
+          record={record}
+          running={running}
+          onToggle={onToggle}
+          pendingToggle={pending.toggle}
+        />
+      )}
 
-      {publishable || published ? (
+      {record.source_publication_id ? null : publishable || published ? (
         <StrategyPublishCard record={record} />
       ) : (
         <Card>
@@ -1776,11 +3810,14 @@ function StrategyDetail({
       )}
 
 
+      {showBacktest && (
       <Card>
         <CardHeader>
           <div>
             <CardTitle>{t.strategies.backtestTitle}</CardTitle>
-            <CardDescription>{t.strategies.backtestDesc}</CardDescription>
+            <CardDescription>
+              {skill ? t.strategies.backtestDescSkill : t.strategies.backtestDesc}
+            </CardDescription>
           </div>
           <label className="flex items-center gap-2 text-[11px] text-muted">
             {t.strategies.backtestDays}
@@ -1805,7 +3842,7 @@ function StrategyDetail({
                   value={`${formatDateTime(report.sample_start)} → ${formatDateTime(report.sample_end)}`}
                 />
                 <Metric
-                  label={t.strategies.report.settlements}
+                  label={skill ? t.strategies.report.bars : t.strategies.report.settlements}
                   value={formatNumber(report.settlements, 0)}
                 />
                 <Metric label={t.strategies.report.trades} value={formatNumber(report.trades, 0)} />
@@ -1814,7 +3851,7 @@ function StrategyDetail({
                   value={winRate === null ? "—" : `${winRate.toFixed(0)}%`}
                 />
                 <Metric
-                  label={t.strategies.report.grossFunding}
+                  label={skill ? t.strategies.report.grossPnl : t.strategies.report.grossFunding}
                   value={formatUsd(report.gross_funding_usd)}
                 />
                 <Metric label={t.strategies.report.fees} value={formatUsd(report.fees_usd)} />
@@ -1856,9 +3893,11 @@ function StrategyDetail({
           )}
         </CardContent>
       </Card>
+      )}
 
-      <StrategyRuntimeCard record={record} />
+      <StrategyRuntimeCard record={record} eventDriven={eventDriven} />
 
+      {!eventDriven && (
       <Card>
         <CardHeader>
           <div>
@@ -1921,6 +3960,7 @@ function StrategyDetail({
           </CardContent>
         )}
       </Card>
+      )}
     </>
   );
 }

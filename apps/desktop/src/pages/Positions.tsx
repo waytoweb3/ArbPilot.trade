@@ -6,7 +6,7 @@ import { Badge } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "../components/ui/card";
 import { ConfirmDialog } from "../components/ui/confirm-dialog";
-import { useClosePosition, useOrders, usePositions } from "../hooks/useApi";
+import { useClosePosition, useOrders, usePositions, useStrategies } from "../hooks/useApi";
 import { toNumber } from "../lib/api";
 import {
   formatNumber,
@@ -23,6 +23,7 @@ const PAGE_SIZES = [10, 20, 50];
 export default function PositionsPage() {
   const positions = usePositions();
   const orders = useOrders();
+  const strategies = useStrategies();
   const closePosition = useClosePosition();
   const { t } = useI18n();
   const navigate = useNavigate();
@@ -36,6 +37,14 @@ export default function PositionsPage() {
 
   const positionRows = positions.data ?? [];
   const orderRows = orders.data ?? [];
+  // 仓位来源由「策略名 · 触发规则名」组成，策略重命名后列表跟随更新。
+  const strategyNames = useMemo(() => {
+    const names = new Map<string, string>();
+    for (const record of strategies.data ?? []) {
+      names.set(record.id, record.definition.name);
+    }
+    return names;
+  }, [strategies.data]);
   const positionPageCount = Math.max(1, Math.ceil(positionRows.length / positionPageSize));
   const positionCurrentPage = Math.min(positionPage, positionPageCount - 1);
   const visiblePositions = positionRows.slice(
@@ -135,12 +144,13 @@ export default function PositionsPage() {
             <EmptyState text={t.positions.empty} />
           ) : (
             <div className="overflow-x-auto">
-              <table className="w-full min-w-[900px] border-collapse text-sm">
+              <table className="w-full min-w-[980px] border-collapse text-sm">
                 <thead>
                   <tr className="text-left text-[11px] tracking-wide text-muted uppercase">
                     <th className="px-4 py-2 font-medium">{t.positions.venue}</th>
                     <th className="px-4 py-2 font-medium">{t.positions.symbol}</th>
                     <th className="px-4 py-2 font-medium">{t.positions.side}</th>
+                    <th className="px-4 py-2 font-medium">{t.positions.source}</th>
                     <th className="px-4 py-2 text-right font-medium">{t.positions.quantity}</th>
                     <th className="px-4 py-2 text-right font-medium">{t.positions.entry}</th>
                     <th className="px-4 py-2 text-right font-medium">{t.positions.mark}</th>
@@ -153,6 +163,11 @@ export default function PositionsPage() {
                 <tbody>
                   {visiblePositions.map((position) => {
                     const canOpenTrade = Boolean(position.group_id);
+                    const source = positionSource(
+                      position,
+                      strategyNames,
+                      t.positions.manualSource,
+                    );
                     return (
                       <tr
                         key={position.id}
@@ -175,6 +190,11 @@ export default function PositionsPage() {
                           <Badge tone={position.side === "buy" ? "success" : "danger"}>
                             {position.side === "buy" ? t.positions.long : t.positions.short}
                           </Badge>
+                        </td>
+                        <td className="max-w-[180px] px-4 py-2.5 text-xs text-muted">
+                          <span className="block truncate" title={source}>
+                            {source}
+                          </span>
                         </td>
                         <td className="px-4 py-2.5 text-right font-mono text-xs text-body">
                           {formatNumber(position.quantity, 6)}
@@ -419,6 +439,22 @@ function TablePager({
       </div>
     </div>
   );
+}
+
+// 仓位来源：规则触发的仓位展示「策略名 · 规则名」，其余标注为手动。
+function positionSource(
+  position: Position,
+  strategyNames: Map<string, string>,
+  manualLabel: string,
+): string {
+  const parts: string[] = [];
+  if (position.strategy_id) {
+    parts.push(strategyNames.get(position.strategy_id) ?? position.strategy_id.slice(0, 8));
+  }
+  if (position.source) {
+    parts.push(position.source);
+  }
+  return parts.length > 0 ? parts.join(" · ") : manualLabel;
 }
 
 // 浮动盈亏：盈利显示正号并用强调色，亏损显示负号并用危险色。

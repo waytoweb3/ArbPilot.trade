@@ -17,11 +17,15 @@ import type {
   EquityHistoryResponse,
   ExecutorLicense,
   LeaderboardEntry,
+  ListingSettings,
+  ListingSettingsResponse,
   MarketConfig,
   MinOrderSpec,
   SandboxDryRunRequest,
   SandboxRunReport,
   SettlementStatus,
+  SkillSettings,
+  SkillSettingsResponse,
   StrategyAuthorCard,
   StrategyPerformanceRecord,
   StrategyPublication,
@@ -41,6 +45,7 @@ import type {
   PublicationBundle,
   RiskLimits,
   StrategyDefinition,
+  StrategyExecutionMode,
   StrategyRecord,
   StrategyRunsResponse,
   StrategySource,
@@ -423,6 +428,12 @@ export const api = {
       body: JSON.stringify({ status }),
     }),
 
+  updateStrategyExecutionMode: (id: string, mode: StrategyExecutionMode) =>
+    request<StrategyRecord>(`/api/v1/strategies/${id}/execution-mode`, {
+      method: "PATCH",
+      body: JSON.stringify({ mode }),
+    }),
+
   updateStrategyDefinition: (id: string, definition: StrategyDefinition) =>
     request<StrategyRecord>(`/api/v1/strategies/${id}/definition`, {
       method: "PATCH",
@@ -498,6 +509,10 @@ export const api = {
   /** 运行实例与事件：策略在哪个交易所组合上跑、跑了多久、期间发生了什么。 */
   strategyRuns: (id: string) =>
     request<StrategyRunsResponse>(`/api/v1/strategies/${id}/runs`),
+
+  /** 清空历史运行实例，运行中的实例保留。 */
+  clearStrategyRuns: (id: string) =>
+    request<{ removed: number }>(`/api/v1/strategies/${id}/runs`, { method: "DELETE" }),
 
   // 策略市场：作者卡片、发布、订阅、表现与结算。
   marketAuthors: () => request<StrategyAuthorCard[]>("/api/v1/market/authors"),
@@ -641,6 +656,30 @@ export const api = {
 
   updateNotificationSettings: (settings: NotificationSettings) =>
     request<NotificationSettings>("/api/v1/config/notifications", {
+      method: "PUT",
+      body: JSON.stringify(settings),
+    }),
+
+  /** 上币公告跟随：按策略实例读取新闻解析、下单交易所、金额与止盈止损设置。 */
+  listingSettings: (strategyId: string) =>
+    request<ListingSettingsResponse>(
+      `/api/v1/listing/settings?strategy_id=${encodeURIComponent(strategyId)}`,
+    ),
+
+  updateListingSettings: (settings: ListingSettings & { strategy_id: string }) =>
+    request<ListingSettingsResponse>("/api/v1/listing/settings", {
+      method: "PUT",
+      body: JSON.stringify(settings),
+    }),
+
+  /** 技能策略：按策略实例读取 SKILL.md 六章参数。 */
+  skillSettings: (strategyId: string) =>
+    request<SkillSettingsResponse>(
+      `/api/v1/skill/settings?strategy_id=${encodeURIComponent(strategyId)}`,
+    ),
+
+  updateSkillSettings: (settings: SkillSettings & { strategy_id: string }) =>
+    request<SkillSettingsResponse>("/api/v1/skill/settings", {
       method: "PUT",
       body: JSON.stringify(settings),
     }),
