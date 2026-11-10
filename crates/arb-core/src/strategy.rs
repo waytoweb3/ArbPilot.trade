@@ -53,6 +53,17 @@ pub enum StrategyRunScope {
     SelfHosted,
 }
 
+/// 下单模式：默认真实下单，也可切到模拟，只记录信号与成交事件。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StrategyExecutionMode {
+    /// 默认：通过统一风控网关把订单提交到交易所。
+    #[default]
+    Real,
+    /// 模拟下单：不向交易所提交任何委托，只在策略事件里记录成交。
+    Paper,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Instrument {
@@ -1041,6 +1052,18 @@ impl StrategyRuntime {
     }
 }
 
+/// 技能参数运行时绑定：用稳定的模板标识取代按策略名称识别。
+///
+/// `settings` 是发布或导入时冻结的技能参数；为空表示按模板补默认值，
+/// 因此模板实例无需再编译沙箱模块。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillBinding {
+    /// 内置模板标识，如 `turtle-breakout`。
+    pub template_key: String,
+    #[serde(default)]
+    pub settings: Option<serde_json::Value>,
+}
+
 /// 策略记录：定义 + 版本 + 校验结果 + 最近回测 + 运行时状态。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StrategyRecord {
@@ -1058,10 +1081,16 @@ pub struct StrategyRecord {
     /// 运行位置：默认自托管，发布到市场后改为平台托管。
     #[serde(default)]
     pub run_scope: StrategyRunScope,
+    /// 下单模式：真实下单或模拟下单，默认真实。
+    #[serde(default)]
+    pub execution_mode: StrategyExecutionMode,
     /// 可选 WASM 沙箱绑定。存在时由沙箱模块替代内置入场/出场判断，
     /// 但输出仍只能通过统一风控网关下单。
     #[serde(default)]
     pub sandbox: Option<crate::sandbox::SandboxBinding>,
+    /// 技能参数运行时绑定；存在时由执行器的技能运行时解释参数，不依赖沙箱模块。
+    #[serde(default)]
+    pub skill: Option<SkillBinding>,
     pub last_heartbeat_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -1085,7 +1114,9 @@ impl StrategyRecord {
             last_backtest: None,
             runtime: StrategyRuntime::default(),
             run_scope: StrategyRunScope::SelfHosted,
+            execution_mode: StrategyExecutionMode::Real,
             sandbox: None,
+            skill: None,
             last_heartbeat_at: Some(now),
             created_at: now,
             updated_at: now,

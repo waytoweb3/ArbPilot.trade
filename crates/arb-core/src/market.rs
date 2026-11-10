@@ -16,7 +16,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::strategy::{
-    StrategyDefinition, StrategyRecord, StrategyValidation, ValidationIssue, ValidationSeverity,
+    SkillBinding, StrategyDefinition, StrategyRecord, StrategyValidation, ValidationIssue,
+    ValidationSeverity,
 };
 
 /// 策略风险等级，用于作者卡片与订阅前审阅。
@@ -197,9 +198,12 @@ pub struct StrategyPublication {
     pub visibility: MarketVisibility,
     pub pricing: StrategyPricing,
     pub status: PublicationStatus,
-    /// 发布时冻结的沙箱模块哈希；订阅者据此校验交付代码。
+    /// 发布时冻结的沙箱模块哈希；代码策略据此校验交付代码。
     #[serde(default)]
     pub artifact_sha256: Option<String>,
+    /// 发布时冻结的技能参数绑定；存在时订阅者无需沙箱模块即可运行。
+    #[serde(default)]
+    pub skill: Option<SkillBinding>,
     /// 发布时冻结的策略定义；订阅者导入时直接使用，不受作者后续修改影响。
     #[serde(default)]
     pub definition: Option<StrategyDefinition>,
@@ -377,12 +381,12 @@ pub fn publish_readiness(
             "策略校验未通过，不能发布",
         ));
     }
-    // 订阅者要在自己机器上运行，发布必须带着可执行的沙箱模块。
-    if record.sandbox.is_none() {
+    // 订阅者要在自己机器上运行，发布必须带着可执行内容：沙箱模块或技能参数。
+    if record.sandbox.is_none() && record.skill.is_none() {
         issues.push(issue(
             ValidationSeverity::Error,
-            "strategy.sandbox",
-            "发布前必须先编译并部署策略代码",
+            "strategy.runtime",
+            "发布前必须先部署策略代码或配置技能参数",
         ));
     }
     if record.status == crate::strategy::StrategyStatus::Running {
@@ -847,6 +851,7 @@ mod tests {
             pricing: StrategyPricing::monthly(dec!(19), 7),
             status: PublicationStatus::Published,
             artifact_sha256: Some("a".repeat(64)),
+            skill: None,
             definition: None,
             changelog: vec![StrategyChangelogEntry {
                 version: 3,

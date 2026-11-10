@@ -249,6 +249,10 @@ pub struct Position {
     /// 来自策略的仓位记录来源策略，手动下单为 None。
     #[serde(default)]
     pub strategy_id: Option<Uuid>,
+    /// 触发该仓位的具体规则名称（例如上币公告跟随的一条规则），用于说明仓位来源；
+    /// 手动下单或策略没有规则时为 None。
+    #[serde(default)]
+    pub source: Option<String>,
     /// 同一次双腿下单产生的仓位共享同一个分组 ID，用于整组平仓。
     #[serde(default)]
     pub group_id: Option<Uuid>,

@@ -58,9 +58,10 @@ pub use strategy::{
     run_backtest, BacktestAssumption, BacktestReport, CostAssumptions, DataRules, EntryRules,
     EquityPoint, ExecutionRules, ExitRules, FundingSample, Instrument, StrategyCode,
     StrategyCodeLanguage, StrategyCodeOrigin, StrategyDefinition, StrategyEvent,
-    StrategyEventLevel, StrategyKind, StrategyOpenPosition, StrategyPendingOrder, StrategyRecord,
-    StrategyRisk, StrategyRunScope, StrategyRuntime, StrategySource, StrategyStatus,
-    StrategyUniverse, StrategyValidation, ValidationIssue, ValidationSeverity,
+    StrategyEventLevel, StrategyExecutionMode, StrategyKind, StrategyOpenPosition,
+    SkillBinding, StrategyPendingOrder, StrategyRecord, StrategyRisk, StrategyRunScope,
+    StrategyRuntime, StrategySource, StrategyStatus, StrategyUniverse, StrategyValidation,
+    ValidationIssue, ValidationSeverity,
 };
 pub use types::{
     Balance, LegStatus, Opportunity, OpportunityKind, Order, OrderIntent, OrderLeg, OrderLegIntent,
