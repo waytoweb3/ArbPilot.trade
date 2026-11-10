@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::RwLock};
+use std::{collections::BTreeMap, collections::HashMap, sync::RwLock};
 
 use arb_core::{
     BacktestReport, Order, SandboxArtifact, Side, StrategyAuthorCard, StrategyCode,
@@ -13,7 +13,8 @@ use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 use uuid::Uuid;
 
 use crate::{
-    conditional::ConditionalOrder, exchange::FundingRate, sqlite_store::SqliteStore,
+    conditional::ConditionalOrder, exchange::FundingRate, listing::ListingSettings,
+    listing::ListingTrade, skill::SkillSettings, sqlite_store::SqliteStore,
     templates::StrategyTemplate,
 };
 
@@ -40,6 +41,11 @@ pub struct FundingSummary {
 /// 仓位组成员：`(venue, symbol, side)` 三元组用于重启后把交易所同步回来的仓位归回原仓位组。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PositionGroupMember {
+    /// 开仓来源策略与规则，重启后随仓位组一起还原到仓位列表。
+    #[serde(default)]
+    pub strategy_id: Option<Uuid>,
+    #[serde(default)]
+    pub source: Option<String>,
     pub venue: String,
     pub symbol: String,
     pub side: Side,
@@ -140,6 +146,9 @@ pub struct StrategyRun {
     pub long_venue: String,
     pub short_venue: String,
     pub symbols: Vec<String>,
+    /// 启动时的规则快照（上币公告跟随用它替代交易对组合），配置改动后历史实例仍是当时的值。
+    #[serde(default)]
+    pub note: Option<String>,
     pub started_at: DateTime<Utc>,
     pub stopped_at: Option<DateTime<Utc>>,
     pub last_heartbeat_at: Option<DateTime<Utc>>,
@@ -158,6 +167,7 @@ impl StrategyRun {
             long_venue: venues.first().cloned().unwrap_or_default(),
             short_venue: venues.get(1).cloned().unwrap_or_default(),
             symbols: record.definition.universe.symbols.clone(),
+            note: None,
             started_at: now,
             stopped_at: None,
             last_heartbeat_at: Some(now),
@@ -225,10 +235,16 @@ pub struct Store {
     sandbox_artifacts: RwLock<Vec<SandboxArtifact>>,
     /// 沙箱模块字节；仅保存在执行器本机。
     sandbox_modules: RwLock<HashMap<Uuid, Vec<u8>>>,
-    /// 内置策略模板（源码 + 默认定义），重启后从数据库恢复。
+    /// 内置策略模板（默认定义与说明），重启后从数据库恢复。
     strategy_templates: RwLock<Vec<StrategyTemplate>>,
     /// 内存降级时的条件单，重启即丢。
     conditional_orders: RwLock<Vec<ConditionalOrder>>,
+    /// 内存降级时的上币单腿交易设置，键为策略 ID。
+    listing_settings: RwLock<BTreeMap<String, ListingSettings>>,
+    /// 内存降级时的上币单腿交易记录。
+    listing_trades: RwLock<Vec<ListingTrade>>,
+    /// 内存降级时的技能策略设置，键为策略 ID。
+    skill_settings: RwLock<BTreeMap<String, SkillSettings>>,
 }
 
 impl Store {
@@ -315,6 +331,9 @@ impl Store {
             sandbox_modules: RwLock::new(HashMap::new()),
             strategy_templates: RwLock::new(Vec::new()),
             conditional_orders: RwLock::new(Vec::new()),
+            listing_settings: RwLock::new(BTreeMap::new()),
+            listing_trades: RwLock::new(Vec::new()),
+            skill_settings: RwLock::new(BTreeMap::new()),
         }
     }
 
@@ -1285,6 +1304,32 @@ impl Store {
         })
     }
 
+    /// 清空策略的历史运行实例（运行中的实例保留），返回删除条数。
+    pub async fn clear_strategy_runs(&self, strategy_id: Uuid) -> usize {
+        sqlite_branch!(self, db => db.clear_strategy_runs(strategy_id).await);
+        let Some(pool) = &self.pool else {
+            let mut rows = self.strategy_runs.write().expect("运行实例锁不可用");
+            let before = rows.len();
+            rows.retain(|run| {
+                !(run.strategy_id == strategy_id && run.status != StrategyStatus::Running)
+            });
+            return before - rows.len();
+        };
+
+        match sqlx::query("delete from strategy_runs where strategy_id = $1 and status <> $2")
+            .bind(strategy_id)
+            .bind(enum_label(&StrategyStatus::Running))
+            .execute(pool)
+            .await
+        {
+            Ok(result) => result.rows_affected() as usize,
+            Err(error) => {
+                tracing::error!(%error, %strategy_id, "清理运行实例失败");
+                0
+            }
+        }
+    }
+
     /// 追加一条运行事件。
     pub async fn append_strategy_run_event(&self, event: &StrategyRunEvent) {
         sqlite_branch!(self, db => db.append_strategy_run_event(event).await);
@@ -1874,6 +1919,25 @@ impl Store {
         }
     }
 
+    /// 删除策略模板。仅用于把官方模板从用户执行器移除。
+    pub async fn delete_strategy_template(&self, key: &str) {
+        sqlite_branch!(self, db => db.delete_strategy_template(key).await);
+        let Some(pool) = &self.pool else {
+            self.strategy_templates
+                .write()
+                .expect("模板锁不可用")
+                .retain(|template| template.key != key);
+            return;
+        };
+        if let Err(error) = sqlx::query("delete from strategy_templates where key = $1")
+            .bind(key)
+            .execute(pool)
+            .await
+        {
+            tracing::error!(%error, %key, "删除策略模板失败");
+        }
+    }
+
     /// 读取全部条件单，按创建时间倒序由调用方排序。
     pub async fn conditional_orders(&self) -> Vec<ConditionalOrder> {
         sqlite_branch!(self, db => db.conditional_orders().await);
@@ -1922,6 +1986,176 @@ impl Store {
         .await
         {
             tracing::error!(%error, %id, "写入条件单失败");
+        }
+    }
+
+    /// 读取各上币公告跟随策略的设置，键为策略 ID。
+    pub async fn listing_settings(&self) -> BTreeMap<String, ListingSettings> {
+        sqlite_branch!(self, db => db.listing_settings().await);
+        let Some(pool) = &self.pool else {
+            return self
+                .listing_settings
+                .read()
+                .expect("上币交易设置锁不可用")
+                .clone();
+        };
+
+        let row = match sqlx::query("select payload from listing_settings where id = 1")
+            .fetch_optional(pool)
+            .await
+        {
+            Ok(row) => row,
+            Err(error) => {
+                tracing::error!(%error, "读取上币交易设置失败");
+                return BTreeMap::new();
+            }
+        };
+        row.and_then(|row| row.try_get::<serde_json::Value, _>("payload").ok())
+            .and_then(|payload| serde_json::from_value(payload).ok())
+            .unwrap_or_default()
+    }
+
+    /// 保存各上币公告跟随策略的设置。
+    pub async fn save_listing_settings(&self, settings: &BTreeMap<String, ListingSettings>) {
+        sqlite_branch!(self, db => db.save_listing_settings(settings).await);
+        let Some(pool) = &self.pool else {
+            *self
+                .listing_settings
+                .write()
+                .expect("上币交易设置锁不可用") = settings.clone();
+            return;
+        };
+
+        let payload = match serde_json::to_value(settings) {
+            Ok(payload) => payload,
+            Err(error) => {
+                tracing::error!(%error, "上币交易设置序列化失败");
+                return;
+            }
+        };
+        if let Err(error) = sqlx::query(
+            r#"
+            insert into listing_settings (id, payload)
+            values (1, $1)
+            on conflict (id) do update
+                set payload = excluded.payload,
+                    updated_at = now()
+            "#,
+        )
+        .bind(payload)
+        .execute(pool)
+        .await
+        {
+            tracing::error!(%error, "写入上币交易设置失败");
+        }
+    }
+
+    /// 读取各技能策略的设置，键为策略 ID。
+    pub async fn skill_settings(&self) -> BTreeMap<String, SkillSettings> {
+        sqlite_branch!(self, db => db.skill_settings().await);
+        let Some(pool) = &self.pool else {
+            return self
+                .skill_settings
+                .read()
+                .expect("技能设置锁不可用")
+                .clone();
+        };
+
+        let row = match sqlx::query("select payload from skill_settings where id = 1")
+            .fetch_optional(pool)
+            .await
+        {
+            Ok(row) => row,
+            Err(error) => {
+                tracing::error!(%error, "读取技能策略设置失败");
+                return BTreeMap::new();
+            }
+        };
+        row.and_then(|row| row.try_get::<serde_json::Value, _>("payload").ok())
+            .and_then(|payload| serde_json::from_value(payload).ok())
+            .unwrap_or_default()
+    }
+
+    /// 保存各技能策略的设置。
+    pub async fn save_skill_settings(&self, settings: &BTreeMap<String, SkillSettings>) {
+        sqlite_branch!(self, db => db.save_skill_settings(settings).await);
+        let Some(pool) = &self.pool else {
+            *self.skill_settings.write().expect("技能设置锁不可用") = settings.clone();
+            return;
+        };
+
+        let payload = match serde_json::to_value(settings) {
+            Ok(payload) => payload,
+            Err(error) => {
+                tracing::error!(%error, "技能策略设置序列化失败");
+                return;
+            }
+        };
+        if let Err(error) = sqlx::query(
+            r#"
+            insert into skill_settings (id, payload)
+            values (1, $1)
+            on conflict (id) do update
+                set payload = excluded.payload,
+                    updated_at = now()
+            "#,
+        )
+        .bind(payload)
+        .execute(pool)
+        .await
+        {
+            tracing::error!(%error, "写入技能策略设置失败");
+        }
+    }
+
+    /// 读取全部上币单腿交易记录，排序由调用方负责。
+    pub async fn listing_trades(&self) -> Vec<ListingTrade> {
+        sqlite_branch!(self, db => db.listing_trades().await);
+        let Some(pool) = &self.pool else {
+            return self
+                .listing_trades
+                .read()
+                .expect("上币交易锁不可用")
+                .clone();
+        };
+        load_payloads(pool, "listing_trades").await
+    }
+
+    /// 写入上币单腿交易记录，按 `id` 幂等。
+    pub async fn save_listing_trade(&self, trade: &ListingTrade) {
+        sqlite_branch!(self, db => db.save_listing_trade(trade).await);
+        let id = trade.id;
+        let Some(pool) = &self.pool else {
+            let mut rows = self.listing_trades.write().expect("上币交易锁不可用");
+            match rows.iter_mut().find(|existing| existing.id == id) {
+                Some(existing) => *existing = trade.clone(),
+                None => rows.push(trade.clone()),
+            }
+            return;
+        };
+
+        let payload = match serde_json::to_value(trade) {
+            Ok(payload) => payload,
+            Err(error) => {
+                tracing::error!(%error, %id, "上币交易序列化失败");
+                return;
+            }
+        };
+        if let Err(error) = sqlx::query(
+            r#"
+            insert into listing_trades (id, payload)
+            values ($1, $2)
+            on conflict (id) do update
+                set payload = excluded.payload,
+                    updated_at = now()
+            "#,
+        )
+        .bind(trade.id)
+        .bind(payload)
+        .execute(pool)
+        .await
+        {
+            tracing::error!(%error, %id, "写入上币交易失败");
         }
     }
 

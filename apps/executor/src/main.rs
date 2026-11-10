@@ -9,6 +9,7 @@ mod funding;
 mod gateway;
 mod http_client;
 mod license;
+mod listing;
 mod llm;
 mod market;
 mod news;
@@ -20,6 +21,9 @@ mod routes;
 mod sandbox;
 mod secret;
 mod selftest;
+mod skill;
+mod skill_backtest;
+mod skill_check;
 mod sqlite_store;
 mod state;
 mod store;
@@ -58,7 +62,7 @@ async fn main() -> anyhow::Result<()> {
     )
     .await;
     let state = state::AppState::new(config.clone(), store).await;
-    // 内置模板存数据库：补齐缺失模板并把源码编译成沙箱模块。
+    // 官方实例补齐全部模板并发布市场；本地只补齐通用技能模板。
     templates::seed(&state).await;
     // 官方只读实例把内置模板发布到策略市场，供所有用户免费订阅。
     routes::market::seed_official(&state).await;
@@ -66,6 +70,10 @@ async fn main() -> anyhow::Result<()> {
     strategy_runner::spawn(state.clone());
     // 条件单：按固定节拍检查有效期与触发条件，命中后走同一风控网关下单。
     conditional::spawn(state.clone());
+    // 上币单腿交易：扫描上币公告推送电报卡片，并按标记价监控止盈止损。
+    listing::spawn(state.clone());
+    // 技能策略：按 SKILL.md 参数化后的触发条件扫描公告并下单。
+    skill::spawn(state.clone());
     let app = routes::build(state);
 
     let listener = TcpListener::bind(config.bind_addr)

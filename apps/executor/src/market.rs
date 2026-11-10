@@ -47,7 +47,8 @@ const DELIVERY_REFRESH_SECS: i64 = 3_600;
 /// 跨所比较以 `funding_annualized_pct`（年化）为准；bps 字段仍按 8 小时一期展示，
 /// 未能确认结算间隔时也回退到该值。
 const FUNDING_TARGET_INTERVAL_SECS: i64 = 8 * 3600;
-const KLINE_INTERVALS: [&str; 9] = ["1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w", "10m"];
+/// 支持的 K 线周期；技能参数校验与行情拉取共用同一份清单。
+pub const KLINE_INTERVALS: [&str; 9] = ["1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w", "10m"];
 /// 30 秒 K 线由 WebSocket 盘口逐秒采样聚合，REST 只提供分钟级历史。
 const TICK_BAR_SECONDS: i64 = 30;
 /// 单个交易对保留的 30 秒 K 线上限（30s × 480 = 4 小时）。

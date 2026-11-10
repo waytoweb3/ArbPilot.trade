@@ -1,7 +1,7 @@
 use arb_core::{
     BacktestReport, CostAssumptions, DataRules, EntryRules, ExecutionRules, ExitRules,
-    FundingSample, Instrument, StrategyDefinition, StrategyEventLevel, StrategyKind,
-    StrategyRecord, StrategyRisk, StrategySource, StrategyStatus, StrategyUniverse,
+    FundingSample, Instrument, StrategyDefinition, StrategyEventLevel, StrategyExecutionMode,
+    StrategyKind, StrategyRecord, StrategyRisk, StrategySource, StrategyStatus, StrategyUniverse,
 };
 use axum::{
     extract::{Path, State},
@@ -22,6 +22,20 @@ use crate::{
 pub async fn list(State(state): State<AppState>) -> Json<Vec<StrategyRecord>> {
     // 列表以数据库为准：没有保存过策略时返回空列表。
     let mut strategies = state.store.load_strategies().await;
+    // 运行时指标只在内存里更新、按需落库；读列表时合并回来，避免「最近评估」长时间不动。
+    // 数据库里有而内存里缺失的记录顺手补回内存，避免列表能点、详情和启停却报「策略不存在」。
+    {
+        let mut live = state.strategies.write().expect("策略锁不可用");
+        for record in &mut strategies {
+            match live.iter_mut().find(|item| item.id == record.id) {
+                Some(current) => {
+                    record.runtime = current.runtime.clone();
+                    record.last_heartbeat_at = current.last_heartbeat_at;
+                }
+                None => live.push(record.clone()),
+            }
+        }
+    }
     strategies.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
     Json(strategies)
 }
@@ -159,9 +173,10 @@ pub async fn update(
     let previous = record.status;
 
     if body.status == StrategyStatus::Running {
-        if record.sandbox.is_none() {
+        // 沙箱模块或技能参数都可以承载运行，两者都没有时无法启动。
+        if record.sandbox.is_none() && record.skill.is_none() {
             return Err(ApiError::Conflict(
-                "请先编译并部署策略代码再启动".to_string(),
+                "请先部署策略代码或配置技能参数再启动".to_string(),
             ));
         }
         record.validation = record.definition.validate(&state.risk_limits());
@@ -178,27 +193,56 @@ pub async fn update(
 
     // 启动时建立运行实例，暂停/停止时关闭，便于按实例回看运行情况。
     if body.status == StrategyStatus::Running && record.runtime.run_id.is_none() {
-        let run = StrategyRun::new(&record);
+        let mut run = StrategyRun::new(&record);
+        // 上币公告跟随没有交易对组合，把当次生效的规则存进实例，之后改配置也不会改写历史。
+        run.note = listing_note(&state, &record).await;
         state.store.save_strategy_run(&run).await;
-        let message = format!("开始运行：{} / {}", run.long_venue, run.short_venue);
-        record
-            .runtime
-            .record(StrategyEventLevel::Info, message.clone(), None);
-        state
-            .store
-            .append_strategy_run_event(&StrategyRunEvent {
-                run_id: run.id,
-                strategy_id: record.id,
-                level: StrategyEventLevel::Info,
-                message,
-                order_id: None,
-                created_at: Utc::now(),
-            })
-            .await;
         record.runtime.run_id = Some(run.id);
     } else if previous == StrategyStatus::Running && body.status != StrategyStatus::Running {
         close_run(&state, &mut record, body.status).await;
     }
+
+    replace(&state, &record);
+    persist(&state, &record).await;
+    Ok(Json(record))
+}
+
+/// 下单模式：真实下单会经统一风控提交给交易所；模拟下单只记录信号与成交事件。
+#[derive(Debug, Deserialize)]
+pub struct UpdateExecutionModeRequest {
+    pub mode: StrategyExecutionMode,
+}
+
+/// 切换下单模式。运行中或仍有持仓时禁止切换，避免真实仓位被模拟平掉。
+pub async fn update_execution_mode(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<UpdateExecutionModeRequest>,
+) -> Result<Json<StrategyRecord>, ApiError> {
+    let mut record = find(&state, id)?;
+    if record.execution_mode == body.mode {
+        return Ok(Json(record));
+    }
+    if record.status == StrategyStatus::Running {
+        return Err(ApiError::Conflict(
+            "请先暂停策略再切换下单模式".to_string(),
+        ));
+    }
+    if record.runtime.open.is_some() {
+        return Err(ApiError::Conflict(
+            "策略仍有未平仓位，不能切换下单模式".to_string(),
+        ));
+    }
+
+    record.execution_mode = body.mode;
+    record.updated_at = Utc::now();
+    let label = match body.mode {
+        StrategyExecutionMode::Real => "真实下单",
+        StrategyExecutionMode::Paper => "模拟下单",
+    };
+    record
+        .runtime
+        .record(StrategyEventLevel::Info, format!("下单模式已切换为{label}"), None);
 
     replace(&state, &record);
     persist(&state, &record).await;
@@ -241,6 +285,21 @@ pub async fn runs(
         None => Vec::new(),
     };
     Ok(Json(StrategyRunsResponse { runs, events }))
+}
+
+#[derive(Debug, Serialize)]
+pub struct ClearRunsResponse {
+    pub removed: usize,
+}
+
+/// 清空历史运行实例：运行中的实例保留，已结束的实例一并清掉。
+pub async fn clear_runs(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<ClearRunsResponse>, ApiError> {
+    find(&state, id)?;
+    let removed = state.store.clear_strategy_runs(id).await;
+    Ok(Json(ClearRunsResponse { removed }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -403,6 +462,17 @@ pub async fn backtest(
     if record.validation.has_errors() {
         return Err(ApiError::Conflict("策略校验未通过，无法回测".to_string()));
     }
+    // 技能策略是 `Custom` 但没有沙箱模块，回测走 SKILL.md 规则重放。
+    if crate::skill::manages(&record) {
+        let report = crate::skill_backtest::run(&state, &record, body.days)
+            .await
+            .map_err(ApiError::Conflict)?;
+        record.last_backtest = Some(report.clone());
+        record.updated_at = Utc::now();
+        replace(&state, &record);
+        persist(&state, &record).await;
+        return Ok(Json(report));
+    }
     if record.definition.kind == StrategyKind::Custom {
         let report = crate::wasm_backtest::run(&state, &record, body.days)
             .await
@@ -498,12 +568,13 @@ pub async fn remove(
         ));
     }
 
+    // 先删数据库再清内存：库删除失败时不会留下「列表看得到、操作报不存在」的幽灵策略。
+    state.store.delete_strategy(id).await;
     state
         .strategies
         .write()
         .expect("策略锁不可用")
         .retain(|existing| existing.id != id);
-    state.store.delete_strategy(id).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -533,4 +604,86 @@ pub(crate) fn replace(state: &AppState, record: &StrategyRecord) {
 pub(crate) async fn persist(state: &AppState, record: &StrategyRecord) {
     state.store.save_strategy(record).await;
     state.store.save_strategy_version(record).await;
+}
+
+/// 事件/指标驱动策略的运行快照：
+/// - 公告类：启用的规则（监听来源/关键词 → 执行交易所）；
+/// - 指标类：启用的规则（周期、通道/均线参数、方向 → 执行交易所）；
+/// - 网格：启用的规则（档位数、间距、每档比例 → 执行交易所）。
+/// 其它策略没有这类规则，返回 None 时运行实例就不显示规则行。
+pub(crate) async fn listing_note(state: &AppState, record: &StrategyRecord) -> Option<String> {
+    if !crate::skill::manages(record) {
+        return None;
+    }
+    let settings = crate::skill::settings_for(state, record);
+    let rules: Vec<String> = settings
+        .enabled_rules()
+        .map(|rule| {
+            let execution = if rule.steps.execution_venues.is_empty() {
+                "全部交易所".to_string()
+            } else {
+                rule.steps.execution_venues.join(" / ")
+            };
+            let condition = match rule.kind {
+                crate::skill::SkillKind::Event => {
+                    let sources = if rule.trigger.event_sources.is_empty() {
+                        "全部来源".to_string()
+                    } else {
+                        rule.trigger.event_sources.join(" / ")
+                    };
+                    let keywords = match rule.trigger.event_keywords.as_slice() {
+                        [] => "内置关键词".to_string(),
+                        [only] => only.clone(),
+                        [first, ..] => {
+                            format!("{} 等 {} 个关键词", first, rule.trigger.event_keywords.len())
+                        }
+                    };
+                    format!("{sources}（{keywords}）")
+                }
+                crate::skill::SkillKind::Breakout => format!(
+                    "{} · 通道 {} · ATR {}×",
+                    rule.trigger.timeframe, rule.trigger.channel, rule.trigger.atr_multiple
+                ),
+                crate::skill::SkillKind::MaTrend => format!(
+                    "{} · 均线 {}/{}",
+                    rule.trigger.timeframe, rule.trigger.fast, rule.trigger.slow
+                ),
+                crate::skill::SkillKind::Grid => format!(
+                    "{} · {} 档 · 间距 {}% · 每档 {}%",
+                    rule.trigger.timeframe,
+                    rule.business.grid_levels,
+                    rule.business.grid_spacing_pct,
+                    rule.business.grid_share_pct
+                ),
+            };
+            match rule.name.trim() {
+                "" => format!("{condition} → {execution}"),
+                name => format!("{name}：{condition} → {execution}"),
+            }
+        })
+        .collect();
+    (!rules.is_empty()).then(|| rules.join("\n"))
+}
+
+/// 规则变更后刷新当前运行实例的规则快照。
+///
+/// 历史实例保留启动时的规则，运行中的实例展示此刻真正生效的规则，
+/// 这样在页面上停止/启动某条规则时能立即反映到「运行实例」。
+pub(crate) async fn refresh_run_note(state: &AppState, strategy_id: Uuid) {
+    let Ok(record) = find(state, strategy_id) else {
+        return;
+    };
+    if record.status != StrategyStatus::Running {
+        return;
+    }
+    let Some(run_id) = record.runtime.run_id else {
+        return;
+    };
+    if let Some(mut run) = state.store.strategy_run(run_id).await {
+        if run.status != StrategyStatus::Running {
+            return;
+        }
+        run.note = listing_note(state, &record).await;
+        state.store.save_strategy_run(&run).await;
+    }
 }

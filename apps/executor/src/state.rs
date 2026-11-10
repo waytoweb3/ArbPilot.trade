@@ -23,11 +23,13 @@ use crate::{
     gateway::MAX_IN_MEMORY_ORDERS,
     http_client::HttpClient,
     license::LicenseManager,
+    listing::ListingDesk,
     market::MarketFeed,
     news::NewsFeed,
     notifier::Notifier,
     onchain::ChainFeed,
     realtime::RealtimeFeed,
+    skill::SkillDesk,
     store::{PositionGroupMember, Store},
     telegram::TelegramBot,
 };
@@ -62,6 +64,10 @@ pub struct AppState {
     pub strategies: Arc<RwLock<Vec<StrategyRecord>>>,
     /// 条件单：等待触发，由后台轮询判断有效期与阈值。
     pub conditional: Arc<ConditionalOrders>,
+    /// 上币单腿交易：公告识别、开仓记录与止盈止损监控。
+    pub listing: Arc<ListingDesk>,
+    /// 技能策略：SKILL.md 六章参数化后的触发设置。
+    pub skill: Arc<SkillDesk>,
     pub idempotency: Arc<RwLock<HashMap<String, Uuid>>>,
     pub events: broadcast::Sender<ExecutorEvent>,
     pub paused: Arc<AtomicBool>,
@@ -151,6 +157,20 @@ impl AppState {
         let strategies = store.load_strategies().await;
         // 条件单持久化在库里，重启后继续等待触发。
         let conditional = ConditionalOrders::with_orders(store.conditional_orders().await);
+        // 上币单腿交易的设置与持仓同样持久化，重启后继续监控止盈止损；
+        // 每个策略实例一套设置，未保存过时杠杆默认取风控的杠杆上限。
+        let listing = ListingDesk::start(
+            store.clone(),
+            store.listing_settings().await,
+            store.listing_trades().await,
+            config.risk.max_leverage,
+        );
+        // 技能策略的设置按策略 ID 持久化，重启后继续按最新参数扫描公告。
+        let skill = SkillDesk::start(
+            store.clone(),
+            store.skill_settings().await,
+            config.risk.max_leverage,
+        );
         // 历史委托与成交记录来自订单表，重启后底部面板仍能看到历史。
         let mut orders = store.orders().await;
         orders.sort_by_key(|order| std::cmp::Reverse(order.created_at));
@@ -182,6 +202,8 @@ impl AppState {
             positions: Arc::new(RwLock::new(Vec::new())),
             strategies: Arc::new(RwLock::new(strategies)),
             conditional: Arc::new(conditional),
+            listing,
+            skill,
             idempotency: Arc::new(RwLock::new(HashMap::new())),
             events,
             paused: Arc::new(AtomicBool::new(false)),
@@ -236,21 +258,40 @@ impl AppState {
                         groups = state.backfill_position_groups(&snapshots).await;
                     }
                 }
-                let lookup: HashMap<(String, String, Side), Uuid> = groups
+                let lookup: HashMap<
+                    (String, String, Side),
+                    (Uuid, Option<Uuid>, Option<String>),
+                > = groups
                     .iter()
                     .flat_map(|(group_id, members)| {
                         members.iter().map(move |member| {
                             (
                                 (member.venue.clone(), member.symbol.clone(), member.side),
-                                *group_id,
+                                (*group_id, member.strategy_id, member.source.clone()),
                             )
                         })
+                    })
+                    .collect();
+                // 单腿上币仓位没有仓位组，用持久化的上币交易补回策略与规则来源。
+                let listing_sources: HashMap<
+                    (String, String, Side),
+                    (Option<Uuid>, Option<String>),
+                > = state
+                    .listing
+                    .open_trades()
+                    .into_iter()
+                    .filter(|trade| !trade.paper)
+                    .map(|trade| {
+                        (
+                            (trade.venue.clone(), trade.symbol.clone(), Side::Buy),
+                            (trade.strategy_id, trade.source.clone()),
+                        )
                     })
                     .collect();
 
                 let stale = {
                     let mut positions = state.positions.write().expect("仓位锁不可用");
-                    merge_exchange_positions(&mut positions, snapshots, &lookup);
+                    merge_exchange_positions(&mut positions, snapshots, &lookup, &listing_sources);
                     // 组内成员全部不在持仓里，说明该组已平仓，删除映射避免同键位被误归组。
                     let live: HashSet<(String, String, Side)> = positions
                         .iter()
@@ -314,6 +355,8 @@ impl AppState {
                 .iter()
                 .filter(|leg| live.contains(&(leg.venue.clone(), leg.symbol.clone(), leg.side)))
                 .map(|leg| PositionGroupMember {
+                    strategy_id: order.intent.strategy_id,
+                    source: None,
                     venue: leg.venue.clone(),
                     symbol: leg.symbol.clone(),
                     side: leg.side,
@@ -455,7 +498,8 @@ impl AppState {
 fn merge_exchange_positions(
     positions: &mut Vec<Position>,
     snapshots: Vec<VenuePositions>,
-    groups: &HashMap<(String, String, Side), Uuid>,
+    groups: &HashMap<(String, String, Side), (Uuid, Option<Uuid>, Option<String>)>,
+    listing_sources: &HashMap<(String, String, Side), (Option<Uuid>, Option<String>)>,
 ) {
     for snapshot in snapshots {
         let (mut local, mut retained): (Vec<Position>, Vec<Position>) = positions
@@ -475,10 +519,24 @@ fn merge_exchange_positions(
                 let existing = local.remove(index);
                 position.id = existing.id;
                 position.strategy_id = existing.strategy_id;
+                position.source = existing.source;
                 position.group_id = existing.group_id;
             }
             if position.group_id.is_none() {
-                position.group_id = groups.get(&key).copied();
+                if let Some((group_id, strategy_id, source)) = groups.get(&key) {
+                    position.group_id = Some(*group_id);
+                    if position.strategy_id.is_none() {
+                        position.strategy_id = *strategy_id;
+                        position.source = source.clone();
+                    }
+                }
+            }
+            // 交易所有仓位但本地没有记录（例如重启后），用上币交易补回来源。
+            if position.strategy_id.is_none() {
+                if let Some((strategy_id, source)) = listing_sources.get(&key) {
+                    position.strategy_id = *strategy_id;
+                    position.source = source.clone();
+                }
             }
             retained.push(position);
         }

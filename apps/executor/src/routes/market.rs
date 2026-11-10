@@ -8,10 +8,10 @@
 use arb_core::{
     compute_settlement_from_gross, period_bounds, publish_readiness, rank_publications,
     settlement_period, LeaderboardEntry, MarketVisibility, PerformanceSource, PublicationStatus,
-    RiskLevel, SandboxArtifact, SandboxArtifactSource, SandboxBinding, SourceVisibility,
-    StrategyAuthorCard, StrategyChangelogEntry, StrategyDefinition, StrategyEventLevel,
-    StrategyPerformanceRecord, StrategyPricing, StrategyPublication, StrategyRunScope,
-    StrategySettlement, StrategyStatus, StrategySubscription, SubscriptionStatus,
+    RiskLevel, SandboxArtifact, SandboxArtifactSource, SandboxBinding, SkillBinding,
+    SourceVisibility, StrategyAuthorCard, StrategyChangelogEntry, StrategyDefinition,
+    StrategyEventLevel, StrategyPerformanceRecord, StrategyPricing, StrategyPublication,
+    StrategyRunScope, StrategySettlement, StrategyStatus, StrategySubscription, SubscriptionStatus,
     ValidationSeverity,
 };
 use axum::{
@@ -25,7 +25,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{error::ApiError, state::AppState};
+use crate::{error::ApiError, state::AppState, templates::OFFICIAL_TEMPLATE_KEYS};
 
 use super::strategies;
 
@@ -33,14 +33,7 @@ use super::strategies;
 // 官方策略目录
 // ---------------------------------------------------------------------------
 
-/// 官方内置模板在策略市场上的发布。
-const OFFICIAL_TEMPLATE_KEYS: [&str; 4] = [
-    "turtle-breakout",
-    "ma-trend",
-    "grid",
-    "listing-follow",
-];
-
+/// 官方发布使用稳定的 UUID，重复启动不会产生新记录。
 fn official_uuid(name: &str) -> Uuid {
     Uuid::new_v5(&Uuid::NAMESPACE_URL, name.as_bytes())
 }
@@ -108,10 +101,6 @@ pub(crate) async fn seed_official(state: &AppState) {
         .into_iter()
         .filter(|template| OFFICIAL_TEMPLATE_KEYS.contains(&template.key.as_str()))
     {
-        // 模板还没编译成功时跳过，下次启动会重试。
-        let Some(sha256) = template.artifact_sha256.clone() else {
-            continue;
-        };
         let existing = snapshot
             .publications
             .iter()
@@ -139,7 +128,7 @@ pub(crate) async fn seed_official(state: &AppState) {
             supported_venues: definition.universe.venues.clone(),
             supported_symbols: definition.universe.symbols.clone(),
             data_sources: official_data_sources(&template.key),
-            runtime: format!("WASM 沙箱 · {}", &sha256[..sha256.len().min(12)]),
+            runtime: "技能参数运行时".to_string(),
             known_limits: vec![
                 "需要足够的可用保证金".to_string(),
                 "行情或公告源中断时不会开新仓".to_string(),
@@ -152,7 +141,12 @@ pub(crate) async fn seed_official(state: &AppState) {
                 .as_ref()
                 .map(|publication| publication.status)
                 .unwrap_or(PublicationStatus::Published),
-            artifact_sha256: Some(sha256),
+            artifact_sha256: None,
+            // 官方模板以技能参数交付，订阅者无需沙箱模块即可运行。
+            skill: Some(SkillBinding {
+                template_key: template.key.clone(),
+                settings: None,
+            }),
             definition: Some(definition),
             changelog: existing
                 .as_ref()
@@ -330,14 +324,22 @@ pub async fn create_publication(
         .find(|card| card.author_id == body.author_id)
         .ok_or_else(|| ApiError::NotFound(format!("作者 {} 不存在", body.author_id)))?;
     let record = find_strategy(&state, body.strategy_id)?;
+    // 订阅导入的策略属于他人发布，不允许再次对外发布。
+    if record.source_publication_id.is_some() {
+        return Err(ApiError::Conflict(
+            "订阅导入的策略不能再次发布".to_string(),
+        ));
+    }
 
     let now = Utc::now();
     let runtime = body.runtime.unwrap_or_else(|| {
-        record
-            .sandbox
-            .as_ref()
-            .map(|binding| format!("WASM 沙箱 · {}", &binding.artifact_hash[..12]))
-            .unwrap_or_else(|| "受限数据定义".to_string())
+        if let Some(binding) = record.sandbox.as_ref() {
+            format!("WASM 沙箱 · {}", &binding.artifact_hash[..12])
+        } else if record.skill.is_some() {
+            "技能参数运行时".to_string()
+        } else {
+            "受限数据定义".to_string()
+        }
     });
     let data_sources = body
         .data_sources
@@ -374,6 +376,7 @@ pub async fn create_publication(
         // 新建发布始终是私有草稿，发布需要显式调用 publish。
         status: PublicationStatus::Private,
         artifact_sha256: None,
+        skill: None,
         definition: None,
         changelog,
         created_at: now,
@@ -455,8 +458,13 @@ pub async fn update_publication(
 
     match body.action {
         Some(PublicationAction::Publish) => {
-            // 重新读取策略当前版本，确保发布的是通过校验且有回测的版本。
+            // 重新读取策略当前版本，确保发布的是通过校验且代码已部署的版本。
             let mut record = find_strategy(&state, publication.strategy_id)?;
+            if record.source_publication_id.is_some() {
+                return Err(ApiError::Conflict(
+                    "订阅导入的策略不能再次发布".to_string(),
+                ));
+            }
             record.validation = record.definition.validate(&state.config.risk);
             let readiness = publish_readiness(&record, &record.validation);
             ensure_valid(&readiness)?;
@@ -472,13 +480,15 @@ pub async fn update_publication(
             {
                 publication.author_name = author.display_name.clone();
             }
-            // 冻结发布版本的代码与定义：订阅者在自己的执行器导入后运行。
-            let Some(binding) = record.sandbox.as_ref() else {
+            // 冻结发布版本的运行载体：沙箱模块或技能参数，订阅者据此在自己机器上运行。
+            publication.artifact_sha256 =
+                record.sandbox.as_ref().map(|binding| binding.artifact_hash.clone());
+            publication.skill = record.skill.clone();
+            if publication.artifact_sha256.is_none() && publication.skill.is_none() {
                 return Err(ApiError::Conflict(
-                    "策略未部署沙箱模块，无法发布".to_string(),
+                    "策略既未部署沙箱模块也未配置技能参数，无法发布".to_string(),
                 ));
-            };
-            publication.artifact_sha256 = Some(binding.artifact_hash.clone());
+            }
             publication.definition = Some(record.definition.clone());
             publication.attach_version(&record, body.changelog_summary);
             publication.status = PublicationStatus::Published;
@@ -741,14 +751,21 @@ pub async fn cancel_subscription(
 // 订阅交付：把发布版本的代码与定义交付到订阅者自己的执行器
 // ---------------------------------------------------------------------------
 
-/// 一次发布的可运行交付物：冻结的定义 + 沙箱模块。
+/// 一次发布的可运行交付物：冻结的定义 + 沙箱模块或技能参数。
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PublicationBundle {
     pub publication_id: Uuid,
     pub strategy_version: u32,
     pub definition: StrategyDefinition,
-    pub artifact_sha256: String,
-    pub wasm_base64: String,
+    /// 沙箱模块哈希；技能参数交付时为空。
+    #[serde(default)]
+    pub artifact_sha256: Option<String>,
+    /// 沙箱模块字节（Base64）；技能参数交付时为空。
+    #[serde(default)]
+    pub wasm_base64: Option<String>,
+    /// 发布时冻结的技能参数；存在时订阅者无需沙箱模块即可运行。
+    #[serde(default)]
+    pub skill: Option<SkillBinding>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -814,7 +831,9 @@ pub async fn import_publication(
     Ok((StatusCode::CREATED, Json(record)))
 }
 
-/// 校验交付代码并把冻结定义落库为一条可自托管的策略。
+/// 校验交付载体并把冻结定义落库为一条可自托管的策略。
+///
+/// 交付物可以是沙箱模块，也可以是技能参数；至少要有其一，否则导入后无法运行。
 async fn install_bundle(
     state: &AppState,
     bundle: PublicationBundle,
@@ -822,50 +841,71 @@ async fn install_bundle(
     suggested_max_notional_usd: Decimal,
     note: &str,
 ) -> Result<arb_core::StrategyRecord, ApiError> {
-    let wasm = BASE64
-        .decode(bundle.wasm_base64.as_bytes())
-        .map_err(|error| ApiError::BadRequest(format!("交付代码无法解码: {error}")))?;
-    if crate::sandbox::hash_wasm(&wasm) != bundle.artifact_sha256 {
-        return Err(ApiError::Conflict(
-            "交付代码与发布哈希不一致，已拒绝导入".to_string(),
-        ));
-    }
-    let abi_version = crate::sandbox::inspect(&wasm, &state.config.sandbox)
-        .map_err(|error| ApiError::BadRequest(format!("交付代码未通过沙箱检查: {error}")))?;
+    let PublicationBundle {
+        publication_id,
+        definition: frozen,
+        artifact_sha256,
+        wasm_base64,
+        skill,
+        ..
+    } = bundle;
 
-    let short_hash = &bundle.artifact_sha256[..bundle.artifact_sha256.len().min(12)];
-    // 官方模板与本机内置模板字节完全相同，哈希已入库时直接复用，避免重复插入。
-    let artifact = match state
-        .store
-        .sandbox_artifacts()
-        .await
-        .into_iter()
-        .find(|artifact| artifact.sha256 == bundle.artifact_sha256)
-    {
-        Some(artifact) => artifact,
-        None => {
-            let artifact = SandboxArtifact {
-                id: Uuid::new_v4(),
-                name: format!("market-{short_hash}"),
-                sha256: bundle.artifact_sha256.clone(),
-                size_bytes: wasm.len(),
-                abi_version: Some(abi_version),
-                source: SandboxArtifactSource::Uploaded,
-                notes: Some(format!("{note}：{title}")),
-                created_at: Utc::now(),
-            };
-            state
+    let sandbox = match (artifact_sha256, wasm_base64) {
+        (Some(sha256), Some(encoded)) => {
+            let wasm = BASE64
+                .decode(encoded.as_bytes())
+                .map_err(|error| ApiError::BadRequest(format!("交付代码无法解码: {error}")))?;
+            if crate::sandbox::hash_wasm(&wasm) != sha256 {
+                return Err(ApiError::Conflict(
+                    "交付代码与发布哈希不一致，已拒绝导入".to_string(),
+                ));
+            }
+            let abi_version = crate::sandbox::inspect(&wasm, &state.config.sandbox)
+                .map_err(|error| ApiError::BadRequest(format!("交付代码未通过沙箱检查: {error}")))?;
+
+            let short_hash = &sha256[..sha256.len().min(12)];
+            // 官方模板与本机内置模板字节完全相同，哈希已入库时直接复用，避免重复插入。
+            let artifact = match state
                 .store
-                .save_sandbox_artifact(&artifact, &wasm)
+                .sandbox_artifacts()
                 .await
-                .map_err(|error| {
-                    ApiError::Internal(format!("保存沙箱模块失败: {error}"))
-                })?;
-            artifact
+                .into_iter()
+                .find(|artifact| artifact.sha256 == sha256)
+            {
+                Some(artifact) => artifact,
+                None => {
+                    let artifact = SandboxArtifact {
+                        id: Uuid::new_v4(),
+                        name: format!("market-{short_hash}"),
+                        sha256: sha256.clone(),
+                        size_bytes: wasm.len(),
+                        abi_version: Some(abi_version),
+                        source: SandboxArtifactSource::Uploaded,
+                        notes: Some(format!("{note}：{title}")),
+                        created_at: Utc::now(),
+                    };
+                    state
+                        .store
+                        .save_sandbox_artifact(&artifact, &wasm)
+                        .await
+                        .map_err(|error| {
+                            ApiError::Internal(format!("保存沙箱模块失败: {error}"))
+                        })?;
+                    artifact
+                }
+            };
+            Some(SandboxBinding::new(&artifact, state.config.sandbox))
         }
+        _ => None,
     };
 
-    let mut definition = bundle.definition;
+    if sandbox.is_none() && skill.is_none() {
+        return Err(ApiError::BadRequest(
+            "交付物既不含沙箱模块也不含技能参数，无法导入".to_string(),
+        ));
+    }
+
+    let mut definition = frozen;
     definition.name = title.clone();
     definition.risk.max_notional_usd = definition
         .risk
@@ -878,8 +918,9 @@ async fn install_bundle(
         arb_core::StrategySource::Manual,
         StrategyStatus::Stopped,
     );
-    record.source_publication_id = Some(bundle.publication_id);
-    record.sandbox = Some(SandboxBinding::new(&artifact, state.config.sandbox));
+    record.source_publication_id = Some(publication_id);
+    record.sandbox = sandbox;
+    record.skill = skill;
     record.runtime.record(
         StrategyEventLevel::Info,
         format!("{note}：{title}"),
@@ -936,11 +977,22 @@ async fn load_bundle(
             "该发布尚未公开发布，暂无可交付内容".to_string(),
         ));
     }
-    let sha256 = publication.artifact_sha256.clone().ok_or_else(|| {
-        ApiError::Conflict("该发布没有可交付的沙箱模块，请作者重新发布".to_string())
-    })?;
     let definition = publication.definition.clone().ok_or_else(|| {
         ApiError::Conflict("该发布缺少冻结的策略定义，请作者重新发布".to_string())
+    })?;
+    // 技能参数是完整的运行载体，不需要沙箱模块字节。
+    if let Some(skill) = publication.skill.clone() {
+        return Ok(PublicationBundle {
+            publication_id: publication.id,
+            strategy_version: publication.strategy_version,
+            definition,
+            artifact_sha256: None,
+            wasm_base64: None,
+            skill: Some(skill),
+        });
+    }
+    let sha256 = publication.artifact_sha256.clone().ok_or_else(|| {
+        ApiError::Conflict("该发布没有可交付的运行载体，请作者重新发布".to_string())
     })?;
     let artifact = state
         .store
@@ -959,8 +1011,9 @@ async fn load_bundle(
         publication_id: publication.id,
         strategy_version: publication.strategy_version,
         definition,
-        artifact_sha256: sha256,
-        wasm_base64: BASE64.encode(wasm),
+        artifact_sha256: Some(sha256),
+        wasm_base64: Some(BASE64.encode(wasm)),
+        skill: None,
     })
 }
 

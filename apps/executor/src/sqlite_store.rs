@@ -1,8 +1,9 @@
-use std::{collections::HashMap, path::Path};
+use std::{collections::BTreeMap, collections::HashMap, path::Path};
 
 use arb_core::{
     Order, SandboxArtifact, StrategyAuthorCard, StrategyCode, StrategyPerformanceRecord,
-    StrategyPublication, StrategyRecord, StrategySettlement, StrategySubscription,
+    StrategyPublication, StrategyRecord, StrategySettlement, StrategyStatus,
+    StrategySubscription,
 };
 use chrono::{DateTime, TimeZone, Utc};
 use rust_decimal::Decimal;
@@ -16,6 +17,8 @@ use uuid::Uuid;
 use crate::{
     conditional::ConditionalOrder,
     exchange::FundingRate,
+    listing::{ListingSettings, ListingTrade},
+    skill::SkillSettings,
     store::{
         EquityPoint, ExchangeVenueConfig, FundingSummary, MarketSnapshot, NotificationSettings,
         PositionGroupMember, StrategyRun, StrategyRunEvent, StrategyVersion, TradableSymbolConfig,
@@ -136,6 +139,8 @@ impl SqliteStore {
             .filename(path)
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
+            // 行情采集与策略运行会并发写库，没有等待会让删除等写操作直接 BUSY 失败。
+            .busy_timeout(std::time::Duration::from_secs(5))
             .foreign_keys(true);
         let pool = SqlitePoolOptions::new()
             .max_connections(4)
@@ -549,6 +554,25 @@ impl SqliteStore {
         self.get_doc("strategy_runs", &run_id.to_string()).await
     }
 
+    /// 删除已结束的运行实例，运行中的实例保留。
+    pub async fn clear_strategy_runs(&self, strategy_id: Uuid) -> usize {
+        let runs: Vec<StrategyRun> = self.docs("strategy_runs").await;
+        let mut removed = 0;
+        for run in runs {
+            if run.strategy_id != strategy_id || run.status == StrategyStatus::Running {
+                continue;
+            }
+            if self
+                .delete_doc("strategy_runs", &run.id.to_string())
+                .await
+                .is_ok()
+            {
+                removed += 1;
+            }
+        }
+        removed
+    }
+
     pub async fn append_strategy_run_event(&self, event: &StrategyRunEvent) {
         if let Err(error) = self
             .put_doc("strategy_run_events", &Uuid::new_v4().to_string(), event)
@@ -597,12 +621,18 @@ impl SqliteStore {
     }
 
     pub async fn delete_strategy(&self, strategy_id: Uuid) {
-        let _ = self
+        if let Err(error) = self
             .delete_doc("strategies", &strategy_id.to_string())
-            .await;
-        let _ = self
+            .await
+        {
+            tracing::error!(%error, %strategy_id, "删除策略失败");
+        }
+        if let Err(error) = self
             .delete_doc("strategy_code", &strategy_id.to_string())
-            .await;
+            .await
+        {
+            tracing::error!(%error, %strategy_id, "删除策略代码失败");
+        }
         self.delete_docs_for_strategy("strategy_versions", strategy_id)
             .await;
         self.delete_docs_for_strategy("strategy_runs", strategy_id)
@@ -720,6 +750,18 @@ impl SqliteStore {
         }
     }
 
+    pub async fn delete_strategy_template(&self, key: &str) {
+        if let Err(error) =
+            sqlx::query("delete from documents where collection = ? and id = ?")
+                .bind("strategy_templates")
+                .bind(key)
+                .execute(&self.pool)
+                .await
+        {
+            tracing::error!(%error, %key, "删除策略模板失败");
+        }
+    }
+
     pub async fn conditional_orders(&self) -> Vec<ConditionalOrder> {
         self.docs("conditional_orders").await
     }
@@ -731,6 +773,40 @@ impl SqliteStore {
             .await
         {
             tracing::error!(%error, %id, "写入条件单失败");
+        }
+    }
+
+    pub async fn listing_settings(&self) -> BTreeMap<String, ListingSettings> {
+        self.get_doc("settings", "listing").await.unwrap_or_default()
+    }
+
+    pub async fn save_listing_settings(&self, settings: &BTreeMap<String, ListingSettings>) {
+        if let Err(error) = self.put_doc("settings", "listing", settings).await {
+            tracing::error!(%error, "写入上币交易设置失败");
+        }
+    }
+
+    pub async fn skill_settings(&self) -> BTreeMap<String, SkillSettings> {
+        self.get_doc("settings", "skill").await.unwrap_or_default()
+    }
+
+    pub async fn save_skill_settings(&self, settings: &BTreeMap<String, SkillSettings>) {
+        if let Err(error) = self.put_doc("settings", "skill", settings).await {
+            tracing::error!(%error, "写入技能策略设置失败");
+        }
+    }
+
+    pub async fn listing_trades(&self) -> Vec<ListingTrade> {
+        self.docs("listing_trades").await
+    }
+
+    pub async fn save_listing_trade(&self, trade: &ListingTrade) {
+        let id = trade.id;
+        if let Err(error) = self
+            .put_doc("listing_trades", &id.to_string(), trade)
+            .await
+        {
+            tracing::error!(%error, %id, "写入上币交易失败");
         }
     }
 

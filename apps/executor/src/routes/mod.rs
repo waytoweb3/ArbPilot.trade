@@ -8,6 +8,7 @@ mod depth;
 mod funding;
 mod health;
 mod license;
+mod listing;
 pub(crate) mod market;
 mod news;
 mod opportunities;
@@ -15,7 +16,8 @@ mod orders;
 mod portfolio;
 mod prices;
 mod sandbox;
-mod strategies;
+mod skill;
+pub(crate) mod strategies;
 mod strategy_code;
 mod telegram;
 mod templates;
@@ -83,10 +85,17 @@ pub fn build(state: AppState) -> Router {
             "/strategies/{id}/scope",
             patch(strategies::update_scope),
         )
+        .route(
+            "/strategies/{id}/execution-mode",
+            patch(strategies::update_execution_mode),
+        )
         .route("/strategies/{id}/validate", post(strategies::validate))
         .route("/strategies/{id}/backtest", post(strategies::backtest))
         .route("/strategies/{id}/versions", get(strategies::versions))
-        .route("/strategies/{id}/runs", get(strategies::runs))
+        .route(
+            "/strategies/{id}/runs",
+            get(strategies::runs).delete(strategies::clear_runs),
+        )
         .route("/strategies/{id}/rollback", post(strategies::rollback))
         .route(
             "/strategies/{id}/sandbox",
@@ -173,6 +182,15 @@ pub fn build(state: AppState) -> Router {
             "/config/notifications",
             get(config::notifications).put(config::update_notifications),
         )
+        .route(
+            "/listing/settings",
+            get(listing::settings).put(listing::update_settings),
+        )
+        .route(
+            "/skill/settings",
+            get(skill::settings).put(skill::update_settings),
+        )
+        .route("/skill/test", post(skill::test_event))
         .route("/news", get(news::list))
         .route("/chain/prices", get(chain::prices))
         .route(

@@ -1602,6 +1602,7 @@ fn to_position(account_id: Uuid, venue: &str, raw: RawPosition) -> Option<Positi
             format!("{account_id}:{venue}:{}:{side_label}", raw.symbol).as_bytes(),
         ),
         strategy_id: None,
+        source: None,
         group_id: None,
         venue: venue.to_string(),
         symbol: raw.symbol,

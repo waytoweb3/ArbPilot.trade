@@ -225,6 +225,11 @@ impl NewsFeed {
         }
     }
 
+    /// 首轮采集是否完成；未完成时缓存里的条目都算历史公告，不应触发上币交易。
+    pub fn primed(&self) -> bool {
+        self.primed.load(Ordering::Relaxed)
+    }
+
     /// 按发布时间倒序返回缓存条目与各来源状态。
     pub fn snapshot(&self, limit: usize) -> NewsResponse {
         let items = self.items.read().expect("新闻缓存锁不可用");

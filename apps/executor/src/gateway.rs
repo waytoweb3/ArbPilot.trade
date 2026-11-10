@@ -43,6 +43,8 @@ pub struct OrderBatchRequest {
     pub leverage: Option<Decimal>,
     pub max_slippage_bps: Option<Decimal>,
     pub strategy_id: Option<Uuid>,
+    /// 触发来源说明（例如上币公告跟随的规则名），随仓位记录以便在仓位列表里展示。
+    pub source: Option<String>,
     pub origin: OrderOrigin,
     pub idempotency_key: String,
     /// 平仓：反向操作、reduce_only，并减少已有仓位。
@@ -224,6 +226,7 @@ pub async fn submit_pair(
             leverage: request.leverage,
             max_slippage_bps: request.max_slippage_bps,
             strategy_id: request.strategy_id,
+            source: None,
             origin: request.origin,
             idempotency_key: request.idempotency_key,
             closing: request.closing,
@@ -714,6 +717,7 @@ pub async fn submit_legs(
             positions.push(Position {
                 id: Uuid::new_v4(),
                 strategy_id: intent.strategy_id,
+                source: request.source.clone(),
                 // 双腿订单产生的仓位共享订单 ID，便于整组查看与平仓。
                 group_id: (order.intent.legs.len() > 1).then_some(order.id),
                 venue: leg.intent.venue.clone(),
@@ -736,6 +740,8 @@ pub async fn submit_legs(
             .iter()
             .filter(|leg| leg.is_filled())
             .map(|leg| PositionGroupMember {
+                strategy_id: order.intent.strategy_id,
+                source: request.source.clone(),
                 venue: leg.intent.venue.clone(),
                 symbol: leg.intent.symbol.clone(),
                 side: leg.intent.side,

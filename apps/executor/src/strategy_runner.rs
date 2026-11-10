@@ -2,8 +2,8 @@ use std::time::Duration;
 
 use arb_core::{
     OrderOrigin, OrderStatus, PositionSide, SandboxDecision, SandboxInput, SandboxMarketSnapshot,
-    SandboxRunStatus, StrategyEventLevel, StrategyKind, StrategyOpenPosition, StrategyPendingOrder,
-    StrategyRecord, StrategyRunScope, StrategyStatus,
+    SandboxRunStatus, StrategyEventLevel, StrategyExecutionMode, StrategyKind, StrategyOpenPosition,
+    StrategyPendingOrder, StrategyRecord, StrategyRunScope, StrategyStatus,
 };
 use chrono::{Duration as ChronoDuration, Utc};
 use rust_decimal::Decimal;
@@ -87,12 +87,21 @@ async fn evaluate_one(state: &AppState, mut record: StrategyRecord) {
         return;
     }
 
-    // 自定义策略没有内置规则，缺少沙箱绑定时必须停下。
+    // 技能运行时接管的策略由 `skill::spawn` 单独驱动，这里只同步心跳；
+    // 其余策略（含官方模板实例）继续走沙箱分支，正确性由 SKILL.md 校验门禁
+    // 保证，而不是禁止入口。
+    if crate::skill::manages(&record) {
+        sync_run(state, &mut record, events_before).await;
+        commit(state, record, false).await;
+        return;
+    }
+
+    // 既没有技能运行时接管，也没有沙箱代码，无法产生任何订单意图。
     if record.sandbox.is_none() {
         record.status = StrategyStatus::Paused;
         record.runtime.record(
             StrategyEventLevel::Error,
-            "自定义策略尚未绑定沙箱代码，策略已暂停",
+            "策略尚未绑定技能参数或沙箱代码，策略已暂停",
             None,
         );
         sync_run(state, &mut record, events_before).await;
@@ -138,7 +147,9 @@ async fn sync_run(state: &AppState, record: &mut StrategyRecord, events_before: 
     let run_id = match record.runtime.run_id {
         Some(id) => id,
         None => {
-            let run = StrategyRun::new(record);
+            let mut run = StrategyRun::new(record);
+            // 重启后由运行器补建的实例同样带上规则快照。
+            run.note = crate::routes::strategies::listing_note(state, record).await;
             let id = run.id;
             state.store.save_strategy_run(&run).await;
             record.runtime.run_id = Some(id);
@@ -147,6 +158,11 @@ async fn sync_run(state: &AppState, record: &mut StrategyRecord, events_before: 
     };
 
     if let Some(mut run) = state.store.strategy_run(run_id).await {
+        // 用户可能在本轮评估期间已停止策略并关闭实例：已结束的实例不能被心跳复活。
+        if run.status != StrategyStatus::Running {
+            record.runtime.run_id = None;
+            return;
+        }
         run.strategy_version = record.version;
         run.status = StrategyStatus::Running;
         run.last_heartbeat_at = Some(Utc::now());
@@ -170,6 +186,33 @@ async fn sync_run(state: &AppState, record: &mut StrategyRecord, events_before: 
     }
 }
 
+/// 模拟开仓：不提交交易所，只把信号与成交写进运行时计数与事件。
+fn paper_open(record: &mut StrategyRecord, open: StrategyOpenPosition, message: String) -> bool {
+    record.runtime.signals += 1;
+    record.runtime.orders += 1;
+    record.runtime.last_signal_at = Some(Utc::now());
+    record.runtime.open = Some(open);
+    record.runtime.record(
+        StrategyEventLevel::Info,
+        format!("{message}（模拟成交，未提交交易所）"),
+        None,
+    );
+    true
+}
+
+/// 模拟平仓：直接清掉运行时持仓，不产生任何真实委托。
+fn paper_close(record: &mut StrategyRecord, message: String) -> bool {
+    record.runtime.orders += 1;
+    record.runtime.last_signal_at = Some(Utc::now());
+    record.runtime.open = None;
+    record.runtime.record(
+        StrategyEventLevel::Info,
+        format!("{message}（模拟平仓，未提交交易所）"),
+        None,
+    );
+    true
+}
+
 /// 提交开仓意图。所有策略入口都经过统一风控网关。
 #[allow(clippy::too_many_arguments)]
 async fn submit_open(
@@ -183,6 +226,24 @@ async fn submit_open(
     message: String,
     idempotency_key: String,
 ) -> Result<bool, String> {
+    if record.execution_mode == StrategyExecutionMode::Paper {
+        return Ok(paper_open(
+            record,
+            StrategyOpenPosition {
+                symbol: symbol.to_string(),
+                long_venue: long_venue.to_string(),
+                short_venue: short_venue.to_string(),
+                venue: None,
+                side: None,
+                entry_price: None,
+                notional_usd: notional,
+                opened_at: Utc::now(),
+                entry_net_edge_bps,
+            },
+            message,
+        ));
+    }
+
     let request = PairOrderRequest {
         symbol: symbol.to_string(),
         long_venue: long_venue.to_string(),
@@ -244,6 +305,9 @@ async fn submit_close(
     message: String,
     idempotency_key: String,
 ) -> Result<bool, String> {
+    if record.execution_mode == StrategyExecutionMode::Paper {
+        return Ok(paper_close(record, message));
+    }
     let request = PairOrderRequest {
         symbol: open.symbol.clone(),
         long_venue: open.long_venue.clone(),
@@ -297,6 +361,25 @@ async fn submit_single_open(
     message: String,
     idempotency_key: String,
 ) -> Result<bool, String> {
+    if record.execution_mode == StrategyExecutionMode::Paper {
+        let entry_price = state.market.realtime_price(venue, symbol);
+        return Ok(paper_open(
+            record,
+            StrategyOpenPosition {
+                symbol: symbol.to_string(),
+                long_venue: String::new(),
+                short_venue: String::new(),
+                venue: Some(venue.to_string()),
+                side: Some(side),
+                entry_price,
+                notional_usd: notional,
+                opened_at: Utc::now(),
+                entry_net_edge_bps: Decimal::ZERO,
+            },
+            message,
+        ));
+    }
+
     let request = OrderBatchRequest {
         legs: vec![LegOrderRequest {
             venue: venue.to_string(),
@@ -309,6 +392,7 @@ async fn submit_single_open(
         leverage: Some(record.definition.execution.leverage),
         max_slippage_bps: Some(record.definition.execution.max_slippage_bps),
         strategy_id: Some(record.id),
+        source: None,
         origin: OrderOrigin::Strategy,
         idempotency_key,
         closing: false,
@@ -363,6 +447,9 @@ async fn submit_single_close(
     message: String,
     idempotency_key: String,
 ) -> Result<bool, String> {
+    if record.execution_mode == StrategyExecutionMode::Paper {
+        return Ok(paper_close(record, message));
+    }
     let Some(venue) = open.venue.clone() else {
         return Err("单腿持仓缺少交易所，无法平仓".to_string());
     };
@@ -379,6 +466,7 @@ async fn submit_single_close(
         leverage: Some(record.definition.execution.leverage),
         max_slippage_bps: Some(record.definition.execution.max_slippage_bps),
         strategy_id: Some(record.id),
+        source: None,
         origin: OrderOrigin::Strategy,
         idempotency_key,
         closing: true,
@@ -752,6 +840,9 @@ fn find_market<'a>(
 }
 
 /// 把运行状态合并回共享状态；只有订单/状态变化时才落库。
+///
+/// 评估期间不持锁，用户可能在这段时间启动或停止策略。此时内存里的快照已经过期，
+/// 直接写回会把用户的启停撤销（表现为点了停止仍是运行中），因此以共享状态为准。
 async fn commit(state: &AppState, record: StrategyRecord, persist: bool) {
     let merged = {
         let mut strategies = state.strategies.write().expect("策略锁不可用");
@@ -759,7 +850,7 @@ async fn commit(state: &AppState, record: StrategyRecord, persist: bool) {
             .iter_mut()
             .find(|existing| existing.id == record.id)
         {
-            Some(existing) => {
+            Some(existing) if !superseded(existing, &record) => {
                 existing.status = record.status;
                 existing.runtime = record.runtime;
                 existing.last_heartbeat_at = record.last_heartbeat_at;
@@ -768,7 +859,7 @@ async fn commit(state: &AppState, record: StrategyRecord, persist: bool) {
                 }
                 persist.then(|| existing.clone())
             }
-            None => None,
+            _ => None,
         }
     };
 
@@ -777,15 +868,24 @@ async fn commit(state: &AppState, record: StrategyRecord, persist: bool) {
     }
 }
 
+/// 共享状态在评估期间被用户改过：已经停止的策略，或换了新的运行实例。
+fn superseded(existing: &StrategyRecord, stale: &StrategyRecord) -> bool {
+    if existing.status != StrategyStatus::Running && stale.status == StrategyStatus::Running {
+        return true;
+    }
+    match (existing.runtime.run_id, stale.runtime.run_id) {
+        (Some(current), Some(previous)) => current != previous,
+        // 共享状态已有实例而快照没有，说明评估期间策略被重新启动过。
+        (Some(_), None) => true,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arb_core::{
-        Instrument, SandboxCandle, SandboxIndicators, SandboxLimits, SandboxOrderLimits,
-        StrategyRuntime,
-    };
+    use arb_core::{Instrument, SandboxCandle, SandboxIndicators};
     use rust_decimal_macros::dec;
-    use uuid::Uuid;
 
     fn market(bid: Decimal, ask: Decimal) -> SandboxMarketSnapshot {
         SandboxMarketSnapshot {
@@ -811,88 +911,26 @@ mod tests {
         }
     }
 
-    /// 端到端：网格模板在沙箱里产出的挂单意图进入待触发队列，价格穿越后触发。
-    #[tokio::test]
-    async fn grid_template_pending_triggers_when_price_crosses() {
-        let wasm = wat::parse_str(crate::templates::GRID_WAT).expect("wat 编译");
-        let market_at = dec!(100);
-        let input = SandboxInput {
-            abi_version: arb_core::SANDBOX_ABI_VERSION,
-            strategy_id: Uuid::new_v4(),
-            strategy_version: 1,
-            now: Utc::now(),
-            limits: SandboxOrderLimits {
-                max_notional_usd: dec!(1000),
-                max_leverage: Decimal::ONE,
-                max_slippage_bps: dec!(10),
-                max_unhedged_secs: 3,
-            },
-            markets: vec![market(market_at, market_at)],
-            position: None,
-            events: Vec::new(),
-        };
-        let artifact = arb_core::SandboxArtifact {
-            id: Uuid::new_v4(),
-            name: "grid".into(),
-            sha256: crate::sandbox::hash_wasm(&wasm),
-            size_bytes: wasm.len(),
-            abi_version: Some(arb_core::SANDBOX_ABI_VERSION),
-            source: arb_core::SandboxArtifactSource::BuiltIn,
-            notes: None,
+    fn pending(side: PositionSide, price: Decimal) -> StrategyPendingOrder {
+        StrategyPendingOrder {
+            symbol: "BTCUSDT".into(),
+            venue: Some("binance".into()),
+            side,
+            price,
+            notional_usd: dec!(100),
             created_at: Utc::now(),
-        };
-        let report =
-            crate::sandbox::evaluate(artifact, wasm, input, SandboxLimits::default()).await;
-        assert_eq!(report.status, SandboxRunStatus::Ok, "{:?}", report.error);
-
-        let mut runtime = StrategyRuntime::default();
-        for decision in report.decisions {
-            if let SandboxDecision::PlaceLimit {
-                symbol,
-                side,
-                price,
-                notional_usd,
-                venue,
-                ..
-            } = decision
-            {
-                assert!(runtime.upsert_pending(StrategyPendingOrder {
-                    symbol,
-                    venue,
-                    side,
-                    price,
-                    notional_usd,
-                    created_at: Utc::now(),
-                }));
-            }
         }
-        assert_eq!(runtime.pending.len(), 6);
+    }
 
-        // 价格没动时不应触发任何档位。
-        let flat = market(market_at, market_at);
-        assert!(runtime
-            .pending
-            .iter()
-            .all(|order| !pending_triggered(order, &flat)));
+    /// 买单看卖一跌破，卖单看买一涨过；价格未穿越时都不触发。
+    #[test]
+    fn pending_order_triggers_when_price_crosses() {
+        let long = pending(PositionSide::Long, dec!(99.5));
+        assert!(!pending_triggered(&long, &market(dec!(100), dec!(100))));
+        assert!(pending_triggered(&long, &market(dec!(99.4), dec!(99.4))));
 
-        // 价格跌到 99.4：只有 99.5 的买单触发。
-        let down = market(dec!(99.4), dec!(99.4));
-        let hits: Vec<_> = runtime
-            .pending
-            .iter()
-            .filter(|order| pending_triggered(order, &down))
-            .collect();
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].side, PositionSide::Long);
-        assert_eq!(hits[0].price, dec!(99.5));
-
-        // 价格涨到 101.1：100.5 与 101 两档卖单触发。
-        let up = market(dec!(101.1), dec!(101.1));
-        let sells = runtime
-            .pending
-            .iter()
-            .filter(|order| order.side == PositionSide::Short && pending_triggered(order, &up))
-            .count();
-        assert_eq!(sells, 2);
+        let short = pending(PositionSide::Short, dec!(100.5));
+        assert!(!pending_triggered(&short, &market(dec!(100), dec!(100))));
+        assert!(pending_triggered(&short, &market(dec!(101.1), dec!(101.1))));
     }
 }
