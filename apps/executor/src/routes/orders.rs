@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use arb_core::{Order, OrderOrigin, OrderStatus, RiskDecision};
 use axum::{
     extract::State,
@@ -37,7 +39,21 @@ pub struct CreateOrderResponse {
 }
 
 pub async fn list(State(state): State<AppState>) -> Json<Vec<Order>> {
-    Json(state.orders.read().expect("订单锁不可用").clone())
+    // 订单历史以持久化记录为准：技能试跑等其它执行器实例写入的订单也能出现在这里；
+    // 内存模式下库为空，再并入本进程的订单快照。
+    let mut orders = state
+        .store
+        .recent_orders(gateway::MAX_IN_MEMORY_ORDERS)
+        .await;
+    let mut seen: HashSet<Uuid> = orders.iter().map(|order| order.id).collect();
+    for order in state.orders.read().expect("订单锁不可用").iter() {
+        if seen.insert(order.id) {
+            orders.push(order.clone());
+        }
+    }
+    orders.sort_by_key(|order| std::cmp::Reverse(order.created_at));
+    orders.truncate(gateway::MAX_IN_MEMORY_ORDERS);
+    Json(orders)
 }
 
 /// 开仓入口：桌面端、Telegram 与策略最终都调用同一路径，统一经过风控。

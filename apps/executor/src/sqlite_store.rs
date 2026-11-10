@@ -2,8 +2,7 @@ use std::{collections::BTreeMap, collections::HashMap, path::Path};
 
 use arb_core::{
     Order, SandboxArtifact, StrategyAuthorCard, StrategyCode, StrategyPerformanceRecord,
-    StrategyPublication, StrategyRecord, StrategySettlement, StrategyStatus,
-    StrategySubscription,
+    StrategyPublication, StrategyRecord, StrategySettlement, StrategyStatus, StrategySubscription,
 };
 use chrono::{DateTime, TimeZone, Utc};
 use rust_decimal::Decimal;
@@ -159,6 +158,29 @@ impl SqliteStore {
 
     pub async fn orders(&self) -> Vec<Order> {
         self.docs("orders").await
+    }
+
+    /// 最近的订单历史：按写入时间倒序，只取前 `limit` 条。
+    ///
+    /// 技能试跑等其它执行器实例也会写订单表，订单历史必须以库为准而不是进程内快照。
+    pub async fn recent_orders(&self, limit: usize) -> Vec<Order> {
+        let rows = sqlx::query(
+            "select payload from documents where collection = 'orders' order by created_at desc limit ?",
+        )
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await;
+
+        let Ok(rows) = rows else {
+            tracing::error!("读取订单历史失败");
+            return Vec::new();
+        };
+        rows.iter()
+            .filter_map(|row| {
+                let payload: String = row.try_get("payload").ok()?;
+                serde_json::from_str(&payload).ok()
+            })
+            .collect()
     }
 
     pub async fn append_order_event(
@@ -751,12 +773,11 @@ impl SqliteStore {
     }
 
     pub async fn delete_strategy_template(&self, key: &str) {
-        if let Err(error) =
-            sqlx::query("delete from documents where collection = ? and id = ?")
-                .bind("strategy_templates")
-                .bind(key)
-                .execute(&self.pool)
-                .await
+        if let Err(error) = sqlx::query("delete from documents where collection = ? and id = ?")
+            .bind("strategy_templates")
+            .bind(key)
+            .execute(&self.pool)
+            .await
         {
             tracing::error!(%error, %key, "删除策略模板失败");
         }
@@ -777,7 +798,9 @@ impl SqliteStore {
     }
 
     pub async fn listing_settings(&self) -> BTreeMap<String, ListingSettings> {
-        self.get_doc("settings", "listing").await.unwrap_or_default()
+        self.get_doc("settings", "listing")
+            .await
+            .unwrap_or_default()
     }
 
     pub async fn save_listing_settings(&self, settings: &BTreeMap<String, ListingSettings>) {
@@ -802,10 +825,7 @@ impl SqliteStore {
 
     pub async fn save_listing_trade(&self, trade: &ListingTrade) {
         let id = trade.id;
-        if let Err(error) = self
-            .put_doc("listing_trades", &id.to_string(), trade)
-            .await
-        {
+        if let Err(error) = self.put_doc("listing_trades", &id.to_string(), trade).await {
             tracing::error!(%error, %id, "写入上币交易失败");
         }
     }

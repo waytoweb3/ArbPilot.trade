@@ -401,6 +401,18 @@ impl Store {
         load_payloads(pool, "orders").await
     }
 
+    /// 最近的订单历史：各存储后端都回填最新的 `limit` 条，供桌面端订单记录使用。
+    pub async fn recent_orders(&self, limit: usize) -> Vec<Order> {
+        sqlite_branch!(self, db => db.recent_orders(limit).await);
+        let Some(pool) = &self.pool else {
+            return Vec::new();
+        };
+        let mut orders: Vec<Order> = load_payloads(pool, "orders").await;
+        orders.sort_by_key(|order| std::cmp::Reverse(order.created_at));
+        orders.truncate(limit);
+        orders
+    }
+
     /// 记录一次双腿开仓产生的仓位组，重启后据此把交易所持仓还原回同一组。
     ///
     /// 未连接数据库时为内存模式，仓位组随进程结束而消失。
@@ -2019,10 +2031,7 @@ impl Store {
     pub async fn save_listing_settings(&self, settings: &BTreeMap<String, ListingSettings>) {
         sqlite_branch!(self, db => db.save_listing_settings(settings).await);
         let Some(pool) = &self.pool else {
-            *self
-                .listing_settings
-                .write()
-                .expect("上币交易设置锁不可用") = settings.clone();
+            *self.listing_settings.write().expect("上币交易设置锁不可用") = settings.clone();
             return;
         };
 
