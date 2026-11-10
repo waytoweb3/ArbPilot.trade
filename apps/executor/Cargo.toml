@@ -35,5 +35,12 @@ wasmtime = { version = "50.0.1", default-features = false, features = ["cranelif
 wat = "1"
 webpki-roots = { workspace = true }
 
+# 桌面端用系统钥匙串保存主密钥；Linux（自托管服务器/容器）走本地密钥文件，避免依赖 D-Bus。
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", features = ["apple-native"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3", features = ["windows-native"] }
+
 [dev-dependencies]
 rust_decimal_macros = { workspace = true }

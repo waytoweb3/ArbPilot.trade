@@ -1,7 +1,7 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 import { useSearchParams } from "react-router-dom";
-import { Users, Wallet } from "lucide-react";
+import { FolderOpen, Lock, ShieldAlert, Trash2, Users, Wallet } from "lucide-react";
 
 import { Badge } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
@@ -13,8 +13,11 @@ import {
   CardTitle,
 } from "../components/ui/card";
 import { BillingCard } from "../components/BillingCard";
+import { ConfirmDialog } from "../components/ui/confirm-dialog";
 import DocsPage from "./Docs";
 import {
+  useAccounts,
+  useClearAccounts,
   useCreateMarketAuthor,
   useCreateSettlement,
   useCreateTelegramPairing,
@@ -30,6 +33,7 @@ import {
   useUpdateSettlement,
 } from "../hooks/useApi";
 import { useAccount } from "../hooks/useAccount";
+import { isDesktopRuntime } from "../lib/deploy";
 import {
   getApiToken,
   getExecutorMode,
@@ -204,6 +208,14 @@ export default function SettingsPage() {
                 <span className="block text-[11px] leading-relaxed text-muted">
                   {t.settings.modeHint}
                 </span>
+                {mode === "self" && (
+                  <div className="flex gap-2 rounded-lg border border-warning/30 bg-warning/10 px-3 py-2">
+                    <ShieldAlert size={14} className="mt-0.5 shrink-0 text-warning" />
+                    <p className="text-[11px] leading-relaxed text-warning">
+                      {t.settings.selfHostedWarning}
+                    </p>
+                  </div>
+                )}
               </div>
 
               {mode === "local" ? (
@@ -270,6 +282,7 @@ export default function SettingsPage() {
               </div>
             </CardContent>
           </Card>
+          <CredentialStorageCard local={getExecutorMode() === "local"} />
           {mode === "self" && <DocsPage embedded />}
         </div>
       )}
@@ -284,6 +297,160 @@ export default function SettingsPage() {
 
       {tab === "telegram" && <TelegramCard />}
     </div>
+  );
+}
+
+/** 展示凭证文件的加密方式、路径与权限，并支持一键清除全部凭证。 */
+function CredentialStorageCard({ local }: { local: boolean }) {
+  const { t } = useI18n();
+  const accounts = useAccounts();
+  const clearAccounts = useClearAccounts();
+  const [confirming, setConfirming] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const storage = accounts.data?.storage;
+  const loaded = Boolean(accounts.data);
+  const count = accounts.data?.accounts.length ?? 0;
+  const encryptionLabel = !storage
+    ? "—"
+    : !storage.encrypted
+      ? t.settings.credentialsUnavailable
+      : storage.backend === "keychain"
+        ? t.settings.credentialsKeychain
+        : t.settings.credentialsKeyFile;
+
+  const reveal = async () => {
+    if (!storage?.path) {
+      return;
+    }
+    setNotice(null);
+    try {
+      if (!isDesktopRuntime() || !local) {
+        await navigator.clipboard.writeText(storage.path);
+        setNotice(t.settings.credentialsPathCopied);
+        return;
+      }
+      const { revealItemInDir } = await import("@tauri-apps/plugin-opener");
+      await revealItemInDir(storage.path);
+    } catch {
+      setNotice(t.settings.credentialsOpenFailed);
+    }
+  };
+
+  const clearAll = () => {
+    setError(null);
+    clearAccounts.mutate(undefined, {
+      onSuccess: (result) => {
+        setConfirming(false);
+        setNotice(fmt(t.settings.credentialsCleared, { count: result.removed }));
+      },
+      onError: (mutationError) =>
+        setError(
+          mutationError instanceof Error ? mutationError.message : String(mutationError),
+        ),
+    });
+  };
+
+  return (
+    <>
+      <Card>
+        <CardHeader>
+          <div>
+            <CardTitle>{t.settings.credentials}</CardTitle>
+            <CardDescription>{t.settings.credentialsDesc}</CardDescription>
+          </div>
+          <Badge tone={!storage ? "neutral" : storage.encrypted ? "success" : "warning"}>
+            <Lock size={11} />
+            {encryptionLabel}
+          </Badge>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <div className="space-y-1">
+            <span className="text-xs text-muted">{t.settings.credentialsPath}</span>
+            <div className={cn(inputClass, "break-all font-mono text-xs text-muted")}>
+              {storage?.path ?? "—"}
+            </div>
+            {!local && (
+              <span className="block text-[11px] leading-relaxed text-muted">
+                {t.settings.credentialsServerPath}
+              </span>
+            )}
+          </div>
+
+          <div className="flex flex-wrap items-center gap-x-6 gap-y-2 text-xs">
+            <div className="flex items-center gap-2">
+              <span className="text-muted">{t.settings.credentialsPermissions}</span>
+              <span className="rounded bg-panel-soft px-2 py-0.5 font-mono text-fg">
+                {storage?.permissions
+                  ? `-${storage.permissions}`
+                  : storage?.exists
+                    ? "—"
+                    : t.settings.credentialsNotCreated}
+              </span>
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="text-muted">{t.settings.credentialsEncryption}</span>
+              <span className="text-fg">{encryptionLabel}</span>
+            </div>
+          </div>
+
+          {storage?.permissions && (
+            <span className="block text-[11px] leading-relaxed text-muted">
+              {t.settings.credentialsPermissionsNote}
+            </span>
+          )}
+
+          <div className="flex flex-wrap items-center gap-2 pt-1">
+            {local && storage?.exists && (
+              <Button size="sm" variant="secondary" onClick={reveal}>
+                <FolderOpen size={13} />
+                {t.settings.credentialsOpenFolder}
+              </Button>
+            )}
+            <Button
+              size="sm"
+              variant="secondary"
+              onClick={() => {
+                setError(null);
+                setNotice(null);
+                setConfirming(true);
+              }}
+              disabled={!loaded || count === 0 || clearAccounts.isPending}
+            >
+              <Trash2 size={13} />
+              {t.settings.credentialsClear}
+            </Button>
+          </div>
+
+          {loaded && count === 0 && (
+            <p className="text-[11px] leading-relaxed text-muted">
+              {t.settings.credentialsClearEmpty}
+            </p>
+          )}
+          {notice && <p className="text-xs text-accent">{notice}</p>}
+          {error && <p className="text-xs text-danger">{error}</p>}
+        </CardContent>
+      </Card>
+
+      <ConfirmDialog
+        open={confirming}
+        title={t.settings.credentialsClearConfirmTitle}
+        message={t.settings.credentialsClearConfirm}
+        confirmLabel={t.settings.credentialsClearConfirmAction}
+        cancelLabel={t.settings.cancel}
+        pending={clearAccounts.isPending}
+        error={error}
+        onCancel={() => {
+          if (clearAccounts.isPending) {
+            return;
+          }
+          setConfirming(false);
+          setError(null);
+        }}
+        onConfirm={clearAll}
+      />
+    </>
   );
 }
 

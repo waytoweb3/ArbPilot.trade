@@ -340,6 +340,17 @@ export function useImportAccount() {
   });
 }
 
+export function useClearAccounts() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: () => api.clearAccounts(),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["accounts"] });
+      queryClient.invalidateQueries({ queryKey: ["account-history"] });
+    },
+  });
+}
+
 export function useRemoveAccount() {
   const queryClient = useQueryClient();
   return useMutation({

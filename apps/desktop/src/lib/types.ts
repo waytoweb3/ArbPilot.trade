@@ -469,10 +469,26 @@ export interface TradingAccount {
   snapshot: AccountSnapshotView | null;
 }
 
+/** 凭证在本机的加密存储方式。 */
+export type CredentialStorageBackend = "keychain" | "key_file" | "unavailable";
+
+export interface CredentialStorageInfo {
+  encrypted: boolean;
+  backend: CredentialStorageBackend;
+  /** 凭证文件路径；自托管时是服务器上的路径。 */
+  path: string;
+  /** 凭证文件是否已创建。 */
+  exists: boolean;
+  /** Unix 权限位（如 rw-------）；Windows 或文件不存在时为 null。 */
+  permissions: string | null;
+}
+
 export interface AccountsResponse {
   accounts: TradingAccount[];
   total_equity_usd: Decimal;
   observed_at: string;
+  /** 旧版执行器可能不返回该字段。 */
+  storage?: CredentialStorageInfo;
 }
 
 /** 交易所在指定合约上当前设置的杠杆；无法查询时为 null。 */
@@ -576,6 +592,10 @@ export interface MinOrderSpec {
   symbol: string;
   min_quantity?: Decimal | null;
   min_notional_usd?: Decimal | null;
+  /** 下单数量的步长（基础币），数量必须是该值的整数倍。 */
+  step_size?: Decimal | null;
+  /** 下单价格的步长（报价币），价格必须是该值的整数倍。 */
+  tick_size?: Decimal | null;
 }
 
 export type ConditionalStatus =

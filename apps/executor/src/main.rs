@@ -18,6 +18,7 @@ mod public_mode;
 mod realtime;
 mod routes;
 mod sandbox;
+mod secret;
 mod selftest;
 mod sqlite_store;
 mod state;

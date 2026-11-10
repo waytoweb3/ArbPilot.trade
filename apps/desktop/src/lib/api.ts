@@ -385,6 +385,9 @@ export const api = {
       body: JSON.stringify(body),
     }),
 
+  clearAccounts: () =>
+    request<{ removed: number }>("/api/v1/accounts", { method: "DELETE" }),
+
   removeAccount: (id: string) =>
     request<null>(`/api/v1/accounts/${id}`, { method: "DELETE" }),
 

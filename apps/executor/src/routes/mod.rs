@@ -55,7 +55,12 @@ pub fn build(state: AppState) -> Router {
             "/positions/groups/{group_id}/close",
             post(portfolio::close_group),
         )
-        .route("/accounts", get(accounts::list).post(accounts::import))
+        .route(
+            "/accounts",
+            get(accounts::list)
+                .post(accounts::import)
+                .delete(accounts::clear),
+        )
         .route("/accounts/history", get(accounts::history))
         .route("/accounts/leverage", get(accounts::leverage))
         .route("/accounts/{id}", delete(accounts::remove))

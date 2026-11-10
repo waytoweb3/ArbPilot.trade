@@ -1,4 +1,4 @@
-import { Plus, RefreshCw, ShieldAlert, Trash2, Wallet } from "lucide-react";
+import { Lock, Plus, RefreshCw, ShieldAlert, ShieldCheck, Trash2, Wallet } from "lucide-react";
 import { useMemo, useState, type FormEvent } from "react";
 
 import {
@@ -58,6 +58,14 @@ export function AccountsPanel() {
   const points = history.data?.points ?? [];
   const change = useMemo(() => computeChange(points), [points]);
   const list = accounts.data?.accounts ?? [];
+  const storage = accounts.data?.storage;
+  const storageLabel = !storage
+    ? null
+    : !storage.encrypted
+      ? t.accounts.storageUnavailable
+      : storage.backend === "keychain"
+        ? t.accounts.storageKeychain
+        : t.accounts.storageKeyFile;
 
   return (
     <Card>
@@ -65,6 +73,17 @@ export function AccountsPanel() {
         <div>
           <CardTitle>{t.accounts.title}</CardTitle>
           <CardDescription>{t.accounts.subtitle}</CardDescription>
+          {storageLabel && (
+            <p
+              className={cn(
+                "mt-1 flex items-center gap-1 text-[11px]",
+                storage?.encrypted ? "text-muted" : "text-warning",
+              )}
+            >
+              {storage?.encrypted ? <Lock size={11} /> : <ShieldAlert size={11} />}
+              {storageLabel}
+            </p>
+          )}
         </div>
         {list.length > 0 && (
           <Button size="sm" variant="secondary" onClick={() => setDialogOpen(true)}>
@@ -294,6 +313,8 @@ function ImportAccountDialog({ onClose }: { onClose: () => void }) {
   const [signerKey, setSignerKey] = useState("");
   const [keyIndex, setKeyIndex] = useState("");
   const [accountIndex, setAccountIndex] = useState("");
+  // 逐项确认交易所侧的权限设置，全部勾选后才允许提交 CEX 密钥。
+  const [permissionChecks, setPermissionChecks] = useState([false, false, false, false]);
   const [error, setError] = useState<string | null>(null);
 
   const kind = VENUES.find((item) => item.id === venue)?.kind ?? "api_key";
@@ -313,12 +334,14 @@ function ImportAccountDialog({ onClose }: { onClose: () => void }) {
     !(venue === "lighter"
       ? /^(0x)?[0-9a-fA-F]{80}$/.test(signerKey.trim())
       : /^(0x)?[0-9a-fA-F]{64}$/.test(signerKey.trim()));
+  const permissionsConfirmed = permissionChecks.every(Boolean);
   const canSubmit =
     (needsWallet
       ? walletAddress.trim().length > 0 && signerKey.trim().length > 0
       : apiKey.trim().length > 0 &&
         apiSecret.trim().length > 0 &&
-        (!needsPassphrase || passphrase.trim().length > 0)) &&
+        (!needsPassphrase || passphrase.trim().length > 0) &&
+        permissionsConfirmed) &&
     !indexInvalid &&
     !signerKeyInvalid;
 
@@ -355,7 +378,7 @@ function ImportAccountDialog({ onClose }: { onClose: () => void }) {
       role="dialog"
       aria-modal="true"
     >
-      <div className="w-full max-w-md rounded-xl border border-line bg-panel shadow-xl">
+      <div className="max-h-[90vh] w-full max-w-md overflow-y-auto rounded-xl border border-line bg-panel shadow-xl">
         <div className="border-b border-line px-4 py-3">
           <p className="text-sm font-semibold text-fg">{t.accounts.importTitle}</p>
           <p className="mt-0.5 text-[11px] leading-relaxed text-muted">{t.accounts.importDesc}</p>
@@ -367,7 +390,10 @@ function ImportAccountDialog({ onClose }: { onClose: () => void }) {
             <select
               className={inputClass}
               value={venue}
-              onChange={(event) => setVenue(event.target.value as AccountVenue)}
+              onChange={(event) => {
+                setVenue(event.target.value as AccountVenue);
+                setPermissionChecks([false, false, false, false]);
+              }}
             >
               {VENUES.map((item) => (
                 <option key={item.id} value={item.id}>
@@ -510,6 +536,40 @@ function ImportAccountDialog({ onClose }: { onClose: () => void }) {
               />
               <span className="block text-[11px] text-muted">{t.accounts.passphraseHint}</span>
             </label>
+          )}
+
+          {!needsWallet && (
+            <div className="rounded-lg border border-line bg-hover/40 px-3 py-2.5">
+              <div className="flex items-center gap-1.5 text-[11px] font-medium text-fg">
+                <ShieldCheck size={13} className="shrink-0 text-accent" />
+                {t.accounts.permissionTitle}
+              </div>
+              <p className="mt-1 text-[11px] leading-relaxed text-muted">
+                {t.accounts.permissionHint}
+              </p>
+              <div className="mt-2 space-y-1.5">
+                {t.accounts.permissionItems.map((item, index) => (
+                  <label
+                    key={item}
+                    className="flex cursor-pointer items-start gap-2 text-[11px] leading-relaxed text-muted"
+                  >
+                    <input
+                      type="checkbox"
+                      className="mt-0.5 h-4 w-4 shrink-0 cursor-pointer accent-accent"
+                      checked={permissionChecks[index]}
+                      onChange={(event) =>
+                        setPermissionChecks((previous) =>
+                          previous.map((checked, itemIndex) =>
+                            itemIndex === index ? event.target.checked : checked,
+                          ),
+                        )
+                      }
+                    />
+                    <span>{item}</span>
+                  </label>
+                ))}
+              </div>
+            </div>
           )}
 
           <p className="text-[11px] leading-relaxed text-muted">{t.accounts.secretNote}</p>

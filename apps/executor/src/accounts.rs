@@ -19,6 +19,7 @@ use uuid::Uuid;
 use crate::{
     exchange::aster,
     http_client::HttpClient,
+    secret::{restrict_permissions, CredentialCipher, StorageBackend, StorageInfo},
     store::{EquityPoint, Store},
 };
 
@@ -182,6 +183,8 @@ pub struct Accounts {
     endpoints: AccountEndpoints,
     data_file: PathBuf,
     store: Arc<Store>,
+    cipher: Option<CredentialCipher>,
+    storage: StorageInfo,
     accounts: RwLock<Vec<AccountCredentials>>,
     snapshots: RwLock<HashMap<Uuid, AccountSnapshotView>>,
     price_cache: Mutex<Option<(Instant, HashMap<String, Decimal>)>>,
@@ -196,12 +199,40 @@ impl Accounts {
         poll_secs: u64,
         store: Arc<Store>,
     ) -> Arc<Self> {
-        let accounts = load_accounts(&data_file);
+        // 主密钥优先放系统钥匙串；拿不到时退回本机密钥文件。初始化失败则拒绝写入，
+        // 避免把交易所凭证静默降级成明文。
+        let cipher = match CredentialCipher::open(&data_file) {
+            Ok(cipher) => Some(cipher),
+            Err(error) => {
+                tracing::error!(%error, path = %data_file.display(), "初始化凭证加密失败，将无法写入新的交易所凭证");
+                None
+            }
+        };
+        let storage = cipher
+            .as_ref()
+            .map(|cipher| cipher.info(&data_file))
+            .unwrap_or_else(|| StorageInfo {
+                encrypted: false,
+                backend: StorageBackend::Unavailable,
+                path: data_file.display().to_string(),
+                exists: data_file.exists(),
+                permissions: crate::secret::file_permissions(&data_file),
+            });
+        let (accounts, plaintext) = load_accounts(&data_file, cipher.as_ref());
+        // 旧版本留下的是明文 JSON；首次读取成功后立即改写为加密信封。
+        if plaintext && cipher.is_some() {
+            match write_accounts(&data_file, &accounts, cipher.as_ref()) {
+                Ok(()) => tracing::info!(path = %data_file.display(), "已将明文账户文件迁移为加密存储"),
+                Err(error) => tracing::warn!(%error, "迁移账户文件为加密存储失败"),
+            }
+        }
         let service = Arc::new(Self {
             http,
             endpoints,
             data_file,
             store,
+            cipher,
+            storage,
             accounts: RwLock::new(accounts),
             snapshots: RwLock::new(HashMap::new()),
             price_cache: Mutex::new(None),
@@ -209,6 +240,34 @@ impl Accounts {
         });
         service.spawn_poller(poll_secs);
         service
+    }
+
+    /// 凭证存储方式，供桌面端展示加密状态。
+    pub fn storage(&self) -> StorageInfo {
+        self.storage.clone()
+    }
+
+    /// 清除全部凭证并从本机删除凭证文件；返回被清除的账户数量。
+    pub async fn clear(&self) -> anyhow::Result<usize> {
+        let mut accounts = self.accounts.write().expect("账户锁不可用");
+        let removed = accounts.len();
+
+        // 先删文件再清空内存：删除失败时保留账户，避免界面显示已清除但重启后又出现。
+        match std::fs::remove_file(&self.data_file) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(anyhow!(
+                    "删除凭证文件失败 ({}): {error}",
+                    self.data_file.display()
+                ));
+            }
+        }
+        accounts.clear();
+        drop(accounts);
+
+        self.snapshots.write().expect("快照锁不可用").clear();
+        Ok(removed)
     }
 
     fn spawn_poller(self: &Arc<Self>, poll_secs: u64) {
@@ -629,7 +688,7 @@ impl Accounts {
 
     fn persist(&self) -> anyhow::Result<()> {
         let accounts = self.accounts.read().expect("账户锁不可用");
-        write_accounts(&self.data_file, &accounts)
+        write_accounts(&self.data_file, &accounts, self.cipher.as_ref())
     }
 }
 
@@ -667,46 +726,75 @@ fn preview_key(key: &str) -> String {
     format!("{}••••{}", &key[..4], &key[key.len() - 4..])
 }
 
-fn load_accounts(path: &Path) -> Vec<AccountCredentials> {
+/// 读取账户文件，返回 `(账户列表, 是否为未加密的旧格式)`。
+fn load_accounts(
+    path: &Path,
+    cipher: Option<&CredentialCipher>,
+) -> (Vec<AccountCredentials>, bool) {
     let raw = match std::fs::read(path) {
         Ok(raw) => raw,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return (Vec::new(), false),
         Err(error) => {
             tracing::warn!(%error, path = %path.display(), "读取账户文件失败");
-            return Vec::new();
+            return (Vec::new(), false);
         }
     };
-    match serde_json::from_slice::<Vec<AccountCredentials>>(&raw) {
-        Ok(accounts) => accounts,
+
+    let encrypted = CredentialCipher::is_encrypted(&raw);
+    let plain = if encrypted {
+        let Some(cipher) = cipher else {
+            tracing::error!(path = %path.display(), "账户文件已加密，但本机主密钥不可用");
+            return (Vec::new(), false);
+        };
+        match cipher.unseal(&raw) {
+            Ok(plain) => plain,
+            Err(error) => {
+                tracing::error!(%error, path = %path.display(), "解密账户文件失败，保留原文件不做覆盖");
+                return (Vec::new(), false);
+            }
+        }
+    } else {
+        raw
+    };
+
+    match serde_json::from_slice::<Vec<AccountCredentials>>(&plain) {
+        Ok(accounts) => (accounts, !encrypted),
         Err(error) => {
             tracing::warn!(%error, path = %path.display(), "解析账户文件失败，忽略已有账户");
-            Vec::new()
+            (Vec::new(), false)
         }
     }
 }
 
-fn write_accounts(path: &Path, accounts: &[AccountCredentials]) -> anyhow::Result<()> {
+fn write_accounts(
+    path: &Path,
+    accounts: &[AccountCredentials],
+    cipher: Option<&CredentialCipher>,
+) -> anyhow::Result<()> {
+    let cipher = cipher.ok_or_else(|| anyhow!("本机主密钥不可用，已拒绝以明文写入交易所凭证"))?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("创建账户目录失败: {}", parent.display()))?;
     }
+
     let json = serde_json::to_vec_pretty(accounts).context("序列化账户失败")?;
-    std::fs::write(path, json).with_context(|| format!("写入账户文件失败: {}", path.display()))?;
+    let sealed = cipher.seal(&json)?;
+
+    // 先写临时文件再原子替换，避免进程中断留下半截凭证文件。
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("accounts.json");
+    let tmp = path.with_file_name(format!("{file_name}.tmp"));
+    std::fs::write(&tmp, sealed).with_context(|| format!("写入临时账户文件失败: {}", tmp.display()))?;
+    restrict_permissions(&tmp)?;
+    if std::fs::rename(&tmp, path).is_err() {
+        // Windows 不允许 rename 覆盖已存在文件，退化为先删除再替换。
+        let _ = std::fs::remove_file(path);
+        std::fs::rename(&tmp, path)
+            .with_context(|| format!("保存账户文件失败: {}", path.display()))?;
+    }
     restrict_permissions(path)?;
-    Ok(())
-}
-
-#[cfg(unix)]
-fn restrict_permissions(path: &Path) -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let mut permissions = std::fs::metadata(path)?.permissions();
-    permissions.set_mode(0o600);
-    std::fs::set_permissions(path, permissions)?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn restrict_permissions(_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
@@ -2323,5 +2411,45 @@ mod tests {
     fn preview_masks_key() {
         assert_eq!(preview_key("abcdefghijklmnop"), "abcd••••mnop");
         assert_eq!(preview_key("short"), "••••");
+    }
+
+    #[test]
+    fn migrates_plaintext_accounts_to_envelope() {
+        let dir = std::env::temp_dir().join(format!("arbpilot-accounts-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("accounts.json");
+        let account = AccountCredentials {
+            id: Uuid::from_u128(1),
+            venue: "binance".to_string(),
+            label: "main".to_string(),
+            api_key: "key-1234567890".to_string(),
+            api_secret: "secret-value".to_string(),
+            passphrase: None,
+            wallet_address: None,
+            signer_key: None,
+            key_index: None,
+            account_index: None,
+            created_at: Utc::now(),
+        };
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&vec![account]).expect("序列化明文账户"),
+        )
+        .unwrap();
+
+        let cipher = CredentialCipher::open(&path).expect("初始化加密器");
+        let (loaded, plaintext) = load_accounts(&path, Some(&cipher));
+        assert!(plaintext);
+        assert_eq!(loaded.len(), 1);
+
+        write_accounts(&path, &loaded, Some(&cipher)).expect("写入加密凭证");
+        let raw = std::fs::read(&path).unwrap();
+        assert!(CredentialCipher::is_encrypted(&raw));
+        assert!(!String::from_utf8_lossy(&raw).contains("secret-value"));
+
+        let (reloaded, plaintext) = load_accounts(&path, Some(&cipher));
+        assert!(!plaintext);
+        assert_eq!(reloaded.len(), 1);
+        assert_eq!(reloaded[0].api_key, "key-1234567890");
     }
 }

@@ -11,6 +11,7 @@ use uuid::Uuid;
 use crate::{
     accounts::{AccountView, ImportRequest},
     error::ApiError,
+    secret::StorageInfo,
     state::AppState,
     store::EquityPoint,
 };
@@ -46,6 +47,14 @@ pub struct AccountsResponse {
     pub accounts: Vec<AccountView>,
     pub total_equity_usd: Decimal,
     pub observed_at: DateTime<Utc>,
+    /// 凭证在本机的存储方式：系统钥匙串或本地密钥文件加密。
+    pub storage: StorageInfo,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ClearResponse {
+    /// 被清除的账户数量。
+    pub removed: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -92,6 +101,7 @@ pub async fn list(State(state): State<AppState>) -> Json<AccountsResponse> {
         accounts,
         total_equity_usd: state.accounts.total_equity_usd(),
         observed_at,
+        storage: state.accounts.storage(),
     })
 }
 
@@ -116,6 +126,16 @@ pub async fn import(
         .await
         .map_err(|error| ApiError::BadRequest(error.to_string()))?;
     Ok((StatusCode::CREATED, Json(view)))
+}
+
+/// 清除本机保存的全部交易所凭证，不可恢复。
+pub async fn clear(State(state): State<AppState>) -> Result<Json<ClearResponse>, ApiError> {
+    let removed = state
+        .accounts
+        .clear()
+        .await
+        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    Ok(Json(ClearResponse { removed }))
 }
 
 pub async fn remove(
