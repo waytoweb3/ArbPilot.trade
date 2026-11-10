@@ -20,7 +20,8 @@ use std::{
 };
 
 use arb_core::{
-    indicators, DataRules, SandboxCandle, Side, StrategyExecutionMode, StrategyRecord, StrategyStatus,
+    indicators, DataRules, SandboxCandle, Side, StrategyExecutionMode, StrategyRecord,
+    StrategyStatus,
 };
 use chrono::Utc;
 use rust_decimal::Decimal;
@@ -335,7 +336,9 @@ impl SkillSettings {
 fn base_name(name: &str) -> &str {
     let head = name.trim().split(" · ").next().unwrap_or(name).trim();
     match head.rsplit_once(' ') {
-        Some((base, suffix)) if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()) => {
+        Some((base, suffix))
+            if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()) =>
+        {
             base.trim()
         }
         _ => head,
@@ -395,8 +398,7 @@ pub fn default_settings(kind: SkillKind, leverage: Decimal) -> SkillSettings {
         }
         SkillKind::Breakout => {
             rule.name = "海龟突破".to_string();
-            rule.purpose =
-                "价格突破唐奇安通道入场，反向突破或 2 倍 ATR 止损离场。".to_string();
+            rule.purpose = "价格突破唐奇安通道入场，反向突破或 2 倍 ATR 止损离场。".to_string();
             rule.trigger.timeframe = "1h".to_string();
             rule.trigger.lookback = 300;
             rule.trigger.fast = 20;
@@ -420,8 +422,7 @@ pub fn default_settings(kind: SkillKind, leverage: Decimal) -> SkillSettings {
         SkillKind::Grid => {
             rule.name = "网格".to_string();
             rule.purpose =
-                "现价上下按固定间距布置档位，价格触及后单腿开仓，到达下一档止盈。"
-                    .to_string();
+                "现价上下按固定间距布置档位，价格触及后单腿开仓，到达下一档止盈。".to_string();
             rule.trigger.timeframe = "5m".to_string();
             rule.trigger.lookback = 200;
             rule.business.take_profit_pct = Decimal::new(5, 1);
@@ -547,11 +548,7 @@ impl SkillDesk {
     }
 
     /// 保存某个策略的设置，返回保存后的完整配置。
-    pub async fn update_settings(
-        &self,
-        strategy_id: Uuid,
-        next: SkillSettings,
-    ) -> SkillSettings {
+    pub async fn update_settings(&self, strategy_id: Uuid, next: SkillSettings) -> SkillSettings {
         let next = next.normalized(self.default_leverage);
         let snapshot = {
             let mut settings = self.settings.write().expect("技能设置锁不可用");
@@ -577,7 +574,9 @@ impl SkillDesk {
         }
         let today = Utc::now().date_naive().to_string();
         let mut daily = self.daily.lock().expect("技能开仓计数锁不可用");
-        let entry = daily.entry(key.to_string()).or_insert_with(|| (today.clone(), 0));
+        let entry = daily
+            .entry(key.to_string())
+            .or_insert_with(|| (today.clone(), 0));
         if entry.0 != today {
             *entry = (today, 0);
         }
@@ -589,12 +588,7 @@ impl SkillDesk {
     }
 
     /// 计算本轮触发的网格档位；首次或全部档位成交后按现价重建。
-    fn grid_triggers(
-        &self,
-        key: &str,
-        price: Decimal,
-        rule: &SkillRule,
-    ) -> Vec<(Side, Decimal)> {
+    fn grid_triggers(&self, key: &str, price: Decimal, rule: &SkillRule) -> Vec<(Side, Decimal)> {
         let levels = rule.business.grid_levels.clamp(1, MAX_GRID_LEVELS) as usize;
         let step = rule.business.grid_spacing_pct / Decimal::from(100);
         if step <= Decimal::ZERO || price <= Decimal::ZERO {
@@ -611,8 +605,11 @@ impl SkillDesk {
             *state = GridState::new(price, levels);
         }
         let anchor = state.anchor;
-        let (buy_levels, sell_levels) =
-            grid_levels(anchor, rule.business.grid_levels, rule.business.grid_spacing_pct);
+        let (buy_levels, sell_levels) = grid_levels(
+            anchor,
+            rule.business.grid_levels,
+            rule.business.grid_spacing_pct,
+        );
         let mut hits = Vec::new();
         if rule.steps.direction != SkillDirection::Short {
             for (index, filled) in state.buys.iter_mut().enumerate() {
@@ -707,6 +704,65 @@ pub fn settings_for(state: &AppState, record: &StrategyRecord) -> SkillSettings 
     state
         .skill
         .settings_or(record.id, || fallback_settings(state, record))
+}
+
+/// 上币公告跟随策略实际生效的单腿参数。
+///
+/// 技能运行时接管后以技能设置为准：旧的监听设置可能停留在历史值，
+/// 直接读它会让电报状态显示的下单模式与真实运行不一致。
+pub fn listing_settings_for(state: &AppState, record: &StrategyRecord) -> listing::ListingSettings {
+    listing::ListingSettings {
+        rules: settings_for(state, record)
+            .rules
+            .into_iter()
+            .map(|rule| listing::ListingRule {
+                id: rule.id,
+                name: rule.name,
+                enabled: rule.enabled,
+                execution_mode: rule.steps.execution_mode,
+                notional_usd: rule.business.notional_usd,
+                leverage: rule.business.leverage,
+                watch_venues: rule.trigger.event_sources,
+                execution_venues: rule.steps.execution_venues,
+                take_profit_pct: rule.business.take_profit_pct,
+                stop_loss_pct: rule.business.stop_loss_pct,
+            })
+            .collect(),
+    }
+}
+
+/// 电报 `/listing amount|leverage|tp|sl`：把数值写到运行中上币策略的每条技能规则。
+///
+/// 返回 false 表示该策略仍由旧的上币监听设置驱动，调用方按原来的方式更新。
+pub async fn update_listing_number(
+    state: &AppState,
+    strategy_id: Uuid,
+    field: &str,
+    number: Decimal,
+) -> bool {
+    let record = state
+        .strategies
+        .read()
+        .expect("策略锁不可用")
+        .iter()
+        .find(|record| record.id == strategy_id)
+        .cloned();
+    let Some(record) = record.filter(manages) else {
+        return false;
+    };
+    let mut settings = settings_for(state, &record);
+    for rule in &mut settings.rules {
+        match field {
+            "amount" => rule.business.notional_usd = number,
+            "leverage" => rule.business.leverage = number,
+            "tp" => rule.business.take_profit_pct = number,
+            "sl" => rule.business.stop_loss_pct = number,
+            _ => {}
+        }
+    }
+    state.skill.update_settings(strategy_id, settings).await;
+    crate::routes::strategies::refresh_run_note(state, strategy_id).await;
+    true
 }
 
 /// 正在运行的技能策略：由模板标识识别，避免误接管用户自定义策略。
@@ -807,10 +863,7 @@ async fn scan_news(state: &AppState) {
                     notify_hit(state, rule, &token, &item.title);
                     continue;
                 }
-                if !state
-                    .skill
-                    .allow_daily(&key, rule.cautions.max_daily_opens)
-                {
+                if !state.skill.allow_daily(&key, rule.cautions.max_daily_opens) {
                     tracing::info!(
                         strategy_id = %strategy.id,
                         %token,
@@ -897,9 +950,11 @@ async fn auto_open(
             }
         }
     }
+    let message = format!("技能自动开仓失败 {token}：{}", failures.join("；"));
+    crate::strategy_runner::note_reject(state, strategy.id, message.clone()).await;
     let _ = state.events.send(ExecutorEvent::Alert {
         level: AlertLevel::Warning,
-        message: format!("技能自动开仓失败 {token}：{}", failures.join("；")),
+        message,
         message_en: Some(format!(
             "Skill auto-open failed for {token}: {}",
             failures.join("; ")
@@ -909,7 +964,11 @@ async fn auto_open(
 }
 
 /// 可执行的交易所：优先按规则设置的优先级，模拟模式允许使用未配置账户的交易所。
-pub(crate) fn candidate_venues(state: &AppState, rule: &SkillRule, universe: &[String]) -> Vec<String> {
+pub(crate) fn candidate_venues(
+    state: &AppState,
+    rule: &SkillRule,
+    universe: &[String],
+) -> Vec<String> {
     let mut venues = listing::execution_venues(state, &rule.steps.execution_venues);
     if rule.steps.execution_mode == StrategyExecutionMode::Paper && venues.is_empty() {
         venues = if rule.steps.execution_venues.is_empty() {
@@ -927,7 +986,9 @@ pub(crate) fn candidate_venues(state: &AppState, rule: &SkillRule, universe: &[S
 /// 单笔金额：业务规则金额与注意事项上限取小。
 pub(crate) fn capped_notional(rule: &SkillRule) -> Decimal {
     if rule.cautions.max_notional_usd > Decimal::ZERO {
-        rule.business.notional_usd.min(rule.cautions.max_notional_usd)
+        rule.business
+            .notional_usd
+            .min(rule.cautions.max_notional_usd)
     } else {
         rule.business.notional_usd
     }
@@ -1023,10 +1084,30 @@ async fn evaluate_indicator(
 
     match rule.kind {
         SkillKind::Breakout => {
-            evaluate_breakout(state, strategy, rule, &venue, symbol, last, &indicators, &open).await
+            evaluate_breakout(
+                state,
+                strategy,
+                rule,
+                &venue,
+                symbol,
+                last,
+                &indicators,
+                &open,
+            )
+            .await
         }
         SkillKind::MaTrend => {
-            evaluate_ma_trend(state, strategy, rule, &venue, symbol, last, &indicators, &open).await
+            evaluate_ma_trend(
+                state,
+                strategy,
+                rule,
+                &venue,
+                symbol,
+                last,
+                &indicators,
+                &open,
+            )
+            .await
         }
         SkillKind::Grid => evaluate_grid(state, strategy, rule, &venue, symbol, last, &open).await,
         SkillKind::Event => Ok(()),
@@ -1086,7 +1167,9 @@ async fn evaluate_breakout(
     };
     if open.is_empty() {
         match breakout_signal(last, high, low, rule.steps.direction) {
-            Some(Side::Buy) => try_open(state, strategy, rule, venue, symbol, Side::Buy, last).await,
+            Some(Side::Buy) => {
+                try_open(state, strategy, rule, venue, symbol, Side::Buy, last).await
+            }
             Some(Side::Sell) => {
                 try_open(state, strategy, rule, venue, symbol, Side::Sell, last).await
             }
@@ -1126,7 +1209,9 @@ async fn evaluate_ma_trend(
     }
     if open.is_empty() {
         match ma_trend_signal(last, fast, slow, rule.steps.direction) {
-            Some(Side::Buy) => try_open(state, strategy, rule, venue, symbol, Side::Buy, last).await,
+            Some(Side::Buy) => {
+                try_open(state, strategy, rule, venue, symbol, Side::Buy, last).await
+            }
             Some(Side::Sell) => {
                 try_open(state, strategy, rule, venue, symbol, Side::Sell, last).await
             }
@@ -1234,7 +1319,11 @@ async fn try_open(
     if notional <= Decimal::ZERO {
         return;
     }
-    let side_zh = if side == Side::Buy { "做多" } else { "做空" };
+    let side_zh = if side == Side::Buy {
+        "做多"
+    } else {
+        "做空"
+    };
     let headline = if rule.purpose.trim().is_empty() {
         format!("{} · {side_zh}信号 {last}", rule.name)
     } else {
@@ -1271,6 +1360,12 @@ async fn try_open(
             rule = %rule.name,
             "技能指标信号开仓失败"
         );
+        crate::strategy_runner::note_reject(
+            state,
+            strategy.id,
+            format!("技能开仓失败 {symbol}（{venue}）：{error}"),
+        )
+        .await;
     }
 }
 
@@ -1628,7 +1723,10 @@ mod tests {
         assert_eq!(kind_from_name("均线趋势"), Some(SkillKind::MaTrend));
         assert_eq!(kind_from_name("网格"), Some(SkillKind::Grid));
         assert_eq!(kind_from_name("上币公告跟随"), Some(SkillKind::Event));
-        assert_eq!(kind_from_name("技能策略（SKILL.md）"), Some(SkillKind::Event));
+        assert_eq!(
+            kind_from_name("技能策略（SKILL.md）"),
+            Some(SkillKind::Event)
+        );
         // 同一模板创建多条实例时重名会自动编号，后缀不影响识别。
         assert_eq!(kind_from_name("海龟突破 2"), Some(SkillKind::Breakout));
         assert_eq!(kind_from_name("网格 · BTCUSDT"), Some(SkillKind::Grid));

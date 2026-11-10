@@ -154,7 +154,7 @@ impl AppState {
         let funding = FundingFeed::start(config.as_ref(), http, realtime, store.clone());
 
         // 策略定义完全以数据库为准：没有保存过策略时列表就是空的，不再自动生成内置策略。
-        let strategies = store.load_strategies().await;
+        let mut strategies = store.load_strategies().await;
         // 条件单持久化在库里，重启后继续等待触发。
         let conditional = ConditionalOrders::with_orders(store.conditional_orders().await);
         // 上币单腿交易的设置与持仓同样持久化，重启后继续监控止盈止损；
@@ -175,6 +175,16 @@ impl AppState {
         let mut orders = store.orders().await;
         orders.sort_by_key(|order| std::cmp::Reverse(order.created_at));
         orders.truncate(MAX_IN_MEMORY_ORDERS);
+        // 运行计数只记录上线后的增量，升级前落库的订单不会计入；
+        // 重启时按订单历史回填一次，避免策略卡片上的信号/订单数一直是 0。
+        for record in &mut strategies {
+            let counted = orders
+                .iter()
+                .filter(|order| order.intent.strategy_id == Some(record.id))
+                .count() as u64;
+            record.runtime.orders = record.runtime.orders.max(counted);
+            record.runtime.signals = record.runtime.signals.max(record.runtime.orders);
+        }
 
         // 授权令牌在启动时从本地恢复，过期后仍需回桌面端重新登录换取。
         let license = Arc::new(LicenseManager::start(
@@ -258,20 +268,18 @@ impl AppState {
                         groups = state.backfill_position_groups(&snapshots).await;
                     }
                 }
-                let lookup: HashMap<
-                    (String, String, Side),
-                    (Uuid, Option<Uuid>, Option<String>),
-                > = groups
-                    .iter()
-                    .flat_map(|(group_id, members)| {
-                        members.iter().map(move |member| {
-                            (
-                                (member.venue.clone(), member.symbol.clone(), member.side),
-                                (*group_id, member.strategy_id, member.source.clone()),
-                            )
+                let lookup: HashMap<(String, String, Side), (Uuid, Option<Uuid>, Option<String>)> =
+                    groups
+                        .iter()
+                        .flat_map(|(group_id, members)| {
+                            members.iter().map(move |member| {
+                                (
+                                    (member.venue.clone(), member.symbol.clone(), member.side),
+                                    (*group_id, member.strategy_id, member.source.clone()),
+                                )
+                            })
                         })
-                    })
-                    .collect();
+                        .collect();
                 // 单腿上币仓位没有仓位组，用持久化的上币交易补回策略与规则来源。
                 let listing_sources: HashMap<
                     (String, String, Side),
@@ -296,7 +304,11 @@ impl AppState {
                     let live: HashSet<(String, String, Side)> = positions
                         .iter()
                         .map(|position| {
-                            (position.venue.clone(), position.symbol.clone(), position.side)
+                            (
+                                position.venue.clone(),
+                                position.symbol.clone(),
+                                position.side,
+                            )
                         })
                         .collect();
                     groups
@@ -330,10 +342,13 @@ impl AppState {
         let live: HashSet<(String, String, Side)> = snapshots
             .iter()
             .flat_map(|snapshot| {
-                snapshot
-                    .positions
-                    .iter()
-                    .map(|position| (position.venue.clone(), position.symbol.clone(), position.side))
+                snapshot.positions.iter().map(|position| {
+                    (
+                        position.venue.clone(),
+                        position.symbol.clone(),
+                        position.side,
+                    )
+                })
             })
             .collect();
         if live.is_empty() {

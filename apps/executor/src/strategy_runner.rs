@@ -2,11 +2,12 @@ use std::time::Duration;
 
 use arb_core::{
     OrderOrigin, OrderStatus, PositionSide, SandboxDecision, SandboxInput, SandboxMarketSnapshot,
-    SandboxRunStatus, StrategyEventLevel, StrategyExecutionMode, StrategyKind, StrategyOpenPosition,
-    StrategyPendingOrder, StrategyRecord, StrategyRunScope, StrategyStatus,
+    SandboxRunStatus, StrategyEventLevel, StrategyExecutionMode, StrategyKind,
+    StrategyOpenPosition, StrategyPendingOrder, StrategyRecord, StrategyRunScope, StrategyStatus,
 };
 use chrono::{Duration as ChronoDuration, Utc};
 use rust_decimal::Decimal;
+use uuid::Uuid;
 
 use crate::{
     gateway::{self, LegOrderRequest, OrderBatchRequest, PairOrderRequest},
@@ -92,7 +93,17 @@ async fn evaluate_one(state: &AppState, mut record: StrategyRecord) {
     // 保证，而不是禁止入口。
     if crate::skill::manages(&record) {
         sync_run(state, &mut record, events_before).await;
-        commit(state, record, false).await;
+        // 技能运行时会自己回写信号/订单/持仓，这里只刷新心跳与实例，
+        // 避免用评估开始时的旧快照覆盖技能刚写入的成交结果。
+        let heartbeat_at = record.last_heartbeat_at;
+        let evaluated_at = record.runtime.last_evaluated_at;
+        let run_id = record.runtime.run_id;
+        update_runtime(state, record.id, |existing| {
+            existing.last_heartbeat_at = heartbeat_at;
+            existing.runtime.last_evaluated_at = evaluated_at;
+            existing.runtime.run_id = run_id;
+        })
+        .await;
         return;
     }
 
@@ -866,6 +877,96 @@ async fn commit(state: &AppState, record: StrategyRecord, persist: bool) {
     if let Some(merged) = merged {
         state.store.save_strategy(&merged).await;
     }
+}
+
+/// 技能运行时（公告/指标）不在本模块的评估循环里跑，成交后由这里回写运行状态，
+/// 让策略卡片上的信号、订单与当前持仓和真实交易一致。
+async fn update_runtime(
+    state: &AppState,
+    strategy_id: Uuid,
+    change: impl FnOnce(&mut StrategyRecord),
+) {
+    let updated = {
+        let mut strategies = state.strategies.write().expect("策略锁不可用");
+        let Some(record) = strategies
+            .iter_mut()
+            .find(|record| record.id == strategy_id)
+        else {
+            return;
+        };
+        change(record);
+        record.updated_at = Utc::now();
+        record.clone()
+    };
+    state.store.save_strategy(&updated).await;
+}
+
+/// 技能运行时开仓成交：计入信号与订单，记录当前持仓与事件。
+pub(crate) async fn note_open(
+    state: &AppState,
+    strategy_id: Uuid,
+    open: StrategyOpenPosition,
+    message: String,
+    order_id: Option<Uuid>,
+) {
+    update_runtime(state, strategy_id, |record| {
+        record.runtime.signals += 1;
+        record.runtime.orders += 1;
+        record.runtime.last_signal_at = Some(Utc::now());
+        record.runtime.last_order_id = order_id;
+        record.runtime.last_error = None;
+        record.runtime.open = Some(open);
+        record
+            .runtime
+            .record(StrategyEventLevel::Info, message, order_id);
+    })
+    .await;
+}
+
+/// 技能运行时平仓成交：计入订单，当前持仓换成剩余持仓（没有则清空）。
+pub(crate) async fn note_close(
+    state: &AppState,
+    strategy_id: Uuid,
+    remaining: Option<StrategyOpenPosition>,
+    message: String,
+    order_id: Option<Uuid>,
+) {
+    update_runtime(state, strategy_id, |record| {
+        record.runtime.orders += 1;
+        record.runtime.last_signal_at = Some(Utc::now());
+        record.runtime.last_order_id = order_id;
+        record.runtime.last_error = None;
+        record.runtime.open = remaining;
+        record
+            .runtime
+            .record(StrategyEventLevel::Info, message, order_id);
+    })
+    .await;
+}
+
+/// 技能信号被拒（没有行情、交易所拒单等）：计入信号，并把拒绝原因记进事件。
+pub(crate) async fn note_reject(state: &AppState, strategy_id: Uuid, message: String) {
+    update_runtime(state, strategy_id, |record| {
+        record.runtime.signals += 1;
+        record.runtime.last_signal_at = Some(Utc::now());
+        record
+            .runtime
+            .record(StrategyEventLevel::Warning, message, None);
+    })
+    .await;
+}
+
+/// 运行期错误（例如平仓重试失败）：只在错误变化时记一条，避免每轮重复刷事件。
+pub(crate) async fn note_error(state: &AppState, strategy_id: Uuid, message: String) {
+    update_runtime(state, strategy_id, |record| {
+        if record.runtime.last_error.as_deref() == Some(message.as_str()) {
+            return;
+        }
+        record
+            .runtime
+            .record(StrategyEventLevel::Warning, message, None);
+    })
+    .await;
 }
 
 /// 共享状态在评估期间被用户改过：已经停止的策略，或换了新的运行实例。

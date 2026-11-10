@@ -10,7 +10,10 @@ use std::{
     time::Duration,
 };
 
-use arb_core::{OrderOrigin, OrderStatus, Side, StrategyExecutionMode, StrategyStatus};
+use arb_core::{
+    OrderOrigin, OrderStatus, PositionSide, Side, StrategyExecutionMode, StrategyOpenPosition,
+    StrategyStatus,
+};
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -395,9 +398,7 @@ impl ListingDesk {
     fn mark_token(&self, token: &str) -> bool {
         let now = Utc::now();
         let mut tokens = self.tokens.lock().expect("上币代币去重锁不可用");
-        tokens.retain(|_, at| {
-            now.signed_duration_since(*at).num_seconds() < TOKEN_COOLDOWN_SECS
-        });
+        tokens.retain(|_, at| now.signed_duration_since(*at).num_seconds() < TOKEN_COOLDOWN_SECS);
         if tokens.contains_key(token) {
             return false;
         }
@@ -412,11 +413,7 @@ impl ListingDesk {
         trades.truncate(MAX_TRADES);
     }
 
-    fn update(
-        &self,
-        id: Uuid,
-        change: impl FnOnce(&mut ListingTrade),
-    ) -> Option<ListingTrade> {
+    fn update(&self, id: Uuid, change: impl FnOnce(&mut ListingTrade)) -> Option<ListingTrade> {
         let mut trades = self.trades.write().expect("上币交易锁不可用");
         let trade = trades.iter_mut().find(|trade| trade.id == id)?;
         change(trade);
@@ -578,13 +575,38 @@ pub async fn open_position(
 
     let mode_zh = if trade.paper { "（模拟）" } else { "" };
     let mode_en = if trade.paper { " (paper)" } else { "" };
-    let label_zh = if trade.skill { "技能单腿" } else { "上币单腿" };
-    let label_en = if trade.skill { "Skill leg" } else { "Listing leg" };
+    let label_zh = if trade.skill {
+        "技能单腿"
+    } else {
+        "上币单腿"
+    };
+    let label_en = if trade.skill {
+        "Skill leg"
+    } else {
+        "Listing leg"
+    };
     let (side_zh, side_en) = if trade.side == Side::Buy {
         ("开多", "long opened")
     } else {
         ("开空", "short opened")
     };
+    // 技能/公告触发的交易回写策略运行状态，让信号、订单与当前持仓和真实成交一致。
+    if let Some(strategy_id) = trade.strategy_id {
+        crate::strategy_runner::note_open(
+            state,
+            strategy_id,
+            strategy_open_position(&trade),
+            format!(
+                "{label_zh}{side_zh}{mode_zh} {} {} @ {}，金额 {} USD",
+                trade.symbol,
+                trade.venue,
+                trade.entry_price.round_dp(6),
+                trade.notional_usd.round_dp(2),
+            ),
+            trade.entry_order_id,
+        )
+        .await;
+    }
     if trade.notify {
         let _ = state.events.send(ExecutorEvent::Alert {
             level: AlertLevel::Info,
@@ -612,6 +634,25 @@ pub async fn open_position(
     Ok(trade)
 }
 
+/// 把单腿交易转成策略运行状态里的当前持仓。
+fn strategy_open_position(trade: &ListingTrade) -> StrategyOpenPosition {
+    StrategyOpenPosition {
+        symbol: trade.symbol.clone(),
+        long_venue: String::new(),
+        short_venue: String::new(),
+        venue: Some(trade.venue.clone()),
+        side: Some(if trade.side == Side::Buy {
+            PositionSide::Long
+        } else {
+            PositionSide::Short
+        }),
+        entry_price: Some(trade.entry_price),
+        notional_usd: trade.notional_usd,
+        opened_at: trade.opened_at,
+        entry_net_edge_bps: Decimal::ZERO,
+    }
+}
+
 /// 市价平掉一笔持仓；止盈止损与手动平仓共用。
 pub async fn close_position(
     state: &AppState,
@@ -630,8 +671,8 @@ pub async fn close_position(
     } else {
         Side::Buy
     };
-    let failure = if trade.paper {
-        None
+    let (failure, close_order_id) = if trade.paper {
+        (None, None)
     } else {
         let notional_usd = trade.quantity * price;
         let outcome = gateway::submit_legs(
@@ -648,9 +689,14 @@ pub async fn close_position(
                 }],
                 leverage: None,
                 max_slippage_bps: None,
-                strategy_id: None,
-                source: None,
-                origin: OrderOrigin::Telegram,
+                strategy_id: trade.strategy_id,
+                source: trade.source.clone(),
+                // 带策略的交易平仓按策略来源记账，其余（电报手动单）记为 Telegram。
+                origin: if trade.strategy_id.is_some() {
+                    OrderOrigin::Strategy
+                } else {
+                    OrderOrigin::Telegram
+                },
                 idempotency_key: format!("listing-close-{}", trade.id),
                 closing: true,
                 max_unhedged_secs: None,
@@ -659,15 +705,20 @@ pub async fn close_position(
         .await;
 
         match outcome {
-            Ok(outcome) if outcome.order.status == OrderStatus::Filled => None,
-            Ok(outcome) => Some(
-                outcome
-                    .order
-                    .note
-                    .clone()
-                    .unwrap_or_else(|| format!("订单状态 {:?}", outcome.order.status)),
+            Ok(outcome) if outcome.order.status == OrderStatus::Filled => {
+                (None, Some(outcome.order.id))
+            }
+            Ok(outcome) => (
+                Some(
+                    outcome
+                        .order
+                        .note
+                        .clone()
+                        .unwrap_or_else(|| format!("订单状态 {:?}", outcome.order.status)),
+                ),
+                Some(outcome.order.id),
             ),
-            Err(error) => Some(error.to_string()),
+            Err(error) => (Some(error.to_string()), None),
         }
     };
 
@@ -676,15 +727,19 @@ pub async fn close_position(
         let note = format!("{}平仓失败，稍后重试: {failure}", reason.label_zh());
         if let Some(updated) = state.listing.update(id, |trade| {
             trade.status = ListingStatus::Open;
-            trade.note = Some(note);
+            trade.note = Some(note.clone());
         }) {
             state.store.save_listing_trade(&updated).await;
+        }
+        if let Some(strategy_id) = trade.strategy_id {
+            crate::strategy_runner::note_error(state, strategy_id, note).await;
         }
         return Err(ApiError::BadRequest(failure));
     }
 
     let Some(closed) = state.listing.update(id, |trade| {
         trade.status = reason.status();
+        trade.close_order_id = close_order_id;
         trade.close_price = Some(price);
         trade.closed_at = Some(Utc::now());
         trade.note = None;
@@ -696,13 +751,45 @@ pub async fn close_position(
     let change_pct = pnl_pct(closed.side, closed.entry_price, price);
     let mode_zh = if closed.paper { "（模拟）" } else { "" };
     let mode_en = if closed.paper { " (paper)" } else { "" };
-    let label_zh = if closed.skill { "技能单腿" } else { "上币单腿" };
-    let label_en = if closed.skill { "Skill leg" } else { "Listing leg" };
+    let label_zh = if closed.skill {
+        "技能单腿"
+    } else {
+        "上币单腿"
+    };
+    let label_en = if closed.skill {
+        "Skill leg"
+    } else {
+        "Listing leg"
+    };
     let (side_zh, side_en) = if closed.side == Side::Buy {
         ("多头", "long")
     } else {
         ("空头", "short")
     };
+    // 平仓后把策略的当前持仓切换成同策略剩余持仓，没有剩余则清空。
+    if let Some(strategy_id) = closed.strategy_id {
+        let remaining = state
+            .listing
+            .open_trades()
+            .into_iter()
+            .find(|trade| trade.strategy_id == Some(strategy_id))
+            .map(|trade| strategy_open_position(&trade));
+        crate::strategy_runner::note_close(
+            state,
+            strategy_id,
+            remaining,
+            format!(
+                "{label_zh}{}{side_zh}{mode_zh} {} {} @ {}，盈亏 {}%",
+                reason.label_zh(),
+                closed.symbol,
+                closed.venue,
+                price.round_dp(6),
+                change_pct,
+            ),
+            close_order_id,
+        )
+        .await;
+    }
     if closed.notify {
         let _ = state.events.send(ExecutorEvent::Alert {
             level: AlertLevel::Info,
@@ -841,11 +928,14 @@ pub async fn running_strategies(state: &AppState) -> Vec<(Uuid, String, ListingS
                 .unwrap_or_else(|| record.definition.name.contains("上币公告跟随"))
         })
         .map(|record| {
-            (
-                record.id,
-                record.definition.name.clone(),
-                state.listing.settings(record.id),
-            )
+            // 技能运行时接管后，状态与手动下单都应以技能设置为准；
+            // 旧的监听设置可能停在历史值，直接读会显示错误的下单模式。
+            let settings = if crate::skill::manages(record) {
+                crate::skill::listing_settings_for(state, record)
+            } else {
+                state.listing.settings(record.id)
+            };
+            (record.id, record.definition.name.clone(), settings)
         })
         .collect()
 }
@@ -1068,11 +1158,48 @@ async fn mark_price(state: &AppState, venue: &str, symbol: &str) -> Option<Decim
 
 /// 不能当作代币代码的常见词。
 const TICKER_STOPWORDS: &[&str] = &[
-    "THE", "AND", "FOR", "WITH", "FROM", "NEW", "WILL", "LIST", "LISTED", "LISTING", "ADD",
-    "ADDS", "LAUNCH", "LAUNCHES", "TRADING", "TRADE", "PAIR", "PAIRS", "SPOT", "PERP",
-    "PERPETUAL", "PERPETUALS", "FUTURES", "CONTRACT", "CONTRACTS", "USDT", "USDC", "USD",
-    "BINANCE", "OKX", "BYBIT", "BITGET", "GATE", "MEXC", "KUCOIN", "UPBIT", "HTX", "BINGX",
-    "ASTER", "HYPERLIQUID", "LIGHTER", "ON",
+    "THE",
+    "AND",
+    "FOR",
+    "WITH",
+    "FROM",
+    "NEW",
+    "WILL",
+    "LIST",
+    "LISTED",
+    "LISTING",
+    "ADD",
+    "ADDS",
+    "LAUNCH",
+    "LAUNCHES",
+    "TRADING",
+    "TRADE",
+    "PAIR",
+    "PAIRS",
+    "SPOT",
+    "PERP",
+    "PERPETUAL",
+    "PERPETUALS",
+    "FUTURES",
+    "CONTRACT",
+    "CONTRACTS",
+    "USDT",
+    "USDC",
+    "USD",
+    "BINANCE",
+    "OKX",
+    "BYBIT",
+    "BITGET",
+    "GATE",
+    "MEXC",
+    "KUCOIN",
+    "UPBIT",
+    "HTX",
+    "BINGX",
+    "ASTER",
+    "HYPERLIQUID",
+    "LIGHTER",
+    "ON",
 ];
 
 /// 从任意公告文本里识别上币代币代码。
@@ -1297,7 +1424,10 @@ mod tests {
         assert_eq!(settings.rules[0].name, "币安 → OKX");
         assert!(settings.rules[0].enabled);
         assert!(!settings.rules[1].enabled);
-        assert_eq!(settings.rules[1].execution_venues, vec!["bybit".to_string()]);
+        assert_eq!(
+            settings.rules[1].execution_venues,
+            vec!["bybit".to_string()]
+        );
         // 手动下单优先取启用的规则。
         assert_eq!(settings.first_rule().name, "币安 → OKX");
         assert_ne!(settings.rules[0].id, settings.rules[1].id);
