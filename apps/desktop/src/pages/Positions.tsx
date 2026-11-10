@@ -16,7 +16,7 @@ import {
   orderStatusTone,
 } from "../lib/format";
 import { fmt, useI18n } from "../lib/i18n";
-import type { Decimal, Position } from "../lib/types";
+import type { Decimal, Order, Position } from "../lib/types";
 
 const PAGE_SIZES = [10, 20, 50];
 
@@ -57,6 +57,15 @@ export default function PositionsPage() {
     orderCurrentPage * orderPageSize,
     (orderCurrentPage + 1) * orderPageSize,
   );
+  // 来源列：手动下单显示业务入口，策略订单显示具体策略名。
+  const originLabel = (order: Order) => {
+    if (order.intent.origin === "desktop") return t.positions.originDesktop;
+    if (order.intent.origin === "telegram") return t.positions.originTelegram;
+    const name = order.intent.strategy_id
+      ? strategyNames.get(order.intent.strategy_id)
+      : undefined;
+    return name ?? t.positions.originStrategy;
+  };
 
   const totalNotional = (positions.data ?? []).reduce(
     (sum, position) => sum + toNumber(position.quantity) * toNumber(position.mark_price),
@@ -300,7 +309,7 @@ export default function PositionsPage() {
                           )
                           .join(" / ")}
                       </td>
-                      <td className="px-4 py-2.5 text-xs text-muted">{order.intent.origin}</td>
+                      <td className="px-4 py-2.5 text-xs text-muted">{originLabel(order)}</td>
                       <td className="px-4 py-2.5 text-right font-mono text-xs text-body">
                         {formatUsd(
                           order.intent.legs.reduce(

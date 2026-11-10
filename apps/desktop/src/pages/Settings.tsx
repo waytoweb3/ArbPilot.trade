@@ -1,5 +1,5 @@
 import { useQueryClient } from "@tanstack/react-query";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { FolderOpen, Lock, ShieldAlert, Trash2, Users, Wallet } from "lucide-react";
 
@@ -479,14 +479,25 @@ function AuthorSettings() {
   const updateSettlement = useUpdateSettlement();
 
   const [selectedId, setSelectedId] = useState("");
+  // 收款标识固定使用当前登录的平台账号 ID，不允许手动修改。
+  const accountId = account.data?.user.id ?? "";
+  // 资料页只管理当前登录账号自己的作者卡片，市场里的官方或其他作者不在此列。
+  const ownAuthors = useMemo(
+    () =>
+      accountId
+        ? (authors.data ?? []).filter(
+            (author) => author.payout_account === accountId,
+          )
+        : (authors.data ?? []),
+    [authors.data, accountId],
+  );
   const active =
-    authors.data?.find((author) => author.author_id === selectedId) ??
-    authors.data?.[0] ??
+    ownAuthors.find((author) => author.author_id === selectedId) ??
+    ownAuthors[0] ??
     null;
   const activeId = active?.author_id ?? "";
   const settlements = useSettlements(activeId || undefined);
-  // 收款标识固定使用当前登录的平台账号 ID，不允许手动修改。
-  const payoutAccount = account.data?.user.id ?? active?.payout_account ?? "";
+  const payoutAccount = accountId || active?.payout_account || "";
 
   const [form, setForm] = useState({ display_name: "", bio: "" });
 
@@ -560,9 +571,9 @@ function AuthorSettings() {
             </div>
           </CardHeader>
           <CardContent className="space-y-3">
-            {authors.data?.length ? (
+            {ownAuthors.length ? (
               <div className="flex flex-wrap gap-2">
-                {authors.data.map((author) => (
+                {ownAuthors.map((author) => (
                   <button
                     key={author.author_id}
                     type="button"
@@ -758,6 +769,23 @@ function LimitsField({
   );
 }
 
+/** 已接入的永续交易所；现货腿不再单独列出。 */
+const RISK_VENUES = [
+  "binance",
+  "okx",
+  "bybit",
+  "bitget",
+  "gate",
+  "aster",
+  "hyperliquid",
+  "lighter",
+] as const;
+
+/** 空列表或已覆盖全部可选交易所，都等价于「不限」。 */
+function isUnrestrictedVenues(venues: string[]): boolean {
+  return venues.length === 0 || RISK_VENUES.every((venue) => venues.includes(venue));
+}
+
 interface VenueLimitsDraft {
   venue: string;
   maxOrder: string;
@@ -775,7 +803,7 @@ interface LimitsDraft {
   quoteAge: string;
   maxLegs: string;
   symbols: string;
-  venues: string;
+  venues: string[];
   overrides: VenueLimitsDraft[];
 }
 
@@ -788,7 +816,9 @@ function toDraft(limits: RiskLimits): LimitsDraft {
     quoteAge: String(limits.max_quote_age_secs),
     maxLegs: String(limits.max_legs),
     symbols: limits.allowed_symbols.join(", "),
-    venues: limits.allowed_venues.join(", "),
+    venues: isUnrestrictedVenues(limits.allowed_venues)
+      ? []
+      : limits.allowed_venues,
     overrides: Object.entries(limits.venue_overrides ?? {}).map(
       ([venue, value]) => ({
         venue,
@@ -850,16 +880,21 @@ function RiskLimitsCard() {
   const limits = useRiskLimits();
   const update = useUpdateRiskLimits();
   const [draft, setDraft] = useState<LimitsDraft | null>(null);
+  // 默认只显示「不限」，按需展开交易所清单。
+  const [venuePickerOpen, setVenuePickerOpen] = useState(false);
 
   const startEdit = () => {
     if (!limits.data) return;
     update.reset();
-    setDraft(toDraft(limits.data));
+    const next = toDraft(limits.data);
+    setDraft(next);
+    setVenuePickerOpen(next.venues.length > 0);
   };
 
   const cancel = () => {
     update.reset();
     setDraft(null);
+    setVenuePickerOpen(false);
   };
 
   const save = () => {
@@ -873,11 +908,23 @@ function RiskLimitsCard() {
         max_quote_age_secs: Number(draft.quoteAge),
         max_legs: Number(draft.maxLegs),
         allowed_symbols: splitList(draft.symbols),
-        allowed_venues: splitList(draft.venues),
+        allowed_venues: isUnrestrictedVenues(draft.venues)
+          ? []
+          : draft.venues,
         venue_overrides: toVenueOverrides(draft.overrides),
       },
       { onSuccess: () => setDraft(null) },
     );
+  };
+
+  const toggleVenue = (venue: string) => {
+    if (!draft) return;
+    setDraft({
+      ...draft,
+      venues: draft.venues.includes(venue)
+        ? draft.venues.filter((item) => item !== venue)
+        : [...draft.venues, venue],
+    });
   };
 
   const addOverride = () => {
@@ -984,8 +1031,9 @@ function RiskLimitsCard() {
                   <LimitItem
                     label={t.settings.venues}
                     value={
-                      limits.data.allowed_venues.join(" / ") ||
-                      t.settings.unlimited
+                      isUnrestrictedVenues(limits.data.allowed_venues)
+                        ? t.settings.unlimited
+                        : limits.data.allowed_venues.join(" / ")
                     }
                   />
                 </dl>
@@ -1103,12 +1151,62 @@ function RiskLimitsCard() {
                   value={draft.symbols}
                   onChange={(value) => setDraft({ ...draft, symbols: value })}
                 />
-                <LimitsField
-                  label={t.settings.venues}
-                  hint={t.settings.limitsVenuesHint}
-                  value={draft.venues}
-                  onChange={(value) => setDraft({ ...draft, venues: value })}
-                />
+                <div className="space-y-1.5 sm:col-span-2">
+                  <span className="text-[11px] text-muted">
+                    {t.settings.venues}
+                  </span>
+                  <div className="flex flex-wrap gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setDraft({ ...draft, venues: [] });
+                        setVenuePickerOpen(false);
+                      }}
+                      disabled={update.isPending}
+                      className={cn(
+                        "rounded-lg border px-2.5 py-1 text-[11px] transition-colors",
+                        draft.venues.length === 0
+                          ? "border-accent/40 bg-accent/10 font-medium text-fg"
+                          : "border-line text-muted hover:bg-hover hover:text-body",
+                      )}
+                    >
+                      {t.settings.unlimited}
+                    </button>
+                    {venuePickerOpen ? (
+                      RISK_VENUES.map((venue) => {
+                        const active = draft.venues.includes(venue);
+                        return (
+                          <button
+                            key={venue}
+                            type="button"
+                            onClick={() => toggleVenue(venue)}
+                            disabled={update.isPending}
+                            className={cn(
+                              "rounded-lg border px-2.5 py-1 font-mono text-[11px] transition-colors",
+                              active
+                                ? "border-accent/40 bg-accent/10 font-medium text-fg"
+                                : "border-line text-muted hover:bg-hover hover:text-body",
+                            )}
+                          >
+                            {venue}
+                          </button>
+                        );
+                      })
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => setVenuePickerOpen(true)}
+                        disabled={update.isPending}
+                        className="rounded-lg border border-line px-2.5 py-1 text-[11px] text-muted transition-colors hover:bg-hover hover:text-body"
+                      >
+                        + {t.settings.venueSelect}
+                      </button>
+                    )}
+                  </div>
+                  <span className="block text-[11px] leading-relaxed text-subtle">
+                    {t.settings.limitsVenuesHint}
+                  </span>
+                </div>
               </div>
               <div className="space-y-3 rounded-lg border border-line p-3">
                 <div className="flex flex-wrap items-start justify-between gap-2">

@@ -42,7 +42,6 @@ import {
   useMarketAuthors,
   useMarketConfig,
   useOrders,
-  usePositions,
   usePublicationPerformance,
   usePublications,
   useRollbackStrategy,
@@ -1816,7 +1815,6 @@ function StrategySkillScopeCard({
         onSuccess: () => {
           setEditing((previous) => ({ ...previous, [key]: false }));
           setCollapsed((previous) => ({ ...previous, [key]: true }));
-          setNotice({ tone: "ok", text: t.strategies.skillSaved });
         },
         onError: (error) => setNotice({ tone: "error", text: errorText(error) }),
       },
@@ -3063,7 +3061,7 @@ function RunRuleList({
   );
 }
 
-/// 运行情况：当前策略仓位、订单与各条规则的运行状态。
+/// 运行情况：订单与各条规则的运行状态。
 function StrategyRuntimeCard({
   record,
   eventDriven,
@@ -3078,13 +3076,9 @@ function StrategyRuntimeCard({
   const { runtime } = record;
   const runsQuery = useStrategyRuns(record.id);
   const clearRuns = useClearStrategyRuns(record.id);
-  const positionsQuery = usePositions();
   const ordersQuery = useOrders();
 
-  // 只看这个策略触发的订单与仓位：手动下单与其它策略的互不干扰。
-  const strategyPositions = (positionsQuery.data ?? []).filter(
-    (position) => position.strategy_id === record.id,
-  );
+  // 只看这个策略触发的订单：手动下单与其它策略的互不干扰。
   const strategyOrders = [...(ordersQuery.data ?? [])]
     .filter((order) => order.intent.strategy_id === record.id)
     .sort((left, right) => right.created_at.localeCompare(left.created_at));
@@ -3092,6 +3086,8 @@ function StrategyRuntimeCard({
   const runs = runsQuery.data?.runs ?? [];
   const finishedRuns = runs.filter((run) => run.status !== "running");
   const hosted = (record.run_scope ?? "self_hosted") === "platform";
+  // 徽标即标签页：运行规则与订单二选一显示，避免同时铺开两段列表。
+  const [view, setView] = useState<"rules" | "orders">("rules");
 
   return (
     <Card>
@@ -3101,65 +3097,75 @@ function StrategyRuntimeCard({
           <CardDescription>{copy.runtimeDesc}</CardDescription>
         </div>
         <div className="flex flex-wrap items-center gap-1">
-          <Badge tone={hosted ? "info" : "neutral"}>
-            {hosted ? copy.runScopePlatform : copy.runScopeSelfHosted}
-          </Badge>
-          <Badge tone="info">{fmt(copy.signals, { count: runtime.signals })}</Badge>
-          <Badge tone="neutral">{fmt(copy.orders, { count: runtime.orders })}</Badge>
+          <button
+            type="button"
+            aria-pressed={view === "rules"}
+            onClick={() => setView("rules")}
+            className="cursor-pointer"
+          >
+            <Badge tone={view === "rules" ? "info" : "neutral"}>
+              {hosted ? copy.runScopePlatform : copy.runScopeSelfHosted}
+            </Badge>
+          </button>
+          <button
+            type="button"
+            aria-pressed={view === "orders"}
+            onClick={() => setView("orders")}
+            className="cursor-pointer"
+          >
+            <Badge tone={view === "orders" ? "info" : "neutral"}>
+              {fmt(copy.orders, { count: runtime.orders })}
+            </Badge>
+          </button>
         </div>
       </CardHeader>
       <CardContent className="space-y-3 text-xs text-muted">
-        {runtime.open && (
-          <p>
-            {copy.openPosition}：{runtime.open.symbol} ·{" "}
-            {runtime.open.long_venue && runtime.open.short_venue
-              ? `${runtime.open.long_venue} / ${runtime.open.short_venue}`
-              : runtime.open.venue ?? "—"}{" "}
-            · {formatUsd(runtime.open.notional_usd)}
-          </p>
-        )}
         {runtime.last_error && (
           <p className="text-danger">{fmt(copy.lastError, { message: runtime.last_error })}</p>
         )}
 
-        {(strategyPositions.length > 0 || strategyOrders.length > 0) && (
-          <div className="space-y-2">
-            <p className="text-[11px] text-muted">{copy.ordersBlock}</p>
-            {strategyPositions.length > 0 && (
-              <div>
-                <p className="mb-1 text-[11px] text-subtle">{copy.orderPositions}</p>
+        {view === "rules" ? (
+          <>
+            <div>
+              {finishedRuns.length > 0 && (
+                <div className="mb-1 flex items-center justify-end">
+                  <button
+                    type="button"
+                    onClick={() => clearRuns.mutate()}
+                    disabled={clearRuns.isPending}
+                    className="text-[11px] text-muted transition-colors hover:text-danger disabled:opacity-50"
+                  >
+                    {copy.runsClear}
+                  </button>
+                </div>
+              )}
+              {runs.length === 0 ? (
+                <p className="text-[11px] text-muted">{copy.runsEmpty}</p>
+              ) : (
                 <ul className="space-y-1">
-                  {strategyPositions.map((position) => (
-                    <li
-                      key={position.id}
-                      className="flex flex-wrap items-center gap-2 rounded-md border border-line bg-panel-soft px-2 py-1 text-[11px]"
-                    >
-                      <span className="font-mono text-body">
-                        {position.venue} · {position.symbol}
-                      </span>
-                      <Badge tone={position.side === "buy" ? "success" : "danger"}>
-                        {position.side === "buy" ? copy.orderLong : copy.orderShort}
-                      </Badge>
-                      <span className="text-muted">
-                        {formatNumber(position.quantity)} @ {formatNumber(position.entry_price)}
-                      </span>
-                      <span
-                        className={
-                          toNumber(position.unrealized_pnl) >= 0 ? "text-accent" : "text-danger"
-                        }
-                      >
-                        {formatUsd(position.unrealized_pnl)}
-                      </span>
-                      {position.source && (
-                        <span className="text-subtle">{position.source}</span>
-                      )}
+                  {runs.slice(0, 5).map((run) => (
+                    <li key={run.id} className="text-[11px]">
+                      {/* 规则行自带卡片样式，外层不再套边框，避免与应用范围卡片出现双层框。 */}
+                      {/* 运行实例只显示规则行与该规则当前状态。 */}
+                      <RunRuleList
+                        strategyId={record.id}
+                        status={record.status}
+                        note={run.note}
+                        live={run.status === "running"}
+                      />
                     </li>
                   ))}
                 </ul>
-              </div>
-            )}
-            {strategyOrders.length > 0 && (
-              <div>
+              )}
+            </div>
+          </>
+        ) : (
+          <div>
+            <p className="text-[11px] text-muted">{copy.ordersBlock}</p>
+            {strategyOrders.length === 0 ? (
+              <p className="mt-1 text-[11px] text-muted">{t.positions.ordersEmpty}</p>
+            ) : (
+              <div className="mt-1">
                 <p className="mb-1 text-[11px] text-subtle">{copy.orderHistory}</p>
                 <ul className="space-y-1">
                   {strategyOrders.slice(0, 10).map((order) => {
@@ -3196,39 +3202,6 @@ function StrategyRuntimeCard({
             )}
           </div>
         )}
-
-        <div>
-          {finishedRuns.length > 0 && (
-            <div className="mb-1 flex items-center justify-end">
-              <button
-                type="button"
-                onClick={() => clearRuns.mutate()}
-                disabled={clearRuns.isPending}
-                className="text-[11px] text-muted transition-colors hover:text-danger disabled:opacity-50"
-              >
-                {copy.runsClear}
-              </button>
-            </div>
-          )}
-          {runs.length === 0 ? (
-            <p className="text-[11px] text-muted">{copy.runsEmpty}</p>
-          ) : (
-            <ul className="space-y-1">
-              {runs.slice(0, 5).map((run) => (
-                <li key={run.id} className="text-[11px]">
-                  {/* 规则行自带卡片样式，外层不再套边框，避免与应用范围卡片出现双层框。 */}
-                  {/* 运行实例只显示规则行与该规则当前状态。 */}
-                  <RunRuleList
-                    strategyId={record.id}
-                    status={record.status}
-                    note={run.note}
-                    live={run.status === "running"}
-                  />
-                </li>
-              ))}
-            </ul>
-          )}
-        </div>
 
         {!eventDriven && (
           <div className="space-y-2 border-t border-line pt-3">
@@ -3747,11 +3720,6 @@ function StrategyDetail({
                   {fmt(t.strategies.validationWarnings, { count: warnings.length })}
                 </Badge>
               )}
-              <span className="text-[11px] text-muted">
-                {fmt(t.strategies.validatedAt, {
-                  value: formatDateTime(validation.validated_at),
-                })}
-              </span>
             </div>
             {validation.issues.length > 0 && (
               <ul className="space-y-1">
