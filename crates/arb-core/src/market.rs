@@ -4,10 +4,11 @@
 //! - 策略默认私有，只有作者主动发布后才出现在市场。
 //! - 发布必须绑定一个已通过校验、且有同版本回测记录的策略版本。
 //! - 表现记录按来源分开，作者自报回测与平台可复现记录不能混为一谈。
-//! - 表现榜使用可复现性、样本量、回撤、执行稳定性与版本透明度综合评分，
-//!   而不是单一收益率排名。
+//! - 表现榜按订阅人数排序，不使用综合评分或收益率排名。
 //! - 撤回发布只影响市场曝光，不影响已有仓位、订单查看与安全处置。
 //! - 结算只记录金额与服务费，不保存任何收款密钥。
+
+use std::collections::HashSet;
 
 use chrono::{DateTime, Datelike, TimeZone, Utc};
 use rust_decimal::{Decimal, RoundingStrategy};
@@ -744,7 +745,7 @@ pub fn compute_settlement_from_gross(
     }
 }
 
-/// 表现榜条目。收益率只占一小部分权重。
+/// 表现榜条目。按订阅人数排序。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LeaderboardEntry {
     pub publication_id: Uuid,
@@ -752,38 +753,16 @@ pub struct LeaderboardEntry {
     pub author_name: String,
     pub strategy_version: u32,
     pub risk_level: RiskLevel,
-    /// 0-100 的综合评分。
-    pub composite_score: Decimal,
-    pub return_pct: Decimal,
-    pub max_drawdown_pct: Decimal,
-    /// 可复现性（0-100）：平台可复现记录越多越高。
-    pub reproducibility_score: Decimal,
-    /// 样本量（0-100）：交易次数越多越高。
-    pub sample_score: Decimal,
-    /// 执行稳定性（0-100）：可复现记录的最大回撤越小越高。
-    pub execution_stability_score: Decimal,
-    /// 版本透明度（0-100）：版本号与变更记录是否完整。
-    pub transparency_score: Decimal,
-    pub verified_records: u32,
-    pub total_trades: u64,
+    /// 当前仍在试用或付费中的独立订阅人数。
+    pub subscriber_count: u32,
     pub sources: Vec<PerformanceSource>,
 }
 
-/// 综合评分权重（百分比）；收益率权重刻意压低，避免单一收益榜。
-const WEIGHT_REPRODUCIBILITY: i64 = 35;
-const WEIGHT_SAMPLE: i64 = 20;
-const WEIGHT_STABILITY: i64 = 20;
-const WEIGHT_TRANSPARENCY: i64 = 10;
-const WEIGHT_RETURN: i64 = 15;
-
-fn clamp_score(value: Decimal) -> Decimal {
-    value.max(Decimal::ZERO).min(Decimal::from(100))
-}
-
-/// 生成表现榜。只统计已发布策略，且同一策略优先使用平台可复现记录。
+/// 生成表现榜。只统计已发布策略，并按订阅人数从高到低排序。
 pub fn rank_publications(
     publications: &[StrategyPublication],
     records: &[StrategyPerformanceRecord],
+    subscriptions: &[StrategySubscription],
 ) -> Vec<LeaderboardEntry> {
     let mut entries: Vec<LeaderboardEntry> = publications
         .iter()
@@ -793,78 +772,21 @@ pub fn rank_publications(
                 .iter()
                 .filter(|record| record.publication_id == publication.id)
                 .collect();
-            let verified: Vec<&&StrategyPerformanceRecord> = own
-                .iter()
-                .filter(|record| record.reproducible && record.source.is_platform_verified())
-                .collect();
 
-            let verified_records = verified.len() as u32;
-            let total_trades: u64 = own.iter().map(|record| record.trades as u64).sum();
             let mut sources: Vec<PerformanceSource> =
                 own.iter().map(|record| record.source).collect();
             sources.sort_by_key(|source| source.label());
             sources.dedup();
 
-            let reproducibility_score = match verified_records {
-                0 => Decimal::ZERO,
-                1 => Decimal::from(60),
-                _ => Decimal::from(100),
-            };
-            let sample_score =
-                (Decimal::from(total_trades) / Decimal::from(200) * Decimal::from(100))
-                    .min(Decimal::from(100));
-
-            // 优先用可复现记录的加权回撤；没有时退化为全部记录。
-            let drawdown = if verified.is_empty() {
-                own.iter()
-                    .map(|record| record.max_drawdown_pct)
-                    .max()
-                    .unwrap_or(Decimal::ZERO)
-            } else {
-                verified
-                    .iter()
-                    .map(|record| record.max_drawdown_pct)
-                    .max()
-                    .unwrap_or(Decimal::ZERO)
-            };
-            let execution_stability_score =
-                clamp_score(Decimal::from(100) - drawdown * Decimal::from(3));
-
-            let latest_version = own
+            let subscriber_count = subscriptions
                 .iter()
-                .map(|record| record.strategy_version)
-                .max()
-                .unwrap_or(publication.strategy_version);
-            let transparency_score = if !publication.changelog.is_empty()
-                && latest_version == publication.strategy_version
-            {
-                Decimal::from(100)
-            } else if !publication.changelog.is_empty() {
-                Decimal::from(70)
-            } else {
-                Decimal::from(40)
-            };
-
-            // 收益率按 10% 收益率 = 70 分折算，避免高收益直接垄断榜首。
-            let return_pct = if verified.is_empty() {
-                own.last()
-                    .map(|record| record.return_pct)
-                    .unwrap_or(Decimal::ZERO)
-            } else {
-                verified
-                    .last()
-                    .map(|record| record.return_pct)
-                    .unwrap_or(Decimal::ZERO)
-            };
-            let return_score =
-                clamp_score(Decimal::from(50) + return_pct * Decimal::from(2));
-
-            let composite = (reproducibility_score * Decimal::from(WEIGHT_REPRODUCIBILITY)
-                + sample_score * Decimal::from(WEIGHT_SAMPLE)
-                + execution_stability_score * Decimal::from(WEIGHT_STABILITY)
-                + transparency_score * Decimal::from(WEIGHT_TRANSPARENCY)
-                + return_score * Decimal::from(WEIGHT_RETURN))
-                / Decimal::from(100);
+                .filter(|subscription| {
+                    subscription.publication_id == publication.id
+                        && subscription.status.is_entitled()
+                })
+                .map(|subscription| subscription.subscriber_id)
+                .collect::<HashSet<Uuid>>()
+                .len() as u32;
 
             LeaderboardEntry {
                 publication_id: publication.id,
@@ -872,15 +794,7 @@ pub fn rank_publications(
                 author_name: publication.author_name.clone(),
                 strategy_version: publication.strategy_version,
                 risk_level: publication.risk_level,
-                composite_score: composite.round_dp(2),
-                return_pct,
-                max_drawdown_pct: drawdown,
-                reproducibility_score: reproducibility_score.round_dp(2),
-                sample_score: sample_score.round_dp(2),
-                execution_stability_score: execution_stability_score.round_dp(2),
-                transparency_score: transparency_score.round_dp(2),
-                verified_records,
-                total_trades,
+                subscriber_count,
                 sources,
             }
         })
@@ -888,9 +802,8 @@ pub fn rank_publications(
 
     entries.sort_by(|left, right| {
         right
-            .composite_score
-            .cmp(&left.composite_score)
-            .then_with(|| right.total_trades.cmp(&left.total_trades))
+            .subscriber_count
+            .cmp(&left.subscriber_count)
             .then_with(|| left.title.cmp(&right.title))
     });
     entries
@@ -1009,35 +922,22 @@ mod tests {
     }
 
     #[test]
-    fn leaderboard_weights_reproducibility_over_return() {
+    fn leaderboard_ranks_by_subscribers() {
         let published = publication();
         let mut other = publication();
         other.id = Uuid::new_v4();
-        other.title = "高收益黑盒".into();
+        other.title = "无人订阅".into();
 
-        let records = vec![
-            record(
-                published.id,
-                PerformanceSource::PlatformReplay,
-                true,
-                220,
-                dec!(6),
-                dec!(2),
-            ),
-            record(
-                other.id,
-                PerformanceSource::AuthorBacktest,
-                false,
-                30,
-                dec!(120),
-                dec!(45),
-            ),
+        let now = Utc::now();
+        let subscriptions = vec![
+            StrategySubscription::new(&published, Uuid::new_v4(), None, now),
+            StrategySubscription::new(&published, Uuid::new_v4(), None, now),
         ];
-        let board = rank_publications(&[published, other], &records);
+        let board = rank_publications(&[published, other], &[], &subscriptions);
         assert_eq!(board.len(), 2);
         assert_eq!(board[0].title, "资金费率基线");
-        assert!(board[0].composite_score > board[1].composite_score);
-        assert_eq!(board[1].reproducibility_score, Decimal::ZERO);
+        assert_eq!(board[0].subscriber_count, 2);
+        assert_eq!(board[1].subscriber_count, 0);
     }
 
     #[test]

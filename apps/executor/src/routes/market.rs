@@ -2,7 +2,7 @@
 //!
 //! - 策略默认私有，只有作者主动发布后才出现在榜单。
 //! - 发布前必须通过校验，并有与当前版本一致的回测记录。
-//! - 表现记录按来源区分，作者自报回测不计入可复现性评分。
+//! - 表现记录按来源区分，作者自报回测不能标记为可复现。
 //! - 订阅与结算只保存业务金额与引用，不接触任何支付凭证或私钥。
 
 use arb_core::{
@@ -515,6 +515,7 @@ pub async fn leaderboard(State(state): State<AppState>) -> Json<Vec<LeaderboardE
     Json(rank_publications(
         &snapshot.publications,
         &snapshot.performance,
+        &snapshot.subscriptions,
     ))
 }
 

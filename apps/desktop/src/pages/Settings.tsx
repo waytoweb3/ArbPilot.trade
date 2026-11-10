@@ -300,7 +300,7 @@ export default function SettingsPage() {
   );
 }
 
-/** 展示凭证文件的加密方式、路径与权限，并支持一键清除全部凭证。 */
+/** 内置执行器展示凭证文件的位置、权限与清除入口；自托管只说明密钥在服务器上。 */
 function CredentialStorageCard({ local }: { local: boolean }) {
   const { t } = useI18n();
   const accounts = useAccounts();
@@ -352,6 +352,24 @@ function CredentialStorageCard({ local }: { local: boolean }) {
     });
   };
 
+  if (!local) {
+    return (
+      <Card>
+        <CardHeader>
+          <div>
+            <CardTitle>{t.settings.credentials}</CardTitle>
+            <CardDescription>{t.settings.credentialsDesc}</CardDescription>
+          </div>
+        </CardHeader>
+        <CardContent>
+          <p className="text-[11px] leading-relaxed text-muted">
+            {t.settings.credentialsSelfHosted}
+          </p>
+        </CardContent>
+      </Card>
+    );
+  }
+
   return (
     <>
       <Card>
@@ -371,11 +389,6 @@ function CredentialStorageCard({ local }: { local: boolean }) {
             <div className={cn(inputClass, "break-all font-mono text-xs text-muted")}>
               {storage?.path ?? "—"}
             </div>
-            {!local && (
-              <span className="block text-[11px] leading-relaxed text-muted">
-                {t.settings.credentialsServerPath}
-              </span>
-            )}
           </div>
 
           <div className="flex flex-wrap items-center gap-x-6 gap-y-2 text-xs">

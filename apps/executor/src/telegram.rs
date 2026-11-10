@@ -26,6 +26,8 @@ use crate::{
 const PENDING_TTL_SECS: i64 = 120;
 /// 单个绑定用户最多保留的待确认订单数。
 const MAX_PENDING: usize = 5;
+/// 用户只输入金额时的默认杠杆。
+const DEFAULT_LEVERAGE: Decimal = Decimal::TEN;
 
 /// 机器人回复与推送支持的语言。Telegram 用户可在会话里用 `/lang` 切换。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -135,6 +137,29 @@ struct PendingTrade {
     expires_at: DateTime<Utc>,
 }
 
+/// 开仓向导当前在等用户做什么。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenStage {
+    /// 等用户发送交易对（`/open` 不带参数时）。
+    Symbol,
+    /// 等用户点按钮选多头交易所。
+    Long,
+    /// 等用户点按钮选空头交易所。
+    Short,
+    /// 等用户发送每条腿金额与杠杆。
+    Amount,
+}
+
+/// 单个用户进行中的开仓向导；金额与杠杆由用户手输，交易所由按钮选择。
+#[derive(Debug, Clone)]
+struct OpenDraft {
+    symbol: Option<String>,
+    long_venue: Option<String>,
+    short_venue: Option<String>,
+    stage: OpenStage,
+    expires_at: DateTime<Utc>,
+}
+
 /// 机器人回复：正文 + 可选内联键盘（确认按钮、面板菜单等）。
 struct BotReply {
     text: String,
@@ -157,6 +182,13 @@ impl BotReply {
                 "callback_data": "menu",
             }]],
         });
+        Self {
+            text: text.into(),
+            markup: Some(markup),
+        }
+    }
+
+    fn with_markup(text: impl Into<String>, markup: Value) -> Self {
         Self {
             text: text.into(),
             markup: Some(markup),
@@ -193,13 +225,22 @@ impl PanelAction {
     }
 }
 
-/// 按钮回调：待确认订单的确认/取消，以及面板菜单。
+/// 开仓向导里的按钮动作：选多头、选空头、取消。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OpenStep {
+    Long(String),
+    Short(String),
+    Cancel,
+}
+
+/// 按钮回调：待确认订单的确认/取消、面板菜单，以及开仓向导的交易所选择。
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Callback {
     Confirm(String),
     Cancel(String),
     Menu,
     Action(PanelAction),
+    Open(OpenStep),
 }
 
 /// Telegram 机器人：配对绑定、查询、暂停/恢复与经确认的双腿开仓。
@@ -211,6 +252,8 @@ pub struct TelegramBot {
     bindings: RwLock<Vec<TelegramBinding>>,
     pairing: Mutex<Option<ActivePairing>>,
     pending: Mutex<HashMap<String, PendingTrade>>,
+    /// 每个用户进行中的开仓向导（交易对、两条腿的交易所）。
+    drafts: Mutex<HashMap<i64, OpenDraft>>,
     offset: Mutex<i64>,
     bot_username: RwLock<Option<String>>,
     last_error: RwLock<Option<String>>,
@@ -232,6 +275,7 @@ impl TelegramBot {
             bindings: RwLock::new(bindings),
             pairing: Mutex::new(None),
             pending: Mutex::new(HashMap::new()),
+            drafts: Mutex::new(HashMap::new()),
             offset: Mutex::new(0),
             bot_username: RwLock::new(None),
             last_error: RwLock::new(None),
@@ -432,6 +476,15 @@ impl TelegramBot {
         let args: Vec<&str> = parts.collect();
         let lang = self.lang_for(user_id, language_code);
 
+        // 开仓向导进行中时，用户下一条普通文本就是交易对或金额/杠杆。
+        if !text.starts_with('/') {
+            if let Some(reply) = self.open_input(state, user_id, lang, text) {
+                self.send_with_markup(chat_id, &reply.text, reply.markup.as_ref())
+                    .await;
+                return;
+            }
+        }
+
         let mut markup = None;
         let reply = match command.as_str() {
             "/start" => {
@@ -532,6 +585,17 @@ impl TelegramBot {
                 Some(Callback::Menu) => self.panel(state, user_id, lang),
                 Some(Callback::Action(action)) => {
                     self.panel_action(state, user_id, lang, action).await
+                }
+                Some(Callback::Open(step)) => {
+                    if self.can_trade(user_id) {
+                        self.open_step(state, user_id, lang, step)
+                    } else {
+                        BotReply::text(pick(
+                            lang,
+                            "该账号没有交易权限。",
+                            "This account has no trading permission.",
+                        ))
+                    }
                 }
                 None => BotReply::text(pick(lang, "无法识别的操作。", "Unrecognized action.")),
             }
@@ -715,6 +779,7 @@ impl TelegramBot {
         self.persist()
     }
 
+    /// `/open` 入口：交易对与交易所都可以逐步选择，金额和杠杆由用户输入。
     fn prepare_open(&self, state: &AppState, user_id: i64, lang: Lang, args: &[&str]) -> BotReply {
         if !self.can_trade(user_id) {
             return BotReply::section(
@@ -726,61 +791,72 @@ impl TelegramBot {
                 ),
             );
         }
-        if args.len() < 4 {
-            return BotReply::section(lang, open_guide_text(lang));
-        }
-        let symbol = args[0].to_ascii_uppercase();
-        let long_venue = args[1].to_ascii_lowercase();
-        let short_venue = args[2].to_ascii_lowercase();
-        if long_venue == short_venue {
+        let venues = tradable_venues(state);
+        if venues.is_empty() {
             return BotReply::section(
                 lang,
                 pick(
                     lang,
-                    "双腿交易所不能相同。",
-                    "The two legs cannot use the same venue.",
+                    "还没有可交易的交易所账户，请先在桌面端「账户」导入 API Key。",
+                    "No tradable exchange account yet. Import API keys from Accounts in the desktop app first.",
                 ),
             );
         }
-        let Ok(notional_usd) = args[3].parse::<Decimal>() else {
-            return BotReply::section(
-                lang,
-                pick(
-                    lang,
-                    "金额不是合法数字。",
-                    "The amount is not a valid number.",
-                ),
-            );
-        };
-        if notional_usd <= Decimal::ZERO {
-            return BotReply::section(
-                lang,
-                pick(
-                    lang,
-                    "金额必须大于 0。",
-                    "The amount must be greater than 0.",
-                ),
-            );
+        if args.len() > 3 {
+            return BotReply::section(lang, wizard_only_text(lang));
         }
-        let leverage = match args.get(4) {
-            Some(value) => match value.parse::<Decimal>() {
-                Ok(value) if value > Decimal::ZERO => value,
-                _ => {
-                    return BotReply::section(
-                        lang,
-                        pick(
-                            lang,
-                            "杠杆不是合法数字。",
-                            "The leverage is not a valid number.",
-                        ),
-                    )
-                }
-            },
-            None => Decimal::ONE,
-        };
 
-        for venue in [&long_venue, &short_venue] {
-            if state.market.quote(venue, &symbol).is_none() {
+        let mut draft = OpenDraft {
+            symbol: None,
+            long_venue: None,
+            short_venue: None,
+            stage: OpenStage::Symbol,
+            expires_at: draft_expiry(),
+        };
+        if let Some(raw) = args.first() {
+            let Some(symbol) = parse_symbol(raw) else {
+                return BotReply::section(lang, symbol_error_text(lang));
+            };
+            draft.symbol = Some(symbol);
+            draft.stage = OpenStage::Long;
+        }
+        if let Some(raw) = args.get(1) {
+            let venue = raw.to_ascii_lowercase();
+            if !venues.contains(&venue) {
+                return BotReply::section(lang, unknown_venue_text(lang, &venue));
+            }
+            draft.long_venue = Some(venue);
+            draft.stage = OpenStage::Short;
+        }
+        if let Some(raw) = args.get(2) {
+            let venue = raw.to_ascii_lowercase();
+            if !venues.contains(&venue) {
+                return BotReply::section(lang, unknown_venue_text(lang, &venue));
+            }
+            if draft.long_venue.as_ref() == Some(&venue) {
+                return BotReply::section(lang, same_venue_text(lang));
+            }
+            draft.short_venue = Some(venue);
+            draft.stage = OpenStage::Amount;
+        }
+        self.store_draft(user_id, draft.clone());
+        self.open_prompt(state, lang, &draft)
+    }
+
+    /// 校验行情后写入待确认订单，并回复确认/取消按钮。
+    fn create_pending(
+        &self,
+        state: &AppState,
+        user_id: i64,
+        lang: Lang,
+        symbol: &str,
+        long_venue: &str,
+        short_venue: &str,
+        notional_usd: Decimal,
+        leverage: Decimal,
+    ) -> BotReply {
+        for venue in [long_venue, short_venue] {
+            if state.market.quote(venue, symbol).is_none() {
                 return BotReply::section(
                     lang,
                     match lang {
@@ -821,9 +897,9 @@ impl TelegramBot {
                 token.clone(),
                 PendingTrade {
                     owner: user_id,
-                    symbol: symbol.clone(),
-                    long_venue: long_venue.clone(),
-                    short_venue: short_venue.clone(),
+                    symbol: symbol.to_string(),
+                    long_venue: long_venue.to_string(),
+                    short_venue: short_venue.to_string(),
                     notional_usd,
                     leverage,
                     expires_at,
@@ -857,7 +933,188 @@ impl TelegramBot {
         }
     }
 
-    /// 控制面板：状态概览 + 按钮菜单。开仓按钮只给引导，实际下单仍需 `/open` + 确认。
+    /// 向导进度提示：按当前阶段告诉用户下一步该做什么。
+    fn open_prompt(&self, state: &AppState, lang: Lang, draft: &OpenDraft) -> BotReply {
+        let venues = tradable_venues(state);
+        let symbol = draft.symbol.clone().unwrap_or_default();
+        match draft.stage {
+            OpenStage::Symbol => BotReply::with_markup(
+                pick(
+                    lang,
+                    "开仓第 1 步：发送交易对，例如 BTCUSDT（仅支持 USDT 本位永续）。",
+                    "Entry step 1: send a symbol such as BTCUSDT (USDT-margined perpetuals only).",
+                ),
+                cancel_markup(lang),
+            ),
+            OpenStage::Long => {
+                let text = match lang {
+                    Lang::Zh => format!("开仓 {symbol}\n第 2 步：选择多头交易所。"),
+                    Lang::En => format!("Entry {symbol}\nStep 2: choose the long venue."),
+                };
+                BotReply::with_markup(text, venue_markup(lang, "long", &venues, true))
+            }
+            OpenStage::Short => {
+                let long = draft.long_venue.clone().unwrap_or_default();
+                let options: Vec<String> = venues
+                    .iter()
+                    .filter(|venue| venue.as_str() != long)
+                    .cloned()
+                    .collect();
+                let text = match lang {
+                    Lang::Zh => format!(
+                        "开仓 {symbol}\n多头 {long}\n第 3 步：选择空头交易所（不能与多头相同）。"
+                    ),
+                    Lang::En => format!(
+                        "Entry {symbol}\nLong {long}\nStep 3: choose the short venue (must differ from the long leg)."
+                    ),
+                };
+                BotReply::with_markup(text, venue_markup(lang, "short", &options, true))
+            }
+            OpenStage::Amount => {
+                let long = draft.long_venue.clone().unwrap_or_default();
+                let short = draft.short_venue.clone().unwrap_or_default();
+                let text = match lang {
+                    Lang::Zh => format!(
+                        "开仓 {symbol}\n多头 {long} / 空头 {short}\n\n第 4 步：发送每条腿的 USD 金额。\n如需自定义杠杆，发送「金额 杠杆」，例如 500 10；只发金额时杠杆默认 {}x。",
+                        DEFAULT_LEVERAGE
+                    ),
+                    Lang::En => format!(
+                        "Entry {symbol}\nLong {long} / short {short}\n\nStep 4: send the USD amount per leg.\nTo set leverage, send \"<amount> <leverage>\", e.g. 500 10; amount alone uses the default {}x.",
+                        DEFAULT_LEVERAGE
+                    ),
+                };
+                BotReply::with_markup(text, cancel_markup(lang))
+            }
+        }
+    }
+
+    /// 向导里的交易所按钮回调。
+    fn open_step(&self, state: &AppState, user_id: i64, lang: Lang, step: OpenStep) -> BotReply {
+        match step {
+            OpenStep::Cancel => {
+                self.clear_draft(user_id);
+                BotReply::section(lang, pick(lang, "已取消开仓。", "Entry cancelled."))
+            }
+            OpenStep::Long(venue) => {
+                let Some(draft) = self.current_draft(user_id) else {
+                    return BotReply::section(lang, expired_open_text(lang));
+                };
+                if draft.stage != OpenStage::Long {
+                    return BotReply::section(lang, expired_open_text(lang));
+                }
+                if !tradable_venues(state).contains(&venue) {
+                    return BotReply::section(lang, unknown_venue_text(lang, &venue));
+                }
+                let mut draft = draft;
+                draft.long_venue = Some(venue);
+                draft.stage = OpenStage::Short;
+                draft.expires_at = draft_expiry();
+                self.store_draft(user_id, draft.clone());
+                self.open_prompt(state, lang, &draft)
+            }
+            OpenStep::Short(venue) => {
+                let Some(draft) = self.current_draft(user_id) else {
+                    return BotReply::section(lang, expired_open_text(lang));
+                };
+                if draft.stage != OpenStage::Short {
+                    return BotReply::section(lang, expired_open_text(lang));
+                }
+                if !tradable_venues(state).contains(&venue) {
+                    return BotReply::section(lang, unknown_venue_text(lang, &venue));
+                }
+                if draft.long_venue.as_ref() == Some(&venue) {
+                    return BotReply::section(lang, same_venue_text(lang));
+                }
+                let mut draft = draft;
+                draft.short_venue = Some(venue);
+                draft.stage = OpenStage::Amount;
+                draft.expires_at = draft_expiry();
+                self.store_draft(user_id, draft.clone());
+                self.open_prompt(state, lang, &draft)
+            }
+        }
+    }
+
+    /// 向导进行中收到的普通文本：当前阶段是输入交易对还是金额/杠杆。
+    fn open_input(
+        &self,
+        state: &AppState,
+        user_id: i64,
+        lang: Lang,
+        text: &str,
+    ) -> Option<BotReply> {
+        if !self.can_trade(user_id) {
+            return None;
+        }
+        let draft = self.current_draft(user_id)?;
+        match draft.stage {
+            OpenStage::Symbol => match parse_symbol(text) {
+                Some(symbol) => {
+                    let mut draft = draft;
+                    draft.symbol = Some(symbol);
+                    draft.stage = OpenStage::Long;
+                    draft.expires_at = draft_expiry();
+                    self.store_draft(user_id, draft.clone());
+                    Some(self.open_prompt(state, lang, &draft))
+                }
+                None => Some(BotReply::section(lang, symbol_error_text(lang))),
+            },
+            OpenStage::Amount => {
+                let Some((notional_usd, leverage)) = parse_amount_input(text) else {
+                    return Some(BotReply::section(lang, amount_error_text(lang)));
+                };
+                let (Some(symbol), Some(long_venue), Some(short_venue)) = (
+                    draft.symbol.clone(),
+                    draft.long_venue.clone(),
+                    draft.short_venue.clone(),
+                ) else {
+                    self.clear_draft(user_id);
+                    return Some(BotReply::section(lang, expired_open_text(lang)));
+                };
+                self.clear_draft(user_id);
+                Some(self.create_pending(
+                    state,
+                    user_id,
+                    lang,
+                    &symbol,
+                    &long_venue,
+                    &short_venue,
+                    notional_usd,
+                    leverage,
+                ))
+            }
+            OpenStage::Long | OpenStage::Short => Some(BotReply::text(pick(
+                lang,
+                "请点击上方按钮选择交易所，或重新发送 /open 开始新的开仓。",
+                "Tap a venue button above, or send /open to restart the entry.",
+            ))),
+        }
+    }
+
+    fn store_draft(&self, user_id: i64, draft: OpenDraft) {
+        self.drafts
+            .lock()
+            .expect("开仓向导锁不可用")
+            .insert(user_id, draft);
+    }
+
+    fn current_draft(&self, user_id: i64) -> Option<OpenDraft> {
+        let mut drafts = self.drafts.lock().expect("开仓向导锁不可用");
+        if matches!(drafts.get(&user_id), Some(draft) if draft.expires_at <= Utc::now()) {
+            drafts.remove(&user_id);
+            return None;
+        }
+        drafts.get(&user_id).cloned()
+    }
+
+    fn clear_draft(&self, user_id: i64) {
+        self.drafts
+            .lock()
+            .expect("开仓向导锁不可用")
+            .remove(&user_id);
+    }
+
+    /// 控制面板：状态概览 + 按钮菜单。开仓按钮进入按钮向导，实际下单仍需确认。
     fn panel(&self, state: &AppState, user_id: i64, lang: Lang) -> BotReply {
         let paused = state.is_paused();
         let positions = state.positions.read().expect("仓位锁不可用").len();
@@ -929,7 +1186,7 @@ impl TelegramBot {
             PanelAction::Orders => BotReply::section(lang, orders_text(lang, state)),
             PanelAction::News => BotReply::section(lang, news_text(lang, state)),
             PanelAction::Help => BotReply::section(lang, help_text(lang, self.enabled())),
-            PanelAction::Open => BotReply::section(lang, open_guide_text(lang)),
+            PanelAction::Open => self.prepare_open(state, user_id, lang, &[]),
             PanelAction::Toggle => {
                 if !self.can_trade(user_id) {
                     return BotReply::section(
@@ -1245,7 +1502,7 @@ fn help_text(lang: Lang, enabled: bool) -> String {
             "/positions 当前仓位",
             "/orders 最近订单",
             "/news 最新上币公告",
-            "/open <交易对> <多头> <空头> <每条腿USD> [杠杆] 发起开仓",
+            "/open 开仓向导：按钮选交易所，输入金额与杠杆（默认 10x）",
             "开仓会回复确认按钮，点击「确认开仓」后才真正下单",
             "/lang zh|en 切换机器人语言",
             "/unbind 解除绑定",
@@ -1260,7 +1517,7 @@ fn help_text(lang: Lang, enabled: bool) -> String {
             "/positions Current positions",
             "/orders Recent orders",
             "/news Latest listing announcements",
-            "/open <symbol> <long venue> <short venue> <USD per leg> [leverage] Prepare an entry",
+            "/open Entry wizard: pick venues with buttons, then type the amount and leverage (default 10x)",
             "Entries reply with a confirm button; tap it to place the order",
             "/lang zh|en Switch the bot language",
             "/unbind Unlink this account",
@@ -1271,14 +1528,137 @@ fn help_text(lang: Lang, enabled: bool) -> String {
     }
 }
 
-/// 面板「开仓」按钮与 `/open` 参数不全时的引导文案。
-fn open_guide_text(lang: Lang) -> String {
+/// 可下单的交易所：已导入账户且凭证齐全，按名称排序去重。
+fn tradable_venues(state: &AppState) -> Vec<String> {
+    let mut venues: Vec<String> = state
+        .accounts
+        .list()
+        .into_iter()
+        .filter(|account| account.can_trade)
+        .map(|account| account.venue)
+        .collect();
+    venues.sort();
+    venues.dedup();
+    venues
+}
+
+/// 交易对统一为大写，仅接受 USDT 本位永续（形如 `BTCUSDT`）。
+fn parse_symbol(value: &str) -> Option<String> {
+    let symbol = value.trim().to_ascii_uppercase();
+    if symbol.len() <= 4 || !symbol.ends_with("USDT") {
+        return None;
+    }
+    if !symbol.chars().all(|ch| ch.is_ascii_alphanumeric()) {
+        return None;
+    }
+    Some(symbol)
+}
+
+/// 解析金额输入：`500` 或 `500 10`；只给金额时使用默认杠杆。
+fn parse_amount_input(text: &str) -> Option<(Decimal, Decimal)> {
+    let mut parts = text.split_whitespace();
+    let notional_usd = parts.next()?.parse::<Decimal>().ok()?;
+    if notional_usd <= Decimal::ZERO {
+        return None;
+    }
+    let leverage = match parts.next() {
+        Some(value) => {
+            let leverage = value.parse::<Decimal>().ok()?;
+            if leverage <= Decimal::ZERO {
+                return None;
+            }
+            leverage
+        }
+        None => DEFAULT_LEVERAGE,
+    };
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((notional_usd, leverage))
+}
+
+fn draft_expiry() -> DateTime<Utc> {
+    Utc::now() + chrono::Duration::seconds(PENDING_TTL_SECS)
+}
+
+/// 交易所按钮：每行两个，`step` 为 `long` 或 `short`。
+fn venue_markup(lang: Lang, step: &str, venues: &[String], cancel: bool) -> Value {
+    let mut rows: Vec<Vec<Value>> = venues
+        .chunks(2)
+        .map(|chunk| {
+            chunk
+                .iter()
+                .map(|venue| {
+                    serde_json::json!({
+                        "text": venue,
+                        "callback_data": format!("open:{step}:{venue}"),
+                    })
+                })
+                .collect()
+        })
+        .collect();
+    if cancel {
+        rows.push(cancel_row(lang));
+    }
+    serde_json::json!({ "inline_keyboard": rows })
+}
+
+fn cancel_markup(lang: Lang) -> Value {
+    serde_json::json!({ "inline_keyboard": [cancel_row(lang)] })
+}
+
+fn cancel_row(lang: Lang) -> Vec<Value> {
+    vec![serde_json::json!({
+        "text": pick(lang, "取消", "Cancel"),
+        "callback_data": "open:cancel",
+    })]
+}
+
+fn symbol_error_text(lang: Lang) -> &'static str {
     pick(
         lang,
-        "发起双腿开仓：\n/open <交易对> <多头交易所> <空头交易所> <每条腿USD> [杠杆]\n例如：/open BTCUSDT binance okx 500 1\n\n发送后回复「确认开仓 / 取消」按钮，点击确认才真正下单；下单仍经过执行器风控。",
-        "Open a hedged entry:\n/open <symbol> <long venue> <short venue> <USD per leg> [leverage]\nExample: /open BTCUSDT binance okx 500 1\n\nThe bot replies with Confirm / Cancel buttons; the order is placed only after you confirm, and risk checks still apply.",
+        "交易对格式不正确，请发送形如 BTCUSDT 的交易对。",
+        "Invalid symbol. Send a symbol such as BTCUSDT.",
     )
-    .to_string()
+}
+
+fn amount_error_text(lang: Lang) -> &'static str {
+    pick(
+        lang,
+        "金额或杠杆不正确。请发送「金额」或「金额 杠杆」，例如 500 10。",
+        "Invalid amount or leverage. Send \"<amount>\" or \"<amount> <leverage>\", e.g. 500 10.",
+    )
+}
+
+fn wizard_only_text(lang: Lang) -> &'static str {
+    pick(
+        lang,
+        "金额与杠杆在向导最后一步输入。请发送 /open <交易对> [多头] [空头] 开始。",
+        "Amount and leverage are entered in the last wizard step. Send /open <symbol> [long] [short] to start.",
+    )
+}
+
+fn same_venue_text(lang: Lang) -> &'static str {
+    pick(
+        lang,
+        "双腿交易所不能相同。",
+        "The two legs cannot use the same venue.",
+    )
+}
+
+fn expired_open_text(lang: Lang) -> &'static str {
+    pick(
+        lang,
+        "开仓流程已过期，请重新发送 /open 开始。",
+        "The entry wizard expired. Send /open to start again.",
+    )
+}
+
+fn unknown_venue_text(lang: Lang, venue: &str) -> String {
+    match lang {
+        Lang::Zh => format!("没有该交易所的可交易账户：{venue}，请用按钮选择。"),
+        Lang::En => format!("No tradable account for venue {venue}; pick one of the buttons."),
+    }
 }
 
 /// Telegram 输入框旁的命令菜单内容。
@@ -1417,7 +1797,8 @@ fn describe_error(lang: Lang, error: &ApiError) -> String {
 }
 
 /// 解析内联按钮的 `callback_data`：
-/// `confirm:<编号>` / `cancel:<编号>` 对应待确认订单，`menu` 打开面板，`panel:<动作>` 是面板菜单项。
+/// `confirm:<编号>` / `cancel:<编号>` 对应待确认订单，`menu` 打开面板，
+/// `panel:<动作>` 是面板菜单项，`open:<步骤>` 是开仓向导的交易所选择。
 fn parse_callback(data: &str) -> Option<Callback> {
     if data == "menu" {
         return Some(Callback::Menu);
@@ -1430,6 +1811,20 @@ fn parse_callback(data: &str) -> Option<Callback> {
         "confirm" => Some(Callback::Confirm(value.to_string())),
         "cancel" => Some(Callback::Cancel(value.to_string())),
         "panel" => PanelAction::parse(value).map(Callback::Action),
+        "open" => match value {
+            "cancel" => Some(Callback::Open(OpenStep::Cancel)),
+            _ => {
+                let (step, venue) = value.split_once(':')?;
+                if venue.is_empty() {
+                    return None;
+                }
+                match step {
+                    "long" => Some(Callback::Open(OpenStep::Long(venue.to_string()))),
+                    "short" => Some(Callback::Open(OpenStep::Short(venue.to_string()))),
+                    _ => None,
+                }
+            }
+        },
         _ => None,
     }
 }
@@ -1553,6 +1948,61 @@ mod tests {
         assert_eq!(parse_callback("delete:ABC123"), None);
         assert_eq!(parse_callback("panel:unknown"), None);
         assert_eq!(parse_callback("ABC123"), None);
+    }
+
+    #[test]
+    fn parses_open_callbacks() {
+        assert_eq!(
+            parse_callback("open:long:binance"),
+            Some(Callback::Open(OpenStep::Long("binance".to_string())))
+        );
+        assert_eq!(
+            parse_callback("open:short:okx"),
+            Some(Callback::Open(OpenStep::Short("okx".to_string())))
+        );
+        assert_eq!(
+            parse_callback("open:cancel"),
+            Some(Callback::Open(OpenStep::Cancel))
+        );
+        assert_eq!(parse_callback("open:long:"), None);
+        assert_eq!(parse_callback("open:side:binance"), None);
+    }
+
+    #[test]
+    fn parses_symbol_and_amount_inputs() {
+        assert_eq!(parse_symbol("btcusdt"), Some("BTCUSDT".to_string()));
+        assert_eq!(parse_symbol(" BTCUSDT "), Some("BTCUSDT".to_string()));
+        assert_eq!(parse_symbol("BTC-USDT"), None);
+        assert_eq!(parse_symbol("BTC"), None);
+
+        assert_eq!(
+            parse_amount_input("500"),
+            Some((Decimal::from(500), DEFAULT_LEVERAGE))
+        );
+        assert_eq!(
+            parse_amount_input("500 5"),
+            Some((Decimal::from(500), Decimal::from(5)))
+        );
+        assert_eq!(parse_amount_input("500 0"), None);
+        assert_eq!(parse_amount_input("abc"), None);
+        assert_eq!(parse_amount_input("500 5 1"), None);
+    }
+
+    #[test]
+    fn venue_markup_links_open_steps() {
+        let venues = vec![
+            "binance".to_string(),
+            "okx".to_string(),
+            "bybit".to_string(),
+        ];
+        let markup = venue_markup(Lang::Zh, "long", &venues, true);
+        let rows = markup["inline_keyboard"]
+            .as_array()
+            .expect("内联键盘应为数组");
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0][0]["callback_data"], "open:long:binance");
+        assert_eq!(rows[1][0]["text"], "bybit");
+        assert_eq!(rows[2][0]["callback_data"], "open:cancel");
     }
 
     #[test]

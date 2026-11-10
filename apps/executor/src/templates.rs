@@ -549,7 +549,7 @@ pub fn builtin() -> Vec<StrategyTemplate> {
             description: "价格突破唐奇安通道入场，反向突破或 2 倍 ATR 止损离场。".to_string(),
             source: TURTLE_WAT.to_string(),
             definition: definition(
-                "海龟突破 · BTCUSDT",
+                "海龟突破",
                 "空仓时突破前 N 根最高价做多、跌破最低价做空；持仓时反向突破或用 2 倍 ATR 止损。",
                 DataRules {
                     timeframe: "1h".to_string(),
@@ -571,7 +571,7 @@ pub fn builtin() -> Vec<StrategyTemplate> {
             description: "快慢均线多头排列做多、空头排列做空，均线反转离场。".to_string(),
             source: MA_TREND_WAT.to_string(),
             definition: definition(
-                "均线趋势 · BTCUSDT",
+                "均线趋势",
                 "快均线在慢均线上方且价格站上快线做多，反之做空；快慢均线重新交叉时离场。",
                 DataRules {
                     timeframe: "1h".to_string(),
@@ -593,7 +593,7 @@ pub fn builtin() -> Vec<StrategyTemplate> {
             description: "现价上下按固定间距挂影子限价单，价格触及后才真正下单。".to_string(),
             source: GRID_WAT.to_string(),
             definition: definition(
-                "网格 · BTCUSDT",
+                "网格",
                 "每轮先撤销旧挂单，再按最新价格在上下方挂出 3 档买单与 3 档卖单；\
                  单档为可用名义额度的 25%，间距 0.5%。",
                 DataRules {
@@ -612,7 +612,7 @@ pub fn builtin() -> Vec<StrategyTemplate> {
             description: "交易所发布上币公告后买入该交易对，持有到期后离场。".to_string(),
             source: LISTING_FOLLOW_WAT.to_string(),
             definition: definition(
-                "上币公告跟随 · BTCUSDT",
+                "上币公告跟随",
                 "主机只注入最近一小时内、命中本策略交易对的上币公告；\
                  公告发布后 15 分钟内市价做多，持有 6 小时后平仓。",
                 DataRules {
@@ -665,17 +665,29 @@ fn definition(name: &str, notes: &str, data: DataRules) -> StrategyDefinition {
 
 /// 启动时补齐模板并确保每个模板都有可执行模块。
 ///
-/// 数据库里的模板是唯一事实来源：已存在的模板不会被内置定义覆盖，只会在缺少
-/// 编译产物（例如清空过模块表）时按库里的源码重新编译。
+/// 数据库里的模板是唯一事实来源：已存在的模板不会整体被内置定义覆盖，只在缺少
+/// 编译产物（例如清空过模块表）时按库里的源码重新编译；内置模板不可在界面编辑，
+/// 因此名称始终跟随代码，避免旧库停留在历史命名。
 pub async fn seed(state: &AppState) {
+    let builtins = builtin();
     let mut stored = state.store.strategy_templates().await;
-    for template in builtin() {
-        if stored.iter().any(|saved| saved.key == template.key) {
-            continue;
+    for template in &builtins {
+        match stored.iter_mut().find(|saved| saved.key == template.key) {
+            Some(saved) => {
+                if saved.name != template.name
+                    || saved.definition.name != template.definition.name
+                {
+                    saved.name = template.name.clone();
+                    saved.definition.name = template.definition.name.clone();
+                    let updated = saved.clone();
+                    state.store.save_strategy_template(&updated).await;
+                }
+            }
+            None => {
+                state.store.save_strategy_template(template).await;
+                stored.push(template.clone());
+            }
         }
-        let created = template.clone();
-        state.store.save_strategy_template(&template).await;
-        stored.push(created);
     }
 
     for mut template in stored {
@@ -692,6 +704,36 @@ pub async fn seed(state: &AppState) {
             template.updated_at = Utc::now();
             state.store.save_strategy_template(&template).await;
         }
+    }
+
+    rename_legacy_strategies(state, &builtins).await;
+}
+
+/// 旧版本把带「 · BTCUSDT」的模板默认名复制进了已创建的策略。
+/// 启动时按旧名精确匹配归一，用户自行改过的名称不受影响。
+async fn rename_legacy_strategies(state: &AppState, builtins: &[StrategyTemplate]) {
+    let legacy: Vec<(String, String)> = builtins
+        .iter()
+        .map(|template| {
+            (
+                format!("{} · BTCUSDT", template.name),
+                template.name.clone(),
+            )
+        })
+        .collect();
+    for mut record in state.store.load_strategies().await {
+        let Some((_, name)) = legacy.iter().find(|(old, _)| *old == record.definition.name) else {
+            continue;
+        };
+        record.definition.name = name.clone();
+        {
+            let mut strategies = state.strategies.write().expect("策略锁不可用");
+            if let Some(existing) = strategies.iter_mut().find(|item| item.id == record.id) {
+                *existing = record.clone();
+            }
+        }
+        state.store.save_strategy(&record).await;
+        state.store.save_strategy_version(&record).await;
     }
 }
 

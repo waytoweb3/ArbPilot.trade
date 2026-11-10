@@ -17,7 +17,7 @@ import {
   useSubscriptions,
 } from "../hooks/useApi";
 import { useAccount } from "../hooks/useAccount";
-import { formatDateTime, formatNumber, formatPercentValue, formatUsd } from "../lib/format";
+import { formatDateTime, formatUsd } from "../lib/format";
 import { BillingError, PAYMENTS_URL, createStrategyCheckout } from "../lib/billing";
 import { fmt, useI18n } from "../lib/i18n";
 import { openExternal } from "../lib/openExternal";
@@ -243,18 +243,13 @@ export default function MarketPage() {
         </CardHeader>
         <CardContent className="overflow-x-auto p-0">
           {leaderboard.data?.length ? (
-            <table className="w-full min-w-[900px] border-collapse text-sm">
+            <table className="w-full min-w-[480px] border-collapse text-sm">
               <thead>
                 <tr className="text-left text-[11px] tracking-wide text-muted uppercase">
                   <th className="px-4 py-2 font-medium">{copy.rank}</th>
                   <th className="px-4 py-2 font-medium">{copy.strategy}</th>
                   <th className="px-4 py-2 font-medium">{copy.author}</th>
-                  <th className="px-4 py-2 text-right font-medium">{copy.score}</th>
-                  <th className="px-4 py-2 text-right font-medium">{copy.reproducibility}</th>
-                  <th className="px-4 py-2 text-right font-medium">{copy.sample}</th>
-                  <th className="px-4 py-2 text-right font-medium">{copy.stability}</th>
-                  <th className="px-4 py-2 text-right font-medium">{copy.transparency}</th>
-                  <th className="px-4 py-2 text-right font-medium">{copy.fields.returnPct}</th>
+                  <th className="px-4 py-2 text-right font-medium">{copy.subscribers}</th>
                 </tr>
               </thead>
               <tbody>
@@ -264,28 +259,12 @@ export default function MarketPage() {
                     <td className="px-4 py-2.5">
                       <p className="font-medium text-fg">{entry.title}</p>
                       <p className="text-[11px] text-subtle">
-                        v{entry.strategy_version} · {riskLabel(entry.risk_level)} ·{" "}
-                        {fmt(copy.totalTrades, { count: entry.total_trades })}
+                        v{entry.strategy_version} · {riskLabel(entry.risk_level)}
                       </p>
                     </td>
                     <td className="px-4 py-2.5 text-body">{entry.author_name}</td>
                     <td className="px-4 py-2.5 text-right font-medium text-fg">
-                      {formatNumber(entry.composite_score, 1)}
-                    </td>
-                    <td className="px-4 py-2.5 text-right text-muted">
-                      {formatNumber(entry.reproducibility_score, 1)}
-                    </td>
-                    <td className="px-4 py-2.5 text-right text-muted">
-                      {formatNumber(entry.sample_score, 1)}
-                    </td>
-                    <td className="px-4 py-2.5 text-right text-muted">
-                      {formatNumber(entry.execution_stability_score, 1)}
-                    </td>
-                    <td className="px-4 py-2.5 text-right text-muted">
-                      {formatNumber(entry.transparency_score, 1)}
-                    </td>
-                    <td className="px-4 py-2.5 text-right text-body">
-                      {formatPercentValue(entry.return_pct)}
+                      {entry.subscriber_count}
                     </td>
                   </tr>
                 ))}
@@ -421,23 +400,15 @@ export default function MarketPage() {
                   key={subscription.id}
                   className="flex items-center justify-between gap-2 rounded-lg border border-line px-3 py-2"
                 >
-                  <div className="min-w-0">
-                    <p className="truncate text-xs font-medium text-fg">
-                      {subscription.publication_title}
-                    </p>
-                    <p className="text-[11px] text-muted">
-                      {formatUsd(subscription.monthly_price_usd)} ·{" "}
-                      {subscription.current_period_end
-                        ? fmt(copy.subscriptionEntitled, {
-                            value: formatDateTime(subscription.current_period_end),
-                          })
-                        : formatDateTime(subscription.updated_at)}
-                    </p>
-                  </div>
+                  <p className="min-w-0 flex-1 truncate text-xs font-medium text-fg">
+                    {publication?.title ?? subscription.publication_title}
+                  </p>
                   <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
-                    <Badge tone={subscriptionTone[subscription.status]}>
-                      {copy.subscriptionStatus[subscription.status]}
-                    </Badge>
+                    {subscription.status !== "active" && (
+                      <Badge tone={subscriptionTone[subscription.status]}>
+                        {copy.subscriptionStatus[subscription.status]}
+                      </Badge>
+                    )}
                     {entitled &&
                       (publication && !publication.artifact_sha256 ? (
                         <span className="max-w-[190px] text-right text-[10.5px] leading-snug text-subtle">
@@ -476,6 +447,11 @@ export default function MarketPage() {
                       </Button>
                     )}
                   </div>
+                  <span className="shrink-0 text-right text-[11px] text-muted">
+                    {fmt(copy.subscriptionStarted, {
+                      value: formatDateTime(subscription.started_at),
+                    })}
+                  </span>
                 </div>
               );
             })

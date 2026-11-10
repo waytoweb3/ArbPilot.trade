@@ -918,22 +918,15 @@ export interface StrategySettlement {
   note: string | null;
 }
 
-/** 表现榜条目，收益只占少量权重。 */
+/** 表现榜条目，按订阅人数排序。 */
 export interface LeaderboardEntry {
   publication_id: string;
   title: string;
   author_name: string;
   strategy_version: number;
   risk_level: RiskLevel;
-  composite_score: Decimal;
-  return_pct: Decimal;
-  max_drawdown_pct: Decimal;
-  reproducibility_score: Decimal;
-  sample_score: Decimal;
-  execution_stability_score: Decimal;
-  transparency_score: Decimal;
-  verified_records: number;
-  total_trades: number;
+  /** 当前仍在试用或付费中的独立订阅人数。 */
+  subscriber_count: number;
   sources: PerformanceSource[];
 }
 
