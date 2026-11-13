@@ -1090,6 +1090,12 @@ pub struct SkillBinding {
     /// 冻结规则的哈希，导入时据此校验交付物未被篡改。
     #[serde(default)]
     pub skill_sha256: Option<String>,
+    /// 参数空间：买家可改哪些参数、范围多少。
+    #[serde(default)]
+    pub params_schema: Option<serde_json::Value>,
+    /// 作者在发布时给出的更严格约束。
+    #[serde(default)]
+    pub param_constraints: Option<serde_json::Value>,
 }
 
 /// 策略记录：定义 + 版本 + 校验结果 + 最近回测 + 运行时状态。
