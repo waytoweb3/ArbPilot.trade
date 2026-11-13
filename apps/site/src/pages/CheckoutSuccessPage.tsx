@@ -156,12 +156,7 @@ function Details({ license }: { license: LicenseInfo | null }) {
   if (!license) {
     return null;
   }
-  const planLabel =
-    license.plan === "arbitrage"
-      ? "自托管部署"
-      : license.plan === "strategy"
-        ? "策略创建附加包"
-        : "—";
+  const planLabel = license.plan === "arbitrage" ? "自托管部署" : "—";
 
   return (
     <dl className="mt-8 grid grid-cols-2 gap-x-6 gap-y-4 rounded-2xl border border-line bg-panel p-5 text-[12px]">

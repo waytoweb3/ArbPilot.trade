@@ -592,7 +592,6 @@ const server = createServer((req, res) => {
             plans: entitlement.plans,
             status: entitlement.status,
             expiresAt: entitlement.expiresAt,
-            trialEndsAt: entitlement.trialEndsAt,
           },
         });
         return;

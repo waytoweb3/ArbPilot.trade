@@ -70,14 +70,18 @@ pub enum PublicationStatus {
 #[serde(rename_all = "snake_case")]
 pub enum PricingModel {
     Free,
-    Monthly,
+    /// 一次性买断，付款后永久授权，无续费与到期。
+    ///
+    /// 旧数据里的 `monthly` 通过 alias 读成买断，避免迁移 JSON 文档。
+    #[serde(alias = "monthly")]
+    OneTime,
 }
 
-/// 订阅与结算使用的定价信息。
+/// 买断与结算使用的定价信息。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StrategyPricing {
     pub model: PricingModel,
-    /// 月费（美元），免费策略必须为 0。
+    /// 买断价（美元），免费策略必须为 0。
     pub monthly_price_usd: Decimal,
     /// 试用天数，0 表示不提供试用。
     #[serde(default)]
@@ -93,9 +97,9 @@ impl StrategyPricing {
         }
     }
 
-    pub fn monthly(price: Decimal, trial_days: u32) -> Self {
+    pub fn one_time(price: Decimal, trial_days: u32) -> Self {
         Self {
-            model: PricingModel::Monthly,
+            model: PricingModel::OneTime,
             monthly_price_usd: price,
             trial_days,
         }
@@ -316,22 +320,22 @@ impl StrategyPublication {
                     issues.push(issue(
                         ValidationSeverity::Error,
                         "pricing.monthly_price_usd",
-                        "免费策略的月费必须为 0",
+                        "免费策略的买断价必须为 0",
                     ));
                 }
             }
-            PricingModel::Monthly => {
+            PricingModel::OneTime => {
                 if self.pricing.monthly_price_usd <= Decimal::ZERO {
                     issues.push(issue(
                         ValidationSeverity::Error,
                         "pricing.monthly_price_usd",
-                        "付费策略的月费必须大于 0",
+                        "付费策略的买断价必须大于 0",
                     ));
                 } else if self.pricing.monthly_price_usd > Decimal::from(500) {
                     issues.push(issue(
                         ValidationSeverity::Warning,
                         "pricing.monthly_price_usd",
-                        "月费超过 500 美元，订阅转化可能较低",
+                        "买断价超过 500 美元，购买转化可能较低",
                     ));
                 }
             }
@@ -588,10 +592,11 @@ pub struct StrategySubscription {
     pub author_id: Uuid,
     pub subscriber_id: Uuid,
     pub status: SubscriptionStatus,
+    /// 买断价（美元）；免费策略为 0。
     pub monthly_price_usd: Decimal,
     /// 试用结束时间；无试用时为 None。
     pub trial_ends_at: Option<DateTime<Utc>>,
-    /// 当前计费周期结束时间；取消后仍可用到该时间。
+    /// 计费周期结束时间；买断订阅为空表示永久有效，历史月订阅仍有到期时间。
     pub current_period_end: Option<DateTime<Utc>>,
     pub started_at: DateTime<Utc>,
     pub cancelled_at: Option<DateTime<Utc>>,
@@ -613,12 +618,11 @@ impl StrategySubscription {
         let (status, current_period_end) = if publication.pricing.model == PricingModel::Free {
             (SubscriptionStatus::Active, None)
         } else if trial_ends_at.is_some() {
-            (SubscriptionStatus::Trial, trial_ends_at)
+            // 试用只看 trial_ends_at；付费转正式后不残留周期，避免买断授权被试用期截断。
+            (SubscriptionStatus::Trial, None)
         } else {
-            (
-                SubscriptionStatus::PendingPayment,
-                Some(now + chrono::Duration::days(30)),
-            )
+            // 一次性买断：付款确认后永久有效，不预置周期。
+            (SubscriptionStatus::PendingPayment, None)
         };
 
         Self {
@@ -639,7 +643,7 @@ impl StrategySubscription {
         }
     }
 
-    /// 是否仍可使用该策略：试用未过期，或付费周期未结束。
+    /// 是否仍可使用该策略：试用未过期，或买断授权仍然有效。
     pub fn is_entitled_at(&self, now: DateTime<Utc>) -> bool {
         match self.status {
             SubscriptionStatus::Trial => self.trial_ends_at.is_some_and(|end| now < end),
@@ -648,7 +652,7 @@ impl StrategySubscription {
         }
     }
 
-    /// 取消订阅：保留到当前周期结束，不立即切断已有仓位管理。
+    /// 取消订阅：不立即切断已有仓位管理；买断授权按取消时刻失效。
     pub fn cancel(&mut self, now: DateTime<Utc>) {
         if matches!(
             self.status,
@@ -657,7 +661,7 @@ impl StrategySubscription {
             self.status = SubscriptionStatus::Cancelled;
             self.cancelled_at = Some(now);
             if self.current_period_end.is_none() {
-                self.current_period_end = Some(now);
+                self.current_period_end = self.trial_ends_at.or(Some(now));
             }
             self.updated_at = now;
         }
@@ -717,7 +721,7 @@ pub fn period_bounds(period: &str) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
     Some((start, end))
 }
 
-/// 按订阅数与月费计算一张结算单。服务费为 bps，向下取整到分。
+/// 按订阅数与买断价计算一张结算单。服务费为 bps，向下取整到分。
 pub fn compute_settlement(
     author_id: Uuid,
     period: &str,
@@ -860,7 +864,7 @@ mod tests {
             known_limits: vec!["仅支持正资金费率".into()],
             source_visibility: SourceVisibility::OpenSource,
             visibility: MarketVisibility::Public,
-            pricing: StrategyPricing::monthly(dec!(19), 7),
+            pricing: StrategyPricing::one_time(dec!(19), 7),
             status: PublicationStatus::Published,
             artifact_sha256: Some("a".repeat(64)),
             skill: None,
@@ -974,6 +978,28 @@ mod tests {
         let (start, end) = period_bounds("2026-12").expect("有效周期");
         assert_eq!(start, Utc.with_ymd_and_hms(2026, 12, 1, 0, 0, 0).unwrap());
         assert_eq!(end, Utc.with_ymd_and_hms(2027, 1, 1, 0, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn paid_subscription_is_permanent_after_payment() {
+        let publication = publication();
+        let now = Utc::now();
+        // 试用期内可继续试用，但不预置买断周期。
+        let mut subscription = StrategySubscription::new(&publication, Uuid::new_v4(), None, now);
+        assert_eq!(subscription.status, SubscriptionStatus::Trial);
+        assert_eq!(subscription.current_period_end, None);
+
+        subscription.status = SubscriptionStatus::Active;
+        assert!(subscription.is_entitled_at(now + chrono::Duration::days(3650)));
+    }
+
+    #[test]
+    fn legacy_monthly_pricing_deserializes_as_one_time() {
+        let publication = publication();
+        let mut value = serde_json::to_value(&publication).expect("序列化");
+        value["pricing"]["model"] = serde_json::json!("monthly");
+        let parsed: StrategyPublication = serde_json::from_value(value).expect("反序列化");
+        assert_eq!(parsed.pricing.model, PricingModel::OneTime);
     }
 
     #[test]

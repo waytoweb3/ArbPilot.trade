@@ -58,7 +58,7 @@ function list(value: string | undefined, fallback: string[]): string[] {
 
 const port = Number(process.env.PORT ?? 8788);
 
-export type PlanId = "arbitrage" | "strategy";
+export type PlanId = "arbitrage";
 
 export interface PlanDefinition {
   id: PlanId;
@@ -67,9 +67,6 @@ export interface PlanDefinition {
   amount: string;
   name: { zh: string; en: string };
   productId: string;
-  /** 附加包必须先拥有该基础套餐；基础版为 null。 */
-  requires: PlanId | null;
-  addon: boolean;
 }
 
 export const config = {
@@ -96,12 +93,24 @@ export const config = {
   /** 账号服务地址；置空可退回旧版 ref 授权模式。 */
   accountsUrl: (process.env.ACCOUNTS_URL ?? "http://127.0.0.1:8789").replace(/\/$/, ""),
   accountsInternalToken: process.env.ACCOUNTS_INTERNAL_TOKEN ?? "dev-internal-token",
+  /** 策略加密支付（NOWPayments）：未配置 API Key 时加密收银台返回 503。 */
+  nowpaymentsApiKey: process.env.NOWPAYMENTS_API_KEY ?? "",
+  nowpaymentsIpnSecret: process.env.NOWPAYMENTS_IPN_SECRET ?? "",
+  nowpaymentsApiUrl: (process.env.NOWPAYMENTS_API_URL ?? "https://api.nowpayments.io/v1").replace(
+    /\/$/,
+    "",
+  ),
+  /** 配置出款账号后，作者分成会在收款确认时自动转到其地址。 */
+  nowpaymentsPayoutEmail: process.env.NOWPAYMENTS_PAYOUT_EMAIL ?? "",
+  nowpaymentsPayoutPassword: process.env.NOWPAYMENTS_PAYOUT_PASSWORD ?? "",
+  /** 冷启动结束时间（ISO）；未设置时按冷启动 10% 计。 */
+  commissionColdStartUntil: process.env.STRATEGY_COMMISSION_COLD_START_UNTIL ?? "",
 } as const;
 
 /**
- * `arbitrage` 是 $19/月的基础版「自托管部署」，包含套利/新闻与策略市场使用；
- * `strategy` 是 +$10/月的「策略创建」附加包，必须先有基础版才能生效。
- * 策略市场里的单个策略由作者自行定价，可免费或按月收费。
+ * `arbitrage` 是 $19/月的「自托管部署」，包含套利/新闻、在本机运行策略与使用策略市场。
+ * 创建与发布策略对所有登录用户免费；策略市场里的单个策略由作者自行定价，
+ * 平台按成交额抽成（冷启动 6 个月 10%，之后 20%）。
  */
 export const plans: PlanDefinition[] = [
   {
@@ -110,17 +119,6 @@ export const plans: PlanDefinition[] = [
     amount: process.env.WAFFO_PRICE_ARBITRAGE ?? "19.00",
     name: { zh: "ArbPilot · 自托管部署", en: "ArbPilot · Self-hosted Deployment" },
     productId: process.env.WAFFO_PRODUCT_ARBITRAGE ?? "",
-    requires: null,
-    addon: false,
-  },
-  {
-    id: "strategy",
-    billingPeriod: "monthly",
-    amount: process.env.WAFFO_PRICE_STRATEGY ?? "10.00",
-    name: { zh: "ArbPilot · 策略创建", en: "ArbPilot · Strategy Creation" },
-    productId: process.env.WAFFO_PRODUCT_STRATEGY ?? "",
-    requires: "arbitrage",
-    addon: true,
   },
 ];
 

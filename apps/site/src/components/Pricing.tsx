@@ -10,12 +10,6 @@ const FALLBACK_PLANS: PlanInfo[] = [
     billingPeriod: "monthly",
     name: { zh: "自托管部署", en: "Self-hosted Deployment" },
   },
-  {
-    id: "strategy",
-    amount: "10.00",
-    billingPeriod: "monthly",
-    name: { zh: "策略创建", en: "Strategy Creation" },
-  },
 ];
 
 function splitAmount(amount: string): { major: string; minor: string } {
@@ -29,7 +23,6 @@ function PlanCard({
   features,
   amount,
   free,
-  addon,
   recommended,
   action,
 }: {
@@ -38,7 +31,6 @@ function PlanCard({
   features: string[];
   amount: string;
   free?: boolean;
-  addon?: boolean;
   recommended?: boolean;
   action: ReactNode;
 }) {
@@ -61,7 +53,7 @@ function PlanCard({
       </div>
 
       <p className="mt-6 flex items-baseline gap-1 text-fg">
-        <span className="text-[15px] text-muted">{addon ? "+$" : "$"}</span>
+        <span className="text-[15px] text-muted">$</span>
         <span className="font-mono text-[34px] leading-none tracking-tight">{price.major}</span>
         {!free && <span className="font-mono text-[15px] text-muted">.{price.minor}</span>}
         <span className="ml-2 text-[11px] text-subtle">
@@ -104,12 +96,6 @@ export default function Pricing() {
       features: t.pricing.arbitrageFeatures,
       cta: t.pricing.arbitrageCta,
     },
-    strategy: {
-      name: t.pricing.strategyName,
-      desc: t.pricing.strategyDesc,
-      features: t.pricing.strategyFeatures,
-      cta: t.pricing.strategyCta,
-    },
   };
 
   return (
@@ -125,7 +111,7 @@ export default function Pricing() {
           <p className="mt-5 max-w-2xl text-[14px] leading-[1.9] text-body">{t.pricing.desc}</p>
         </div>
 
-        <div className="mt-12 grid gap-4 lg:grid-cols-3">
+        <div className="mt-12 grid gap-4 lg:grid-cols-2">
           <PlanCard
             name={t.pricing.freeName}
             desc={t.pricing.freeDesc}
@@ -139,17 +125,16 @@ export default function Pricing() {
             }
           />
 
-          {(["arbitrage", "strategy"] as const).map((id) => (
+          {(["arbitrage"] as const).map((id) => (
             <PlanCard
               key={id}
               name={copy[id].name}
               desc={copy[id].desc}
               features={copy[id].features}
               amount={amountFor(id)}
-              addon={id === "strategy"}
-              recommended={id === "arbitrage"}
+              recommended
               action={
-                <a href="#download" className={id === "arbitrage" ? primaryCta : secondaryCta}>
+                <a href="#download" className={primaryCta}>
                   {copy[id].cta}
                 </a>
               }

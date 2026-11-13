@@ -8,7 +8,7 @@ export interface StrategyPublicationView {
   author_id: string;
   status: "private" | "published" | "withdrawn";
   pricing: {
-    model: "free" | "monthly";
+    model: "free" | "one_time";
     monthly_price_usd: string | number;
     trial_days: number;
   };

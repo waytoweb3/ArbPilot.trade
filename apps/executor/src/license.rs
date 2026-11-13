@@ -202,7 +202,7 @@ impl LicenseManager {
         claims.exp + self.grace_secs <= Utc::now().timestamp()
     }
 
-    /// 判断某个套餐是否被授权；`strategy` 是附加包，必须同时拥有 `arbitrage` 基础版。
+    /// 判断某个套餐是否被授权；`arbitrage` 是 $19/月 的自托管部署订阅。
     pub fn allows(&self, plan: &str) -> bool {
         match self.claims() {
             Some(claims) => self.allows_claims(&claims, plan),
@@ -219,10 +219,8 @@ impl LicenseManager {
             return false;
         }
         let has_base = claims.plans.iter().any(|item| item == "arbitrage");
-        let has_creator = claims.plans.iter().any(|item| item == "strategy");
         match plan {
             "arbitrage" => has_base,
-            "strategy" => has_base && has_creator,
             other => claims.plans.iter().any(|item| item == other),
         }
     }
@@ -348,9 +346,8 @@ fn persist_token(path: &Path, token: &str) -> anyhow::Result<()> {
 /// 各路由所属套餐；返回 None 表示免费模块，不校验授权。
 ///
 /// `arbitrage`（$19 自托管部署）覆盖套利、新闻与资金费率数据；
-/// `strategy`（+$10 策略创建附加包）覆盖从零创建策略、回测、沙盒与发布市场。
-/// 订阅并导入市场策略后的使用（查看、编辑定义、配置范围、启停、删除）不要求套餐。
-pub fn required_plan(method: &str, path: &str) -> Option<&'static str> {
+/// 创建、回测与发布策略对所有登录用户免费，不校验套餐。
+pub fn required_plan(_method: &str, path: &str) -> Option<&'static str> {
     let path = path.strip_prefix("/api/v1").unwrap_or(path);
     // 资金费率历史登录即可读取，不校验套餐；其余资金费率接口仍属套利套餐。
     if path == "/funding/history" {
@@ -362,53 +359,6 @@ pub fn required_plan(method: &str, path: &str) -> Option<&'static str> {
     {
         return Some("arbitrage");
     }
-
-    let write = !matches!(method, "GET" | "HEAD" | "OPTIONS");
-
-    if path.starts_with("/templates") {
-        // 模板列表只用于浏览与“从模板新建”，免费；实例化会创建策略，属于策略附加包。
-        return if write { Some("strategy") } else { None };
-    }
-
-    if path.starts_with("/sandbox") {
-        return Some("strategy");
-    }
-
-    if path.starts_with("/market") {
-        if !write {
-            // 市场目录、榜单与交付物免费浏览；结算单属于作者收款信息。
-            if path.starts_with("/market/settlements") {
-                return Some("arbitrage");
-            }
-            return None;
-        }
-        // 订阅/导入/退订他人的策略属于“使用策略”，不要求套餐；
-        // 付费订阅仍只是生成待支付记录，实际授权由支付回调开通。
-        // 退订必须放行：免费账号也能订阅免费策略，取消时不能反被附加包拦住。
-        if path.ends_with("/subscribe")
-            || path.ends_with("/import")
-            || (method == "DELETE" && path.starts_with("/market/subscriptions"))
-        {
-            return None;
-        }
-        return Some("strategy");
-    }
-
-    if path.starts_with("/strategies") {
-        // 使用策略免费：查看、编辑定义、配置范围、校验、回滚、启停与删除都不要求套餐，
-        // 这样订阅市场里的免费策略后即可在本机编辑、配置与运行。
-        // 从零创建策略、回测，以及沙盒与代码生成/编译/部署仍属于策略创建附加包。
-        let creation = path == "/strategies" && write;
-        let authoring = path.ends_with("/backtest")
-            || path.ends_with("/sandbox")
-            || (path.ends_with("/code") && write)
-            || path.contains("/code/");
-        if creation || authoring {
-            return Some("strategy");
-        }
-        return None;
-    }
-
     None
 }
 
@@ -562,40 +512,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn plan_mapping_covers_paid_modules() {
+    fn plan_mapping_only_gates_data_modules() {
         assert_eq!(
             required_plan("GET", "/api/v1/funding/status"),
             Some("arbitrage")
         );
         assert_eq!(required_plan("GET", "/api/v1/funding/history"), None);
         assert_eq!(required_plan("GET", "/api/v1/news"), Some("arbitrage"));
-        assert_eq!(
-            required_plan("POST", "/api/v1/strategies"),
-            Some("strategy")
-        );
+        // 创建、回测、沙盒与发布策略均不再校验套餐。
+        assert_eq!(required_plan("POST", "/api/v1/strategies"), None);
         assert_eq!(required_plan("GET", "/api/v1/strategies/abc"), None);
         assert_eq!(required_plan("PATCH", "/api/v1/strategies/abc"), None);
         assert_eq!(required_plan("PATCH", "/api/v1/strategies/abc/scope"), None);
         assert_eq!(required_plan("GET", "/api/v1/strategies/abc/code"), None);
-        assert_eq!(
-            required_plan("PUT", "/api/v1/strategies/abc/code"),
-            Some("strategy")
-        );
+        assert_eq!(required_plan("PUT", "/api/v1/strategies/abc/code"), None);
         assert_eq!(required_plan("GET", "/api/v1/templates"), None);
         assert_eq!(
             required_plan("POST", "/api/v1/templates/turtle-breakout/instantiate"),
-            Some("strategy")
+            None
         );
         assert_eq!(
             required_plan("POST", "/api/v1/strategies/abc/backtest"),
-            Some("strategy")
+            None
         );
         assert_eq!(required_plan("GET", "/api/v1/market/leaderboard"), None);
         assert_eq!(required_plan("GET", "/api/v1/market/subscriptions"), None);
-        assert_eq!(
-            required_plan("GET", "/api/v1/market/settlements"),
-            Some("arbitrage")
-        );
+        assert_eq!(required_plan("GET", "/api/v1/market/settlements"), None);
         assert_eq!(
             required_plan("POST", "/api/v1/market/publications/abc/subscribe"),
             None
@@ -612,16 +554,13 @@ mod tests {
             required_plan("DELETE", "/api/v1/market/subscriptions/abc"),
             None
         );
-        assert_eq!(
-            required_plan("POST", "/api/v1/market/publications"),
-            Some("strategy")
-        );
+        assert_eq!(required_plan("POST", "/api/v1/market/publications"), None);
         assert_eq!(required_plan("GET", "/api/v1/orders"), None);
         assert_eq!(required_plan("GET", "/api/v1/license"), None);
     }
 
     #[test]
-    fn creator_addon_requires_base_plan() {
+    fn only_self_hosted_plan_is_gated() {
         let manager = LicenseManager {
             required: true,
             public_key: None,
@@ -641,9 +580,7 @@ mod tests {
         };
 
         assert!(manager.allows_claims(&claims(&["arbitrage"]), "arbitrage"));
-        assert!(!manager.allows_claims(&claims(&["arbitrage"]), "strategy"));
-        assert!(!manager.allows_claims(&claims(&["strategy"]), "arbitrage"));
-        assert!(!manager.allows_claims(&claims(&["strategy"]), "strategy"));
-        assert!(manager.allows_claims(&claims(&["arbitrage", "strategy"]), "strategy"));
+        assert!(!manager.allows_claims(&claims(&[]), "arbitrage"));
+        assert!(!manager.allows_claims(&claims(&["other"]), "arbitrage"));
     }
 }

@@ -108,7 +108,6 @@ const STATUS_LABEL: Record<string, string> = {
 
 const PLAN_LABEL: Record<string, string> = {
   arbitrage: "自托管部署",
-  strategy: "策略创建附加包",
 };
 
 function statusClass(status: string): string {

@@ -2,16 +2,13 @@ export const PAYMENTS_URL = (
   (import.meta.env.VITE_PAYMENTS_URL as string | undefined) ?? "http://127.0.0.1:8788"
 ).replace(/\/$/, "");
 
-export type PlanId = "arbitrage" | "strategy";
+export type PlanId = "arbitrage";
 
 export interface PlanInfo {
   id: PlanId;
   amount: string;
   billingPeriod: "monthly";
   name: { zh: string; en: string };
-  /** 附加包必须先拥有该基础套餐；基础版为 null。 */
-  requires?: PlanId | null;
-  addon?: boolean;
 }
 
 export type LicenseStatus =

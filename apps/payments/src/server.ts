@@ -32,6 +32,17 @@ import {
 } from "./licenses";
 import { ensureProducts } from "./products";
 import {
+  createInvoice,
+  getCryptoCheckout,
+  getWallet,
+  handleIpnPayment,
+  isCryptoCurrency,
+  normalizeAddress,
+  saveCryptoCheckout,
+  saveWallet,
+  verifyIpn,
+} from "./crypto";
+import {
   ensureStrategyProduct,
   getStrategyCheckout,
   saveStrategyCheckout,
@@ -133,19 +144,7 @@ async function handleCheckout(req: IncomingMessage, res: ServerResponse): Promis
 
   const plan = findPlan(typeof body.plan === "string" ? body.plan : "");
   if (!plan) {
-    sendJson(res, 400, { error: "unknown_plan", message: "plan 必须是 arbitrage 或 strategy" });
-    return;
-  }
-  // 策略创建是附加包，必须先有 $19/月 的自托管部署基础订阅。
-  if (
-    plan.addon &&
-    plan.requires &&
-    !(user.entitlement?.plans ?? []).includes(plan.requires)
-  ) {
-    sendJson(res, 409, {
-      error: "base_plan_required",
-      message: "请先订阅自托管部署，再购买策略创建附加包",
-    });
+    sendJson(res, 400, { error: "unknown_plan", message: "plan 必须是 arbitrage" });
     return;
   }
   if (!client) {
@@ -197,7 +196,7 @@ interface StrategyCheckoutBody {
   darkMode?: unknown;
 }
 
-/** 按策略发布定价创建收银台会话；订阅本身已在执行器创建为待支付。 */
+/** 按策略买断价创建收银台会话；订阅记录已在执行器创建为待支付。 */
 async function handleStrategyCheckout(
   req: IncomingMessage,
   res: ServerResponse,
@@ -214,7 +213,7 @@ async function handleStrategyCheckout(
   if (!user) {
     sendJson(res, 401, {
       error: "login_required",
-      message: "请先登录 ArbPilot 账号后再订阅策略",
+      message: "请先登录 ArbPilot 账号后再购买策略",
     });
     return;
   }
@@ -257,12 +256,12 @@ async function handleStrategyCheckout(
   }
 
   if (publication.status !== "published") {
-    sendJson(res, 409, { error: "not_published", message: "该策略当前未发布，无法订阅" });
+    sendJson(res, 409, { error: "not_published", message: "该策略当前未发布，无法购买" });
     return;
   }
   const amount = Number(publication.pricing.monthly_price_usd);
-  if (publication.pricing.model !== "monthly" || !Number.isFinite(amount) || amount <= 0) {
-    sendJson(res, 400, { error: "not_billable", message: "该策略没有可支付的月费定价" });
+  if (publication.pricing.model !== "one_time" || !Number.isFinite(amount) || amount <= 0) {
+    sendJson(res, 400, { error: "not_billable", message: "该策略没有可支付的买断价" });
     return;
   }
 
@@ -312,6 +311,189 @@ async function handleStrategyCheckout(
     expiresAt: session.expiresAt,
     amount: amount.toFixed(2),
   });
+}
+
+interface CryptoCheckoutBody {
+  publication_id?: unknown;
+  subscription_id?: unknown;
+  subscriber_id?: unknown;
+  pay_currency?: unknown;
+}
+
+interface CryptoWalletBody {
+  currency?: unknown;
+  address?: unknown;
+}
+
+/** 作者收款地址：加密通道把作者分成直接转到这个地址。 */
+async function handleCryptoWallet(
+  req: IncomingMessage,
+  res: ServerResponse,
+): Promise<void> {
+  const authorization = req.headers.authorization;
+  const user = await resolveUser(Array.isArray(authorization) ? authorization[0] : authorization);
+  if (!user) {
+    sendJson(res, 401, { error: "login_required", message: "请先登录后再设置收款地址" });
+    return;
+  }
+
+  if (req.method === "GET") {
+    const wallet = getWallet(user.id);
+    sendJson(res, 200, { wallet });
+    return;
+  }
+
+  const raw = await readRaw(req, 8 * 1024);
+  const body = raw ? (JSON.parse(raw) as CryptoWalletBody) : {};
+  const currency = body.currency;
+  if (!isCryptoCurrency(currency)) {
+    sendJson(res, 400, {
+      error: "invalid_currency",
+      message: "currency 必须是 usdttrc20 或 usdc",
+    });
+    return;
+  }
+  const address = typeof body.address === "string" ? normalizeAddress(currency, body.address) : null;
+  if (!address) {
+    sendJson(res, 400, {
+      error: "invalid_address",
+      message:
+        currency === "usdttrc20"
+          ? "TRC20 地址需以 T 开头且长度为 34"
+          : "USDC 地址需为 0x 开头的 40 位十六进制",
+    });
+    return;
+  }
+
+  const wallet = saveWallet({
+    accountId: user.id,
+    currency,
+    address,
+    updatedAt: new Date().toISOString(),
+  });
+  sendJson(res, 200, { wallet });
+}
+
+/**
+ * 策略买断（加密）：一次付清买断价，USDT-TRC20 或 USDC。
+ */
+async function handleCryptoStrategyCheckout(
+  req: IncomingMessage,
+  res: ServerResponse,
+): Promise<void> {
+  const raw = await readRaw(req, 64 * 1024);
+  const body = raw ? (JSON.parse(raw) as CryptoCheckoutBody) : {};
+  const authorization = req.headers.authorization;
+  const user = await resolveUser(Array.isArray(authorization) ? authorization[0] : authorization);
+  if (!user) {
+    sendJson(res, 401, { error: "login_required", message: "请先登录后再购买策略" });
+    return;
+  }
+  if (!config.nowpaymentsApiKey) {
+    sendJson(res, 503, {
+      error: "crypto_not_configured",
+      message: "服务端未配置 NOWPAYMENTS_API_KEY，暂时无法使用加密支付",
+    });
+    return;
+  }
+
+  const publicationId = text(body.publication_id);
+  const subscriptionId = text(body.subscription_id);
+  const subscriberId = text(body.subscriber_id) ?? user.id;
+  if (subscriberId !== user.id) {
+    sendJson(res, 409, {
+      error: "subscriber_mismatch",
+      message: "购买人需要与当前登录账号一致",
+    });
+    return;
+  }
+  if (!publicationId || !subscriptionId) {
+    sendJson(res, 400, {
+      error: "invalid_request",
+      message: "publication_id、subscription_id 均为必填",
+    });
+    return;
+  }
+  if (!isCryptoCurrency(body.pay_currency)) {
+    sendJson(res, 400, {
+      error: "invalid_currency",
+      message: "pay_currency 必须是 usdttrc20 或 usdc",
+    });
+    return;
+  }
+
+  let publication;
+  try {
+    publication = await fetchPublication(publicationId);
+  } catch (error) {
+    const status = error instanceof ExecutorError && error.status === 404 ? 404 : 502;
+    sendJson(res, status, {
+      error: "publication_unavailable",
+      message: error instanceof Error ? error.message : "无法读取策略发布信息",
+    });
+    return;
+  }
+  if (publication.status !== "published") {
+    sendJson(res, 409, { error: "not_published", message: "该策略当前未发布，无法购买" });
+    return;
+  }
+  if (publication.pricing.model !== "one_time") {
+    sendJson(res, 400, { error: "not_billable", message: "该策略没有可支付的买断价" });
+    return;
+  }
+
+  // 作者未填收款地址时不收钱，避免形成无法结算的订单。
+  const wallet = getWallet(publication.author_id);
+  if (!wallet) {
+    sendJson(res, 409, {
+      error: "author_wallet_missing",
+      message: "作者尚未填写加密收款地址，请改用卡支付",
+    });
+    return;
+  }
+
+  const invoice = await createInvoice({
+    publication,
+    subscriptionId,
+    subscriberId,
+    payCurrency: body.pay_currency,
+  });
+
+  saveCryptoCheckout({
+    ref: invoice.ref,
+    invoiceId: invoice.invoiceId,
+    invoiceUrl: invoice.invoiceUrl,
+    publicationId: publication.id,
+    subscriptionId,
+    subscriberId,
+    authorId: publication.author_id,
+    title: publication.title,
+    amountUsd: invoice.amountUsd.toFixed(2),
+    payCurrency: body.pay_currency,
+    status: "pending",
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  });
+
+  sendJson(res, 201, {
+    ref: invoice.ref,
+    invoiceUrl: invoice.invoiceUrl,
+    amount: invoice.amountUsd.toFixed(2),
+    payCurrency: body.pay_currency,
+  });
+}
+
+/** NOWPayments IPN：验签通过后开通买断授权并记录作者应收。 */
+async function handleCryptoIpn(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const raw = await readRaw(req, 1024 * 1024);
+  const signature = req.headers["x-nowpayments-sig"];
+  if (!verifyIpn(raw, Array.isArray(signature) ? signature[0] : signature)) {
+    sendJson(res, 401, { error: "invalid_signature" });
+    return;
+  }
+  const payload = raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
+  await handleIpnPayment(payload);
+  sendJson(res, 200, { ok: true });
 }
 
 interface PancakeWebhookData {
@@ -381,10 +563,8 @@ async function syncStrategySubscription(
 
   const patch: SubscriptionPatch = { status: mapped.executor, payment_ref: data.orderId ?? ref };
   if (data.currentPeriodEnd) {
+    // 历史月订阅事件仍带周期；买断订单不带，保持永久授权。
     patch.current_period_end = data.currentPeriodEnd;
-  } else if (mapped.executor === "active") {
-    // 月订阅事件未带周期时按 30 天续期，避免激活后立即过期。
-    patch.current_period_end = new Date(Date.now() + 30 * 86_400_000).toISOString();
   }
   await updateSubscription(subscriptionId, patch);
 
@@ -432,7 +612,7 @@ async function handleWebhook(req: IncomingMessage, res: ServerResponse): Promise
   if (ref && status) {
     const planId = data.orderMetadata?.plan;
     const patch: Parameters<typeof upsertLicense>[1] = { status };
-    if (planId === "arbitrage" || planId === "strategy") {
+    if (planId === "arbitrage") {
       patch.plan = planId;
     }
     if (data.buyerEmail) {
@@ -451,7 +631,7 @@ async function handleWebhook(req: IncomingMessage, res: ServerResponse): Promise
     await notifyLicense({
       ref,
       userId: data.orderMetadata?.user_id ?? null,
-      plan: planId === "arbitrage" || planId === "strategy" ? planId : null,
+      plan: planId === "arbitrage" ? planId : null,
       status,
       email: data.buyerEmail ?? null,
       orderId: data.orderId ?? null,
@@ -596,8 +776,6 @@ const server = createServer((req, res) => {
             amount: plan.amount,
             billingPeriod: plan.billingPeriod,
             name: plan.name,
-            requires: plan.requires,
-            addon: plan.addon,
           })),
         });
         return;
@@ -621,6 +799,37 @@ const server = createServer((req, res) => {
           return;
         }
         sendJson(res, 200, checkout);
+        return;
+      }
+
+      if (req.method === "POST" && pathname === "/api/crypto/strategy-checkout") {
+        await handleCryptoStrategyCheckout(req, res);
+        return;
+      }
+
+      if (
+        (req.method === "GET" || req.method === "POST") &&
+        pathname === "/api/crypto/wallet"
+      ) {
+        await handleCryptoWallet(req, res);
+        return;
+      }
+
+      if (req.method === "GET" && pathname.startsWith("/api/crypto/strategy-checkouts/")) {
+        const ref = decodeURIComponent(
+          pathname.slice("/api/crypto/strategy-checkouts/".length),
+        );
+        const checkout = getCryptoCheckout(ref);
+        if (!checkout) {
+          sendJson(res, 404, { ref, status: "unknown" });
+          return;
+        }
+        sendJson(res, 200, checkout);
+        return;
+      }
+
+      if (req.method === "POST" && pathname === "/api/crypto/ipn") {
+        await handleCryptoIpn(req, res);
         return;
       }
 

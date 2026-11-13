@@ -32,8 +32,32 @@ function writeIds(ids: ProductIds): void {
 let pending: Promise<Record<PlanId, string>> | null = null;
 
 /**
+ * 发布商品。测试环境密钥创建的商品只有测试版本，需要 publish 提升到生产；
+ * 生产环境密钥创建的商品本身就是生产版本，没有测试版本可发布，平台会返回
+ * "No test version found"，这属于正常情况。
+ */
+export async function publishProduct(
+  client: WaffoPancake,
+  id: string,
+  kind: "subscription" | "onetime" = "subscription",
+): Promise<void> {
+  try {
+    if (kind === "onetime") {
+      await client.onetimeProducts.publish({ id });
+    } else {
+      await client.subscriptionProducts.publish({ id });
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "";
+    if (!message.includes("No test version found")) {
+      throw error;
+    }
+  }
+}
+
+/**
  * 订阅商品 ID 的解析顺序：环境变量 → 本地缓存 → 在店铺内创建并发布。
- * 建议正式环境用 WAFFO_PRODUCT_ARBITRAGE / WAFFO_PRODUCT_STRATEGY 固定，避免重复建品。
+ * 建议正式环境用 WAFFO_PRODUCT_ARBITRAGE 固定，避免重复建品。
  */
 export function ensureProducts(client: WaffoPancake): Promise<Record<PlanId, string>> {
   pending ??= provision(client).catch((error: unknown) => {
@@ -69,8 +93,8 @@ async function provision(client: WaffoPancake): Promise<Record<PlanId, string>> 
       },
       metadata: { arbpilot_plan: plan.id },
     });
-    // 新建版本先落在 test 环境，发布后才会在收银台生效。
-    await client.subscriptionProducts.publish({ id: product.id });
+    // 测试环境密钥新建的版本先落在 test，发布后才在收银台生效；生产密钥无需发布。
+    await publishProduct(client, product.id);
     ids[plan.id] = product.id;
     created = true;
     console.log(`[payments] 已创建订阅商品 ${plan.id}: ${product.id}`);
@@ -80,5 +104,5 @@ async function provision(client: WaffoPancake): Promise<Record<PlanId, string>> 
     writeIds(ids);
   }
 
-  return { arbitrage: ids.arbitrage!, strategy: ids.strategy! };
+  return { arbitrage: ids.arbitrage! };
 }

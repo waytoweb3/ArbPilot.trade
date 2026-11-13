@@ -2,17 +2,18 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 import {
-  BillingPeriod,
   TaxCategory,
   type WaffoPancake,
 } from "@waffo/pancake-ts";
 
 import { config } from "./config";
 import type { StrategyPublicationView } from "./executor";
+import { publishProduct } from "./products";
 
 /**
- * 策略订阅的商品与订单引用。
+ * 策略买断的商品与订单引用。
  *
+ * 每个发布只创建一个一次性商品；买家付款后永久获得该版本授权，不存在续费。
  * 这里只保存业务标识、金额与支付订单号；策略代码、交易所密钥与交易权限
  * 始终留在执行器一侧，支付服务从不接触。
  */
@@ -71,7 +72,7 @@ export function saveStrategyCheckout(checkout: StrategyCheckout): StrategyChecko
   return next;
 }
 
-/** 发布定价可能被作者修改，缓存键带上金额以生成新的订阅商品。 */
+/** 发布定价可能被作者修改，缓存键带上金额以生成新的一次性商品。 */
 type ProductCache = Record<string, string>;
 
 function readProductCache(): ProductCache {
@@ -95,13 +96,13 @@ const creating = new Map<string, Promise<string>>();
 function parseAmount(publication: StrategyPublicationView): string {
   const amount = Number(publication.pricing.monthly_price_usd);
   if (!Number.isFinite(amount) || amount <= 0) {
-    throw new Error("该策略没有有效的月费定价");
+    throw new Error("该策略没有有效的买断价");
   }
   return amount.toFixed(2);
 }
 
 /**
- * 每个「发布 + 金额」对应一个店铺订阅商品。
+ * 每个「发布 + 金额」对应一个店铺一次性商品。
  * 正式环境可用 WAFFO_STORE_ID 指向同一店铺，并把缓存文件持久化。
  */
 export function ensureStrategyProduct(
@@ -122,22 +123,22 @@ export function ensureStrategyProduct(
 
   const task = (async () => {
     if (!config.storeId) {
-      throw new Error("缺少 WAFFO_STORE_ID，无法创建策略订阅商品");
+      throw new Error("缺少 WAFFO_STORE_ID，无法创建策略买断商品");
     }
-    const { product } = await client.subscriptionProducts.create({
+    const { product } = await client.onetimeProducts.create({
       storeId: config.storeId,
       name: `ArbPilot Strategy · ${publication.title}`.slice(0, 120),
-      billingPeriod: BillingPeriod.Monthly,
+      description: "一次性买断，永久使用该发布版本",
       prices: {
-        [config.currency]: { amount, taxCategory: TaxCategory.SaaS },
+        [config.currency]: { amount, taxCategory: TaxCategory.DigitalGoods },
       },
       metadata: { arbpilot_kind: "strategy", publication_id: publication.id },
     });
-    await client.subscriptionProducts.publish({ id: product.id });
+    await publishProduct(client, product.id, "onetime");
     const cache = readProductCache();
     cache[key] = product.id;
     writeProductCache(cache);
-    console.log(`[payments] 已创建策略订阅商品 ${key}: ${product.id}`);
+    console.log(`[payments] 已创建策略买断商品 ${key}: ${product.id}`);
     return product.id;
   })().finally(() => {
     creating.delete(key);

@@ -32,8 +32,8 @@ pub fn spawn(state: AppState) {
 }
 
 async fn evaluate(state: &AppState) -> anyhow::Result<()> {
-    // 开启授权校验时，没有 strategy 套餐就不产生新的订单意图（默认关闭）。
-    if !state.license.allows("strategy") {
+    // 开启授权校验时，没有自托管部署订阅就不产生新的订单意图（默认关闭）。
+    if !state.license.allows("arbitrage") {
         tracing::debug!("授权不足，跳过策略运行评估");
         return Ok(());
     }
