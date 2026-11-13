@@ -11,7 +11,7 @@
 //! `net = gross - fees - slippage`。
 
 use arb_core::{
-    indicators, BacktestAssumption, BacktestReport, DataRules, EquityPoint, SandboxCandle,
+    indicators, program, BacktestAssumption, BacktestReport, DataRules, EquityPoint, SandboxCandle,
     SandboxIndicators, Side, StrategyRecord,
 };
 use chrono::{DateTime, Utc};
@@ -117,6 +117,7 @@ pub fn replay(
             costs,
         ),
         SkillKind::MaTrend => replay_signal(rule, symbol, candles, notional, costs),
+        SkillKind::Program => replay_program(rule, symbol, candles, notional, costs),
     }
 }
 
@@ -362,6 +363,7 @@ fn replay_signal(
                     &indicators,
                     &rule.trigger,
                 ),
+                SkillKind::Program => false,
                 _ => exit_by_signal(rule, &open, &indicators, last),
             };
             if signal_exit || exit_by_risk(&open, last) {
@@ -381,6 +383,7 @@ fn replay_signal(
             },
             SkillKind::MaTrend => skill::ma_entry_signal(last, &indicators, &rule.trigger)
                 .filter(|side| skill::direction_allows(*side, rule.steps.direction)),
+            SkillKind::Program => None,
             _ => None,
         };
         if let Some(side) = signal {
@@ -397,6 +400,94 @@ fn replay_signal(
                 take_profit_pct(rule, last, indicators.atr),
             ));
             last_open_at = Some(candle.open_time);
+        }
+    }
+
+    if let Some(open) = position {
+        let candle = candles.last().expect("K 线非空");
+        trades.push(close_position(open, candle, candle.close, costs));
+    }
+    trades
+}
+
+/// 通用表达式程序的回放：与运行期共用同一个求值器，避免两套语义。
+fn replay_program(
+    rule: &SkillRule,
+    symbol: &str,
+    candles: &[SandboxCandle],
+    notional: Decimal,
+    costs: Costs,
+) -> Vec<ReplayTrade> {
+    let Some(strategy) = rule.program.as_ref() else {
+        return Vec::new();
+    };
+    if candles.len() < 4 || notional <= Decimal::ZERO {
+        return Vec::new();
+    }
+    let mut trades = Vec::new();
+    let mut position: Option<OpenPosition> = None;
+    let mut highest = Decimal::ZERO;
+    let mut lowest = Decimal::ZERO;
+    let mut last_open_at: Option<DateTime<Utc>> = None;
+
+    for index in 3..candles.len() {
+        let candle = &candles[index];
+        let last = candle.close;
+        if last <= Decimal::ZERO {
+            continue;
+        }
+        let view = position.as_ref().map(|open| program::ProgramPosition {
+            side: open.side,
+            entry_price: open.entry_price,
+            opened_at: open.opened_at,
+            highest_since_entry: highest.max(open.entry_price),
+            lowest_since_entry: lowest.min(open.entry_price),
+        });
+        let decision = program::evaluate(
+            strategy,
+            &program::ProgramContext {
+                candles: &candles[..=index],
+                funding_rate: None,
+                position: view,
+                now: candle.open_time,
+            },
+        );
+        match decision.action {
+            program::ProgramAction::Hold => {
+                if position.is_some() {
+                    highest = highest.max(candle.high);
+                    lowest = lowest.min(candle.low);
+                }
+            }
+            program::ProgramAction::Close => {
+                if let Some(open) = position.take() {
+                    trades.push(close_position(open, candle, last, costs));
+                }
+                highest = Decimal::ZERO;
+                lowest = Decimal::ZERO;
+            }
+            program::ProgramAction::Open(side) => {
+                if position.is_some()
+                    || !skill::direction_allows(side, rule.steps.direction)
+                    || in_cooldown(rule, last_open_at, candle.open_time)
+                {
+                    continue;
+                }
+                let mut open = open_position(
+                    rule,
+                    symbol,
+                    side,
+                    last,
+                    notional,
+                    candle.open_time,
+                    strategy.risk.take_profit_pct,
+                );
+                open.stop_loss_pct = strategy.risk.stop_loss_pct;
+                position = Some(open);
+                highest = candle.high;
+                lowest = candle.low;
+                last_open_at = Some(candle.open_time);
+            }
         }
     }
 

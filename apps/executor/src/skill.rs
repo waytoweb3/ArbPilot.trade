@@ -4,13 +4,14 @@
 //! 输出格式与注意事项。这里把这些章节映射成结构化参数，由执行器按参数判断触发条件、
 //! 通过统一风控网关下单；止盈止损沿用单腿交易监控。
 //!
-//! 「什么时候调用」支持四种触发方式：
+//! 「什么时候调用」支持五种触发方式：
 //! - `event`：交易所公告（上币公告跟随、技能策略）；
 //! - `breakout`：唐奇安通道突破（海龟突破）；
 //! - `ma_trend`：快慢均线趋势（均线趋势）；
-//! - `grid`：围绕锚定价的本地网格档位（网格）。
+//! - `grid`：围绕锚定价的本地网格档位（网格）；
+//! - `program`：作者组合指标与逻辑表达式的通用程序。
 //!
-//! 四种方式共用同一套六章参数与单腿交易记录，因此同一个执行器可以同时运行多条
+//! 五种方式共用同一套六章参数与单腿交易记录，因此同一个执行器可以同时运行多条
 //! 互不干扰的技能规则。
 
 use std::{
@@ -98,6 +99,8 @@ pub enum SkillKind {
     MaTrend,
     /// 围绕锚定价的网格档位。
     Grid,
+    /// 通用表达式程序：入场、离场、过滤与风控由作者组合，不再受内置引擎限制。
+    Program,
 }
 
 /// 允许开仓的方向。
@@ -446,7 +449,7 @@ pub struct SkillRule {
     pub enabled: bool,
     /// 技能用途：给人看的说明，也用于运行实例快照。
     pub purpose: String,
-    /// 触发方式：公告、通道突破、均线趋势或网格。
+    /// 触发方式：公告、通道突破、均线趋势、网格或通用表达式。
     pub kind: SkillKind,
     /// 什么时候调用。
     pub trigger: SkillTrigger,
@@ -467,6 +470,9 @@ pub struct SkillRule {
     /// 来源版本里的原始规则 ID，用于升级时对齐规则并保留本地启用状态。
     #[serde(default)]
     pub source_rule_id: Option<Uuid>,
+    /// 通用表达式程序；`kind == Program` 时必填。
+    #[serde(default)]
+    pub program: Option<arb_core::program::StrategyProgram>,
 }
 
 impl Default for SkillRule {
@@ -485,6 +491,7 @@ impl Default for SkillRule {
             source_skill_id: None,
             source_skill_version: None,
             source_rule_id: None,
+            program: None,
         }
     }
 }
@@ -555,6 +562,28 @@ impl SkillSettings {
                     rule.business.max_leverage = rule.business.leverage.max(Decimal::ONE);
                 }
             }
+            // 通用表达式程序：参数夹紧后把风控同步到技能业务规则，
+            // 这样校验、展示与统一风控网关看到的是同一套数值。
+            if rule.kind == SkillKind::Program {
+                if rule.program.is_none() {
+                    rule.program = Some(arb_core::program::StrategyProgram::example_ma_cross());
+                }
+                if let Some(program) = rule.program.as_mut() {
+                    program.normalize();
+                    rule.trigger.timeframe = program.data.timeframe.clone();
+                    rule.trigger.lookback = program.data.lookback;
+                    rule.business.stop_loss_pct = program.risk.stop_loss_pct;
+                    rule.business.take_profit_pct = program.risk.take_profit_pct;
+                    rule.business.max_hold_hours = program.risk.max_hold_hours;
+                    rule.cautions.cooldown_hours = program.risk.cooldown_hours;
+                    if program.sizing.notional_usd > Decimal::ZERO {
+                        rule.business.notional_usd = program.sizing.notional_usd;
+                    }
+                    if program.sizing.risk_pct > Decimal::ZERO {
+                        rule.cautions.risk_pct = program.sizing.risk_pct;
+                    }
+                }
+            }
             // 「只通知不下单」已从输出格式移除，迁移为模拟开仓：
             // 既不会真实下单，也不会出现界面显示开仓而运行期不下单。
             if rule.output.action == SkillAction::NotifyOnly {
@@ -591,6 +620,7 @@ pub fn kind_from_template(key: &str) -> Option<SkillKind> {
         "turtle-breakout" => Some(SkillKind::Breakout),
         "ma-trend" => Some(SkillKind::MaTrend),
         "grid" => Some(SkillKind::Grid),
+        "program" | "expression" => Some(SkillKind::Program),
         _ => None,
     }
 }
@@ -602,6 +632,7 @@ pub fn kind_from_name(name: &str) -> Option<SkillKind> {
         "海龟突破" => Some(SkillKind::Breakout),
         "均线趋势" => Some(SkillKind::MaTrend),
         "网格" => Some(SkillKind::Grid),
+        "通用表达式" | "策略程序" | "通用均线交叉" => Some(SkillKind::Program),
         _ => None,
     }
 }
@@ -728,6 +759,20 @@ pub fn default_settings(kind: SkillKind, leverage: Decimal) -> SkillSettings {
             rule.business.grid_share_pct = Decimal::from(10);
             rule.business.grid_spacing_mode = GridSpacingMode::Arithmetic;
         }
+        SkillKind::Program => {
+            rule.name = "通用表达式".to_string();
+            rule.purpose =
+                "用指标、比较与逻辑表达式组合入场/离场条件，参数空间由程序自动生成。".to_string();
+            let program = arb_core::program::StrategyProgram::example_ma_cross();
+            rule.trigger.timeframe = program.data.timeframe.clone();
+            rule.trigger.lookback = program.data.lookback;
+            rule.business.notional_usd = program.sizing.notional_usd;
+            rule.business.stop_loss_pct = program.risk.stop_loss_pct;
+            rule.business.take_profit_pct = program.risk.take_profit_pct;
+            rule.business.max_hold_hours = program.risk.max_hold_hours;
+            rule.cautions.cooldown_hours = program.risk.cooldown_hours;
+            rule.program = Some(program);
+        }
     }
     SkillSettings { rules: vec![rule] }
 }
@@ -768,6 +813,7 @@ fn from_listing(settings: &listing::ListingSettings) -> SkillSettings {
                 source_skill_id: None,
                 source_skill_version: None,
                 source_rule_id: None,
+                program: None,
             })
             .collect(),
     }
@@ -1590,7 +1636,104 @@ async fn evaluate_indicator(
             .await
         }
         SkillKind::Grid => evaluate_grid(state, strategy, rule, &venue, symbol, last, &open).await,
+        SkillKind::Program => {
+            evaluate_program(state, strategy, rule, &venue, symbol, &snapshots, &open).await
+        }
         SkillKind::Event => Ok(()),
+    }
+}
+
+/// 通用表达式程序：由作者组合入场/离场/过滤条件，执行侧只负责拉行情与下单。
+async fn evaluate_program(
+    state: &AppState,
+    strategy: &SkillStrategy,
+    rule: &SkillRule,
+    venue: &str,
+    symbol: &str,
+    snapshots: &[SandboxCandle],
+    open: &[listing::ListingTrade],
+) -> Result<(), String> {
+    let Some(program) = rule.program.as_ref() else {
+        return Err("通用表达式规则缺少程序定义".to_string());
+    };
+    let funding_rate = state
+        .funding
+        .status()
+        .await
+        .into_iter()
+        .find(|status| status.venue == venue)
+        .and_then(|status| {
+            status
+                .symbols
+                .into_iter()
+                .find(|item| item.symbol == symbol)
+        })
+        .and_then(|item| item.predicted_rate.or(item.last_funding_rate));
+    let position = open.first().map(|trade| {
+        let since: Vec<&SandboxCandle> = snapshots
+            .iter()
+            .filter(|candle| candle.open_time >= trade.opened_at)
+            .collect();
+        arb_core::program::ProgramPosition {
+            side: trade.side,
+            entry_price: trade.entry_price,
+            opened_at: trade.opened_at,
+            highest_since_entry: since
+                .iter()
+                .map(|candle| candle.high)
+                .max()
+                .unwrap_or(trade.entry_price),
+            lowest_since_entry: since
+                .iter()
+                .map(|candle| candle.low)
+                .min()
+                .unwrap_or(trade.entry_price),
+        }
+    });
+    let decision = arb_core::program::evaluate(
+        program,
+        &arb_core::program::ProgramContext {
+            candles: snapshots,
+            funding_rate,
+            position,
+            now: Utc::now(),
+        },
+    );
+    match decision.action {
+        arb_core::program::ProgramAction::Hold => Ok(()),
+        arb_core::program::ProgramAction::Close => {
+            for trade in open {
+                close_signal(state, trade.id).await;
+            }
+            Ok(())
+        }
+        arb_core::program::ProgramAction::Open(side) => {
+            if !open.is_empty() {
+                return Ok(());
+            }
+            if !direction_allows(side, rule.steps.direction)
+                || max_symbols_reached(state, strategy, rule)
+            {
+                return Ok(());
+            }
+            try_open(
+                state,
+                strategy,
+                rule,
+                venue,
+                symbol,
+                side,
+                snapshots
+                    .last()
+                    .map(|candle| candle.close)
+                    .unwrap_or_default(),
+                None,
+                None,
+                None,
+            )
+            .await;
+            Ok(())
+        }
     }
 }
 
@@ -2091,6 +2234,18 @@ async fn try_open(
 ) -> bool {
     let key = format!("{}:{}:{symbol}", strategy.id, rule.id);
     let is_add = placement.map(|p| p.is_add).unwrap_or(false);
+    let spot = crate::market::is_spot_venue(venue);
+    // 现货腿只能买入：做空信号直接跳过，避免把订单打到交易所才被拒。
+    if spot && side == Side::Sell {
+        tracing::info!(
+            strategy_id = %strategy.id,
+            %symbol,
+            %venue,
+            rule = %rule.name,
+            "现货交易所不支持开空，忽略本次做空信号"
+        );
+        return false;
+    }
     // 持仓数量按「策略 + 规则」统计，不区分交易对；加仓不受此限制。
     if !is_add && rule.cautions.max_positions > 0 {
         let held = state
@@ -2166,7 +2321,11 @@ async fn try_open(
     // 海龟按整组名义价值约束最大杠杆，避免加仓后超过配置上限。
     if rule.kind == SkillKind::Breakout {
         let equity = state.accounts.total_equity_usd();
-        let max_leverage = rule.business.max_leverage.max(Decimal::ONE);
+        let max_leverage = if spot {
+            Decimal::ONE
+        } else {
+            rule.business.max_leverage.max(Decimal::ONE)
+        };
         if equity > Decimal::ZERO {
             let held_notional: Decimal = state
                 .listing
@@ -2216,19 +2375,23 @@ async fn try_open(
             rule.business.take_profit_pct
         }
     });
-    let leverage = if rule.kind == SkillKind::Breakout {
+    let leverage = if spot {
+        // 现货没有杠杆，整组敞口也不能超过权益。
+        Decimal::ONE
+    } else if rule.kind == SkillKind::Breakout {
         rule.business.max_leverage.max(Decimal::ONE)
     } else {
         rule.business.leverage
     };
-    let max_hold_secs =
-        if rule.kind == SkillKind::Breakout && rule.business.max_hold_hours > Decimal::ZERO {
-            (rule.business.max_hold_hours * Decimal::from(3600))
-                .to_i64()
-                .unwrap_or(0)
-        } else {
-            0
-        };
+    let max_hold_secs = if matches!(rule.kind, SkillKind::Breakout | SkillKind::Program)
+        && rule.business.max_hold_hours > Decimal::ZERO
+    {
+        (rule.business.max_hold_hours * Decimal::from(3600))
+            .to_i64()
+            .unwrap_or(0)
+    } else {
+        0
+    };
     // 首仓生成组标识，后续加仓沿用，便于整组平仓与系统一盈利过滤。
     let group_id = placement.map(|p| p.group_id.unwrap_or_else(Uuid::new_v4));
     let request = OpenListingRequest {
@@ -2604,6 +2767,34 @@ mod tests {
         assert_eq!(rule.kind, SkillKind::Event);
         assert_eq!(rule.trigger.event_keywords, vec!["will list".to_string()]);
         assert_eq!(rule.business.notional_usd, Decimal::from(50));
+    }
+
+    #[test]
+    fn program_rule_normalizes_and_syncs_risk() {
+        let mut settings = default_settings(SkillKind::Program, Decimal::from(2));
+        let rule = settings.rules.first_mut().expect("默认程序规则");
+        let program = rule.program.as_mut().expect("默认程序");
+        program.data.timeframe = "4h".to_string();
+        program.data.lookback = 120;
+        program.risk.stop_loss_pct = Decimal::from(8);
+        program.risk.take_profit_pct = Decimal::from(16);
+        program.risk.max_hold_hours = Decimal::from(12);
+        program.risk.cooldown_hours = Decimal::from(3);
+        program.sizing.notional_usd = Decimal::from(250);
+        program.sizing.risk_pct = Decimal::from(2);
+
+        let normalized = settings.normalized(Decimal::from(2));
+        let rule = &normalized.rules[0];
+        assert_eq!(rule.kind, SkillKind::Program);
+        assert_eq!(rule.trigger.timeframe, "4h");
+        assert_eq!(rule.trigger.lookback, 120);
+        assert_eq!(rule.business.stop_loss_pct, Decimal::from(8));
+        assert_eq!(rule.business.take_profit_pct, Decimal::from(16));
+        assert_eq!(rule.business.max_hold_hours, Decimal::from(12));
+        assert_eq!(rule.cautions.cooldown_hours, Decimal::from(3));
+        assert_eq!(rule.business.notional_usd, Decimal::from(250));
+        assert_eq!(rule.cautions.risk_pct, Decimal::from(2));
+        assert!(rule.program.is_some());
     }
 
     fn frozen_fixture() -> SkillSettings {

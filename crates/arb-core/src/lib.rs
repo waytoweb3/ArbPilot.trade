@@ -11,6 +11,7 @@ pub mod exchange;
 pub mod indicators;
 pub mod market;
 pub mod order;
+pub mod program;
 pub mod risk;
 pub mod sandbox;
 pub mod strategy;

@@ -5,7 +5,11 @@
 //! 2. 选择技能：`NotifyOnly`、`Paper`、空执行交易所等配置是否被正确理解；
 //! 3. 执行步骤：是否会把「只提醒」当成真实下单，或把模拟单发到交易所。
 
-use arb_core::{indicators, DataRules, SandboxCandle, StrategyExecutionMode};
+use arb_core::{
+    indicators,
+    program::{self, ProgramAction, ProgramContext},
+    DataRules, SandboxCandle, StrategyExecutionMode,
+};
 use chrono::{TimeZone, Utc};
 use rust_decimal::Decimal;
 
@@ -69,6 +73,7 @@ fn check_trigger(rule: &SkillRule, issues: &mut Vec<Issue>) {
     };
     let hits = match rule.kind {
         SkillKind::Grid => grid_hits(rule, &candles),
+        SkillKind::Program => program_hits(rule, &candles),
         _ => signal_hits(rule, &candles),
     };
     if hits == 0 {
@@ -164,6 +169,29 @@ fn signal_hits(rule: &SkillRule, candles: &[SandboxCandle]) -> usize {
             _ => None,
         };
         if signal.is_some() {
+            hits += 1;
+        }
+    }
+    hits
+}
+
+/// 通用表达式程序：用与运行期相同的求值器统计入场触发次数。
+fn program_hits(rule: &SkillRule, candles: &[SandboxCandle]) -> usize {
+    let Some(strategy) = rule.program.as_ref() else {
+        return 0;
+    };
+    let mut hits = 0;
+    for index in 3..candles.len() {
+        let decision = program::evaluate(
+            strategy,
+            &ProgramContext {
+                candles: &candles[..=index],
+                funding_rate: None,
+                position: None,
+                now: candles[index].open_time,
+            },
+        );
+        if matches!(decision.action, ProgramAction::Open(_)) {
             hits += 1;
         }
     }

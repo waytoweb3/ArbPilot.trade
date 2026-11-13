@@ -725,6 +725,14 @@ pub(crate) async fn listing_note(state: &AppState, record: &StrategyRecord) -> O
                         rule.business.grid_spacing_pct
                     )
                 }
+                crate::skill::SkillKind::Program => {
+                    let params = rule
+                        .program
+                        .as_ref()
+                        .map(|program| program.params.len())
+                        .unwrap_or(0);
+                    format!("{} · 通用表达式 · {params} 个参数", rule.trigger.timeframe)
+                }
             };
             match rule.name.trim() {
                 "" => format!("{condition} → {execution}"),
