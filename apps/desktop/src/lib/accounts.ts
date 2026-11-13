@@ -15,8 +15,6 @@ export interface AccountEntitlement {
   plans: string[];
   status: "active" | "canceling" | "past_due" | "none";
   expiresAt: string | null;
-  /** 基础版当前周期内赠送的策略创建试用截止时间；不在试用期为 null。 */
-  trialEndsAt?: string | null;
 }
 
 export interface AccountMe {

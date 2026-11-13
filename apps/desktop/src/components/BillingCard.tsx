@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 import {
   useAccount,
@@ -10,7 +10,15 @@ import {
 } from "../hooks/useAccount";
 import { useBillingPlans, useCreateCheckout } from "../hooks/useBilling";
 import { useAccountDialog } from "../lib/accountDialog";
-import { BillingError, PAYMENTS_URL, type BillingPlan, type BillingPlanId } from "../lib/billing";
+import {
+  BillingError,
+  PAYMENTS_URL,
+  getAuthorWallet,
+  saveAuthorWallet,
+  type BillingPlan,
+  type BillingPlanId,
+  type CryptoPayCurrency,
+} from "../lib/billing";
 import { fmt, useI18n } from "../lib/i18n";
 import { openExternal } from "../lib/openExternal";
 import { useSessionStore } from "../lib/session";
@@ -28,16 +36,6 @@ const FALLBACK_PLANS: BillingPlan[] = [
       zh: "ArbPilot · 自托管部署",
       en: "ArbPilot · Self-hosted Deployment",
     },
-    requires: null,
-    addon: false,
-  },
-  {
-    id: "strategy",
-    amount: "10.00",
-    billingPeriod: "monthly",
-    name: { zh: "ArbPilot · 策略创建", en: "ArbPilot · Strategy Creation" },
-    requires: "arbitrage",
-    addon: true,
   },
 ];
 
@@ -59,6 +57,11 @@ export function BillingCard() {
   const [checkoutUrl, setCheckoutUrl] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [walletCurrency, setWalletCurrency] = useState<CryptoPayCurrency>("usdttrc20");
+  const [walletAddress, setWalletAddress] = useState("");
+  const [walletStatus, setWalletStatus] = useState<string | null>(null);
+  const [walletError, setWalletError] = useState<string | null>(null);
+  const [walletSaving, setWalletSaving] = useState(false);
 
   const account = useAccount();
   const subscriptions = useAccountSubscriptions();
@@ -85,28 +88,15 @@ export function BillingCard() {
   const entitlement = me?.entitlement;
   const license = licenseQuery.data;
   const activePlans = entitlement?.plans ?? [];
-  const hasBasePlan = activePlans.includes("arbitrage");
-  /** 基础版每周期赠送 3 天策略创建试用，试用期内 plans 里会带上 strategy。 */
-  const trialEndsAt = entitlement?.trialEndsAt ?? null;
   const dateText = (value: string | null | undefined) =>
     value ? new Date(value).toLocaleDateString(locale === "zh" ? "zh-CN" : "en-US") : "—";
   const secondsText = (value: number | null | undefined) =>
     value ? new Date(value * 1000).toLocaleDateString(locale === "zh" ? "zh-CN" : "en-US") : "—";
 
   const planLabel = (id: string | null | undefined) =>
-    id === "arbitrage"
-      ? t.settings.billingArbitrage
-      : id === "strategy"
-        ? t.settings.billingStrategy
-        : t.settings.accountPlanNone;
+    id === "arbitrage" ? t.settings.billingArbitrage : t.settings.accountPlanNone;
   const activePlanText = activePlans.length
-    ? activePlans
-        .map((id) =>
-          id === "strategy" && trialEndsAt
-            ? fmt(t.settings.billingStrategyTrial, { value: dateText(trialEndsAt) })
-            : planLabel(id),
-        )
-        .join(" · ")
+    ? activePlans.map(planLabel).join(" · ")
     : t.settings.accountPlanNone;
 
   const entitlementStatus =
@@ -174,6 +164,54 @@ export function BillingCard() {
             : String(cancelSubscription.error),
       })
     : null;
+
+  useEffect(() => {
+    if (!token) {
+      setWalletAddress("");
+      return;
+    }
+    let cancelled = false;
+    getAuthorWallet(token)
+      .then((wallet) => {
+        if (cancelled || !wallet) {
+          return;
+        }
+        setWalletCurrency(wallet.currency);
+        setWalletAddress(wallet.address);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [token]);
+
+  const submitWallet = async () => {
+    if (!token) {
+      return;
+    }
+    setWalletStatus(null);
+    setWalletError(null);
+    setWalletSaving(true);
+    try {
+      const wallet = await saveAuthorWallet({
+        session: token,
+        currency: walletCurrency,
+        address: walletAddress,
+      });
+      setWalletAddress(wallet.address);
+      setWalletStatus(t.settings.cryptoWalletSaved);
+    } catch (cause) {
+      setWalletError(
+        cause instanceof BillingError && cause.status === 400
+          ? t.settings.cryptoWalletInvalid
+          : cause instanceof Error
+            ? cause.message
+            : String(cause),
+      );
+    } finally {
+      setWalletSaving(false);
+    }
+  };
 
   return (
     <Card>
@@ -367,44 +405,28 @@ export function BillingCard() {
           {cancelError && <p className="mt-2 text-[11px] text-danger">{cancelError}</p>}
         </div>
 
-        <div className="grid gap-3 sm:grid-cols-2">
+        <div className="grid gap-3">
           {plans.map((item) => {
-            const featured = item.id === "arbitrage";
             const label = planLabel(item.id);
-            const missingBase =
-              item.id === "strategy" && Boolean(token) && !hasBasePlan;
             return (
               <div
                 key={item.id}
-                className={`flex flex-col justify-between rounded-xl border px-4 py-3.5 ${
-                  featured ? "border-accent/30 bg-accent/[0.04]" : "border-line bg-panel-soft"
-                }`}
+                className="flex flex-col justify-between rounded-xl border border-accent/30 bg-accent/[0.04] px-4 py-3.5"
               >
-                <div>
-                  <div className="flex items-baseline justify-between">
-                    <span className="text-[11px] text-muted">{label}</span>
-                    <span className="font-mono text-sm text-fg">${item.amount}</span>
-                  </div>
-                  {item.addon && (
-                    <p className="mt-1 text-[10.5px] leading-relaxed text-subtle">
-                      {trialEndsAt
-                        ? fmt(t.settings.billingAddonTrialHint, { value: dateText(trialEndsAt) })
-                        : t.settings.billingAddonHint}
-                    </p>
-                  )}
+                <div className="flex items-baseline justify-between">
+                  <span className="text-[11px] text-muted">{label}</span>
+                  <span className="font-mono text-sm text-fg">${item.amount}</span>
                 </div>
                 <Button
                   size="sm"
-                  variant={featured ? "primary" : "secondary"}
+                  variant="primary"
                   className="mt-3"
                   onClick={() => subscribe(item.id)}
-                  disabled={checkout.isPending || missingBase}
+                  disabled={checkout.isPending}
                 >
-                  {missingBase
-                    ? t.settings.billingAddonMissingBase
-                    : checkout.isPending && checkout.variables?.plan === item.id
-                      ? t.settings.billingOpening
-                      : fmt(t.settings.billingSubscribe, { plan: label })}
+                  {checkout.isPending && checkout.variables?.plan === item.id
+                    ? t.settings.billingOpening
+                    : fmt(t.settings.billingSubscribe, { plan: label })}
                 </Button>
               </div>
             );
@@ -412,6 +434,44 @@ export function BillingCard() {
         </div>
 
         <p className="text-[11px] leading-relaxed text-muted">{t.settings.billingMarketNote}</p>
+
+        {token && (
+          <div className="rounded-xl border border-line bg-panel-soft px-4 py-3.5">
+            <p className="text-[11px] uppercase tracking-[0.14em] text-subtle">
+              {t.settings.cryptoWalletTitle}
+            </p>
+            <p className="mt-1 text-[11px] leading-relaxed text-muted">
+              {t.settings.cryptoWalletDesc}
+            </p>
+            <div className="mt-2.5 flex flex-wrap items-center gap-2">
+              <select
+                value={walletCurrency}
+                onChange={(event) => setWalletCurrency(event.target.value as CryptoPayCurrency)}
+                className="h-8 rounded-lg border border-line bg-canvas px-2 text-[11px] text-fg outline-none focus:border-accent"
+              >
+                <option value="usdttrc20">USDT · TRC20</option>
+                <option value="usdc">USDC · ERC20</option>
+              </select>
+              <input
+                value={walletAddress}
+                onChange={(event) => setWalletAddress(event.target.value)}
+                placeholder={t.settings.cryptoWalletAddress}
+                spellCheck={false}
+                className="h-8 min-w-0 flex-1 rounded-lg border border-line bg-canvas px-2 font-mono text-[11px] text-fg outline-none placeholder:text-subtle focus:border-accent"
+              />
+              <Button
+                size="sm"
+                variant="secondary"
+                onClick={() => void submitWallet()}
+                disabled={walletSaving || !walletAddress.trim()}
+              >
+                {walletSaving ? t.settings.cryptoWalletSaving : t.settings.cryptoWalletSave}
+              </Button>
+            </div>
+            {walletStatus && <p className="mt-2 text-[11px] text-success">{walletStatus}</p>}
+            {walletError && <p className="mt-2 text-[11px] text-danger">{walletError}</p>}
+          </div>
+        )}
 
         {checkoutUrl && (
           <div className="rounded-xl border border-line bg-panel-soft px-4 py-3">

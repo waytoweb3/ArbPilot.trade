@@ -126,12 +126,7 @@ export function AccountButton() {
     ? `${device.verification_uri_complete}&provider=google${switching ? "&switch=1" : ""}`
     : "";
   const plan = me?.entitlement.plans[0];
-  const planLabel =
-    plan === "arbitrage"
-      ? t.settings.billingArbitrage
-      : plan === "strategy"
-        ? t.settings.billingStrategy
-        : t.settings.accountPlanNone;
+  const planLabel = plan === "arbitrage" ? t.settings.billingArbitrage : t.settings.accountPlanNone;
 
   return (
     <>

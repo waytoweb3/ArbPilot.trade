@@ -2,16 +2,13 @@ export const PAYMENTS_URL = (
   (import.meta.env.VITE_PAYMENTS_URL as string | undefined) ?? "http://127.0.0.1:8788"
 ).replace(/\/$/, "");
 
-export type BillingPlanId = "arbitrage" | "strategy";
+export type BillingPlanId = "arbitrage";
 
 export interface BillingPlan {
   id: BillingPlanId;
   amount: string;
   billingPeriod: "monthly";
   name: { zh: string; en: string };
-  /** 附加包必须先拥有该基础套餐；基础版为 null。 */
-  requires?: BillingPlanId | null;
-  addon?: boolean;
 }
 
 export class BillingError extends Error {
@@ -120,4 +117,90 @@ export async function createStrategyCheckout(input: {
     expiresAt: typeof payload?.expiresAt === "string" ? payload.expiresAt : "",
     amount: typeof payload?.amount === "string" ? payload.amount : "",
   };
+}
+
+export type CryptoPayCurrency = "usdttrc20" | "usdc";
+
+export interface CryptoStrategyCheckout {
+  ref: string;
+  invoiceUrl: string;
+  amount: string;
+}
+
+/** 策略买断（加密）：一次付清买断价，付款确认后由 IPN 回写永久授权。 */
+export async function createCryptoStrategyCheckout(input: {
+  publicationId: string;
+  subscriberId: string;
+  subscriptionId: string;
+  payCurrency: CryptoPayCurrency;
+  session: string;
+}): Promise<CryptoStrategyCheckout> {
+  let response: Response;
+  try {
+    response = await fetch(`${PAYMENTS_URL}/api/crypto/strategy-checkout`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${input.session}` },
+      body: JSON.stringify({
+        publication_id: input.publicationId,
+        subscriber_id: input.subscriberId,
+        subscription_id: input.subscriptionId,
+        pay_currency: input.payCurrency,
+      }),
+    });
+  } catch {
+    throw new BillingError(0, "payments service unreachable");
+  }
+  const payload = await readJson(response);
+  const invoiceUrl = typeof payload?.invoiceUrl === "string" ? payload.invoiceUrl : null;
+  const ref = typeof payload?.ref === "string" ? payload.ref : null;
+  if (!response.ok || !invoiceUrl || !ref) {
+    const message =
+      typeof payload?.message === "string"
+        ? payload.message
+        : `crypto checkout: ${response.status}`;
+    throw new BillingError(response.status, message);
+  }
+  return {
+    ref,
+    invoiceUrl,
+    amount: typeof payload?.amount === "string" ? payload.amount : "",
+  };
+}
+
+export interface AuthorWallet {
+  accountId: string;
+  currency: CryptoPayCurrency;
+  address: string;
+  updatedAt: string;
+}
+
+export async function getAuthorWallet(session: string): Promise<AuthorWallet | null> {
+  const response = await fetch(`${PAYMENTS_URL}/api/crypto/wallet`, {
+    headers: { Authorization: `Bearer ${session}` },
+  });
+  const payload = await readJson(response);
+  if (!response.ok) {
+    throw new BillingError(response.status, `wallet: ${response.status}`);
+  }
+  return (payload?.wallet as AuthorWallet | null) ?? null;
+}
+
+export async function saveAuthorWallet(input: {
+  session: string;
+  currency: CryptoPayCurrency;
+  address: string;
+}): Promise<AuthorWallet> {
+  const response = await fetch(`${PAYMENTS_URL}/api/crypto/wallet`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${input.session}` },
+    body: JSON.stringify({ currency: input.currency, address: input.address }),
+  });
+  const payload = await readJson(response);
+  const wallet = payload?.wallet as AuthorWallet | undefined;
+  if (!response.ok || !wallet) {
+    const message =
+      typeof payload?.message === "string" ? payload.message : `wallet: ${response.status}`;
+    throw new BillingError(response.status, message);
+  }
+  return wallet;
 }

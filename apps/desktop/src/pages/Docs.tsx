@@ -277,6 +277,32 @@ export default function DocsPage({ embedded = false }: { embedded?: boolean }) {
         </div>
       )}
 
+      <Card>
+        <CardHeader>
+          <div>
+            <CardTitle>{t.docs.steps}</CardTitle>
+          </div>
+        </CardHeader>
+        <CardContent className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+          {[
+            [t.docs.step1Title, t.docs.step1],
+            [t.docs.step2Title, t.docs.step2],
+            [t.docs.step3Title, t.docs.step3],
+            [t.docs.step4Title, t.docs.step4],
+          ].map(([title, body], index) => (
+            <div key={title} className="flex gap-3">
+              <span className="grid h-6 w-6 shrink-0 place-items-center rounded-full bg-accent/15 text-[11px] font-semibold text-accent">
+                {index + 1}
+              </span>
+              <div className="space-y-1">
+                <p className="text-xs font-medium text-fg">{title}</p>
+                <p className="text-[11px] leading-relaxed text-muted">{body}</p>
+              </div>
+            </div>
+          ))}
+        </CardContent>
+      </Card>
+
       <div className="grid gap-4 xl:grid-cols-2">
         <Card>
           <CardHeader>
@@ -471,32 +497,6 @@ export default function DocsPage({ embedded = false }: { embedded?: boolean }) {
           </CardContent>
         </Card>
       </div>
-
-      <Card>
-        <CardHeader>
-          <div>
-            <CardTitle>{t.docs.steps}</CardTitle>
-          </div>
-        </CardHeader>
-        <CardContent className="grid gap-4 md:grid-cols-2">
-          {[
-            [t.docs.step1Title, t.docs.step1],
-            [t.docs.step2Title, t.docs.step2],
-            [t.docs.step3Title, t.docs.step3],
-            [t.docs.step4Title, t.docs.step4],
-          ].map(([title, body], index) => (
-            <div key={title} className="flex gap-3">
-              <span className="grid h-6 w-6 shrink-0 place-items-center rounded-full bg-accent/15 text-[11px] font-semibold text-accent">
-                {index + 1}
-              </span>
-              <div className="space-y-1">
-                <p className="text-xs font-medium text-fg">{title}</p>
-                <p className="text-[11px] leading-relaxed text-muted">{body}</p>
-              </div>
-            </div>
-          ))}
-        </CardContent>
-      </Card>
 
       <Card>
         <CardHeader>

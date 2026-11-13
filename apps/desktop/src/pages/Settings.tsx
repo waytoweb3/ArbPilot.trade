@@ -88,6 +88,11 @@ export default function SettingsPage() {
     mode === "self" &&
     /^https?:\/\/(127\.0\.0\.1|localhost)(:|\/|$)/.test(address.trim());
   const { t } = useI18n();
+  // 自托管连接属于 $19/月基础版权益，未订阅时不允许保存与连接。
+  const account = useAccount();
+  const hasDeployPlan =
+    account.data?.entitlement?.plans.includes("arbitrage") ?? false;
+  const saveBlocked = mode === "self" && !hasDeployPlan;
   // 支持从升级提示直接跳到连接标签页：/settings?tab=connection
   const [searchParams, setSearchParams] = useSearchParams();
   const requested = searchParams.get("tab");
@@ -271,7 +276,7 @@ export default function SettingsPage() {
               )}
 
               <div className="flex items-center gap-3">
-                <Button size="sm" onClick={save}>
+                <Button size="sm" onClick={save} disabled={saveBlocked}>
                   {t.settings.save}
                 </Button>
                 {saved && (
@@ -280,9 +285,23 @@ export default function SettingsPage() {
                   </span>
                 )}
               </div>
+              {saveBlocked && (
+                <div className="flex flex-wrap items-center gap-2 rounded-lg border border-warning/30 bg-warning/10 px-3 py-2">
+                  <p className="flex-1 text-[11px] leading-relaxed text-warning">
+                    {t.settings.connectRequiresPlan}
+                  </p>
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    onClick={() => setTab("account")}
+                  >
+                    {t.settings.connectRequiresPlanAction}
+                  </Button>
+                </div>
+              )}
             </CardContent>
           </Card>
-          <CredentialStorageCard local={getExecutorMode() === "local"} />
+          {mode === "local" && <CredentialStorageCard />}
           {mode === "self" && <DocsPage embedded />}
         </div>
       )}
@@ -300,8 +319,8 @@ export default function SettingsPage() {
   );
 }
 
-/** 内置执行器展示凭证文件的位置、权限与清除入口；自托管只说明密钥在服务器上。 */
-function CredentialStorageCard({ local }: { local: boolean }) {
+/** 内置执行器展示凭证文件的位置、权限与清除入口。 */
+function CredentialStorageCard() {
   const { t } = useI18n();
   const accounts = useAccounts();
   const clearAccounts = useClearAccounts();
@@ -326,7 +345,7 @@ function CredentialStorageCard({ local }: { local: boolean }) {
     }
     setNotice(null);
     try {
-      if (!isDesktopRuntime() || !local) {
+      if (!isDesktopRuntime()) {
         await navigator.clipboard.writeText(storage.path);
         setNotice(t.settings.credentialsPathCopied);
         return;
@@ -351,24 +370,6 @@ function CredentialStorageCard({ local }: { local: boolean }) {
         ),
     });
   };
-
-  if (!local) {
-    return (
-      <Card>
-        <CardHeader>
-          <div>
-            <CardTitle>{t.settings.credentials}</CardTitle>
-            <CardDescription>{t.settings.credentialsDesc}</CardDescription>
-          </div>
-        </CardHeader>
-        <CardContent>
-          <p className="text-[11px] leading-relaxed text-muted">
-            {t.settings.credentialsSelfHosted}
-          </p>
-        </CardContent>
-      </Card>
-    );
-  }
 
   return (
     <>
@@ -415,7 +416,7 @@ function CredentialStorageCard({ local }: { local: boolean }) {
           )}
 
           <div className="flex flex-wrap items-center gap-2 pt-1">
-            {local && storage?.exists && (
+            {storage?.exists && (
               <Button size="sm" variant="secondary" onClick={reveal}>
                 <FolderOpen size={13} />
                 {t.settings.credentialsOpenFolder}

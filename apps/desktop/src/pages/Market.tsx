@@ -18,11 +18,21 @@ import {
 } from "../hooks/useApi";
 import { useAccount } from "../hooks/useAccount";
 import { formatDateTime, formatUsd } from "../lib/format";
-import { BillingError, PAYMENTS_URL, createStrategyCheckout } from "../lib/billing";
+import {
+  BillingError,
+  PAYMENTS_URL,
+  createCryptoStrategyCheckout,
+  createStrategyCheckout,
+  type CryptoPayCurrency,
+} from "../lib/billing";
 import { fmt, useI18n } from "../lib/i18n";
 import { openExternal } from "../lib/openExternal";
 import { useSessionStore } from "../lib/session";
 import type {
+  ParamSpec,
+  ParamValue,
+  ParamValues,
+  ParamsSchema,
   PublicationStatus,
   RiskLevel,
   StrategyRecord,
@@ -31,6 +41,49 @@ import type {
 } from "../lib/types";
 
 const SUBSCRIBER_KEY = "arbpilot.market.subscriber";
+
+/** 参数表单的输入框样式；与策略页保持一致。 */
+const inputClass =
+  "w-full rounded-md border border-line bg-panel px-2 py-1 text-xs text-fg outline-none focus:border-accent";
+
+/** 把一个参数值格式化成输入框文本；数字统一走字符串以保留精度。 */
+function paramText(value: unknown): string {
+  if (value === null || value === undefined) {
+    return "";
+  }
+  return typeof value === "string" ? value : JSON.stringify(value);
+}
+
+/** 按参数类型解析输入；解析失败返回 undefined，由调用方提示。 */
+function parseParamValue(spec: ParamSpec, raw: string): unknown {
+  const text = raw.trim();
+  if (typeof spec.param_type === "object" && "enum" in spec.param_type) {
+    return spec.param_type.enum.options.includes(text) ? text : undefined;
+  }
+  switch (spec.param_type) {
+    case "boolean":
+      return text === "true" ? true : text === "false" ? false : undefined;
+    case "integer": {
+      const number = Number(text);
+      return Number.isInteger(number) ? number : undefined;
+    }
+    case "number":
+    case "percent": {
+      const number = Number(text);
+      return Number.isFinite(number) ? text : undefined;
+    }
+    case "string_list": {
+      try {
+        const parsed = JSON.parse(text);
+        return Array.isArray(parsed) ? parsed : undefined;
+      } catch {
+        return undefined;
+      }
+    }
+    default:
+      return text;
+  }
+}
 
 /** 未登录时用本机匿名身份；登录后改用账号 ID，购买记录可跨设备同步。 */
 function localSubscriberId(): string {
@@ -69,6 +122,13 @@ export default function MarketPage() {
   } | null>(null);
   const [cancelError, setCancelError] = useState<string | null>(null);
   const [cancelling, setCancelling] = useState(false);
+  // Skill 版导入前先让买家填参数：表单按交付的参数空间渲染。
+  const [paramTarget, setParamTarget] = useState<{
+    subscription: StrategySubscription;
+    schema: ParamsSchema;
+  } | null>(null);
+  const [paramDraft, setParamDraft] = useState<Record<string, string>>({});
+  const [paramError, setParamError] = useState<string | null>(null);
 
   // 市场只展示公开可见的发布，私有草稿与作者管理都在「策略」和「设置」里。
   const publications = usePublications(false);
@@ -115,6 +175,65 @@ export default function MarketPage() {
           strategy.definition.name === subscription.publication_title,
       );
     });
+  };
+
+  /** 提交买家参数并生成实例；成功后跳到策略页启动。 */
+  const runImport = (
+    publicationId: string,
+    paramValues?: ParamValues,
+  ) => {
+    setParamError(null);
+    importPublication.mutate(
+      { publicationId, subscriberId: subscriber, paramValues },
+      {
+        onSuccess: () => {
+          setParamTarget(null);
+          navigate("/strategies");
+        },
+        onError: (error) => setParamError(messageOf(error)),
+      },
+    );
+  };
+
+  /** 有可改参数时先打开表单，否则直接导入（参数全锁死时等同原配置版）。 */
+  const startImport = (subscription: StrategySubscription) => {
+    const publication = (publications.data ?? []).find(
+      (item) => item.id === subscription.publication_id,
+    );
+    const schema = publication?.skill?.params_schema ?? null;
+    const editable = (schema?.params ?? []).filter((spec) => spec.editable);
+    if (schema && editable.length) {
+      setParamDraft(
+        Object.fromEntries(
+          editable.map((spec) => [`${spec.rule_key}/${spec.path}`, paramText(spec.default)]),
+        ),
+      );
+      setParamError(null);
+      setParamTarget({ subscription, schema });
+      return;
+    }
+    runImport(subscription.publication_id);
+  };
+
+  /** 校验表单并按参数类型转成后端要的形态。 */
+  const submitParams = () => {
+    if (!paramTarget) {
+      return;
+    }
+    const values: ParamValue[] = [];
+    for (const spec of paramTarget.schema.params) {
+      if (!spec.editable) {
+        continue;
+      }
+      const raw = paramDraft[`${spec.rule_key}/${spec.path}`] ?? "";
+      const parsed = parseParamValue(spec, raw);
+      if (parsed === undefined) {
+        setParamError(`${spec.label} 的取值不合法`);
+        return;
+      }
+      values.push({ rule_key: spec.rule_key, path: spec.path, value: parsed });
+    }
+    runImport(paramTarget.subscription.publication_id, { values });
   };
 
   /** 退订前先清空由该策略导入的本机策略；删除完成后才真正取消订阅。 */
@@ -201,6 +320,67 @@ export default function MarketPage() {
       }
     }
   };
+
+  /** 加密买断：一次付清买断价，确认后由 IPN 回写永久授权。 */
+  const startCryptoCheckout = async (
+    publicationId: string,
+    subscriptionId: string,
+    payCurrency: CryptoPayCurrency,
+  ): Promise<boolean> => {
+    setCheckoutFor(publicationId);
+    setCheckoutUrl(null);
+    setCheckoutError(null);
+    if (!session) {
+      setCheckoutError(copy.checkoutLoginRequired);
+      return false;
+    }
+    try {
+      const created = await createCryptoStrategyCheckout({
+        publicationId,
+        subscriberId: subscriber,
+        subscriptionId,
+        payCurrency,
+        session,
+      });
+      setCheckoutUrl(created.invoiceUrl);
+      void openExternal(created.invoiceUrl);
+      return true;
+    } catch (cause) {
+      if (cause instanceof BillingError && cause.status === 401) {
+        setCheckoutError(copy.checkoutLoginRequired);
+      } else if (cause instanceof BillingError && cause.status === 503) {
+        setCheckoutError(copy.cryptoNeedsKey);
+      } else if (cause instanceof BillingError && cause.status === 0) {
+        setCheckoutError(fmt(copy.checkoutUnreachable, { url: PAYMENTS_URL }));
+      } else if (
+        cause instanceof BillingError &&
+        cause.message.includes("收款地址")
+      ) {
+        setCheckoutError(copy.cryptoAuthorWalletMissing);
+      } else {
+        setCheckoutError(
+          fmt(copy.cryptoFailed, {
+            message: cause instanceof Error ? cause.message : String(cause),
+          }),
+        );
+      }
+      return false;
+    }
+  };
+
+  /** 加密购买失败时撤销刚创建的待支付订阅，避免按钮被隐藏。 */
+  const buyCrypto = (publicationId: string, payCurrency: CryptoPayCurrency) =>
+    subscribe.mutate(
+      { publicationId, subscriberId: subscriber },
+      {
+        onSuccess: async (subscription) => {
+          const started = await startCryptoCheckout(publicationId, subscription.id, payCurrency);
+          if (!started) {
+            cancelSubscription.mutate(subscription.id);
+          }
+        },
+      },
+    );
 
   const riskLabel = (level: RiskLevel) =>
     level === "low" ? copy.riskLow : level === "medium" ? copy.riskMedium : copy.riskHigh;
@@ -297,7 +477,7 @@ export default function MarketPage() {
           {publications.data?.length ? (
             publications.data.map((publication) => {
               const current = subscriptionFor(publication.id);
-              const monthly = Number(publication.pricing.monthly_price_usd);
+              const price = Number(publication.pricing.monthly_price_usd);
               return (
                 <div
                   key={publication.id}
@@ -325,7 +505,7 @@ export default function MarketPage() {
                         <span>
                           {publication.pricing.model === "free"
                             ? copy.free
-                            : fmt(copy.monthly, {
+                            : fmt(copy.buyout, {
                                 price: formatUsd(publication.pricing.monthly_price_usd),
                               })}
                         </span>
@@ -343,8 +523,8 @@ export default function MarketPage() {
                               {
                                 onSuccess: (subscription) => {
                                   if (
-                                    publication.pricing.model === "monthly" &&
-                                    monthly > 0
+                                    publication.pricing.model === "one_time" &&
+                                    price > 0
                                   ) {
                                     void startCheckout(publication.id, subscription.id);
                                   }
@@ -356,6 +536,26 @@ export default function MarketPage() {
                         >
                           {subscribe.isPending ? copy.subscribing : copy.subscribe}
                         </Button>
+                      )}
+                      {!current && price > 0 && publication.status === "published" && (
+                        <div className="flex gap-1.5">
+                          <Button
+                            size="sm"
+                            variant="secondary"
+                            disabled={subscribe.isPending}
+                            onClick={() => buyCrypto(publication.id, "usdttrc20")}
+                          >
+                            {copy.cryptoUsdt}
+                          </Button>
+                          <Button
+                            size="sm"
+                            variant="secondary"
+                            disabled={subscribe.isPending}
+                            onClick={() => buyCrypto(publication.id, "usdc")}
+                          >
+                            {copy.cryptoUsdc}
+                          </Button>
+                        </div>
                       )}
                     </div>
                   </div>
@@ -428,18 +628,7 @@ export default function MarketPage() {
                       ) : (
                         <Button
                           size="sm"
-                          onClick={() =>
-                            importPublication.mutate(
-                              {
-                                publicationId: subscription.publication_id,
-                                subscriberId: subscriber,
-                              },
-                              {
-                                // 导入后策略出现在自己的执行器，直接跳到策略页启动。
-                                onSuccess: () => navigate("/strategies"),
-                              },
-                            )
-                          }
+                          onClick={() => startImport(subscription)}
                           disabled={importPublication.isPending}
                         >
                           {importPublication.isPending ? copy.importing : copy.importStrategy}
@@ -469,6 +658,126 @@ export default function MarketPage() {
           )}
         </CardContent>
       </Card>
+
+      {paramTarget && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
+          role="dialog"
+          aria-modal="true"
+        >
+          <div className="w-full max-w-md rounded-xl border border-line bg-panel shadow-xl">
+            <div className="border-b border-line px-4 py-3">
+              <p className="text-sm font-semibold text-fg">配置参数</p>
+              <p className="mt-0.5 text-[11px] text-muted">
+                这个策略按「逻辑 + 参数空间」交付，填好参数后生成属于你的实例。
+              </p>
+            </div>
+            <div className="max-h-[60vh] space-y-3 overflow-y-auto p-4">
+              {paramTarget.schema.params.map((spec) => {
+                const key = `${spec.rule_key}/${spec.path}`;
+                if (!spec.editable) {
+                  return (
+                    <div
+                      key={key}
+                      className="flex items-center justify-between gap-3 text-[11px] text-muted"
+                    >
+                      <span>{spec.label}</span>
+                      <span className="font-mono">{paramText(spec.default)}（锁定）</span>
+                    </div>
+                  );
+                }
+                const enumType =
+                  typeof spec.param_type === "object" && spec.param_type !== null
+                    ? spec.param_type
+                    : null;
+                return (
+                  <label key={key} className="block space-y-1">
+                    <span className="flex items-center justify-between text-[11px] text-muted">
+                      <span>{spec.label}</span>
+                      <span className="font-mono">
+                        {paramText(spec.min)} ~ {paramText(spec.max)}
+                      </span>
+                    </span>
+                    {enumType ? (
+                      <select
+                        className={inputClass}
+                        value={paramDraft[key] ?? ""}
+                        onChange={(event) =>
+                          setParamDraft((draft) => ({
+                            ...draft,
+                            [key]: event.target.value,
+                          }))
+                        }
+                      >
+                        {enumType.enum.options.map((option: string) => (
+                          <option key={option} value={option}>
+                            {option}
+                          </option>
+                        ))}
+                      </select>
+                    ) : spec.param_type === "boolean" ? (
+                      <select
+                        className={inputClass}
+                        value={paramDraft[key] ?? "false"}
+                        onChange={(event) =>
+                          setParamDraft((draft) => ({
+                            ...draft,
+                            [key]: event.target.value,
+                          }))
+                        }
+                      >
+                        <option value="true">true</option>
+                        <option value="false">false</option>
+                      </select>
+                    ) : (
+                      <input
+                        className={inputClass}
+                        inputMode={
+                          spec.param_type === "integer" ||
+                          spec.param_type === "number" ||
+                          spec.param_type === "percent"
+                            ? "decimal"
+                            : "text"
+                        }
+                        value={paramDraft[key] ?? ""}
+                        onChange={(event) =>
+                          setParamDraft((draft) => ({
+                            ...draft,
+                            [key]: event.target.value,
+                          }))
+                        }
+                      />
+                    )}
+                  </label>
+                );
+              })}
+              {paramError && (
+                <p className="text-[11px] leading-snug text-danger">{paramError}</p>
+              )}
+            </div>
+            <div className="flex items-center justify-end gap-2 border-t border-line px-4 py-3">
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => {
+                  setParamTarget(null);
+                  setParamError(null);
+                }}
+                disabled={importPublication.isPending}
+              >
+                取消
+              </Button>
+              <Button
+                size="sm"
+                onClick={submitParams}
+                disabled={importPublication.isPending}
+              >
+                {importPublication.isPending ? copy.importing : "生成实例"}
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
 
       <ConfirmDialog
         open={cancelTarget !== null}
