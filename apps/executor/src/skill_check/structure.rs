@@ -155,6 +155,7 @@ pub fn parse(text: &str) -> Parsed {
         source_skill_id: None,
         source_skill_version: None,
         source_rule_id: None,
+        program: None,
     };
     let failed = issues
         .iter()
@@ -975,6 +976,7 @@ fn parse_kind(value: &Value, path: &str, issues: &mut Vec<Issue>) -> Option<Skil
         "breakout" => Some(SkillKind::Breakout),
         "ma_trend" | "ma-trend" => Some(SkillKind::MaTrend),
         "grid" => Some(SkillKind::Grid),
+        "program" | "expression" => Some(SkillKind::Program),
         other => {
             issues.push(Issue::error(
                 Dimension::Structure,
