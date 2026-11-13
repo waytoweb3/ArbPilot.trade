@@ -21,7 +21,7 @@ use crate::{
     routes::strategies,
     skill::{self, SkillKind, SkillRule, SkillSettings},
     skill_check::{self, Costs, ValidationReport},
-    skill_library::{self, RuleDiff, Skill, SkillVersion},
+    skill_library::{self, ParamsSchema, RuleDiff, Skill, SkillVersion},
     state::AppState,
 };
 
@@ -347,17 +347,7 @@ fn event_sources() -> Vec<String> {
 
 /// 当前有下单凭证的交易所，去空、去重并统一小写。
 fn available_execution_venues(state: &AppState) -> Vec<String> {
-    let mut venues: Vec<String> = state
-        .accounts
-        .list()
-        .into_iter()
-        .filter(|account| account.can_trade)
-        .map(|account| account.venue.trim().to_lowercase())
-        .filter(|venue| !venue.is_empty())
-        .collect();
-    venues.sort();
-    venues.dedup();
-    venues
+    crate::listing::tradable_venues(state)
 }
 
 /// 只保留可用项，按用户设定的顺序去重；清空表示不限。
@@ -406,6 +396,8 @@ pub struct CreateSkillRequest {
     #[serde(default)]
     pub markdown: Option<String>,
     #[serde(default)]
+    pub params_schema: Option<ParamsSchema>,
+    #[serde(default)]
     pub changelog: Option<String>,
 }
 
@@ -416,6 +408,8 @@ pub struct CreateVersionRequest {
     #[serde(default)]
     pub markdown: Option<String>,
     #[serde(default)]
+    pub params_schema: Option<ParamsSchema>,
+    #[serde(default)]
     pub changelog: Option<String>,
 }
 
@@ -425,6 +419,8 @@ pub struct ValidateSkillRequest {
     pub settings: Option<SkillSettings>,
     #[serde(default)]
     pub markdown: Option<String>,
+    #[serde(default)]
+    pub params_schema: Option<ParamsSchema>,
     #[serde(default)]
     pub version: Option<u32>,
 }
@@ -524,15 +520,20 @@ async fn skill_candles(state: &AppState, rule: &SkillRule) -> Vec<SandboxCandle>
     Vec::new()
 }
 
-/// 对一组规则跑六维校验；只校验启用的规则。
-async fn validate_settings(state: &AppState, settings: &SkillSettings) -> ValidationReport {
-    validate_with_backtests(state, settings).await.0
+/// 对一组规则跑七维校验；只校验启用的规则。
+async fn validate_settings(
+    state: &AppState,
+    settings: &SkillSettings,
+    schema: &ParamsSchema,
+) -> ValidationReport {
+    validate_with_backtests(state, settings, schema).await.0
 }
 
-/// 六维校验 + 每条启用规则的回测快照；快照只用于展示，不参与门禁判定。
+/// 七维校验 + 每条启用规则的回测快照；快照只用于展示，不参与门禁判定。
 async fn validate_with_backtests(
     state: &AppState,
     settings: &SkillSettings,
+    schema: &ParamsSchema,
 ) -> (ValidationReport, Vec<RuleBacktest>) {
     let limits = state.risk_limits();
     let enabled: Vec<&SkillRule> = settings.rules.iter().filter(|rule| rule.enabled).collect();
@@ -551,6 +552,7 @@ async fn validate_with_backtests(
         }
         backtests.extend(backtest_snapshot(state, rule, &candles));
     }
+    report.extend(skill_check::params::check(schema, settings));
     (report.view(), backtests)
 }
 
@@ -622,11 +624,15 @@ pub async fn create_skill(
     let mut skill = Skill::new(body.author_id, body.name.trim(), body.description.trim());
     skill.latest_version = 1;
     skill_library::tag_rules(&mut settings, skill.id, 1);
-    let report = validate_settings(&state, &settings).await;
+    let schema = body
+        .params_schema
+        .unwrap_or_else(|| ParamsSchema::from_settings(&settings));
+    let report = validate_settings(&state, &settings, &schema).await;
     let version = SkillVersion::new(
         skill.id,
         1,
         settings,
+        schema,
         serde_json::to_value(&report).unwrap_or_default(),
         report.passed,
         body.changelog.unwrap_or_else(|| "初始版本".to_string()),
@@ -697,11 +703,15 @@ pub async fn create_skill_version(
 
     let next = skill.latest_version.saturating_add(1).max(1);
     skill_library::tag_rules(&mut settings, skill_id, next);
-    let report = validate_settings(&state, &settings).await;
+    let schema = body
+        .params_schema
+        .unwrap_or_else(|| ParamsSchema::from_settings(&settings));
+    let report = validate_settings(&state, &settings, &schema).await;
     let version = SkillVersion::new(
         skill_id,
         next,
         settings,
+        schema,
         serde_json::to_value(&report).unwrap_or_default(),
         report.passed,
         body.changelog.unwrap_or_default(),
@@ -758,23 +768,29 @@ pub async fn validate_skill(
     Json(body): Json<ValidateSkillRequest>,
 ) -> Result<Json<SkillValidationResponse>, ApiError> {
     find_skill(state.store.skills().await, skill_id)?;
-    let settings = if body.settings.is_some() || body.markdown.is_some() {
+    let (settings, schema) = if body.settings.is_some() || body.markdown.is_some() {
         let mut settings = parse_skill_settings(&state, body.settings, body.markdown)?;
         normalize_settings(&state, &mut settings);
-        settings
+        let schema = body
+            .params_schema
+            .unwrap_or_else(|| ParamsSchema::from_settings(&settings));
+        (settings, schema)
     } else if let Some(version) = body.version {
-        state
+        let stored = state
             .store
             .skill_version(skill_id, version)
             .await
-            .ok_or_else(|| ApiError::NotFound(format!("技能版本 v{version} 不存在")))?
-            .settings
+            .ok_or_else(|| ApiError::NotFound(format!("技能版本 v{version} 不存在")))?;
+        let schema = body
+            .params_schema
+            .unwrap_or_else(|| stored.params_schema.clone());
+        (stored.settings, schema)
     } else {
         return Err(ApiError::BadRequest(
             "请提供技能参数、SKILL.md 或版本号".to_string(),
         ));
     };
-    let (report, backtests) = validate_with_backtests(&state, &settings).await;
+    let (report, backtests) = validate_with_backtests(&state, &settings, &schema).await;
     Ok(Json(SkillValidationResponse { report, backtests }))
 }
 

@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
-    skill,
+    skill::{self, SkillSettings},
     skill_check::{self, Costs},
     skill_library::{self, Skill, SkillVersion},
     state::AppState,
@@ -170,9 +170,10 @@ fn definition(name: &str, notes: &str, data: DataRules) -> StrategyDefinition {
         name: name.to_string(),
         kind: StrategyKind::Custom,
         universe: StrategyUniverse {
-            venues: vec!["binance".to_string()],
+            // 永续在前、现货腿在后：默认走永续，技能参数里可以只选现货。
+            venues: vec!["binance".to_string(), "binance-spot".to_string()],
             symbols: vec!["BTCUSDT".to_string()],
-            instruments: vec![Instrument::Perp],
+            instruments: vec![Instrument::Perp, Instrument::Spot],
         },
         entry: EntryRules {
             funding_spread_min: Decimal::ZERO,
@@ -242,9 +243,10 @@ pub async fn seed(state: &AppState) {
 ///
 /// 四个模板不再只靠模板标识特例识别：它们和用户创建的技能共用同一条
 /// 「技能 → 版本 → 发布 → 订阅 → 导入 → 规则实例」链路，发布与导入都用
-/// 这里的版本哈希校验。版本一旦写入就不再覆盖，调整默认参数只能追加新版本。
+/// 这里的版本哈希校验。
 ///
-/// 每个实例都会补齐：官方实例据此发布，用户实例也能在技能库里看到并复用同一份版本。
+/// 目前还没有外部用户，内置 v1 直接就地刷新（逻辑或参数空间变化即覆盖），
+/// 不需要为了调整参数空间另造 v2。
 pub async fn seed_skills(state: &AppState) {
     let templates: Vec<StrategyTemplate> = builtin()
         .into_iter()
@@ -260,12 +262,38 @@ pub async fn seed_skills(state: &AppState) {
         };
         let id = builtin_skill_id(&template.key);
         let existing = skills.iter().find(|item| item.id == id);
-        // 已存在 v1 且技能信息一致时保持原样：版本不可变，也不重复写库。
-        if matches!(existing, Some(skill) if skill.latest_version >= 1 && skill.name == template.name)
-            && state.store.skill_version(id, 1).await.is_some()
-        {
-            continue;
+
+        let mut settings = skill::default_settings(kind, template.definition.execution.leverage);
+        skill_library::tag_rules(&mut settings, id, 1);
+        let schema = builtin_params_schema(&template.key, &settings);
+        let mut report = skill_check::Report::default();
+        for rule in &settings.rules {
+            for issue in skill_check::evaluate_rule(rule, &limits, &candles, Costs::default()).issues
+            {
+                report.push(issue);
+            }
         }
+        report.extend(skill_check::params::check(&schema, &settings));
+        let view = report.view();
+        let version = SkillVersion::new(
+            id,
+            1,
+            settings,
+            schema,
+            serde_json::to_value(&view).unwrap_or_default(),
+            view.passed,
+            "官方内置模板",
+        );
+        let stale = match state.store.skill_version(id, 1).await {
+            Some(stored) => {
+                stored.logic_sha256 != version.logic_sha256 || stored.passed != version.passed
+            }
+            None => true,
+        };
+        if stale {
+            state.store.save_skill_version(&version).await;
+        }
+
         let mut skill = match existing {
             Some(existing) => existing.clone(),
             None => {
@@ -278,38 +306,56 @@ pub async fn seed_skills(state: &AppState) {
                 skill
             }
         };
-
-        // 已存在同号版本时保留历史冻结规则，只把技能实体补到 v1。
-        if state.store.skill_version(id, 1).await.is_none() {
-            let mut settings =
-                skill::default_settings(kind, template.definition.execution.leverage);
-            skill_library::tag_rules(&mut settings, id, 1);
-            let mut report = skill_check::Report::default();
-            for rule in &settings.rules {
-                for issue in
-                    skill_check::evaluate_rule(rule, &limits, &candles, Costs::default()).issues
-                {
-                    report.push(issue);
-                }
-            }
-            let view = report.view();
-            let version = SkillVersion::new(
-                id,
-                1,
-                settings,
-                serde_json::to_value(&view).unwrap_or_default(),
-                view.passed,
-                "官方内置模板",
-            );
-            state.store.save_skill_version(&version).await;
-        }
-
         skill.latest_version = skill.latest_version.max(1);
         skill.name = template.name.clone();
         skill.description = template.description.clone();
         skill.updated_at = Utc::now();
         state.store.save_skill(&skill).await;
     }
+}
+
+/// 官方内置策略的参数空间：在推导出的全锁死基础上，放开少量安全的可调项。
+fn builtin_params_schema(key: &str, settings: &SkillSettings) -> skill_library::ParamsSchema {
+    // (path, min, max)；0 的语义由字段自己定义（0 = 不限/自动）。
+    let fields: &[(&str, &str, &str)] = match key {
+        "turtle-breakout" => &[
+            ("business.notional_usd", "20", "10000"),
+            ("trigger.channel", "10", "120"),
+            ("trigger.lookback", "100", "1000"),
+            ("trigger.atr", "10", "60"),
+            ("trigger.atr_multiple", "1", "5"),
+            ("cautions.max_positions", "0", "10"),
+        ],
+        "ma-trend" => &[
+            ("business.notional_usd", "20", "10000"),
+            ("trigger.fast", "3", "50"),
+            ("trigger.slow", "10", "200"),
+            ("business.stop_loss_pct", "0", "30"),
+            ("cautions.max_positions", "0", "10"),
+        ],
+        "grid" => &[
+            ("business.notional_usd", "20", "10000"),
+            ("business.grid_count", "2", "50"),
+            ("business.grid_spacing_pct", "0.1", "10"),
+            ("business.grid_lower_price", "0", "1000000"),
+            ("business.grid_upper_price", "0", "1000000"),
+        ],
+        "listing-follow" => &[
+            ("business.notional_usd", "20", "10000"),
+            ("business.max_hold_hours", "0", "72"),
+            ("cautions.max_daily_opens", "0", "100"),
+        ],
+        _ => &[],
+    };
+    let mut schema = skill_library::ParamsSchema::from_settings(settings);
+    for spec in &mut schema.params {
+        if let Some((_, min, max)) = fields.iter().find(|(path, _, _)| *path == spec.path) {
+            spec.editable = true;
+            spec.min = Some(serde_json::Value::String((*min).to_string()));
+            spec.max = Some(serde_json::Value::String((*max).to_string()));
+        }
+    }
+    schema
 }
 
 /// 旧版本把带「 · BTCUSDT」的模板默认名复制进了已创建的策略。
@@ -393,14 +439,27 @@ mod tests {
                     report.push(issue);
                 }
             }
+            // 内置 v1 自带参数空间：至少有一项可改，且参数维度校验通过。
+            let schema = builtin_params_schema(key, &settings);
+            assert!(
+                schema.params.iter().any(|spec| spec.editable),
+                "{key} 没有放开任何可调参数"
+            );
+            report.extend(skill_check::params::check(&schema, &settings));
             assert!(report.view().passed, "{key} 的默认参数未通过校验");
 
             let mut imported = settings.clone();
             skill_library::tag_rules(&mut imported, id, 1);
             assert_eq!(
-                skill_library::hash_settings(&settings),
-                skill_library::hash_settings(&imported),
-                "{key} 发布与导入的规则哈希不一致"
+                skill_library::hash_logic(
+                    &skill_library::normalize_settings(&settings, &schema),
+                    &schema
+                ),
+                skill_library::hash_logic(
+                    &skill_library::normalize_settings(&imported, &schema),
+                    &schema
+                ),
+                "{key} 发布与导入的逻辑哈希不一致"
             );
         }
     }

@@ -25,7 +25,12 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{error::ApiError, state::AppState, templates::OFFICIAL_TEMPLATE_KEYS};
+use crate::{
+    error::ApiError,
+    skill_library::{self, ParamIssue, ParamValues, ParamsSchema, SkillVersion},
+    state::AppState,
+    templates::OFFICIAL_TEMPLATE_KEYS,
+};
 
 use super::strategies;
 
@@ -115,13 +120,26 @@ pub(crate) async fn seed_official(state: &AppState) {
         }
         // 内置模板已补成技能库版本：发布绑定该版本，订阅者导入时按同一份哈希校验。
         let version = crate::templates::builtin_version(state, &template.key).await;
-        let frozen = version.as_ref().and_then(|version| {
-            serde_json::to_value(&version.settings)
-                .map_err(
-                    |error| tracing::error!(%error, key = %template.key, "内置技能参数序列化失败"),
-                )
-                .ok()
-        });
+        // Skill 版只交付逻辑骨架 + 参数空间，作者填的具体值不进交付物。
+        let schema = version
+            .as_ref()
+            .map(|version| {
+                if version.params_schema.params.is_empty() {
+                    ParamsSchema::from_settings(&version.settings)
+                } else {
+                    version.params_schema.clone()
+                }
+            })
+            .unwrap_or_default();
+        let logic = version
+            .as_ref()
+            .map(|version| skill_library::normalize_settings(&version.settings, &schema));
+        let frozen = logic
+            .as_ref()
+            .and_then(|settings| serde_json::to_value(settings).ok());
+        let logic_sha256 = logic
+            .as_ref()
+            .map(|settings| skill_library::hash_logic(settings, &schema));
 
         let publication = StrategyPublication {
             id: official_publication_id(&template.key),
@@ -151,21 +169,19 @@ pub(crate) async fn seed_official(state: &AppState) {
                 .map(|publication| publication.status)
                 .unwrap_or(PublicationStatus::Published),
             artifact_sha256: None,
-            // 官方模板以技能参数交付，订阅者无需沙箱模块即可运行。
+            // 官方模板以「逻辑 + 参数空间」交付，订阅者无需沙箱模块即可运行。
             skill: Some(SkillBinding {
                 template_key: template.key.clone(),
                 settings: frozen,
                 skill_id: version.as_ref().map(|version| version.skill_id),
                 skill_version: version.as_ref().map(|version| version.version),
-                skill_sha256: version
-                    .as_ref()
-                    .map(|version| version.settings_sha256.clone()),
+                skill_sha256: logic_sha256.clone(),
+                params_schema: serde_json::to_value(&schema).ok(),
+                param_constraints: None,
             }),
             skill_id: version.as_ref().map(|version| version.skill_id),
             skill_version: version.as_ref().map(|version| version.version),
-            skill_sha256: version
-                .as_ref()
-                .map(|version| version.settings_sha256.clone()),
+            skill_sha256: logic_sha256,
             definition: Some(definition),
             changelog: existing
                 .as_ref()
@@ -335,6 +351,9 @@ pub struct CreatePublicationRequest {
     pub skill_id: Option<Uuid>,
     #[serde(default)]
     pub skill_version: Option<u32>,
+    /// 作者加在参数空间之上的更严格约束；必须落在版本参数空间内。
+    #[serde(default)]
+    pub param_constraints: Option<ParamsSchema>,
 }
 
 pub async fn create_publication(
@@ -352,6 +371,7 @@ pub async fn create_publication(
     if record.source_publication_id.is_some() {
         return Err(ApiError::Conflict("订阅导入的策略不能再次发布".to_string()));
     }
+    let mut skill_parts = None;
     let skill_version = match (body.skill_id, body.skill_version) {
         (Some(skill_id), Some(version)) => {
             let skill = state
@@ -378,6 +398,7 @@ pub async fn create_publication(
                     "技能版本未通过校验，不能发布".to_string(),
                 ));
             }
+            skill_parts = Some(skill_bundle_parts(&version, body.param_constraints.as_ref())?);
             Some(version)
         }
         (None, None) => None,
@@ -387,6 +408,12 @@ pub async fn create_publication(
             ))
         }
     };
+    if skill_version.is_none() {
+        // 市场只卖 Skill：发布必须绑定技能库版本，参数空间随版本交付。
+        return Err(ApiError::BadRequest(
+            "请选择要发布的技能与版本".to_string(),
+        ));
+    }
 
     let now = Utc::now();
     let runtime = body.runtime.unwrap_or_else(|| {
@@ -433,18 +460,21 @@ pub async fn create_publication(
         // 新建发布始终是私有草稿，发布需要显式调用 publish。
         status: PublicationStatus::Private,
         artifact_sha256: None,
-        skill: skill_version.as_ref().map(|version| SkillBinding {
+        skill: skill_parts.as_ref().map(|parts| SkillBinding {
             template_key: "skill".to_string(),
-            settings: serde_json::to_value(&version.settings).ok(),
-            skill_id: Some(version.skill_id),
-            skill_version: Some(version.version),
-            skill_sha256: Some(version.settings_sha256.clone()),
+            settings: serde_json::to_value(&parts.logic).ok(),
+            skill_id: skill_version.as_ref().map(|version| version.skill_id),
+            skill_version: skill_version.as_ref().map(|version| version.version),
+            skill_sha256: Some(parts.sha256.clone()),
+            params_schema: serde_json::to_value(&parts.schema).ok(),
+            param_constraints: body
+                .param_constraints
+                .as_ref()
+                .and_then(|constraints| serde_json::to_value(constraints).ok()),
         }),
         skill_id: skill_version.as_ref().map(|version| version.skill_id),
         skill_version: skill_version.as_ref().map(|version| version.version),
-        skill_sha256: skill_version
-            .as_ref()
-            .map(|version| version.settings_sha256.clone()),
+        skill_sha256: skill_parts.as_ref().map(|parts| parts.sha256.clone()),
         definition: None,
         changelog,
         created_at: now,
@@ -568,13 +598,22 @@ pub async fn update_publication(
                         "技能版本未通过校验，不能发布".to_string(),
                     ));
                 }
-                publication.skill_sha256 = Some(version.settings_sha256.clone());
+                // 约束在创建发布时确定，重新发布沿用同一组约束。
+                let retained = publication
+                    .skill
+                    .as_ref()
+                    .and_then(|binding| binding.param_constraints.clone());
+                let constraints = schema_from_value(retained.as_ref())?;
+                let parts = skill_bundle_parts(&version, constraints.as_ref())?;
+                publication.skill_sha256 = Some(parts.sha256.clone());
                 publication.skill = Some(SkillBinding {
                     template_key: "skill".to_string(),
-                    settings: serde_json::to_value(&version.settings).ok(),
+                    settings: serde_json::to_value(&parts.logic).ok(),
                     skill_id: Some(skill_id),
                     skill_version: Some(version.version),
-                    skill_sha256: Some(version.settings_sha256.clone()),
+                    skill_sha256: Some(parts.sha256),
+                    params_schema: serde_json::to_value(&parts.schema).ok(),
+                    param_constraints: retained,
                 });
             } else {
                 // 路径 A：技能参数以作者当前生效的规则为准。
@@ -854,7 +893,7 @@ pub async fn cancel_subscription(
 // 订阅交付：把发布版本的代码与定义交付到订阅者自己的执行器
 // ---------------------------------------------------------------------------
 
-/// 一次发布的可运行交付物：冻结的定义 + 沙箱模块或技能参数。
+/// 一次发布的可运行交付物：冻结的定义 + 沙箱模块或「逻辑 + 参数空间」。
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PublicationBundle {
     pub publication_id: Uuid,
@@ -866,9 +905,12 @@ pub struct PublicationBundle {
     /// 沙箱模块字节（Base64）；技能参数交付时为空。
     #[serde(default)]
     pub wasm_base64: Option<String>,
-    /// 发布时冻结的技能参数；存在时订阅者无需沙箱模块即可运行。
+    /// 发布时冻结的技能基线（逻辑骨架与默认值）；存在时订阅者无需沙箱模块即可运行。
     #[serde(default)]
     pub skill: Option<SkillBinding>,
+    /// 买家可填的参数空间；与 `skill` 同时出现时按参数空间生成实例。
+    #[serde(default)]
+    pub params_schema: Option<ParamsSchema>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -890,6 +932,18 @@ pub async fn publication_bundle(
 #[derive(Debug, Deserialize)]
 pub struct ImportPublicationRequest {
     pub subscriber_id: Uuid,
+    /// 买家填写的一组参数；Skill 版缺省时按默认值生成。
+    #[serde(default)]
+    pub param_values: Option<ParamValues>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ImportBundleRequest {
+    #[serde(flatten)]
+    pub bundle: PublicationBundle,
+    /// 买家填写的一组参数；技能版缺省时按默认值生成。
+    #[serde(default)]
+    pub param_values: Option<ParamValues>,
 }
 
 /// 本地执行器导入官方交付物：官方发布不在本地数据库，因此直接接收交付物本身。
@@ -897,12 +951,13 @@ pub struct ImportPublicationRequest {
 /// 模块哈希必须与交付物声明一致，导入后作为一条自托管策略落库，可编辑、配置与执行。
 pub async fn import_bundle(
     State(state): State<AppState>,
-    Json(bundle): Json<PublicationBundle>,
+    Json(body): Json<ImportBundleRequest>,
 ) -> Result<(StatusCode, Json<arb_core::StrategyRecord>), ApiError> {
-    let title = bundle.definition.name.clone();
+    let title = body.bundle.definition.name.clone();
     let record = install_bundle(
         &state,
-        bundle,
+        body.bundle,
+        body.param_values,
         title,
         state.risk_limits().max_order_notional_usd,
         "从策略市场导入",
@@ -926,6 +981,31 @@ pub async fn import_publication(
     let record = install_bundle(
         &state,
         bundle,
+        body.param_values,
+        title,
+        suggested_max_notional_usd,
+        "从策略市场导入",
+    )
+    .await?;
+    Ok((StatusCode::CREATED, Json(record)))
+}
+
+/// 买家提交自己的参数并生成实例；未填写的参数取默认值。
+pub async fn instantiate_publication(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<ImportPublicationRequest>,
+) -> Result<(StatusCode, Json<arb_core::StrategyRecord>), ApiError> {
+    let publication = find_publication(&state, id).await?;
+    ensure_entitled(&state, &publication, Some(body.subscriber_id)).await?;
+    let bundle = load_bundle(&state, &publication).await?;
+
+    let title = publication.title.clone();
+    let suggested_max_notional_usd = publication.suggested_max_notional_usd;
+    let record = install_bundle(
+        &state,
+        bundle,
+        body.param_values,
         title,
         suggested_max_notional_usd,
         "从策略市场导入",
@@ -936,10 +1016,11 @@ pub async fn import_publication(
 
 /// 校验交付载体并把冻结定义落库为一条可自托管的策略。
 ///
-/// 交付物可以是沙箱模块，也可以是技能参数；至少要有其一，否则导入后无法运行。
+/// 交付物可以是沙箱模块，也可以是「逻辑 + 参数空间」；至少要有其一，否则导入后无法运行。
 async fn install_bundle(
     state: &AppState,
     bundle: PublicationBundle,
+    param_values: Option<ParamValues>,
     title: String,
     suggested_max_notional_usd: Decimal,
     note: &str,
@@ -950,6 +1031,7 @@ async fn install_bundle(
         artifact_sha256,
         wasm_base64,
         skill,
+        params_schema,
         ..
     } = bundle;
 
@@ -1026,7 +1108,15 @@ async fn install_bundle(
     record.source_publication_id = Some(publication_id);
     record.sandbox = sandbox;
     let mut skill = skill;
-    // 技能参数以冻结快照交付；带哈希时先校验再落库，避免导入被篡改的规则。
+    // 参数空间随交付物下发；缺失时回落到绑定里的副本。
+    let schema = params_schema
+        .or_else(|| {
+            skill
+                .as_ref()
+                .and_then(|binding| binding.params_schema.clone())
+                .and_then(|value| serde_json::from_value::<ParamsSchema>(value).ok())
+        })
+        .unwrap_or_default();
     let mut frozen_skill_settings = skill
         .as_ref()
         .and_then(|binding| binding.settings.clone())
@@ -1038,15 +1128,23 @@ async fn install_bundle(
     if let (Some(settings), Some(binding)) = (frozen_skill_settings.as_mut(), skill.as_ref()) {
         if let Some(skill_id) = binding.skill_id {
             let expected = binding.skill_sha256.as_deref().ok_or_else(|| {
-                ApiError::Conflict("技能库版本缺少规则哈希，已拒绝导入".to_string())
+                ApiError::Conflict("技能库版本缺少逻辑哈希，已拒绝导入".to_string())
             })?;
             crate::skill_library::tag_rules(settings, skill_id, binding.skill_version.unwrap_or(1));
-            let actual = crate::skill_library::hash_settings(settings);
+            // 先还原逻辑基线（默认值），再套用买家参数；哈希只覆盖逻辑与参数空间。
+            let baseline = crate::skill_library::normalize_settings(settings, &schema);
+            let applied = match param_values.as_ref() {
+                Some(values) => crate::skill_library::apply_params(&baseline, &schema, values)
+                    .map_err(param_error)?,
+                None => baseline,
+            };
+            let actual = crate::skill_library::hash_logic(&applied, &schema);
             if actual != expected {
                 return Err(ApiError::Conflict(
-                    "技能参数与发布哈希不一致，已拒绝导入".to_string(),
+                    "技能逻辑与发布哈希不一致，已拒绝导入".to_string(),
                 ));
             }
+            *settings = applied;
         }
     }
     if let (Some(settings), Some(binding)) = (frozen_skill_settings.as_ref(), skill.as_mut()) {
@@ -1122,8 +1220,9 @@ async fn load_bundle(
     let definition = publication.definition.clone().ok_or_else(|| {
         ApiError::Conflict("该发布缺少冻结的策略定义，请作者重新发布".to_string())
     })?;
-    // 技能参数是完整的运行载体，不需要沙箱模块字节。
+    // 「逻辑 + 参数空间」是完整的运行载体，不需要沙箱模块字节。
     if let Some(skill) = publication.skill.clone() {
+        let schema = schema_from_value(skill.params_schema.as_ref())?.unwrap_or_default();
         return Ok(PublicationBundle {
             publication_id: publication.id,
             strategy_version: publication.strategy_version,
@@ -1131,6 +1230,7 @@ async fn load_bundle(
             artifact_sha256: None,
             wasm_base64: None,
             skill: Some(skill),
+            params_schema: Some(schema),
         });
     }
     let sha256 = publication.artifact_sha256.clone().ok_or_else(|| {
@@ -1156,6 +1256,7 @@ async fn load_bundle(
         artifact_sha256: Some(sha256),
         wasm_base64: Some(BASE64.encode(wasm)),
         skill: None,
+        params_schema: None,
     })
 }
 
@@ -1197,11 +1298,11 @@ pub async fn create_settlement(
     Json(body): Json<CreateSettlementRequest>,
 ) -> Result<(StatusCode, Json<StrategySettlement>), ApiError> {
     let period = body.period.unwrap_or_else(|| settlement_period(Utc::now()));
-    if period_bounds(&period).is_none() {
+    let Some((period_start, period_end)) = period_bounds(&period) else {
         return Err(ApiError::BadRequest(
             "结算周期格式必须为 YYYY-MM".to_string(),
         ));
-    }
+    };
 
     let snapshot = state.store.market_snapshot().await;
     if let Some(existing) = snapshot
@@ -1225,6 +1326,7 @@ pub async fn create_settlement(
         )));
     }
 
+    // 买断收入只在购买当月计入一次，避免每个周期重复结算同一笔永久授权。
     let billable: Vec<&StrategySubscription> = snapshot
         .subscriptions
         .iter()
@@ -1235,11 +1337,14 @@ pub async fn create_settlement(
                 SubscriptionStatus::Active | SubscriptionStatus::Cancelled
             )
         })
+        .filter(|subscription| {
+            subscription.started_at >= period_start && subscription.started_at < period_end
+        })
         .filter(|subscription| subscription.monthly_price_usd > Decimal::ZERO)
         .collect();
 
     if billable.is_empty() {
-        return Err(ApiError::Conflict("该周期没有付费订阅可结算".to_string()));
+        return Err(ApiError::Conflict("该周期没有买断订单可结算".to_string()));
     }
 
     let gross: Decimal = billable
@@ -1328,4 +1433,55 @@ fn ensure_valid(issues: &[arb_core::ValidationIssue]) -> Result<(), ApiError> {
         .collect::<Vec<_>>()
         .join("；");
     Err(ApiError::BadRequest(message))
+}
+
+/// 发布的交付物：收窄后的参数空间、逻辑基线、以及对应的哈希。
+struct SkillParts {
+    schema: ParamsSchema,
+    logic: crate::skill::SkillSettings,
+    sha256: String,
+}
+
+/// Skill 版只交付逻辑骨架与参数空间；买家取值在导入时再应用。
+fn skill_bundle_parts(
+    version: &SkillVersion,
+    constraints: Option<&ParamsSchema>,
+) -> Result<SkillParts, ApiError> {
+    let base = if version.params_schema.params.is_empty() {
+        // 旧版本没有显式参数空间：按「全部锁死」推导，等价于原配置版。
+        ParamsSchema::from_settings(&version.settings)
+    } else {
+        version.params_schema.clone()
+    };
+    let effective = match constraints {
+        Some(constraints) if !constraints.params.is_empty() => {
+            base.intersect(constraints).map_err(param_error)?
+        }
+        _ => base,
+    };
+    let logic = skill_library::normalize_settings(&version.settings, &effective);
+    let sha256 = skill_library::hash_logic(&logic, &effective);
+    Ok(SkillParts {
+        schema: effective,
+        logic,
+        sha256,
+    })
+}
+
+fn schema_from_value(value: Option<&serde_json::Value>) -> Result<Option<ParamsSchema>, ApiError> {
+    value
+        .map(|value| {
+            serde_json::from_value::<ParamsSchema>(value.clone())
+                .map_err(|error| ApiError::BadRequest(format!("参数空间无法解析: {error}")))
+        })
+        .transpose()
+}
+
+fn param_error(issues: Vec<ParamIssue>) -> ApiError {
+    let message = issues
+        .iter()
+        .map(|issue| format!("{} · {}：{}", issue.rule_key, issue.path, issue.message))
+        .collect::<Vec<_>>()
+        .join("；");
+    ApiError::BadRequest(message)
 }

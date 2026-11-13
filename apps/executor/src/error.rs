@@ -125,7 +125,7 @@ mod tests {
             ApiError::SkillValidation(report) => json!(report),
             _ => json!(null),
         };
-        assert_eq!(body["dimensions"].as_array().map(Vec::len), Some(6));
+        assert_eq!(body["dimensions"].as_array().map(Vec::len), Some(7));
         assert_eq!(body["passed"], json!(false));
     }
 }

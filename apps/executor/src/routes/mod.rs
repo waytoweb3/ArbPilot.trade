@@ -167,6 +167,10 @@ pub fn build(state: AppState) -> Router {
             "/market/publications/{id}/import",
             post(market::import_publication),
         )
+        .route(
+            "/market/publications/{id}/instantiate",
+            post(market::instantiate_publication),
+        )
         .route("/market/subscriptions", get(market::list_subscriptions))
         .route(
             "/market/subscriptions/{id}",

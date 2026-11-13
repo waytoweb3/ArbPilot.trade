@@ -82,11 +82,17 @@ pub async fn instantiate(
                 settings: if template.key == "listing-follow" {
                     None
                 } else {
-                    serde_json::to_value(&version.settings).ok()
+                    serde_json::to_value(crate::skill_library::normalize_settings(
+                        &version.settings,
+                        &version.params_schema,
+                    ))
+                    .ok()
                 },
                 skill_id: Some(version.skill_id),
                 skill_version: Some(version.version),
-                skill_sha256: Some(version.settings_sha256),
+                skill_sha256: Some(version.logic_sha256.clone()),
+                params_schema: serde_json::to_value(&version.params_schema).ok(),
+                param_constraints: None,
             },
             None => SkillBinding {
                 template_key: template.key.clone(),

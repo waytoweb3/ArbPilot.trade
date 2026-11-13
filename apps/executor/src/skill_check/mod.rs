@@ -17,6 +17,7 @@
 mod agent;
 mod backtest;
 mod math;
+pub mod params;
 mod rules;
 mod safety;
 pub mod structure;
@@ -38,6 +39,7 @@ pub enum Dimension {
     Backtest,
     Agent,
     Safety,
+    Params,
 }
 
 impl Dimension {
@@ -49,6 +51,7 @@ impl Dimension {
             Self::Backtest => "回测结果可信",
             Self::Agent => "Agent 按预期调用",
             Self::Safety => "交易安全",
+            Self::Params => "参数空间可用",
         }
     }
 }
@@ -149,7 +152,7 @@ impl Report {
             .any(|issue| issue.dimension == dimension && issue.severity == Severity::Error)
     }
 
-    /// 六个维度的一句话结论；顺序固定，便于比对。
+    /// 七个维度的一句话结论；顺序固定，便于比对。
     pub fn summary(&self) -> String {
         [
             Dimension::Structure,
@@ -158,6 +161,7 @@ impl Report {
             Dimension::Backtest,
             Dimension::Agent,
             Dimension::Safety,
+            Dimension::Params,
         ]
         .into_iter()
         .map(|dimension| {
@@ -206,7 +210,7 @@ impl ValidationReport {
 }
 
 impl Report {
-    /// 转成固定六维的对外报告；没有 `Error` 即整体通过。
+    /// 转成固定七维的对外报告；没有 `Error` 即整体通过。
     pub fn view(&self) -> ValidationReport {
         let dimensions = [
             Dimension::Structure,
@@ -215,6 +219,7 @@ impl Report {
             Dimension::Backtest,
             Dimension::Agent,
             Dimension::Safety,
+            Dimension::Params,
         ]
         .into_iter()
         .map(|dimension| {
@@ -287,7 +292,32 @@ pub fn evaluate_rule(
     report.extend(agent::check(rule));
     report.extend(safety::check(rule, limits));
     report.extend(backtest::check(rule, candles, costs));
+    if rule.kind == crate::skill::SkillKind::Program {
+        report.extend(check_program(rule));
+    }
     report
+}
+
+/// 通用表达式的结构校验：AST、参数引用、周期与风控边界。
+fn check_program(rule: &SkillRule) -> Vec<Issue> {
+    let Some(program) = rule.program.as_ref() else {
+        return vec![Issue::error(
+            Dimension::Structure,
+            "program.missing",
+            "通用表达式规则缺少 program 定义".to_string(),
+        )];
+    };
+    program
+        .validate()
+        .into_iter()
+        .map(|issue| {
+            Issue::error(
+                Dimension::Structure,
+                "program.invalid",
+                format!("{}：{}", issue.path, issue.message),
+            )
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -360,7 +390,7 @@ cautions:
         }
         let view = evaluation.report.view();
         assert!(view.passed);
-        assert_eq!(view.dimensions.len(), 6);
+        assert_eq!(view.dimensions.len(), 7);
         assert!(view.blockers().next().is_none());
     }
 
