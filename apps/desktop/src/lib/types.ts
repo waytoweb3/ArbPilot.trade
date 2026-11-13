@@ -122,7 +122,106 @@ export interface ListingSettingsResponse {
 export type SkillAction = "open_long" | "notify_only";
 
 /** 技能的触发方式，对应「什么时候调用」这一章的具体形态。 */
-export type SkillKind = "event" | "breakout" | "ma_trend" | "grid";
+export type SkillKind = "event" | "breakout" | "ma_trend" | "grid" | "program";
+
+/** 通用表达式可读取的行情序列。 */
+export type ProgramSeries =
+  | "open"
+  | "high"
+  | "low"
+  | "close"
+  | "volume"
+  | "funding_rate"
+  | "open_interest";
+
+/** 可组合的指标原语；新增指标由求值器扩展，策略本身只是数据。 */
+export type ProgramPrimitive =
+  | "sma"
+  | "ema"
+  | "rsi"
+  | "atr"
+  | "donchian_high"
+  | "donchian_low"
+  | "highest"
+  | "lowest"
+  | "stddev"
+  | "abs"
+  | "max"
+  | "min"
+  | "shift";
+
+export type ProgramBinOp =
+  | "add"
+  | "sub"
+  | "mul"
+  | "div"
+  | "gt"
+  | "gte"
+  | "lt"
+  | "lte"
+  | "eq"
+  | "neq"
+  | "cross_above"
+  | "cross_below"
+  | "and"
+  | "or";
+
+export type ProgramUnOp = "neg" | "not";
+
+/** 策略表达式；与 `arb_core::program::Expr` 的 serde 形态一致。 */
+export type ProgramExpr =
+  | { type: "const"; value: Decimal }
+  | { type: "param"; key: string }
+  | { type: "series"; series: ProgramSeries }
+  | { type: "call"; primitive: ProgramPrimitive; args: ProgramExpr[] }
+  | { type: "binary"; op: ProgramBinOp; left: ProgramExpr; right: ProgramExpr }
+  | { type: "unary"; op: ProgramUnOp; value: ProgramExpr };
+
+/** 一个可配置参数；`value` 是作者默认值，买家在参数空间内覆盖。 */
+export interface ProgramParam {
+  label?: string;
+  value: Decimal;
+  min?: Decimal | null;
+  max?: Decimal | null;
+  step?: Decimal | null;
+  editable?: boolean;
+}
+
+export interface ProgramData {
+  timeframe: string;
+  lookback: number;
+}
+
+export type ProgramDirection = "both" | "long" | "short";
+
+export interface ProgramSizing {
+  notional_usd: Decimal;
+  risk_pct: Decimal;
+}
+
+export interface ProgramRisk {
+  stop_loss_pct: Decimal;
+  take_profit_pct: Decimal;
+  trailing_stop_pct: Decimal;
+  max_hold_hours: Decimal;
+  cooldown_hours: Decimal;
+}
+
+/** 一条完整策略程序；策略是数据，新增策略不需要新增 SkillKind。 */
+export interface StrategyProgram {
+  schema_version?: number;
+  name?: string;
+  description?: string;
+  data: ProgramData;
+  params: Record<string, ProgramParam>;
+  entry_long?: ProgramExpr | null;
+  entry_short?: ProgramExpr | null;
+  exit?: ProgramExpr | null;
+  filters?: ProgramExpr[];
+  direction?: ProgramDirection;
+  sizing: ProgramSizing;
+  risk: ProgramRisk;
+}
 
 /** 指标类技能允许的开仓方向。 */
 export type SkillDirection = "both" | "long" | "short";
@@ -274,6 +373,8 @@ export interface SkillRule {
   source_skill_version?: number | null;
   /** 来源版本里的原始规则 ID，用于升级时对齐并保留本地启停状态。 */
   source_rule_id?: string | null;
+  /** 通用表达式程序；仅 `kind === "program"` 时存在。 */
+  program?: StrategyProgram | null;
 }
 
 export interface SkillSettings {
@@ -481,12 +582,57 @@ export interface StrategyRunsResponse {
 export interface SkillBinding {
   /** 内置模板标识，如 `turtle-breakout`；技能库版本为 `skill`。 */
   template_key: string;
-  /** 冻结的技能参数；为空表示按模板补默认值。 */
+  /** 冻结的技能基线（逻辑骨架与默认值）；为空表示按模板补默认值。 */
   settings?: unknown | null;
   /** 技能库版本溯源。 */
   skill_id?: string | null;
   skill_version?: number | null;
+  /** 逻辑 + 参数空间的哈希，不含买家填的值。 */
   skill_sha256?: string | null;
+  /** 买家可填的参数空间。 */
+  params_schema?: ParamsSchema | null;
+  /** 作者在参数空间之上给出的更严格约束。 */
+  param_constraints?: ParamsSchema | null;
+}
+
+export type ParamType =
+  | "number"
+  | "percent"
+  | "integer"
+  | "boolean"
+  | "string_list"
+  | { enum: { options: string[] } };
+
+export type Sensitivity = "low" | "medium" | "high";
+
+/** 一个可配置参数的定义。 */
+export interface ParamSpec {
+  rule_key: string;
+  path: string;
+  label: string;
+  param_type: ParamType;
+  default: unknown;
+  min?: unknown | null;
+  max?: unknown | null;
+  step?: unknown | null;
+  sensitivity: Sensitivity;
+  required: boolean;
+  /** false 表示作者锁死，买家不可修改。 */
+  editable: boolean;
+}
+
+export interface ParamsSchema {
+  params: ParamSpec[];
+}
+
+export interface ParamValue {
+  rule_key: string;
+  path: string;
+  value: unknown;
+}
+
+export interface ParamValues {
+  values: ParamValue[];
 }
 
 /** 技能库实体：作者侧唯一事实来源。 */
@@ -551,7 +697,11 @@ export interface SkillVersion {
   skill_id: string;
   version: number;
   settings: SkillSettings;
+  /** 作者定义的参数空间；买家按它填值生成实例。 */
+  params_schema: ParamsSchema;
   settings_sha256: string;
+  /** 逻辑 + 参数空间的哈希，不含买家填的值。 */
+  logic_sha256: string;
   validation: SkillValidationReport;
   passed: boolean;
   changelog: string;
@@ -1110,7 +1260,7 @@ export type MarketVisibility = "invite_only" | "public";
 
 export type PublicationStatus = "private" | "published" | "withdrawn";
 
-export type PricingModel = "free" | "monthly";
+export type PricingModel = "free" | "one_time";
 
 /** 表现记录来源：作者自报与平台可复现记录分开统计。 */
 export type PerformanceSource =
@@ -1133,7 +1283,7 @@ export interface StrategyAuthorCard {
 
 export interface StrategyPricing {
   model: PricingModel;
-  /** 月费（美元），免费策略必须为 0。 */
+  /** 买断价（美元），免费策略必须为 0。 */
   monthly_price_usd: Decimal;
   trial_days: number;
 }
@@ -1180,17 +1330,19 @@ export interface StrategyPublication {
   updated_at: string;
 }
 
-/** 订阅可下载的策略交付物：冻结的定义 + 沙箱模块或技能参数。 */
+/** 订阅可下载的策略交付物：冻结的定义 + 沙箱模块或「逻辑 + 参数空间」。 */
 export interface PublicationBundle {
   publication_id: string;
   strategy_version: number;
   definition: StrategyDefinition;
-  /** 沙箱模块哈希；技能参数交付时为空。 */
+  /** 沙箱模块哈希；技能交付时为空。 */
   artifact_sha256?: string | null;
-  /** 沙箱模块字节（Base64）；技能参数交付时为空。 */
+  /** 沙箱模块字节（Base64）；技能交付时为空。 */
   wasm_base64?: string | null;
-  /** 发布时冻结的技能参数；存在时无需沙箱模块即可运行。 */
+  /** 发布时冻结的基线；存在时无需沙箱模块即可运行。 */
   skill?: SkillBinding | null;
+  /** 买家可填的参数空间；存在时导入需要先填参数。 */
+  params_schema?: ParamsSchema | null;
 }
 
 /** 版本化表现记录，必须绑定策略版本、区间与成本假设。 */
@@ -1224,6 +1376,7 @@ export interface StrategySubscription {
   author_id: string;
   subscriber_id: string;
   status: SubscriptionStatus;
+  /** 买断价（美元）；免费策略为 0。 */
   monthly_price_usd: Decimal;
   trial_ends_at: string | null;
   current_period_end: string | null;
@@ -1357,6 +1510,8 @@ export interface CreatePublicationRequest {
   /** 绑定技能库版本发布；同一 Skill 可发布多条不同定义的策略。 */
   skill_id?: string | null;
   skill_version?: number | null;
+  /** 发布时在版本参数空间之上附加的更严格约束。 */
+  param_constraints?: ParamsSchema | null;
 }
 
 export interface UpdatePublicationRequest {

@@ -92,6 +92,7 @@ import type {
   SkillSettings,
   SourceVisibility,
   StrategyExecutionMode,
+  StrategyProgram,
   StrategyRecord,
   StrategyStatus,
 } from "../lib/types";
@@ -150,15 +151,19 @@ function skillBaseName(name: string): string {
 /** 识别策略属于哪种技能触发方式；非内置技能策略返回 null。 */
 function skillKind(record: StrategyRecord): SkillKind | null {
   const key = record.skill?.template_key;
+  // 技能库版本用通用 `skill` 标识交付，触发方式以冻结规则为准，
+  // 这样同一份 SKILL.md 载体既能承载公告、指标，也能承载通用表达式。
+  const frozen = record.skill?.settings as SkillSettings | null | undefined;
+  const inferred = frozen?.rules?.[0]?.kind;
+  if (key === "skill") {
+    return inferred ?? "event";
+  }
   if (key) {
     const mapped = SKILL_KINDS_BY_TEMPLATE_KEY[key];
     if (mapped) {
       return mapped;
     }
   }
-  // 技能库版本用通用 `skill` 标识交付，触发方式以冻结规则为准。
-  const frozen = record.skill?.settings as SkillSettings | null | undefined;
-  const inferred = frozen?.rules?.[0]?.kind;
   if (inferred) {
     return inferred;
   }
@@ -779,8 +784,11 @@ function StrategyScopeCard({
 function venueLabel(venue: string): string {
   const labels: Record<string, string> = {
     binance: "Binance",
+    "binance-spot": "Binance 现货",
     okx: "OKX",
+    "okx-spot": "OKX 现货",
     bybit: "Bybit",
+    "bybit-spot": "Bybit 现货",
     bitget: "Bitget",
     gate: "Gate",
     upbit: "Upbit",
@@ -1423,8 +1431,10 @@ interface SkillRuleDraft {
   enabled: boolean;
   /** 技能用途：这条技能负责识别什么、做什么。 */
   purpose: string;
-  /** 触发方式：公告、通道突破、均线趋势或网格。 */
+  /** 触发方式：公告、通道突破、均线趋势、网格或通用表达式。 */
   kind: SkillKind;
+  /** 通用表达式程序；仅 program 规则使用，编辑时原样保留。 */
+  program?: StrategyProgram | null;
   eventSources: string[];
   /** 触发关键词，用逗号或空格分隔。 */
   keywords: string;
@@ -1555,6 +1565,18 @@ function skillKindDefaults(kind: SkillKind): Partial<SkillRuleDraft> {
         gridShift: "none",
         gridCloseOnFail: false,
       };
+    case "program":
+      return {
+        timeframe: "1h",
+        lookback: "300",
+        direction: "both",
+        riskPct: "1",
+        riskReward: "2",
+        maxPositions: "3",
+        cooldownHours: "4",
+        takeProfit: "0",
+        stopLoss: "0",
+      };
     default:
       return {};
   }
@@ -1638,6 +1660,7 @@ function skillDraftFrom(rule: SkillRule): SkillRuleDraft {
     enabled: rule.enabled ?? true,
     purpose: rule.purpose,
     kind: rule.kind ?? "event",
+    program: rule.program ?? null,
     eventSources: rule.trigger.event_sources,
     keywords: rule.trigger.event_keywords.join(", "),
     eventWindow: String(rule.trigger.event_window_secs),
@@ -1796,6 +1819,29 @@ function StrategySkillScopeCard({
 
   /** 「添加均线」输入框的临时值。 */
   const [maInput, setMaInput] = useState<Record<string, string>>({});
+
+  /** 通用表达式编辑框的临时 JSON 文本；提交时才解析，避免每次按键都报错。 */
+  const [programInput, setProgramInput] = useState<Record<string, string>>({});
+
+  /** 把编辑框里的 JSON 写回规则；格式错误时保留原文并提示。 */
+  const commitProgram = (key: string) => {
+    const text = programInput[key];
+    if (text === undefined) {
+      return;
+    }
+    try {
+      const parsed = JSON.parse(text) as StrategyProgram;
+      patchRule(key, { program: parsed });
+      setProgramInput((previous) => {
+        const next = { ...previous };
+        delete next[key];
+        return next;
+      });
+      setNotice(null);
+    } catch {
+      setNotice({ tone: "error", text: t.strategies.skillProgramInvalid });
+    }
+  };
 
   /** 添加一条均线周期；唯一性由 parsePeriods 保证。 */
   const addMaPeriod = (key: string, current: string) => {
@@ -2068,12 +2114,37 @@ function StrategySkillScopeCard({
         setNotice({ tone: "error", text: t.strategies.skillInvalid });
         return null;
       }
+      // 通用表达式：保留作者定义的 AST，只把界面上的周期、风控与金额同步进程序，
+      // 避免编辑一次就丢掉整个策略程序。
+      const program =
+        rule.kind === "program" && rule.program
+          ? {
+              ...rule.program,
+              data: {
+                timeframe: rule.timeframe,
+                lookback: Number.isFinite(lookback) ? lookback : 300,
+              },
+              sizing: {
+                ...rule.program.sizing,
+                notional_usd: amount,
+                risk_pct: riskPct,
+              },
+              risk: {
+                ...rule.program.risk,
+                take_profit_pct: tp,
+                stop_loss_pct: sl,
+                max_hold_hours: maxHoldHours,
+                cooldown_hours: cooldownHours,
+              },
+            }
+          : null;
       payload.push({
         id: rule.key,
         name: rule.name.trim(),
         enabled: rule.enabled,
         purpose: rule.purpose.trim(),
         kind: rule.kind,
+        ...(program ? { program } : {}),
         trigger: {
           event_sources: rule.eventSources,
           event_keywords: parseKeywords(rule.keywords),
@@ -2288,7 +2359,9 @@ function StrategySkillScopeCard({
                 ? `${rule.timeframe} · ${rule.gridLevels} 档 · ${rule.gridSpacing}%`
                 : rule.kind === "ma_trend"
                   ? `${rule.timeframe} · ${maList.map((period) => `MA${period}`).join("/")}`
-                  : `${rule.timeframe} · 系统一 ${rule.entry1}/${rule.exit1} · 系统二 ${rule.entry2}/${rule.exit2}`;
+                  : rule.kind === "program"
+                    ? `${rule.timeframe} · ${rule.program?.name?.trim() || t.strategies.skillProgramTitle}`
+                    : `${rule.timeframe} · 系统一 ${rule.entry1}/${rule.exit1} · 系统二 ${rule.entry2}/${rule.exit2}`;
           const target =
             rule.kind === "grid"
               ? `${rule.notional} USD × ${rule.gridShare}%`
@@ -2483,6 +2556,32 @@ function StrategySkillScopeCard({
                             />
                           </label>
                         </div>
+                        {rule.kind === "program" && (
+                          <div className="space-y-1.5">
+                            <span className="text-[11px] font-medium text-main">
+                              {t.strategies.skillProgramTitle}
+                            </span>
+                            <textarea
+                              className={cn(inputClass, "min-h-48 font-mono text-[11px]")}
+                              spellCheck={false}
+                              disabled={!editingRule}
+                              value={
+                                programInput[rule.key] ??
+                                JSON.stringify(rule.program ?? {}, null, 2)
+                              }
+                              onChange={(event) =>
+                                setProgramInput((previous) => ({
+                                  ...previous,
+                                  [rule.key]: event.target.value,
+                                }))
+                              }
+                              onBlur={() => commitProgram(rule.key)}
+                            />
+                            <p className="text-[11px] text-muted">
+                              {t.strategies.skillProgramHint}
+                            </p>
+                          </div>
+                        )}
                         {rule.kind === "ma_trend" && (
                           <>
                             {/* 指标层：只声明要算哪些均线，规则层再引用它们。 */}
@@ -3761,7 +3860,7 @@ function StrategyPublishCard({ record }: { record: StrategyRecord }) {
     notional: "1000",
     visibility: "invite_only" as MarketVisibility,
     sourceVisibility: "open_source" as SourceVisibility,
-    pricing: "monthly" as PricingModel,
+    pricing: "one_time" as PricingModel,
     price: "19",
     trial: "3",
     limits: "",
@@ -3918,7 +4017,7 @@ function StrategyPublishCard({ record }: { record: StrategyRecord }) {
                   }
                 >
                   <option value="free">{copy.freePlan}</option>
-                  <option value="monthly">{copy.monthlyPlan}</option>
+                  <option value="one_time">{copy.oneTimePlan}</option>
                 </select>
               </label>
               <label className="text-[11px] text-muted">
@@ -3972,7 +4071,10 @@ function StrategyPublishCard({ record }: { record: StrategyRecord }) {
                 !activeAuthorId ||
                 !draft.title.trim() ||
                 !draft.summary.trim() ||
-                draft.logic.trim().length < 40
+                draft.logic.trim().length < 40 ||
+                // Skill 版必须绑定一个技能库版本，参数空间随版本交付。
+                !record.skill?.skill_id ||
+                !skillVersion
               }
               onClick={() => {
                 createPublication.mutate(
@@ -3996,12 +4098,8 @@ function StrategyPublishCard({ record }: { record: StrategyRecord }) {
                         draft.pricing === "free" ? 0 : Number(draft.price) || 0,
                       trial_days: draft.pricing === "free" ? 0 : Number(draft.trial) || 0,
                     },
-                    ...(record.skill?.skill_id && skillVersion
-                      ? {
-                          skill_id: record.skill.skill_id,
-                          skill_version: Number(skillVersion),
-                        }
-                      : {}),
+                    skill_id: record.skill?.skill_id,
+                    skill_version: Number(skillVersion),
                   },
                   {
                     onSuccess: (publication) => {
@@ -4045,7 +4143,7 @@ function StrategyPublishCard({ record }: { record: StrategyRecord }) {
                   {fmt(copy.versionTag, { version: publication.strategy_version })} ·{" "}
                   {publication.pricing.model === "free"
                     ? copy.free
-                    : fmt(copy.monthly, {
+                    : fmt(copy.buyout, {
                         price: formatUsd(publication.pricing.monthly_price_usd),
                       })}
                 </p>
@@ -4298,7 +4396,9 @@ function RunRuleList({
           )
             .map((period) => `MA${period}`)
             .join("/")}`
-        : `${rule.trigger.timeframe} · 通道 ${rule.trigger.channel} · ATR ${rule.trigger.atr_multiple}×`;
+        : rule.kind === "program"
+          ? `${rule.trigger.timeframe} · ${rule.program?.name?.trim() || "通用表达式"}`
+          : `${rule.trigger.timeframe} · 通道 ${rule.trigger.channel} · ATR ${rule.trigger.atr_multiple}×`;
   };
 
   /** 折叠摘要：条件 → 执行交易所 · 输出方式 · 金额/杠杆 · 止盈止损。 */
@@ -4569,10 +4669,8 @@ function TurtleSimPanel({ stepN, maxUnits }: { stepN: string; maxUnits: string }
 export default function StrategiesPage() {
   const { t } = useI18n();
   const account = useAccount();
-  const plans = account.data?.entitlement?.plans ?? [];
-  const hasBasePlan = plans.includes("arbitrage");
-  /** 策略创建是 +$10/月 附加包；基础版每个计费周期含 3 天免费试用。 */
-  const canCreateStrategy = hasBasePlan && plans.includes("strategy");
+  /** 创建与发布策略对所有登录用户免费，不锁套餐。 */
+  const canCreateStrategy = Boolean(account.data);
   const strategies = useStrategies();
   const updateStrategy = useUpdateStrategy();
   const createStrategy = useCreateStrategy();
@@ -4652,14 +4750,6 @@ export default function StrategiesPage() {
           {t.strategies.create}
         </Button>
       </header>
-
-      {!canCreateStrategy && (
-        <p className="rounded-lg border border-warning/30 bg-warning/10 px-3 py-2 text-xs leading-relaxed text-warning">
-          {hasBasePlan
-            ? t.strategies.createTrialEnded
-            : t.strategies.createRequiresPlan}
-        </p>
-      )}
 
       {actionError && (
         <p className="rounded-lg border border-danger/30 bg-danger/10 px-3 py-2 text-xs text-danger">

@@ -48,6 +48,8 @@ import type {
   NotificationSettings,
   Opportunity,
   Order,
+  ParamValues,
+  ParamsSchema,
   Position,
   PublicationBundle,
   RiskLimits,
@@ -607,11 +609,15 @@ export const api = {
     ),
 
   /** 把已订阅的策略导入为自己的自托管策略，代码在本机执行器运行。 */
-  importPublication: async (publicationId: string, subscriberId: string) => {
+  importPublication: async (
+    publicationId: string,
+    subscriberId: string,
+    paramValues?: ParamValues,
+  ) => {
     if (getExecutorMode() !== "local" || !DATA_URL || DATA_URL === getExecutorUrl("local")) {
       return request<StrategyRecord>(`/api/v1/market/publications/${publicationId}/import`, {
         method: "POST",
-        body: JSON.stringify({ subscriber_id: subscriberId }),
+        body: JSON.stringify({ subscriber_id: subscriberId, param_values: paramValues }),
       });
     }
     // 官方发布不在本机数据库：先取交付物，再交给本机执行器校验并落库。
@@ -620,7 +626,31 @@ export const api = {
     );
     return request<StrategyRecord>("/api/v1/market/publications/import", {
       method: "POST",
-      body: JSON.stringify(bundle),
+      body: JSON.stringify({ ...bundle, param_values: paramValues }),
+    });
+  },
+
+  /** 提交买家填的参数，按发布的参数空间生成实例。 */
+  instantiatePublication: async (
+    publicationId: string,
+    subscriberId: string,
+    paramValues: ParamValues,
+  ) => {
+    if (getExecutorMode() !== "local" || !DATA_URL || DATA_URL === getExecutorUrl("local")) {
+      return request<StrategyRecord>(
+        `/api/v1/market/publications/${publicationId}/instantiate`,
+        {
+          method: "POST",
+          body: JSON.stringify({ subscriber_id: subscriberId, param_values: paramValues }),
+        },
+      );
+    }
+    const bundle = await marketRequest<PublicationBundle>(
+      `/api/v1/market/publications/${publicationId}/bundle?subscriber_id=${encodeURIComponent(subscriberId)}`,
+    );
+    return request<StrategyRecord>("/api/v1/market/publications/import", {
+      method: "POST",
+      body: JSON.stringify({ ...bundle, param_values: paramValues }),
     });
   },
 
@@ -721,6 +751,7 @@ export const api = {
     body: {
       settings?: SkillSettings;
       markdown?: string;
+      params_schema?: ParamsSchema;
       changelog?: string;
     },
   ) =>
@@ -731,7 +762,12 @@ export const api = {
 
   validateSkill: (
     skillId: string,
-    body: { settings?: SkillSettings; markdown?: string; version?: number },
+    body: {
+      settings?: SkillSettings;
+      markdown?: string;
+      params_schema?: ParamsSchema;
+      version?: number;
+    },
   ) =>
     request<SkillValidationResult>(`/api/v1/skills/${skillId}/validate`, {
       method: "POST",

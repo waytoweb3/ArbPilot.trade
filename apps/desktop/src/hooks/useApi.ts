@@ -8,6 +8,8 @@ import type {
   CreatePublicationRequest,
   ImportAccountRequest,
   ListingSettings,
+  ParamValues,
+  ParamsSchema,
   Position,
   SettlementStatus,
   Skill,
@@ -339,6 +341,7 @@ export function useCreateSkillVersion() {
       skillId: string;
       settings?: SkillSettings;
       markdown?: string;
+      params_schema?: ParamsSchema;
       changelog?: string;
     }) => api.createSkillVersion(skillId, body),
     onSuccess: (data: SkillVersion) => {
@@ -946,10 +949,31 @@ export function useImportPublication() {
     mutationFn: ({
       publicationId,
       subscriberId,
+      paramValues,
     }: {
       publicationId: string;
       subscriberId: string;
-    }) => api.importPublication(publicationId, subscriberId),
+      paramValues?: ParamValues;
+    }) => api.importPublication(publicationId, subscriberId, paramValues),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["strategies"] });
+      queryClient.invalidateQueries({ queryKey: ["strategy-versions"] });
+    },
+  });
+}
+
+export function useInstantiatePublication() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      publicationId,
+      subscriberId,
+      paramValues,
+    }: {
+      publicationId: string;
+      subscriberId: string;
+      paramValues: ParamValues;
+    }) => api.instantiatePublication(publicationId, subscriberId, paramValues),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["strategies"] });
       queryClient.invalidateQueries({ queryKey: ["strategy-versions"] });

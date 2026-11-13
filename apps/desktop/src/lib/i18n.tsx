@@ -490,10 +490,6 @@ const zh = {
     start: "启动策略",
     stop: "停止策略",
     create: "新建策略",
-    createRequiresPlan:
-      "创建策略需要先订阅「自托管部署」基础版（$19/月），再叠加「策略创建」附加包（+$10/月）。",
-    createTrialEnded:
-      "本期 3 天策略创建试用已结束，订阅「策略创建」附加包（+$10/月）后可继续创建。",
     createTitle: "新建资金费率策略",
     templatesTitle: "内置模板",
     templatesDesc:
@@ -727,6 +723,10 @@ const zh = {
     skillOutputPaper: "模拟开仓",
     skillInvalid:
       "请检查事件窗口（60–604800 秒）、指标周期（K 线根数与均线/通道/ATR ≥ 2）与金额、杠杆、止盈止损、网格档位等参数。",
+    skillProgramTitle: "通用表达式",
+    skillProgramHint:
+      "策略是数据：入场、离场、过滤与参数都由这份程序描述，实盘、回测与平台重放共用同一个求值器。新增指标或玩法只需扩展原语，不需要新增触发方式。",
+    skillProgramInvalid: "通用表达式不是合法的 JSON，请检查括号与引号后再提交。",
     skillTimeframe: "K 线周期",
     skillLookback: "K 线根数",
     skillFast: "快均线周期",
@@ -871,11 +871,11 @@ const zh = {
     suggestedNotional: "建议单笔上限 {value}",
     changelog: "版本变更",
     free: "免费",
-    monthly: "每月 {price}",
+    buyout: "{price} · 永久买断",
     trialDays: "{days} 天试用",
-    subscribe: "订阅",
-    subscribing: "订阅中…",
-    subscribed: "已订阅",
+    subscribe: "买断",
+    subscribing: "处理中…",
+    subscribed: "已买断",
     cancelSubscription: "取消订阅",
     importStrategy: "导入到我的策略",
     importing: "导入中…",
@@ -918,9 +918,9 @@ const zh = {
     suggestedNotionalLabel: "建议单笔名义价值（USD）",
     visibilityLabel: "可见范围",
     pricingLabel: "定价",
-    priceLabel: "月费（USD）",
+    priceLabel: "买断价（USD）",
     freePlan: "免费",
-    monthlyPlan: "按月付费",
+    oneTimePlan: "一次性买断",
     trialLabel: "试用天数",
     knownLimitsLabel: "已知限制（每行一条）",
     createDraft: "创建私有草稿",
@@ -964,6 +964,11 @@ const zh = {
     checkoutFailed: "创建支付会话失败：{message}",
     checkoutLoginRequired:
       "购买策略需要先登录账号，请点击右上角头像使用 Google 登录。",
+    cryptoUsdt: "USDT 买断",
+    cryptoUsdc: "USDC 买断",
+    cryptoNeedsKey: "支付服务未配置加密收款，暂时无法使用 USDT / USDC。",
+    cryptoAuthorWalletMissing: "作者尚未填写加密收款地址，请改用卡支付。",
+    cryptoFailed: "创建加密支付失败：{message}",
     fields: {
       trades: "交易次数",
       sample: "样本条数",
@@ -1122,8 +1127,6 @@ const zh = {
       "非托管模式：随桌面端启动，数据保存在本机 SQLite 文件，交易所 API Key 与订单都不会离开本机；行情、资金费率与资讯等只读数据默认使用官方接口 exec.arbpilot.trade。",
     credentials: "凭证存储",
     credentialsDesc: "交易所密钥的加密存放方式。",
-    credentialsSelfHosted:
-      "交易所密钥保存在你填写的服务器上，由该服务器加密存储；桌面端无法查看或打开这些文件。",
     credentialsPath: "存储位置",
     credentialsPermissions: "文件权限",
     credentialsPermissionsNote: "仅当前系统用户可读写",
@@ -1154,6 +1157,9 @@ const zh = {
     saved: "已保存并重新连接",
     tokenNote:
       "令牌仅用于桌面端访问本机执行器 API。服务器模式建议通过安全隧道或 VPN 连接，不要将执行器端口直接暴露到公网。",
+    connectRequiresPlan:
+      "自托管连接属于 $19/月的基础版权益，完成支付后才能保存并连接。",
+    connectRequiresPlanAction: "去订阅",
     limits: "风控限额",
     limitsDesc: "可直接修改，保存后立即对后续订单生效，并写入本机配置文件。",
     limitsEdit: "编辑",
@@ -1250,13 +1256,15 @@ const zh = {
     billingStatus: "当前授权",
     billingNone: "尚未绑定授权。选择方案后会打开支付页面完成订阅。",
     billingArbitrage: "自托管部署",
-    billingStrategy: "策略创建",
-    billingStrategyTrial: "策略创建试用（至 {value}）",
-    billingAddonMissingBase: "需先订阅自托管部署",
-    billingAddonHint: "在自托管部署基础上升级",
-    billingAddonTrialHint: "本期试用至 {value}，之后需订阅附加包",
     billingMarketNote:
-      "策略市场中的策略由用户定价，可免费或按月收费；购买和使用已订阅策略不需要再额外付费。",
+      "发布策略免费，不锁套餐；平台按策略成交额抽成，冷启动期 6 个月 10%，之后 20%。",
+    cryptoWalletTitle: "策略收款地址",
+    cryptoWalletDesc: "买家使用 USDT / USDC 买断时，分成会转到这个地址。",
+    cryptoWalletAddress: "地址",
+    cryptoWalletSave: "保存地址",
+    cryptoWalletSaving: "保存中…",
+    cryptoWalletSaved: "已保存，加密买断会打款到该地址。",
+    cryptoWalletInvalid: "地址格式与所选网络不匹配。",
     billingSubscribe: "订阅{plan}",
     billingOpening: "正在创建收银台…",
     billingRefresh: "刷新状态",
@@ -1882,10 +1890,6 @@ const en: typeof zh = {
     start: "Start strategy",
     stop: "Stop strategy",
     create: "New strategy",
-    createRequiresPlan:
-      "Creating strategies requires the self-hosted deployment base plan ($19/mo) plus the Strategy Creation add-on (+$10/mo).",
-    createTrialEnded:
-      "The 3-day strategy creation trial for this billing period has ended. Subscribe to the Strategy Creation add-on (+$10/mo) to keep creating.",
     createTitle: "New funding-rate strategy",
     templatesTitle: "Built-in templates",
     templatesDesc:
@@ -2140,6 +2144,10 @@ const en: typeof zh = {
     skillOutputPaper: "Paper open",
     skillInvalid:
       "Check the event window (60–604800 seconds), indicator periods (bars and SMA/channel/ATR ≥ 2) and the size, leverage, TP/SL and grid values.",
+    skillProgramTitle: "General expression",
+    skillProgramHint:
+      "A strategy is data: entries, exits, filters and parameters live in this program, and live trading, backtests and platform replay share one evaluator. New indicators extend the primitives, not the trigger types.",
+    skillProgramInvalid: "The general expression is not valid JSON; check brackets and quotes before saving.",
     skillTimeframe: "Timeframe",
     skillLookback: "Lookback bars",
     skillFast: "Fast SMA",
@@ -2289,11 +2297,11 @@ const en: typeof zh = {
     suggestedNotional: "Suggested cap {value}",
     changelog: "Changelog",
     free: "Free",
-    monthly: "{price} / month",
+    buyout: "{price} · one-time",
     trialDays: "{days}-day trial",
-    subscribe: "Subscribe",
-    subscribing: "Subscribing…",
-    subscribed: "Subscribed",
+    subscribe: "Buy out",
+    subscribing: "Processing…",
+    subscribed: "Purchased",
     cancelSubscription: "Cancel subscription",
     importStrategy: "Import to my strategies",
     importing: "Importing…",
@@ -2337,9 +2345,9 @@ const en: typeof zh = {
     suggestedNotionalLabel: "Suggested notional (USD)",
     visibilityLabel: "Visibility",
     pricingLabel: "Pricing",
-    priceLabel: "Monthly price (USD)",
+    priceLabel: "Buyout price (USD)",
     freePlan: "Free",
-    monthlyPlan: "Monthly",
+    oneTimePlan: "One-time purchase",
     trialLabel: "Trial days",
     knownLimitsLabel: "Known limits (one per line)",
     createDraft: "Create private draft",
@@ -2385,6 +2393,11 @@ const en: typeof zh = {
     checkoutFailed: "Failed to create a checkout session: {message}",
     checkoutLoginRequired:
       "Sign in first to purchase a strategy — use the avatar in the top right to continue with Google.",
+    cryptoUsdt: "USDT buyout",
+    cryptoUsdc: "USDC buyout",
+    cryptoNeedsKey: "The payment service has no crypto payout configured; USDT / USDC is unavailable.",
+    cryptoAuthorWalletMissing: "The author has not set a crypto payout address; pay by card instead.",
+    cryptoFailed: "Failed to create crypto checkout: {message}",
     fields: {
       trades: "Trades",
       sample: "Sample size",
@@ -2562,8 +2575,6 @@ const en: typeof zh = {
       "Unmanaged mode: starts with the desktop app, keeps data in a local SQLite file, and never sends exchange API keys or orders off this machine; market, funding and news data come from the official exec.arbpilot.trade endpoint.",
     credentials: "Credential storage",
     credentialsDesc: "How exchange keys are encrypted at rest.",
-    credentialsSelfHosted:
-      "Exchange keys are stored on the server you entered, encrypted by that server. The desktop cannot view or open those files.",
     credentialsPath: "Location",
     credentialsPermissions: "File permissions",
     credentialsPermissionsNote: "Readable and writable only by the current user",
@@ -2594,6 +2605,9 @@ const en: typeof zh = {
     saved: "Saved and reconnecting",
     tokenNote:
       "The token only grants the desktop access to the local executor API. For server mode, use an encrypted tunnel or VPN instead of exposing the port publicly.",
+    connectRequiresPlan:
+      "Connecting a self-hosted executor requires the $19/month plan. Complete payment before saving and connecting.",
+    connectRequiresPlanAction: "Subscribe",
     limits: "Risk limits",
     limitsDesc:
       "Editable here; changes apply to new orders immediately and are saved on the executor host.",
@@ -2702,14 +2716,15 @@ const en: typeof zh = {
     billingNone:
       "No license linked yet. Choosing a plan opens a payment page to complete the subscription.",
     billingArbitrage: "Self-hosted Deployment",
-    billingStrategy: "Strategy Creation",
-    billingStrategyTrial: "Strategy Creation trial (until {value})",
-    billingAddonMissingBase: "Subscribe to self-hosted deployment first",
-    billingAddonHint: "Add-on on top of self-hosted deployment",
-    billingAddonTrialHint:
-      "Trial until {value}; subscribe to the add-on afterwards",
     billingMarketNote:
-      "Strategies in the market are priced by their users, free or monthly; using a subscribed strategy needs no extra add-on.",
+      "Publishing is free on any plan; the platform takes 10% of strategy sales during the first 6 months, then 20%.",
+    cryptoWalletTitle: "Strategy payout address",
+    cryptoWalletDesc: "When buyers pay in USDT / USDC for a one-time purchase, the author share is sent to this address.",
+    cryptoWalletAddress: "Address",
+    cryptoWalletSave: "Save address",
+    cryptoWalletSaving: "Saving…",
+    cryptoWalletSaved: "Saved. Crypto buyout payments will be sent to this address.",
+    cryptoWalletInvalid: "The address does not match the selected network.",
     billingSubscribe: "Subscribe · {plan}",
     billingOpening: "Opening checkout…",
     billingRefresh: "Refresh",

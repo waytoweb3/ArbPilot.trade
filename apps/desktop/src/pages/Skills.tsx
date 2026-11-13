@@ -24,6 +24,7 @@ import {
 } from "../hooks/useApi";
 import { useI18n } from "../lib/i18n";
 import type {
+  ParamSpec,
   RuleBacktest,
   RuleDiff,
   SkillValidationIssue,
@@ -32,6 +33,22 @@ import type {
 } from "../lib/types";
 
 const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error));
+
+/** 把参数值格式化成输入框文本；数字统一走字符串以保留精度。 */
+function paramText(value: unknown): string {
+  if (value === null || value === undefined) {
+    return "";
+  }
+  return typeof value === "string" ? value : JSON.stringify(value);
+}
+
+/** 参数空间的一行编辑态。 */
+interface ParamDraft {
+  editable: boolean;
+  min: string;
+  max: string;
+  step: string;
+}
 
 function reportTone(report: SkillValidationReport) {
   if (!report.passed) {
@@ -175,7 +192,9 @@ function VersionCard({
       </div>
       <p className="mt-1 truncate text-[10px] text-muted">{version.changelog || "—"}</p>
       <p className="mt-0.5 truncate font-mono text-[10px] text-subtle">
-        {t.skillsLibrary.rules} {version.settings.rules.length} · {version.settings_sha256.slice(0, 12)}
+        {t.skillsLibrary.rules} {version.settings.rules.length} · 可改{" "}
+        {(version.params_schema?.params ?? []).filter((spec) => spec.editable).length} ·{" "}
+        {(version.logic_sha256 || version.settings_sha256).slice(0, 12)}
       </p>
     </button>
   );
@@ -197,6 +216,8 @@ export default function SkillsPage() {
   const [diffFrom, setDiffFrom] = useState(1);
   const [diffTo, setDiffTo] = useState(1);
   const [notice, setNotice] = useState<string | null>(null);
+  // 参数空间编辑态：键为 `rule_key/path`。
+  const [paramDrafts, setParamDrafts] = useState<Record<string, ParamDraft>>({});
 
   const activeAuthorId = authorId || authors.data?.[0]?.author_id || "";
   const skills = useSkills(activeAuthorId || undefined);
@@ -234,6 +255,23 @@ export default function SkillsPage() {
     () => versions.data?.find((version) => version.version === selectedVersion) ?? null,
     [versions.data, selectedVersion],
   );
+
+  // 切换版本时把已保存的参数空间还原成编辑态。
+  useEffect(() => {
+    setParamDrafts(
+      Object.fromEntries(
+        (activeVersion?.params_schema?.params ?? []).map((spec) => [
+          `${spec.rule_key}/${spec.path}`,
+          {
+            editable: spec.editable,
+            min: paramText(spec.min),
+            max: paramText(spec.max),
+            step: paramText(spec.step),
+          },
+        ]),
+      ),
+    );
+  }, [activeVersion]);
 
   const handleCreate = async () => {
     if (!activeAuthorId) {
@@ -282,6 +320,50 @@ export default function SkillsPage() {
       setVersionMarkdown("");
       setVersionChangelog("");
       setNotice(`${t.skillsLibrary.versions} v${created.version}`);
+    } catch (error) {
+      setNotice(errorText(error));
+    }
+  };
+
+  const setDraft = (key: string, patch: Partial<ParamDraft>) =>
+    setParamDrafts((drafts) => {
+      const merged: ParamDraft = drafts[key] ?? {
+        editable: false,
+        min: "",
+        max: "",
+        step: "",
+      };
+      return { ...drafts, [key]: { ...merged, ...patch } };
+    });
+
+  /** 以当前版本的规则骨架 + 编辑后的参数空间另存新版本。 */
+  const handleSaveParams = async () => {
+    if (!selectedId || !activeVersion) {
+      return;
+    }
+    const params: ParamSpec[] = (activeVersion.params_schema?.params ?? []).map((spec) => {
+      const draft = paramDrafts[`${spec.rule_key}/${spec.path}`];
+      if (!draft) {
+        return spec;
+      }
+      return {
+        ...spec,
+        editable: draft.editable,
+        min: draft.min.trim() ? draft.min.trim() : null,
+        max: draft.max.trim() ? draft.max.trim() : null,
+        step: draft.step.trim() ? draft.step.trim() : null,
+      };
+    });
+    try {
+      const created = await createVersion.mutateAsync({
+        skillId: selectedId,
+        settings: activeVersion.settings,
+        params_schema: { params },
+        changelog: versionChangelog.trim() || "调整参数空间",
+      });
+      setSelectedVersion(created.version);
+      setVersionChangelog("");
+      setNotice(`参数空间已保存为 v${created.version}`);
     } catch (error) {
       setNotice(errorText(error));
     }
@@ -488,6 +570,81 @@ export default function SkillsPage() {
                 report={activeVersion.validation}
                 backtests={validate.data?.backtests}
               />
+            )}
+
+            {activeVersion && (
+              <div className="space-y-2 rounded-lg border border-line bg-panel-soft/40 p-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <p className="text-[11px] font-medium text-body">参数空间</p>
+                    <p className="text-[10px] text-muted">
+                      勾选「可改」并设置范围后，买家可在自己的终端里填值生成实例。
+                    </p>
+                  </div>
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    onClick={handleSaveParams}
+                    disabled={createVersion.isPending}
+                  >
+                    保存为新版本
+                  </Button>
+                </div>
+                <div className="max-h-64 space-y-1 overflow-y-auto">
+                  {(activeVersion.params_schema?.params ?? []).map((spec) => {
+                    const key = `${spec.rule_key}/${spec.path}`;
+                    const draft = paramDrafts[key] ?? {
+                      editable: spec.editable,
+                      min: paramText(spec.min),
+                      max: paramText(spec.max),
+                      step: paramText(spec.step),
+                    };
+                    return (
+                      <div
+                        key={key}
+                        className="grid grid-cols-[minmax(0,1fr)_auto_4.5rem_4.5rem_4.5rem] items-center gap-2"
+                      >
+                        <span className="truncate text-[11px] text-body" title={spec.path}>
+                          {spec.label}
+                        </span>
+                        <label className="flex items-center gap-1 text-[10px] text-muted">
+                          <input
+                            type="checkbox"
+                            checked={draft.editable}
+                            onChange={(event) =>
+                              setDraft(key, { editable: event.target.checked })
+                            }
+                          />
+                          可改
+                        </label>
+                        <input
+                          className="rounded border border-line bg-panel px-1 font-mono text-[10px]"
+                          placeholder="最小"
+                          value={draft.min}
+                          onChange={(event) => setDraft(key, { min: event.target.value })}
+                        />
+                        <input
+                          className="rounded border border-line bg-panel px-1 font-mono text-[10px]"
+                          placeholder="最大"
+                          value={draft.max}
+                          onChange={(event) => setDraft(key, { max: event.target.value })}
+                        />
+                        <input
+                          className="rounded border border-line bg-panel px-1 font-mono text-[10px]"
+                          placeholder="步长"
+                          value={draft.step}
+                          onChange={(event) => setDraft(key, { step: event.target.value })}
+                        />
+                      </div>
+                    );
+                  })}
+                  {(activeVersion.params_schema?.params ?? []).length === 0 && (
+                    <p className="text-[10px] text-muted">
+                      当前版本没有可参数化的字段。
+                    </p>
+                  )}
+                </div>
+              </div>
             )}
 
             <div className="grid gap-2 md:grid-cols-[1fr_1fr_auto]">
