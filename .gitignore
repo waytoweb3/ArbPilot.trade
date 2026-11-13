@@ -25,3 +25,6 @@ data/
 .idea/
 .vscode/*
 !.vscode/extensions.json
+
+# 本地回测与运营报告输出
+reports/
