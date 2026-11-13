@@ -20,9 +20,9 @@ services:
       retries: 5
 
   executor:
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile.executor
+    # 镜像由 GitHub Actions 构建并推送到 GHCR（.github/workflows/executor-image.yml），
+    # 服务器只 pull，不再同步源码；可用 ARBPILOT_EXECUTOR_IMAGE 固定到某个 sha-<commit>。
+    image: ${ARBPILOT_EXECUTOR_IMAGE:-ghcr.io/waytoweb3/arbpilot-executor:latest}
     restart: unless-stopped
     depends_on:
       postgres:
@@ -46,7 +46,7 @@ services:
       RUST_LOG: info,arbpilot_executor=debug
     # 账户凭证、风控限额与 Telegram 绑定都在 data/ 下，必须持久化。
     volumes:
-      - arbpilot-data:/home/arbpilot/data
+      - arbpilot-data:/data
     # 默认只绑定回环地址，桌面端通过 SSH 隧道连接；
     # 需要让桌面端直接用服务器 IP 访问时，设置 ARBPILOT_EXECUTOR_HOST=0.0.0.0 并放行端口。
     ports:

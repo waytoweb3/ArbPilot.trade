@@ -21,11 +21,13 @@ MANIFEST="$OUT_DIR/manifest.json"
 mkdir -p "$OUT_DIR"
 rm -f "$TARBALL" "$MANIFEST"
 
-# 只打包构建执行器所需的源码：桌面端仅保留 workspace 解析需要的 manifest。
-tar czf "$TARBALL" -C "$ROOT_DIR" \
+# 执行器镜像由 GitHub Actions 构建（.github/workflows/executor-image.yml），服务器只拉镜像，
+# 因此部署包只需要 compose、安装脚本与文档，不再包含源码。
+# macOS 的 bsdtar 会把扩展属性写成 `._` AppleDouble 成员，解包后会被 sqlx 当作迁移文件，必须排除。
+COPYFILE_DISABLE=1 tar czf "$TARBALL" -C "$ROOT_DIR" \
+  --exclude='._*' \
   --exclude='*.log' \
-  Cargo.toml Cargo.lock crates apps/executor deploy docs \
-  apps/desktop/src-tauri/Cargo.toml apps/desktop/src-tauri/build.rs
+  deploy docs
 
 if command -v sha256sum >/dev/null 2>&1; then
   SHA256="$(sha256sum "$TARBALL" | awk '{print $1}')"
