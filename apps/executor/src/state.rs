@@ -128,6 +128,7 @@ impl AppState {
         // 实盘下单走各交易所的私有合约接口，复用已导入账户的凭证。
         let live_endpoints = LiveEndpoints {
             binance: config.binance_fapi_url.clone(),
+            binance_spot: config.binance_spot_url.clone(),
             okx: config.okx_base_url.clone(),
             bybit: config.bybit_base_url.clone(),
             bitget: config.bitget_base_url.clone(),

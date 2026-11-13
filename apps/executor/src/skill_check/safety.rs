@@ -17,7 +17,7 @@ use chrono::{DateTime, Duration, Utc};
 use rust_decimal::Decimal;
 
 use super::{Dimension, Issue};
-use crate::skill::{self, SkillKind, SkillRule};
+use crate::skill::{self, SkillDirection, SkillKind, SkillRule};
 
 /// 校验用的合成价格：只为把金额换成数量，与真实行情无关。
 const SAMPLE_PRICE: i64 = 60_000;
@@ -60,6 +60,21 @@ fn check_rule(rule: &SkillRule, limits: &RiskLimits, issues: &mut Vec<Issue>) {
                 format!("{venue} 单笔金额 {per_order} USD 低于交易所最小下单额 {minimum} USD"),
             ));
         }
+    }
+
+    // 现货腿只能买入（做多），带做空方向时现货交易所上的信号会被跳过。
+    if rule.steps.direction != SkillDirection::Long
+        && rule
+            .steps
+            .execution_venues
+            .iter()
+            .any(|venue| crate::market::is_spot_venue(venue))
+    {
+        issues.push(Issue::warning(
+            Dimension::Safety,
+            "safety.spot_long_only",
+            "现货交易所只能做多，做空信号会在现货腿上被跳过".to_string(),
+        ));
     }
 
     // 规则金额与杠杆必须能通过网关；否则策略「看起来在跑，实际一单都下不出去」。
@@ -205,6 +220,12 @@ fn intent(
         .first()
         .cloned()
         .unwrap_or_else(|| "binance".to_string());
+    // 现货腿没有杠杆，按 1 倍校验，避免误报「杠杆超限」。
+    let leverage = if crate::market::is_spot_venue(&venue) {
+        Decimal::ONE
+    } else {
+        rule.business.leverage
+    };
     OrderIntent {
         idempotency_key: "skill-check".to_string(),
         origin: OrderOrigin::Strategy,
@@ -221,7 +242,7 @@ fn intent(
             limit_price: price,
             reduce_only: false,
         }],
-        leverage: rule.business.leverage,
+        leverage,
         max_slippage_bps: limits.max_slippage_bps,
         quote_observed_at: now,
         created_at: now,
@@ -315,5 +336,31 @@ mod tests {
         assert!(issues
             .iter()
             .any(|issue| issue.code == "safety.below_venue_minimum"));
+    }
+
+    #[test]
+    fn spot_venue_with_short_signals_is_a_warning() {
+        let mut rule = rule();
+        rule.steps.execution_venues = vec!["binance-spot".to_string()];
+        rule.steps.direction = SkillDirection::Both;
+        let issues = check(&rule, &RiskLimits::default());
+        assert!(issues
+            .iter()
+            .any(|issue| issue.code == "safety.spot_long_only"));
+    }
+
+    #[test]
+    fn spot_venue_is_checked_at_one_x_leverage() {
+        let mut rule = rule();
+        rule.steps.execution_venues = vec!["binance-spot".to_string()];
+        rule.steps.direction = SkillDirection::Long;
+        rule.business.leverage = dec!(5);
+        let issues = check(&rule, &RiskLimits::default());
+        assert!(
+            !issues
+                .iter()
+                .any(|issue| issue.code == "safety.order_would_be_rejected"),
+            "现货腿不应因杠杆被拒：{issues:?}"
+        );
     }
 }

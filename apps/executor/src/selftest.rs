@@ -71,6 +71,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         Some(http.clone()),
         LiveEndpoints {
             binance: config.binance_fapi_url.clone(),
+            binance_spot: config.binance_spot_url.clone(),
             okx: config.okx_base_url.clone(),
             bybit: config.bybit_base_url.clone(),
             bitget: config.bitget_base_url.clone(),

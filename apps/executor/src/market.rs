@@ -36,6 +36,14 @@ pub const OKX_SPOT_VENUE: &str = "okx-spot";
 /// Bybit 现货腿标识；Bybit 永续沿用 `bybit`。
 pub const BYBIT_SPOT_VENUE: &str = "bybit-spot";
 
+/// 是否现货腿：沿用「以 `-spot` 结尾」的交易所标识约定。
+pub fn is_spot_venue(venue: &str) -> bool {
+    venue.trim().to_ascii_lowercase().ends_with("-spot")
+}
+
+/// 已接入现货下单的交易所；与永续腿共用同一个交易所账户。
+pub const SPOT_VENUES: [&str; 3] = [SPOT_VENUE, OKX_SPOT_VENUE, BYBIT_SPOT_VENUE];
+
 /// 单腿手续费估算（bps）：现货与永续各 4 bps。
 const LEG_FEE_BPS: i64 = 4;
 /// 双腿滑点估算（bps）。
@@ -328,12 +336,22 @@ impl BookClients {
                 .as_ref()
                 .ok_or_else(|| anyhow!("Binance 行情客户端未初始化"))?
                 .min_order(venue, symbol, segment),
-            OKX_SPOT_VENUE | OKX_VENUE => self
+            OKX_SPOT_VENUE => self
+                .okx
+                .as_ref()
+                .ok_or_else(|| anyhow!("OKX 行情客户端未启用"))?
+                .spot_min_order(symbol),
+            OKX_VENUE => self
                 .okx
                 .as_ref()
                 .ok_or_else(|| anyhow!("OKX 行情客户端未启用"))?
                 .min_order(symbol),
-            BYBIT_SPOT_VENUE | BYBIT_VENUE => self
+            BYBIT_SPOT_VENUE => self
+                .bybit
+                .as_ref()
+                .ok_or_else(|| anyhow!("Bybit 行情客户端未启用"))?
+                .spot_min_order(symbol),
+            BYBIT_VENUE => self
                 .bybit
                 .as_ref()
                 .ok_or_else(|| anyhow!("Bybit 行情客户端未启用"))?
@@ -1026,8 +1044,11 @@ impl MarketFeed {
     pub async fn order_step_spec(&self, venue: &str, symbol: &str) -> Option<MinOrderSpec> {
         let target = venue.trim().to_ascii_lowercase();
         if target != VENUE
+            && target != SPOT_VENUE
             && target != ASTER_VENUE
             && target != BYBIT_VENUE
+            && target != BYBIT_SPOT_VENUE
+            && target != OKX_SPOT_VENUE
             && target != LIGHTER_VENUE
             && target != HYPERLIQUID_VENUE
         {

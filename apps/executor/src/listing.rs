@@ -501,6 +501,18 @@ pub async fn open_position(
     if state.is_paused() {
         return Err(ApiError::BadRequest("执行器已暂停开仓".to_string()));
     }
+    // 现货腿只能买入（做多或平掉已有持仓），没有开空能力。
+    if crate::market::is_spot_venue(&venue) && request.side == Side::Sell {
+        return Err(ApiError::BadRequest(format!(
+            "{venue} 是现货交易所，不支持开空；请改用永续交易所或改为买入"
+        )));
+    }
+    // 现货没有杠杆，单腿记录按 1 倍保存。
+    let leverage = if crate::market::is_spot_venue(&venue) {
+        Decimal::ONE
+    } else {
+        request.leverage
+    };
 
     // 先确认该交易所有行情，避免把「未上线」误判成可下单。
     let quote = state
@@ -539,7 +551,7 @@ pub async fn open_position(
                     limit_price: None,
                     quantity: None,
                 }],
-                leverage: Some(request.leverage),
+                leverage: Some(leverage),
                 max_slippage_bps: None,
                 strategy_id: request.strategy_id,
                 source: request.rule_name.clone(),
@@ -592,7 +604,7 @@ pub async fn open_position(
         symbol: symbol.clone(),
         side: request.side,
         notional_usd: request.notional_usd,
-        leverage: request.leverage,
+        leverage,
         quantity,
         entry_price,
         take_profit_pct: request.take_profit_pct,
@@ -1082,9 +1094,12 @@ async fn auto_open(
     });
 }
 
-/// 执行交易所：按设置里的优先级排列，只保留当前可下单的交易所。
-pub(crate) fn execution_venues(state: &AppState, priority: &[String]) -> Vec<String> {
-    let mut tradable: Vec<String> = state
+/// 可下单的交易所：已接入账户的永续交易所，加上同一账户的现货腿。
+///
+/// 现货腿与永续腿共用同一个交易所账户凭证（例如 `binance-spot` 用 `binance`
+/// 账户），因此账户可交易且交易所支持现货时，一并纳入可执行交易所。
+pub(crate) fn tradable_venues(state: &AppState) -> Vec<String> {
+    let mut perp: Vec<String> = state
         .accounts
         .list()
         .into_iter()
@@ -1092,8 +1107,26 @@ pub(crate) fn execution_venues(state: &AppState, priority: &[String]) -> Vec<Str
         .map(|account| account.venue.trim().to_lowercase())
         .filter(|venue| !venue.is_empty())
         .collect();
-    tradable.sort();
-    tradable.dedup();
+    perp.sort();
+    perp.dedup();
+
+    let mut venues = perp.clone();
+    for spot in crate::market::SPOT_VENUES {
+        let Some(base) = spot.strip_suffix("-spot") else {
+            continue;
+        };
+        if perp.iter().any(|venue| venue == base) {
+            venues.push(spot.to_string());
+        }
+    }
+    venues.sort();
+    venues.dedup();
+    venues
+}
+
+/// 执行交易所：按设置里的优先级排列，只保留当前可下单的交易所。
+pub(crate) fn execution_venues(state: &AppState, priority: &[String]) -> Vec<String> {
+    let tradable = tradable_venues(state);
     if priority.is_empty() {
         return tradable;
     }

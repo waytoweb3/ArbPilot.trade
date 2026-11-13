@@ -418,12 +418,21 @@ pub async fn submit_legs(
         });
     }
 
+    // 现货腿没有杠杆，杠杆只对永续腿生效；整笔都是现货时按 1 倍记录。
+    let leverage = if legs
+        .iter()
+        .all(|leg| crate::market::is_spot_venue(&leg.venue))
+    {
+        Decimal::ONE
+    } else {
+        request.leverage.unwrap_or(Decimal::ONE)
+    };
     let intent = OrderIntent {
         idempotency_key: request.idempotency_key.clone(),
         origin: request.origin,
         strategy_id: request.strategy_id,
         legs,
-        leverage: request.leverage.unwrap_or(Decimal::ONE),
+        leverage,
         max_slippage_bps: request.max_slippage_bps.unwrap_or(limits.max_slippage_bps),
         quote_observed_at: observed_at,
         created_at: Utc::now(),
@@ -508,8 +517,12 @@ pub async fn submit_legs(
         let leg = order.intent.legs[index].clone();
         let venue = leg.venue.clone();
         // 开仓前先把杠杆写到交易所；设置失败则不下单，避免按交易所默认杠杆开出
-        // 与风控/仓位记录不一致的仓位。平仓只为降低敞口，不做杠杆调整。
-        if let (Some(leverage), false) = (request.leverage, request.closing) {
+        // 与风控/仓位记录不一致的仓位。平仓只为降低敞口，不做杠杆调整；现货腿没有杠杆。
+        if let (Some(leverage), false, false) = (
+            request.leverage,
+            request.closing,
+            crate::market::is_spot_venue(&venue),
+        ) {
             log_event(
                 state,
                 order.id,
@@ -550,7 +563,8 @@ pub async fn submit_legs(
             side: leg.side,
             quantity: leg.quantity,
             limit_price: leg.limit_price,
-            reduce_only: leg.reduce_only,
+            // 现货没有 reduceOnly；平仓就是卖出持仓，订单意图仍按平仓记账。
+            reduce_only: leg.reduce_only && !crate::market::is_spot_venue(&venue),
             client_order_id: format!("{}-{index}", request.idempotency_key),
             leverage: request.leverage,
         };

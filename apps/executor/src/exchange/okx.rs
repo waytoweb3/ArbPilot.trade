@@ -473,6 +473,35 @@ impl OkxMarketClient {
         Ok(Some(order))
     }
 
+    /// 单个现货交易对的最小下单数量与步长；现货直接按基础币计量。
+    pub fn spot_min_order(&self, symbol: &str) -> anyhow::Result<Option<MinOrderSpec>> {
+        let inst_id = spot_inst_id(symbol)?;
+        let url = format!(
+            "{}/api/v5/public/instruments?instType=SPOT&instId={inst_id}",
+            self.base_url
+        );
+        let envelope: Envelope<OkxInstrument> = serde_json::from_value(self.http.get_json(&url)?)
+            .context("解析 OKX instruments 失败")?;
+        let Some(instrument) = into_data(envelope, "public/instruments")?
+            .into_iter()
+            .next()
+        else {
+            return Ok(None);
+        };
+        let mut order = MinOrderSpec::new(VENUE, symbol);
+        order.min_quantity = instrument
+            .min_sz
+            .as_deref()
+            .and_then(|raw| raw.parse::<Decimal>().ok())
+            .filter(|value| *value > Decimal::ZERO);
+        order.step_size = instrument
+            .lot_sz
+            .as_deref()
+            .and_then(|raw| raw.parse::<Decimal>().ok())
+            .filter(|value| *value > Decimal::ZERO);
+        Ok(Some(order))
+    }
+
     /// 当前在交易的 USDT 本位交割合约；每个交易对只保留最近到期的一张。
     pub fn delivery_contracts(&self, symbols: &[String]) -> anyhow::Result<Vec<DeliveryContract>> {
         let url = format!(

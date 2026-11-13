@@ -25,6 +25,8 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct LiveEndpoints {
     pub binance: String,
+    /// Binance 现货接口根地址；现货腿与永续腿共用同一套 API Key。
+    pub binance_spot: String,
     pub okx: String,
     pub bybit: String,
     pub bitget: String,
@@ -93,6 +95,10 @@ impl LiveExchange {
         if leverage <= Decimal::ZERO {
             return Err(ExchangeError::Rejected("杠杆必须大于 0".to_string()));
         }
+        // 现货腿没有杠杆概念，下单前无需调用交易所的杠杆接口。
+        if is_spot(venue) {
+            return Ok(());
+        }
         let http = self.http.clone().ok_or_else(|| {
             ExchangeError::Transport("HTTP 客户端不可用，无法设置杠杆".to_string())
         })?;
@@ -121,6 +127,10 @@ impl LiveExchange {
         let Some(http) = self.http.clone() else {
             return Ok(None);
         };
+        // 现货腿没有杠杆。
+        if is_spot(venue) {
+            return Ok(None);
+        }
         let venue = venue.trim().to_ascii_lowercase();
         let Some(credentials) = self.accounts.credentials_for(&venue) else {
             return Ok(None);
@@ -153,6 +163,22 @@ fn place(
         "binance" => binance_place(
             http,
             &endpoints.binance,
+            credentials,
+            request,
+            &client_order_id,
+        ),
+        // 现货腿：Binance / OKX / Bybit 共用同一账户凭证，接口与永续不同。
+        "binance-spot" => binance_spot_place(
+            http,
+            &endpoints.binance_spot,
+            credentials,
+            request,
+            &client_order_id,
+        ),
+        "okx-spot" => okx_spot_place(http, &endpoints.okx, credentials, request, &client_order_id),
+        "bybit-spot" => bybit_spot_place(
+            http,
+            &endpoints.bybit,
             credentials,
             request,
             &client_order_id,
@@ -220,6 +246,11 @@ fn place(
             "{other} 暂未接入实盘下单"
         ))),
     }
+}
+
+/// 以 `-spot` 结尾的交易所标识表示现货腿。
+fn is_spot(venue: &str) -> bool {
+    venue.trim().to_ascii_lowercase().ends_with("-spot")
 }
 
 /// 各交易所的杠杆设置入口。`symbol` 为内部交易对（如 `BTCUSDT`）。
@@ -1455,6 +1486,163 @@ fn bybit_place(
     let order_id = value["result"]["orderId"]
         .as_str()
         .ok_or_else(|| ExchangeError::Rejected(format!("Bybit 响应缺少 orderId: {value}")))?;
+    Ok(ack(order_id, client_order_id))
+}
+
+/// Binance 现货下单：走现货域名与 `/api/v3/order`，现货没有 `reduceOnly`。
+fn binance_spot_place(
+    http: &HttpClient,
+    base_url: &str,
+    credentials: &AccountCredentials,
+    request: &PlaceOrderRequest,
+    client_order_id: &str,
+) -> Result<VenueOrderAck, ExchangeError> {
+    let (key, secret) = key_pair(credentials)?;
+    let base_url = base_url.trim_end_matches('/');
+    let params = format!(
+        "symbol={}&side={}&type=LIMIT&timeInForce=GTC&quantity={}&price={}&newClientOrderId={}&recvWindow=5000&timestamp={}",
+        internal_symbol(request),
+        if request.side == Side::Buy { "BUY" } else { "SELL" },
+        num(request.quantity),
+        num(request.limit_price),
+        client_order_id,
+        now_millis(),
+    );
+    let signature = hmac_hex(secret, &params)?;
+    let value = http
+        .post_with_headers(
+            &format!("{base_url}/api/v3/order?{params}&signature={signature}"),
+            &[("X-MBX-APIKEY", key)],
+        )
+        .map_err(transport)?;
+
+    // 现货错误响应带负的 code；成功响应没有 code 字段。
+    if let Some(code) = value["code"].as_i64() {
+        if code != 0 {
+            return Err(ExchangeError::Rejected(format!(
+                "Binance 现货拒单: {}",
+                value["msg"].as_str().unwrap_or("未知错误")
+            )));
+        }
+    }
+    let order_id = value["orderId"].as_i64().ok_or_else(|| {
+        ExchangeError::Rejected(format!("Binance 现货响应缺少 orderId: {value}"))
+    })?;
+    Ok(ack(order_id.to_string(), client_order_id))
+}
+
+/// OKX 现货下单：`tdMode=cash`，数量单位就是基础币（不是张），没有杠杆与 reduceOnly。
+fn okx_spot_place(
+    http: &HttpClient,
+    base_url: &str,
+    credentials: &AccountCredentials,
+    request: &PlaceOrderRequest,
+    client_order_id: &str,
+) -> Result<VenueOrderAck, ExchangeError> {
+    let (key, secret) = key_pair(credentials)?;
+    let passphrase = credentials
+        .passphrase
+        .as_deref()
+        .ok_or_else(|| ExchangeError::Credentials("OKX 需要 Passphrase".to_string()))?;
+    let base_url = base_url.trim_end_matches('/');
+    let inst_id = format!("{}-USDT", base_asset(request)?);
+
+    // 现货的 minSz / lotSz 都以基础币计，先按步长向下取整再校验最小值。
+    let instrument = http
+        .get_json(&format!(
+            "{base_url}/api/v5/public/instruments?instType=SPOT&instId={inst_id}"
+        ))
+        .map_err(transport)?;
+    let lot_size = decimal(&instrument["data"][0]["lotSz"])
+        .filter(|value| *value > Decimal::ZERO)
+        .unwrap_or(Decimal::ONE);
+    let min_size = decimal(&instrument["data"][0]["minSz"])
+        .filter(|value| *value > Decimal::ZERO)
+        .unwrap_or(Decimal::ZERO);
+    let quantity = (request.quantity / lot_size).floor() * lot_size;
+    if quantity <= Decimal::ZERO || quantity < min_size {
+        return Err(ExchangeError::Rejected(format!(
+            "OKX {inst_id} 现货数量不足最小下单 {min_size}（步长 {lot_size}）"
+        )));
+    }
+
+    let body = json!({
+        "instId": inst_id,
+        "tdMode": "cash",
+        "side": if request.side == Side::Buy { "buy" } else { "sell" },
+        "ordType": "limit",
+        "px": num(request.limit_price),
+        "sz": num(quantity),
+        "clOrdId": client_order_id,
+    })
+    .to_string();
+    let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+    let signature = hmac_base64(secret, &format!("{timestamp}POST/api/v5/trade/order{body}"))?;
+    let headers = [
+        ("OK-ACCESS-KEY", key),
+        ("OK-ACCESS-SIGN", signature.as_str()),
+        ("OK-ACCESS-TIMESTAMP", timestamp.as_str()),
+        ("OK-ACCESS-PASSPHRASE", passphrase),
+    ];
+    let value = http
+        .post_body_with_headers(&format!("{base_url}/api/v5/trade/order"), &headers, &body)
+        .map_err(transport)?;
+
+    let data = &value["data"][0];
+    if data["sCode"].as_str().unwrap_or("0") != "0" {
+        return Err(ExchangeError::Rejected(format!(
+            "OKX 现货拒单: {}",
+            data["sMsg"].as_str().unwrap_or("未知错误")
+        )));
+    }
+    let order_id = data["ordId"]
+        .as_str()
+        .ok_or_else(|| ExchangeError::Rejected(format!("OKX 现货响应缺少 ordId: {value}")))?;
+    Ok(ack(order_id, client_order_id))
+}
+
+/// Bybit 现货下单：`category=spot`，数量按基础币，现货没有 `reduceOnly`。
+fn bybit_spot_place(
+    http: &HttpClient,
+    base_url: &str,
+    credentials: &AccountCredentials,
+    request: &PlaceOrderRequest,
+    client_order_id: &str,
+) -> Result<VenueOrderAck, ExchangeError> {
+    let (key, secret) = key_pair(credentials)?;
+    let base_url = base_url.trim_end_matches('/');
+    let body = json!({
+        "category": "spot",
+        "symbol": internal_symbol(request),
+        "side": if request.side == Side::Buy { "Buy" } else { "Sell" },
+        "orderType": "Limit",
+        "qty": num(request.quantity),
+        "price": num(request.limit_price),
+        "orderLinkId": client_order_id,
+    })
+    .to_string();
+    let timestamp = now_millis().to_string();
+    let recv_window = "5000";
+    let signature = hmac_hex(secret, &format!("{timestamp}{key}{recv_window}{body}"))?;
+    let headers = [
+        ("X-BAPI-API-KEY", key),
+        ("X-BAPI-TIMESTAMP", timestamp.as_str()),
+        ("X-BAPI-SIGN", signature.as_str()),
+        ("X-BAPI-RECV-WINDOW", recv_window),
+    ];
+    let value = http
+        .post_body_with_headers(&format!("{base_url}/v5/order/create"), &headers, &body)
+        .map_err(transport)?;
+
+    if value["retCode"].as_i64().unwrap_or(0) != 0 {
+        return Err(ExchangeError::Rejected(format!(
+            "Bybit 现货拒单: {}",
+            value["retMsg"].as_str().unwrap_or("未知错误")
+        )));
+    }
+    let order_id = value["result"]["orderId"]
+        .as_str()
+        .ok_or_else(|| ExchangeError::Rejected(format!("Bybit 现货响应缺少 orderId: {value}")))?;
     Ok(ack(order_id, client_order_id))
 }
 

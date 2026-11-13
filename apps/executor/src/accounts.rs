@@ -293,12 +293,17 @@ impl Accounts {
     }
 
     /// 实盘下单使用的账户凭证；同一交易所优先取已配置签名凭证的账户。
+    ///
+    /// 现货腿（如 `binance-spot`、`okx-spot`、`bybit-spot`）与永续腿共用同一个
+    /// 交易所账户，按去掉 `-spot` 后的交易所名查找凭证。
     pub fn credentials_for(&self, venue: &str) -> Option<AccountCredentials> {
+        let venue = venue.trim().to_ascii_lowercase();
+        let base = venue.strip_suffix("-spot").unwrap_or(&venue);
         let accounts = self.accounts.read().expect("账户锁不可用");
         accounts
             .iter()
-            .find(|account| account.venue == venue && has_trading_credentials(account))
-            .or_else(|| accounts.iter().find(|account| account.venue == venue))
+            .find(|account| account.venue == base && has_trading_credentials(account))
+            .or_else(|| accounts.iter().find(|account| account.venue == base))
             .cloned()
     }
 

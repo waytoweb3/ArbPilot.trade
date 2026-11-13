@@ -120,6 +120,12 @@ struct LotSizeFilter {
     /// 数量步长（基础币），下单数量必须是该值的整数倍。
     #[serde(default)]
     qty_step: Option<String>,
+    /// 现货的最小下单金额（USDT）。
+    #[serde(default)]
+    min_order_amt: Option<String>,
+    /// 现货的数量精度（基础币），相当于永续的 qtyStep。
+    #[serde(default)]
+    base_precision: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -318,6 +324,54 @@ impl BybitFundingClient {
             // 下单数量必须是 qtyStep 的整数倍，否则 Bybit 以 10001「Qty invalid」拒单。
             spec.step_size = filter
                 .qty_step
+                .as_deref()
+                .and_then(|value| parse_decimal(value).ok())
+                .filter(|value| *value > Decimal::ZERO);
+        }
+        if let Some(filter) = row.price_filter {
+            spec.tick_size = filter
+                .tick_size
+                .as_deref()
+                .and_then(|value| parse_decimal(value).ok())
+                .filter(|value| *value > Decimal::ZERO);
+        }
+        Ok(Some(spec))
+    }
+
+    /// 单个现货交易对的最小下单数量、最小下单额与数量精度。
+    ///
+    /// 现货的 `lotSizeFilter` 用 `basePrecision` / `minOrderAmt` 描述精度与最小值，
+    /// 与永续的 `qtyStep` / `minNotionalValue` 字段不同，需要单独解析。
+    pub fn spot_min_order(&self, symbol: &str) -> anyhow::Result<Option<MinOrderSpec>> {
+        let url = format!(
+            "{}/v5/market/instruments-info?category=spot&symbol={symbol}",
+            self.base_url
+        );
+        let envelope: Envelope<InstrumentResult> =
+            serde_json::from_value(self.http.get_json(&url)?)
+                .context("解析 Bybit instruments 失败")?;
+        let Some(row) = into_result(envelope, "market/instruments-info")?
+            .list
+            .into_iter()
+            .next()
+        else {
+            return Ok(None);
+        };
+
+        let mut spec = MinOrderSpec::new(VENUE, symbol);
+        if let Some(filter) = row.lot_size_filter {
+            spec.min_quantity = filter
+                .min_order_qty
+                .as_deref()
+                .and_then(|value| parse_decimal(value).ok())
+                .filter(|value| *value > Decimal::ZERO);
+            spec.min_notional_usd = filter
+                .min_order_amt
+                .as_deref()
+                .and_then(|value| parse_decimal(value).ok())
+                .filter(|value| *value > Decimal::ZERO);
+            spec.step_size = filter
+                .base_precision
                 .as_deref()
                 .and_then(|value| parse_decimal(value).ok())
                 .filter(|value| *value > Decimal::ZERO);
@@ -584,6 +638,37 @@ mod tests {
                 .as_deref()
                 .and_then(|value| parse_decimal(value).ok()),
             Some(dec!(0.1))
+        );
+    }
+
+    #[test]
+    fn parses_spot_lot_size_precision_and_min_amount() {
+        let payload: InstrumentResult = serde_json::from_str(
+            r#"{"list":[{"symbol":"BTCUSDT","baseCoin":"BTC","quoteCoin":"USDT",
+                "lotSizeFilter":{"basePrecision":"0.000001","minOrderQty":"0.000048","minOrderAmt":"1"},
+                "priceFilter":{"tickSize":"0.01"}}]}"#,
+        )
+        .expect("fixture 应可解析");
+
+        let row = payload.list.into_iter().next().expect("应含一条现货");
+        let lot = row.lot_size_filter.expect("应含 lotSizeFilter");
+        assert_eq!(
+            lot.base_precision
+                .as_deref()
+                .and_then(|value| parse_decimal(value).ok()),
+            Some(dec!(0.000001))
+        );
+        assert_eq!(
+            lot.min_order_amt
+                .as_deref()
+                .and_then(|value| parse_decimal(value).ok()),
+            Some(dec!(1))
+        );
+        assert_eq!(
+            lot.min_order_qty
+                .as_deref()
+                .and_then(|value| parse_decimal(value).ok()),
+            Some(dec!(0.000048))
         );
     }
 }
