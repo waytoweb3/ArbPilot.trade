@@ -69,7 +69,8 @@ jobs:
           if [ -z "$APPLE_CERTIFICATE" ]; then
             unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID
           fi
-          pnpm tauri build --bundles dmg
+          # 同时产出 app 与 dmg：更新包 .app.tar.gz 只在打包 app 时生成。
+          pnpm tauri build --bundles app,dmg
 
       - name: 生成 latest.json
         env:
@@ -80,6 +81,7 @@ jobs:
           const path = require("path");
 
           (async () => {
+            const crypto = require("crypto");
             const version = JSON.parse(
               fs.readFileSync("apps/desktop/src-tauri/tauri.conf.json", "utf8"),
             ).version;
@@ -112,6 +114,17 @@ jobs:
             fs.copyFileSync(
               path.join(macosDir, `${updater}.sig`),
               path.join(outDir, `${updater}.sig`),
+            );
+
+            // macOS 未配置 Developer ID，官网靠 SHA-256 + 签名信息让用户自行核对安装包。
+            const sha256 = (file) =>
+              crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+            fs.writeFileSync(
+              path.join(outDir, "SHA256SUMS-macos.txt"),
+              [
+                `${sha256(path.join(dmgDir, dmg))}  ${dmg}`,
+                `${sha256(path.join(macosDir, updater))}  ${updater}`,
+              ].join("\n") + "\n",
             );
 
             const baseUrl = "https://download.arbpilot.trade/desktop";
