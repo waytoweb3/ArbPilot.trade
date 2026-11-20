@@ -207,7 +207,7 @@ const zh = {
     perMonth: "/ 月",
     payment: "支付由 Waffo Pancake 作为记录商户处理，卡数据不经过我们的服务器。",
     policies: "订阅即表示同意服务条款与隐私政策；退款政策见服务条款第 7 条。",
-    note: "价格以美元计价，不含适用税费。策略由作者定价，可免费或按月收费；平台按成交额抽成，冷启动期 6 个月 10%，之后 20%，免费策略不抽成。",
+    note: "价格以美元计价，不含适用税费。策略由作者定价，可免费或一次性买断（永久授权）；平台按成交额抽成，冷启动期 6 个月 10%，之后 20%，免费策略不抽成。",
   },
   checkout: {
     eyebrow: "Checkout",
@@ -454,7 +454,7 @@ const en: typeof zh = {
     perMonth: "/ mo",
     payment: "Payments are processed by Waffo Pancake as Merchant of Record. Card data never touches our servers.",
     policies: "Subscribing means you accept the Terms of Service and Privacy Policy; refunds are covered by Section 7 of the Terms.",
-    note: "Prices are in USD and exclude applicable taxes. Strategies are priced by their authors, free or monthly; the platform takes 10% of sales for the first 6 months, then 20%, and free strategies take no cut.",
+    note: "Prices are in USD and exclude applicable taxes. Strategies are priced by their authors, free or one-time purchase with lifetime access; the platform takes 10% of sales for the first 6 months, then 20%, and free strategies take no cut.",
   },
   checkout: {
     eyebrow: "Checkout",
