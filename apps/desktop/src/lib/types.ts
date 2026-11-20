@@ -1542,3 +1542,32 @@ export interface CreatePerformanceRequest {
   reproducible?: boolean;
   note?: string;
 }
+
+/** 机会净收益使用的手续费档位，单位 bps。 */
+export interface FeeConfig {
+  taker_bps: Decimal;
+  maker_bps: Decimal;
+  slippage_bps: Decimal;
+}
+
+/** Telegram Bot 配置状态；Token 本身不会通过接口回传。 */
+export interface TelegramConfig {
+  configured: boolean;
+  enabled: boolean;
+  api_base: string;
+  /** 内置执行器保存后需要重启 sidecar 才生效。 */
+  restart_required: boolean;
+}
+
+/** 启动对账结果：仍未完成的订单与是否已暂停。 */
+export interface ReconcileReport {
+  incomplete_orders: string[];
+  paused: boolean;
+}
+
+/** 一键脱困结果：撤销的订单数、平掉的仓位数与失败明细。 */
+export interface PanicResponse {
+  cancelled_orders: number;
+  closed_positions: number;
+  errors: string[];
+}

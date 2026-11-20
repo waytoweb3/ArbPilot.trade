@@ -234,7 +234,7 @@ export default function TradePage() {
   );
   const livePrices = usePriceStream(priceLegs);
 
-  // 部分交易所（如 OKX、HTX）的资金费接口不带标记价，用实时盘口中间价兜底。
+  // 部分交易所（如 OKX）的资金费接口不带标记价，用实时盘口中间价兜底。
   const priceOf = (venue: string, entry: FundingSymbolStatus | null): number | null => {
     const markPrice = entry?.mark_price;
     if (markPrice != null) {

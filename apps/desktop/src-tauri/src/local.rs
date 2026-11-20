@@ -98,11 +98,14 @@ pub fn start(app: &AppHandle) -> ExecutorRuntime {
         .env("ARBPILOT_LOCAL_DB", &database)
         .env("ARBPILOT_ACCOUNTS_FILE", data_dir.join("accounts.json"))
         .env("ARBPILOT_RISK_FILE", data_dir.join("risk_limits.json"))
+        .env("ARBPILOT_FEES_FILE", data_dir.join("fees.json"))
         .env("ARBPILOT_LICENSE_FILE", data_dir.join("license.json"))
         .env(
             "ARBPILOT_TELEGRAM_BINDINGS_FILE",
             data_dir.join("telegram_bindings.json"),
         )
+        // 内置执行器没有 .env：Token 由桌面端设置页写入 telegram_bot.json 后在这里读取。
+        .env("ARBPILOT_TELEGRAM_FILE", data_dir.join("telegram_bot.json"))
         .env("ARBPILOT_PUBLIC_MODE", "false")
         // 内置执行器由桌面端登录态控制授权，不做执行器级校验；显式置空，避免继承仓库根 .env 的 true。
         .env("ARBPILOT_LICENSE_REQUIRED", "false")
@@ -113,6 +116,19 @@ pub fn start(app: &AppHandle) -> ExecutorRuntime {
         .stderr(Stdio::null());
     if let Some(dir) = binary.parent() {
         command.current_dir(dir);
+    }
+    // 显式设置过的 Telegram 环境变量优先于 telegram_bot.json。
+    for key in [
+        "ARBPILOT_TELEGRAM_BOT_TOKEN",
+        "ARBPILOT_TELEGRAM_ENABLED",
+        "ARBPILOT_TELEGRAM_API_BASE",
+        "ARBPILOT_TELEGRAM_POLL_SECS",
+    ] {
+        if let Ok(value) = std::env::var(key) {
+            if !value.trim().is_empty() {
+                command.env(key, value);
+            }
+        }
     }
 
     match command.spawn() {

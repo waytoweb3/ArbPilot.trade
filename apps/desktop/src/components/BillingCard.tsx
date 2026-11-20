@@ -376,6 +376,13 @@ export function BillingCard() {
                     <p className="mt-0.5 text-[11px] text-subtle">
                       {t.settings.accountExpires} {dateText(item.currentPeriodEnd)}
                     </p>
+                    {item.cancelAtPeriodEnd && (
+                      <p className="mt-0.5 text-[10px] text-warning">
+                        {fmt(t.settings.accountSubCancelScheduled, {
+                          date: dateText(item.currentPeriodEnd),
+                        })}
+                      </p>
+                    )}
                   </div>
                   <div className="flex shrink-0 items-center gap-2">
                     <Badge tone={statusTones[item.status] ?? "neutral"}>
@@ -404,6 +411,14 @@ export function BillingCard() {
           )}
           {cancelError && <p className="mt-2 text-[11px] text-danger">{cancelError}</p>}
         </div>
+
+        {activePlans.length > 0 && (
+          <p className="text-[11px] leading-relaxed text-subtle">
+            {fmt(t.settings.billingEntitlementNote, {
+              value: dateText(entitlement?.expiresAt),
+            })}
+          </p>
+        )}
 
         <div className="grid gap-3">
           {plans.map((item) => {

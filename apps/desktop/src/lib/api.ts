@@ -47,6 +47,10 @@ import type {
   NewsResponse,
   NotificationSettings,
   Opportunity,
+  PanicResponse,
+  ReconcileReport,
+  FeeConfig,
+  TelegramConfig,
   Order,
   ParamValues,
   ParamsSchema,
@@ -383,6 +387,46 @@ export const api = {
     ),
 
   orders: () => request<Order[]>("/api/v1/orders"),
+
+  /** 撤单：只对仍在执行中的订单有效，失败时返回交易所原始错误。 */
+  cancelOrder: (id: string) =>
+    request<Order>(`/api/v1/orders/${encodeURIComponent(id)}/cancel`, { method: "POST" }),
+
+  /** 改单：撤掉原单后按新价格/数量重新走风控。 */
+  replaceOrder: (id: string, body: { limit_price: Decimal; quantity?: Decimal | null }) =>
+    request<Order>(`/api/v1/orders/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+    }),
+
+  /** 启动对账：返回仍未完成的订单，并在不一致时同步暂停状态。 */
+  reconcileOrders: () =>
+    request<ReconcileReport>("/api/v1/orders/reconcile", { method: "POST" }),
+
+  /** 一键脱困：撤销全部挂单并平掉全部仓位，执行后保持暂停。 */
+  panic: () =>
+    request<PanicResponse>("/api/v1/control/panic", {
+      method: "POST",
+      body: JSON.stringify({ confirm: true }),
+    }),
+
+  /** 当前生效的手续费档位（bps）。 */
+  fees: () => request<FeeConfig>("/api/v1/config/fees"),
+
+  updateFees: (body: FeeConfig) =>
+    request<FeeConfig>("/api/v1/config/fees", {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }),
+
+  /** Telegram Bot 配置状态；Token 不回传。 */
+  telegramConfig: () => request<TelegramConfig>("/api/v1/config/telegram"),
+
+  updateTelegramConfig: (body: { token?: string | null; enabled?: boolean }) =>
+    request<TelegramConfig>("/api/v1/config/telegram", {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }),
 
   /** 导入的交易所账户、余额与权益汇总。 */
   accounts: () => request<AccountsResponse>("/api/v1/accounts"),

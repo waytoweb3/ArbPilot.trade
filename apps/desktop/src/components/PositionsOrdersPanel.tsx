@@ -1,8 +1,15 @@
-import { ChevronLeft, ChevronRight } from "lucide-react";
-import { useMemo, useState } from "react";
+import { ChevronLeft, ChevronRight, ShieldAlert } from "lucide-react";
+import { Fragment, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 
-import { useCloseAllPositions, useClosePosition } from "../hooks/useApi";
+import {
+  useCancelOrder,
+  useCloseAllPositions,
+  useClosePosition,
+  usePanic,
+  useReconcileOrders,
+  useReplaceOrder,
+} from "../hooks/useApi";
 import { toNumber } from "../lib/api";
 import {
   formatNumber,
@@ -44,8 +51,21 @@ export function PositionsOrdersPanel({
   const { t } = useI18n();
   const closePosition = useClosePosition();
   const closeAll = useCloseAllPositions();
+  const cancelOrder = useCancelOrder();
+  const replaceOrder = useReplaceOrder();
+  const reconcile = useReconcileOrders();
+  const panic = usePanic();
   // 平仓相关的错误（单腿 / 一键）统一展示在持仓面板顶部。
   const positionCloseError = closeAll.error ?? closePosition.error;
+  // 改单：一次只展开一行，避免多行表单互相覆盖。
+  const [editing, setEditing] = useState<{
+    id: string;
+    price: string;
+    quantity: string;
+  } | null>(null);
+  // 一键脱困必须手动输入确认码，避免误触清仓。
+  const [panicOpen, setPanicOpen] = useState(false);
+  const [panicInput, setPanicInput] = useState("");
 
   // 仓位组筛选：下拉选择后只看该组仓位；分组消失（已平仓）时自动回落到全部。
   const [tab, setTab] = useState<BottomTab>("positions");
@@ -149,10 +169,46 @@ export function PositionsOrdersPanel({
             </button>
           ))}
         </div>
-        <Link to="/positions" className="shrink-0 pr-1 text-[11px] text-muted hover:text-body">
-          {t.trade.viewAll}
-        </Link>
+        <div className="flex shrink-0 items-center gap-2">
+          <button
+            type="button"
+            disabled={reconcile.isPending}
+            onClick={() => reconcile.mutate()}
+            className="text-[11px] text-muted transition-colors hover:text-body disabled:opacity-50"
+          >
+            {t.trade.reconcile}
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setPanicInput("");
+              setPanicOpen(true);
+            }}
+            className="flex items-center gap-1 rounded-md border border-danger/40 px-2 py-1 text-[11px] text-danger transition-colors hover:bg-danger/10"
+          >
+            <ShieldAlert size={12} />
+            {t.trade.panic}
+          </button>
+          <Link to="/positions" className="pr-1 text-[11px] text-muted hover:text-body">
+            {t.trade.viewAll}
+          </Link>
+        </div>
       </div>
+      {(reconcile.data || reconcile.error || panic.data || panic.error) && (
+        <p className="border-b border-line px-4 py-1.5 text-[11px] text-muted">
+          {reconcile.data &&
+            `${fmt(t.trade.reconcileDone, { count: reconcile.data.incomplete_orders.length })} · ${
+              reconcile.data.paused ? t.trade.reconcilePaused : t.trade.reconcileClear
+            }`}
+          {reconcile.error && <span className="text-danger">{reconcile.error.message}</span>}
+          {panic.data &&
+            ` ${fmt(t.trade.panicDone, {
+              orders: panic.data.cancelled_orders,
+              positions: panic.data.closed_positions,
+            })}`}
+          {panic.error && <span className="text-danger">{panic.error.message}</span>}
+        </p>
+      )}
       <CardContent className="p-0">
         {tab === "positions" && (
           <>
@@ -270,42 +326,149 @@ export function PositionsOrdersPanel({
                     <th className="px-4 py-2 text-left font-medium">{t.positions.status}</th>
                     <th className="px-4 py-2 text-right font-medium">{t.positions.time}</th>
                     <th className="px-4 py-2 text-left font-medium">{t.positions.note}</th>
+                    {tab === "openOrders" && (
+                      <th className="px-4 py-2 text-right font-medium">
+                        {t.positions.action}
+                      </th>
+                    )}
                   </tr>
                 </thead>
                 <tbody>
                   {pageRows(orderList).map((order) => (
-                    <tr key={order.id} className="border-b border-line/70 last:border-0">
-                      <td className="px-4 py-2 font-mono text-[11px] text-muted">
-                        {order.id.slice(0, 8)}
-                      </td>
-                      <td className="px-4 py-2 font-mono text-[11px] text-muted">
-                        {order.intent.legs
-                          .map(
-                            (leg) =>
-                              `${leg.venue} ${leg.side === "buy" ? t.positions.buy : t.positions.sell}`,
-                          )
-                          .join(" / ")}
-                      </td>
-                      <td className="px-4 py-2 text-right font-mono text-body">
-                        {formatUsd(
-                          order.intent.legs.reduce(
-                            (sum, leg) => sum + toNumber(leg.quantity) * toNumber(leg.limit_price),
-                            0,
-                          ),
+                    <Fragment key={order.id}>
+                      <tr className="border-b border-line/70 last:border-0">
+                        <td className="px-4 py-2 font-mono text-[11px] text-muted">
+                          {order.id.slice(0, 8)}
+                        </td>
+                        <td className="px-4 py-2 font-mono text-[11px] text-muted">
+                          {order.intent.legs
+                            .map(
+                              (leg) =>
+                                `${leg.venue} ${leg.side === "buy" ? t.positions.buy : t.positions.sell}`,
+                            )
+                            .join(" / ")}
+                        </td>
+                        <td className="px-4 py-2 text-right font-mono text-body">
+                          {formatUsd(
+                            order.intent.legs.reduce(
+                              (sum, leg) => sum + toNumber(leg.quantity) * toNumber(leg.limit_price),
+                              0,
+                            ),
+                          )}
+                        </td>
+                        <td className="px-4 py-2">
+                          <Badge tone={orderStatusTone[order.status]}>
+                            {orderStatusLabel(order.status)}
+                          </Badge>
+                        </td>
+                        <td className="px-4 py-2 text-right font-mono text-[11px] text-muted">
+                          {formatTime(order.created_at)}
+                        </td>
+                        <td className="max-w-[220px] px-4 py-2 text-[11px] text-warning">
+                          {order.note ?? "—"}
+                        </td>
+                        {tab === "openOrders" && (
+                          <td className="whitespace-nowrap px-4 py-2 text-right">
+                            <div className="flex items-center justify-end gap-2">
+                              <button
+                                type="button"
+                                disabled={replaceOrder.isPending}
+                                onClick={() => {
+                                  const leg = order.intent.legs[0];
+                                  setEditing({
+                                    id: order.id,
+                                    price: leg ? String(toNumber(leg.limit_price)) : "",
+                                    quantity: leg ? String(toNumber(leg.quantity)) : "",
+                                  });
+                                }}
+                                className="text-muted transition-colors hover:text-body disabled:opacity-50"
+                              >
+                                {t.trade.replaceOrder}
+                              </button>
+                              <button
+                                type="button"
+                                disabled={cancelOrder.isPending}
+                                onClick={() => cancelOrder.mutate(order.id)}
+                                className="text-danger transition-opacity hover:opacity-80 disabled:opacity-50"
+                              >
+                                {cancelOrder.isPending
+                                  ? t.trade.cancelOrdering
+                                  : t.trade.cancelOrder}
+                              </button>
+                            </div>
+                          </td>
                         )}
-                      </td>
-                      <td className="px-4 py-2">
-                        <Badge tone={orderStatusTone[order.status]}>
-                          {orderStatusLabel(order.status)}
-                        </Badge>
-                      </td>
-                      <td className="px-4 py-2 text-right font-mono text-[11px] text-muted">
-                        {formatTime(order.created_at)}
-                      </td>
-                      <td className="max-w-[220px] px-4 py-2 text-[11px] text-warning">
-                        {order.note ?? "—"}
-                      </td>
-                    </tr>
+                      </tr>
+                      {tab === "openOrders" && editing?.id === order.id && (
+                        <tr className="border-b border-line/70 bg-panel-soft/60">
+                          <td colSpan={7} className="px-4 py-2">
+                            <div className="flex flex-wrap items-end gap-2">
+                              <label className="space-y-1">
+                                <span className="block text-[10px] text-muted">
+                                  {t.trade.replacePrice}
+                                </span>
+                                <input
+                                  value={editing.price}
+                                  onChange={(event) =>
+                                    setEditing({ ...editing, price: event.target.value })
+                                  }
+                                  className="w-28 rounded-md border border-line bg-panel px-2 py-1 font-mono text-[11px] text-body outline-none focus:border-accent/60"
+                                />
+                              </label>
+                              <label className="space-y-1">
+                                <span className="block text-[10px] text-muted">
+                                  {t.trade.replaceQty}
+                                </span>
+                                <input
+                                  value={editing.quantity}
+                                  onChange={(event) =>
+                                    setEditing({ ...editing, quantity: event.target.value })
+                                  }
+                                  className="w-28 rounded-md border border-line bg-panel px-2 py-1 font-mono text-[11px] text-body outline-none focus:border-accent/60"
+                                />
+                              </label>
+                              <button
+                                type="button"
+                                disabled={replaceOrder.isPending}
+                                onClick={() => {
+                                  const price = Number(editing.price);
+                                  if (!Number.isFinite(price) || price <= 0) {
+                                    return;
+                                  }
+                                  const quantity = editing.quantity.trim()
+                                    ? editing.quantity.trim()
+                                    : null;
+                                  replaceOrder.mutate(
+                                    {
+                                      id: editing.id,
+                                      limitPrice: editing.price.trim(),
+                                      quantity,
+                                    },
+                                    { onSuccess: () => setEditing(null) },
+                                  );
+                                }}
+                                className="rounded-md border border-accent/40 px-2 py-1 text-[11px] text-accent transition-colors hover:bg-accent/10 disabled:opacity-50"
+                              >
+                                {t.trade.replaceSubmit}
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setEditing(null)}
+                                className="rounded-md border border-line px-2 py-1 text-[11px] text-muted transition-colors hover:bg-hover"
+                              >
+                                {t.trade.replaceCancel}
+                              </button>
+                              <span className="text-[10px] text-muted">{t.trade.replaceHint}</span>
+                            </div>
+                            {replaceOrder.error && (
+                              <p className="mt-1 text-[11px] text-danger">
+                                {replaceOrder.error.message}
+                              </p>
+                            )}
+                          </td>
+                        </tr>
+                      )}
+                    </Fragment>
                   ))}
                 </tbody>
               </table>
@@ -396,6 +559,63 @@ export function PositionsOrdersPanel({
           </div>
         )}
       </CardContent>
+
+      {panicOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
+          role="dialog"
+          aria-modal="true"
+        >
+          <div className="w-full max-w-sm rounded-xl border border-line bg-panel shadow-xl">
+            <div className="border-b border-line px-4 py-3">
+              <p className="text-sm font-semibold text-fg">{t.trade.panicTitle}</p>
+            </div>
+            <div className="space-y-3 p-4">
+              <p className="text-xs leading-relaxed text-muted">{t.trade.panicDesc}</p>
+              <label className="block space-y-1">
+                <span className="text-[11px] text-muted">{t.trade.panicInputLabel}</span>
+                <input
+                  autoFocus
+                  value={panicInput}
+                  onChange={(event) => setPanicInput(event.target.value)}
+                  placeholder={t.trade.panicHint}
+                  className="w-full rounded-md border border-line bg-panel-soft px-2 py-1.5 font-mono text-xs text-body outline-none focus:border-danger/60"
+                />
+              </label>
+              {panic.error && (
+                <p className="break-words text-[11px] leading-relaxed text-danger">
+                  {panic.error.message}
+                </p>
+              )}
+              <div className="flex justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => setPanicOpen(false)}
+                  disabled={panic.isPending}
+                  className="rounded-md border border-line px-3 py-1.5 text-xs text-muted transition-colors hover:bg-hover disabled:opacity-50"
+                >
+                  {t.trade.panicCancel}
+                </button>
+                <button
+                  type="button"
+                  disabled={panic.isPending || panicInput.trim() !== "PANIC"}
+                  onClick={() =>
+                    panic.mutate(undefined, {
+                      onSuccess: () => {
+                        setPanicOpen(false);
+                        setPanicInput("");
+                      },
+                    })
+                  }
+                  className="rounded-md bg-danger px-3 py-1.5 text-xs font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-40"
+                >
+                  {t.trade.panicConfirm}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

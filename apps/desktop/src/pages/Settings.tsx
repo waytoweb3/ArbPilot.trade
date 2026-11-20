@@ -21,16 +21,20 @@ import {
   useCreateMarketAuthor,
   useCreateSettlement,
   useCreateTelegramPairing,
+  useFees,
   useMarketAuthors,
   useNotificationSettings,
   useRevokeTelegramBinding,
   useRiskLimits,
   useSettlements,
+  useTelegramConfig,
   useTelegramStatus,
+  useUpdateFees,
   useUpdateMarketAuthor,
   useUpdateNotificationSettings,
   useUpdateRiskLimits,
   useUpdateSettlement,
+  useUpdateTelegramConfig,
 } from "../hooks/useApi";
 import { useAccount } from "../hooks/useAccount";
 import { isDesktopRuntime } from "../lib/deploy";
@@ -306,7 +310,12 @@ export default function SettingsPage() {
         </div>
       )}
 
-      {tab === "risk" && <RiskLimitsCard />}
+      {tab === "risk" && (
+        <div className="space-y-4">
+          <RiskLimitsCard />
+          <FeeTierCard />
+        </div>
+      )}
 
       {tab === "account" && <BillingCard />}
 
@@ -1344,6 +1353,94 @@ function RiskLimitsCard() {
   );
 }
 
+/** 费率档位：机会净收益按这里的三项费率重算，VIP 用户可换成自己的实际费率。 */
+function FeeTierCard() {
+  const { t } = useI18n();
+  const fees = useFees();
+  const update = useUpdateFees();
+  const [draft, setDraft] = useState({ taker: "4", maker: "2", slippage: "1" });
+  const [saved, setSaved] = useState(false);
+
+  useEffect(() => {
+    if (!fees.data) {
+      return;
+    }
+    setDraft({
+      taker: String(fees.data.taker_bps),
+      maker: String(fees.data.maker_bps),
+      slippage: String(fees.data.slippage_bps),
+    });
+  }, [fees.data]);
+
+  const taker = Number(draft.taker);
+  const slippage = Number(draft.slippage);
+  const roundTrip =
+    Number.isFinite(taker) && Number.isFinite(slippage) ? taker * 2 + slippage : null;
+
+  const fields = [
+    { key: "taker" as const, label: t.settings.feesTaker },
+    { key: "maker" as const, label: t.settings.feesMaker },
+    { key: "slippage" as const, label: t.settings.feesSlippage },
+  ];
+
+  return (
+    <Card>
+      <CardHeader>
+        <div>
+          <CardTitle>{t.settings.fees}</CardTitle>
+          <CardDescription>{t.settings.feesDesc}</CardDescription>
+        </div>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <div className="grid gap-3 sm:grid-cols-3">
+          {fields.map((field) => (
+            <label key={field.key} className="block space-y-1.5">
+              <span className="text-xs text-muted">{field.label}</span>
+              <input
+                className={`${smallInputClass} font-mono`}
+                inputMode="decimal"
+                value={draft[field.key]}
+                onChange={(event) => {
+                  setDraft({ ...draft, [field.key]: event.target.value });
+                  setSaved(false);
+                }}
+              />
+            </label>
+          ))}
+        </div>
+        {roundTrip !== null && (
+          <p className="text-[11px] text-muted">
+            {fmt(t.settings.feesRoundTrip, { value: roundTrip })}
+          </p>
+        )}
+        <div className="flex flex-wrap items-center gap-3">
+          <Button
+            size="sm"
+            disabled={update.isPending}
+            onClick={() =>
+              update.mutate(
+                {
+                  taker_bps: draft.taker,
+                  maker_bps: draft.maker,
+                  slippage_bps: draft.slippage,
+                },
+                { onSuccess: () => setSaved(true) },
+              )
+            }
+          >
+            {update.isPending ? t.settings.feesSaving : t.settings.feesSave}
+          </Button>
+          {saved && <span className="text-xs text-accent">{t.settings.feesSaved}</span>}
+          {update.isError && (
+            <span className="text-xs text-danger">{update.error.message}</span>
+          )}
+          <span className="text-[11px] text-muted">{t.settings.feesHint}</span>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
 function LimitItem({ label, value }: { label: string; value: string }) {
   return (
     <div>
@@ -1646,6 +1743,11 @@ function TelegramCard() {
   const status = useTelegramStatus();
   const pairing = useCreateTelegramPairing();
   const revoke = useRevokeTelegramBinding();
+  const tokenConfig = useTelegramConfig();
+  const saveToken = useUpdateTelegramConfig();
+  // 内置执行器没有 .env，Token 必须通过设置页写入本机文件后重启生效。
+  const [tokenDraft, setTokenDraft] = useState("");
+  const [tokenSaved, setTokenSaved] = useState(false);
   const data = status.data;
 
   return (
@@ -1678,6 +1780,56 @@ function TelegramCard() {
                 {t.settings.telegramNotConfigured}
               </p>
             )}
+
+            <div className="space-y-2 rounded-lg border border-line bg-panel-soft/50 px-3 py-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <span className="text-xs text-muted">{t.settings.telegramToken}</span>
+                {tokenConfig.data?.configured ? (
+                  <Badge tone="success">{t.settings.telegramTokenConfigured}</Badge>
+                ) : null}
+              </div>
+              <input
+                type="password"
+                className={`${inputClass} font-mono`}
+                value={tokenDraft}
+                placeholder="123456789:AA..."
+                onChange={(event) => {
+                  setTokenDraft(event.target.value);
+                  setTokenSaved(false);
+                }}
+              />
+              <p className="text-[11px] leading-relaxed text-muted">
+                {t.settings.telegramTokenHint}
+              </p>
+              <div className="flex flex-wrap items-center gap-3">
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  disabled={saveToken.isPending}
+                  onClick={() =>
+                    saveToken.mutate(
+                      { token: tokenDraft.trim() || null },
+                      {
+                        onSuccess: () => {
+                          setTokenDraft("");
+                          setTokenSaved(true);
+                        },
+                      },
+                    )
+                  }
+                >
+                  {saveToken.isPending
+                    ? t.settings.telegramTokenSaving
+                    : t.settings.telegramTokenSave}
+                </Button>
+                {tokenSaved && (
+                  <span className="text-xs text-accent">{t.settings.telegramTokenSaved}</span>
+                )}
+                {saveToken.isError && (
+                  <span className="text-xs text-danger">{saveToken.error.message}</span>
+                )}
+              </div>
+            </div>
 
             <div className="flex flex-wrap items-center gap-3">
               <Button

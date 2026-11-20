@@ -6,6 +6,8 @@ import type {
   CreateOrderRequest,
   CreatePerformanceRequest,
   CreatePublicationRequest,
+  Decimal,
+  FeeConfig,
   ImportAccountRequest,
   ListingSettings,
   ParamValues,
@@ -157,6 +159,101 @@ export function useClosePosition() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["positions"] });
       queryClient.invalidateQueries({ queryKey: ["orders"] });
+    },
+  });
+}
+
+/** 撤单：成功后刷新订单列表。 */
+export function useCancelOrder() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => api.cancelOrder(id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["orders"] });
+      queryClient.invalidateQueries({ queryKey: ["positions"] });
+    },
+  });
+}
+
+/** 改单：撤原单后按新价格/数量重新下单，成功后刷新订单与仓位。 */
+export function useReplaceOrder() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (variables: { id: string; limitPrice: Decimal; quantity?: Decimal | null }) =>
+      api.replaceOrder(variables.id, {
+        limit_price: variables.limitPrice,
+        quantity: variables.quantity ?? null,
+      }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["orders"] });
+      queryClient.invalidateQueries({ queryKey: ["positions"] });
+    },
+  });
+}
+
+/** 手动触发启动对账。 */
+export function useReconcileOrders() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: () => api.reconcileOrders(),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["orders"] });
+      queryClient.invalidateQueries({ queryKey: ["positions"] });
+      queryClient.invalidateQueries({ queryKey: ["health"] });
+    },
+  });
+}
+
+/** 一键脱困：撤全部挂单 + 平全部仓位，随后保持暂停。 */
+export function usePanic() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: () => api.panic(),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["orders"] });
+      queryClient.invalidateQueries({ queryKey: ["positions"] });
+      queryClient.invalidateQueries({ queryKey: ["health"] });
+    },
+  });
+}
+
+/** 当前生效的手续费档位。 */
+export function useFees() {
+  return useQuery({
+    queryKey: ["fees"],
+    queryFn: api.fees,
+  });
+}
+
+/** 保存费率档位后立即重算机会。 */
+export function useUpdateFees() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (fees: FeeConfig) => api.updateFees(fees),
+    onSuccess: (fees) => {
+      queryClient.setQueryData(["fees"], fees);
+      queryClient.invalidateQueries({ queryKey: ["opportunities"] });
+      queryClient.invalidateQueries({ queryKey: ["opportunities", "basis"] });
+    },
+  });
+}
+
+/** Telegram Bot 配置状态。 */
+export function useTelegramConfig() {
+  return useQuery({
+    queryKey: ["telegram-config"],
+    queryFn: api.telegramConfig,
+  });
+}
+
+/** 保存 Telegram Bot Token；内置执行器需要重启后生效。 */
+export function useUpdateTelegramConfig() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (body: { token?: string | null; enabled?: boolean }) =>
+      api.updateTelegramConfig(body),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["telegram-config"] });
     },
   });
 }
