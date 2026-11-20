@@ -425,10 +425,12 @@ impl FundingFeed {
         intervals
     }
 
-    /// 全部启用交易所已发现的合约并集，行情侧据此把盘口与机会扩到全市场。
+    /// 至少两家启用交易所都上架的合约，行情侧据此把盘口与机会扩到全市场。
+    ///
+    /// 跨所资金费率机会必须两条腿，只在一家上架的合约不可能成交；
+    /// 把它们排除掉可以避免为上千个单所合约订阅盘口、反复回退 REST。
     pub fn traded_symbols(&self) -> Vec<String> {
-        let mut seen = HashSet::new();
-        let mut symbols = Vec::new();
+        let mut counts: HashMap<String, usize> = HashMap::new();
         for venue in &self.venues {
             if venue.client.is_none() {
                 continue;
@@ -439,11 +441,14 @@ impl FundingFeed {
                 .expect("资金费率交易对锁不可用")
                 .iter()
             {
-                if seen.insert(symbol.clone()) {
-                    symbols.push(symbol.clone());
-                }
+                *counts.entry(symbol.clone()).or_default() += 1;
             }
         }
+        let mut symbols = counts
+            .into_iter()
+            .filter(|(_, count)| *count >= 2)
+            .map(|(symbol, _)| symbol)
+            .collect::<Vec<_>>();
         symbols.sort();
         symbols
     }

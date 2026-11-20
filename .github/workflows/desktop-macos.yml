@@ -64,7 +64,12 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        run: pnpm tauri build --bundles dmg
+        run: |
+          # Secret 为空时 Tauri 仍会尝试导入证书并失败；未配置证书就退化为 ad-hoc 签名。
+          if [ -z "$APPLE_CERTIFICATE" ]; then
+            unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID
+          fi
+          pnpm tauri build --bundles dmg
 
       - name: 生成 latest.json
         env:
