@@ -24,16 +24,13 @@ use crate::{
 };
 
 /// 支持导入 API Key 的 CEX，以及用钱包地址 + 签名私钥认证的 DEX 与 Aster。
-pub const SUPPORTED_VENUES: [&str; 11] = [
+pub const SUPPORTED_VENUES: [&str; 8] = [
     "binance",
     "okx",
     "bybit",
     "bitget",
     "gate",
     "aster",
-    "htx",
-    "mexc",
-    "bingx",
     "hyperliquid",
     "lighter",
 ];
@@ -66,9 +63,6 @@ pub struct AccountEndpoints {
     pub bitget: String,
     pub gate: String,
     pub aster: String,
-    pub htx: String,
-    pub mexc: String,
-    pub bingx: String,
     pub hyperliquid: String,
     pub lighter: String,
 }
@@ -82,9 +76,6 @@ impl AccountEndpoints {
             "bitget" => Some(&self.bitget),
             "gate" => Some(&self.gate),
             "aster" => Some(&self.aster),
-            "htx" => Some(&self.htx),
-            "mexc" => Some(&self.mexc),
-            "bingx" => Some(&self.bingx),
             "hyperliquid" => Some(&self.hyperliquid),
             "lighter" => Some(&self.lighter),
             _ => None,
@@ -862,9 +853,6 @@ fn fetch_snapshot(
         "bitget" => fetch_bitget(http, base_url, credentials)?,
         "gate" => fetch_gate(http, base_url, credentials)?,
         "aster" => fetch_aster(http, base_url, credentials)?,
-        "htx" => fetch_htx(http, base_url, credentials)?,
-        "mexc" => fetch_mexc(http, base_url, credentials)?,
-        "bingx" => fetch_bingx(http, base_url, credentials)?,
         "hyperliquid" => fetch_hyperliquid(http, base_url, credentials)?,
         "lighter" => fetch_lighter(http, base_url, credentials)?,
         other => bail!("暂不支持该交易所: {other}"),
@@ -1442,115 +1430,6 @@ fn fetch_lighter(
     ))
 }
 
-/// HTX（火币）U 本位永续：只读取全仓保证金账户的 USDT 权益。
-fn fetch_htx(
-    http: &HttpClient,
-    base_url: &str,
-    credentials: &AccountCredentials,
-) -> anyhow::Result<(RawBalances, Option<Decimal>, Option<Decimal>)> {
-    let path = "/linear-swap-api/v1/swap_cross_account_info";
-    let value = htx_get(http, base_url, path, &[], credentials)?;
-    if value["status"].as_str() != Some("ok") {
-        bail!("HTX 返回错误: {}", htx_error(&value));
-    }
-
-    let account = &value["data"][0];
-    let equity = decimal(&account["margin_balance"]).unwrap_or_default();
-    let available = decimal(&account["margin_available"]).unwrap_or_default();
-    let mut balances = Vec::new();
-    if equity > Decimal::ZERO {
-        balances.push((
-            "USDT".to_string(),
-            available,
-            (equity - available).max(Decimal::ZERO),
-        ));
-    }
-
-    Ok((balances, None, Some(available)))
-}
-
-/// MEXC 合约账户：私有接口用 `ApiKey + 时间戳 + 参数串` 做 HMAC-SHA256。
-fn fetch_mexc(
-    http: &HttpClient,
-    base_url: &str,
-    credentials: &AccountCredentials,
-) -> anyhow::Result<(RawBalances, Option<Decimal>, Option<Decimal>)> {
-    let base_url = base_url.trim_end_matches('/');
-    let value = mexc_get(
-        http,
-        base_url,
-        "/api/v1/private/account/assets",
-        "",
-        credentials,
-    )?;
-    if value["success"].as_bool() != Some(true) {
-        bail!(
-            "MEXC 返回错误: {}",
-            value["message"].as_str().unwrap_or("未知错误")
-        );
-    }
-
-    let rows = value["data"]
-        .as_array()
-        .ok_or_else(|| anyhow!("MEXC 响应缺少 data"))?;
-    let mut balances = Vec::with_capacity(rows.len());
-    let mut available_margin = Decimal::ZERO;
-    for row in rows {
-        let currency = row
-            .get("currency")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let equity = decimal(&row["equity"]).unwrap_or_default();
-        let available = decimal(&row["availableBalance"]).unwrap_or_default();
-        if equity > Decimal::ZERO {
-            if currency == "USDT" {
-                available_margin += available;
-            }
-            balances.push((
-                currency.to_string(),
-                available,
-                (equity - available).max(Decimal::ZERO),
-            ));
-        }
-    }
-
-    Ok((balances, None, Some(available_margin)))
-}
-
-/// BingX 永续账户：签名是 `timestamp` 参数串的 HMAC-SHA256，放在 query 上。
-fn fetch_bingx(
-    http: &HttpClient,
-    base_url: &str,
-    credentials: &AccountCredentials,
-) -> anyhow::Result<(RawBalances, Option<Decimal>, Option<Decimal>)> {
-    let base_url = base_url.trim_end_matches('/');
-    let path = "/openApi/swap/v2/user/balance";
-    let timestamp = Utc::now().timestamp_millis();
-    let params = format!("timestamp={timestamp}");
-    let signature = hmac_sha256_hex(&credentials.api_secret, &params)?;
-    let value = http.get_json_with_headers(
-        &format!("{base_url}{path}?{params}&signature={signature}"),
-        &[("X-BX-APIKEY", credentials.api_key.as_str())],
-    )?;
-    if value["code"].as_i64().unwrap_or(-1) != 0 {
-        bail!(
-            "BingX 返回错误: {}",
-            value["msg"].as_str().unwrap_or("未知错误")
-        );
-    }
-
-    let balance = &value["data"]["balance"];
-    let asset = balance["asset"].as_str().unwrap_or("USDT").to_string();
-    let total = decimal(&balance["balance"]).unwrap_or_default();
-    let available = decimal(&balance["availableMargin"]).unwrap_or_default();
-    let mut balances = Vec::new();
-    if total > Decimal::ZERO {
-        balances.push((asset, available, (total - available).max(Decimal::ZERO)));
-    }
-
-    Ok((balances, None, Some(available)))
-}
-
 /// 各交易所持仓解析后的统一结构。
 struct RawPosition {
     symbol: String,
@@ -1576,9 +1455,6 @@ fn fetch_positions(
         "bybit" => positions_bybit(http, base_url, credentials)?,
         "bitget" => positions_bitget(http, base_url, credentials)?,
         "gate" => positions_gate(http, base_url, credentials)?,
-        "htx" => positions_htx(http, base_url, credentials)?,
-        "mexc" => positions_mexc(http, base_url, credentials)?,
-        "bingx" => positions_bingx(http, base_url, credentials)?,
         "hyperliquid" => positions_hyperliquid(http, base_url, credentials)?,
         "lighter" => positions_lighter(http, base_url, credentials)?,
         other => bail!("暂不支持该交易所: {other}"),
@@ -1968,169 +1844,6 @@ fn positions_gate(
     Ok(positions)
 }
 
-fn positions_htx(
-    http: &HttpClient,
-    base_url: &str,
-    credentials: &AccountCredentials,
-) -> anyhow::Result<Vec<RawPosition>> {
-    let value = htx_get(
-        http,
-        base_url,
-        "/linear-swap-api/v1/swap_cross_position_info",
-        &[],
-        credentials,
-    )?;
-    if value["status"].as_str() != Some("ok") {
-        bail!("HTX 返回错误: {}", htx_error(&value));
-    }
-
-    let mut positions = Vec::new();
-    if let Some(rows) = value["data"].as_array() {
-        for row in rows {
-            let volume = decimal(&row["volume"]).unwrap_or_default();
-            if volume.is_zero() {
-                continue;
-            }
-            let last = decimal(&row["last_price"]).unwrap_or_default();
-            let margin = decimal(&row["position_margin"]).unwrap_or_default();
-            let lever = decimal(&row["lever_rate"]).unwrap_or(Decimal::ONE);
-            // HTX 返回张数；保证金 × 杠杆即名义价值，再换算成币数量。
-            let quantity = if last > Decimal::ZERO && margin > Decimal::ZERO {
-                (margin * lever / last).abs()
-            } else {
-                volume.abs()
-            };
-            positions.push(RawPosition {
-                symbol: normalized_symbol(row["contract_code"].as_str().unwrap_or_default()),
-                side: if row["direction"].as_str() == Some("sell") {
-                    Side::Sell
-                } else {
-                    Side::Buy
-                },
-                quantity,
-                entry_price: decimal(&row["cost_open"]).unwrap_or_default(),
-                mark_price: last,
-                leverage: lever,
-                unrealized_pnl: decimal(&row["profit_unreal"]).unwrap_or_default(),
-            });
-        }
-    }
-    Ok(positions)
-}
-
-fn positions_mexc(
-    http: &HttpClient,
-    base_url: &str,
-    credentials: &AccountCredentials,
-) -> anyhow::Result<Vec<RawPosition>> {
-    let value = mexc_get(
-        http,
-        base_url.trim_end_matches('/'),
-        "/api/v1/private/position/open_positions",
-        "",
-        credentials,
-    )?;
-    if value["success"].as_bool() != Some(true) {
-        bail!(
-            "MEXC 返回错误: {}",
-            value["message"].as_str().unwrap_or("未知错误")
-        );
-    }
-
-    let mut positions = Vec::new();
-    if let Some(rows) = value["data"].as_array() {
-        for row in rows {
-            if row["state"].as_i64().unwrap_or(1) != 1 {
-                continue;
-            }
-            let hold_vol = decimal(&row["holdVol"]).unwrap_or_default();
-            if hold_vol.is_zero() {
-                continue;
-            }
-            let price = decimal(&row["holdAvgPrice"])
-                .or_else(|| decimal(&row["openAvgPrice"]))
-                .unwrap_or_default();
-            let margin = decimal(&row["im"]).unwrap_or_default();
-            let lever = decimal(&row["leverage"]).unwrap_or(Decimal::ONE);
-            // holdVol 是张数，im × 杠杆得到名义价值，再换算成币数量。
-            let quantity = if price > Decimal::ZERO && margin > Decimal::ZERO {
-                (margin * lever / price).abs()
-            } else {
-                hold_vol.abs()
-            };
-            positions.push(RawPosition {
-                symbol: normalized_symbol(row["symbol"].as_str().unwrap_or_default()),
-                side: if row["positionType"].as_i64() == Some(2) {
-                    Side::Sell
-                } else {
-                    Side::Buy
-                },
-                quantity,
-                entry_price: price,
-                mark_price: price,
-                leverage: lever,
-                unrealized_pnl: Decimal::ZERO,
-            });
-        }
-    }
-    Ok(positions)
-}
-
-fn positions_bingx(
-    http: &HttpClient,
-    base_url: &str,
-    credentials: &AccountCredentials,
-) -> anyhow::Result<Vec<RawPosition>> {
-    let base_url = base_url.trim_end_matches('/');
-    let path = "/openApi/swap/v2/user/positions";
-    let timestamp = Utc::now().timestamp_millis();
-    let params = format!("timestamp={timestamp}");
-    let signature = hmac_sha256_hex(&credentials.api_secret, &params)?;
-    let value = http.get_json_with_headers(
-        &format!("{base_url}{path}?{params}&signature={signature}"),
-        &[("X-BX-APIKEY", credentials.api_key.as_str())],
-    )?;
-    if value["code"].as_i64().unwrap_or(-1) != 0 {
-        bail!(
-            "BingX 返回错误: {}",
-            value["msg"].as_str().unwrap_or("未知错误")
-        );
-    }
-
-    let mut positions = Vec::new();
-    if let Some(rows) = value["data"].as_array() {
-        for row in rows {
-            let Some(amount) = decimal(&row["positionAmt"]) else {
-                continue;
-            };
-            if amount.is_zero() {
-                continue;
-            }
-            let side = match row["positionSide"].as_str().unwrap_or_default() {
-                "LONG" => Side::Buy,
-                "SHORT" => Side::Sell,
-                _ => {
-                    if amount > Decimal::ZERO {
-                        Side::Buy
-                    } else {
-                        Side::Sell
-                    }
-                }
-            };
-            positions.push(RawPosition {
-                symbol: normalized_symbol(row["symbol"].as_str().unwrap_or_default()),
-                side,
-                quantity: amount.abs(),
-                entry_price: decimal(&row["avgPrice"]).unwrap_or_default(),
-                mark_price: decimal(&row["markPrice"]).unwrap_or_default(),
-                leverage: decimal(&row["leverage"]).unwrap_or(Decimal::ONE),
-                unrealized_pnl: decimal(&row["unrealizedProfit"]).unwrap_or_default(),
-            });
-        }
-    }
-    Ok(positions)
-}
-
 fn positions_hyperliquid(
     http: &HttpClient,
     base_url: &str,
@@ -2265,92 +1978,6 @@ fn gate_get(
         ("TIMESTAMP", timestamp.as_str()),
     ];
     http.get_json_with_headers(&format!("{base_url}{path}"), &headers)
-}
-
-/// HTX 签名查询串：参数按编码后的键排序，签名覆盖 `方法\n主机\n路径\n参数串`。
-fn htx_get(
-    http: &HttpClient,
-    base_url: &str,
-    path: &str,
-    params: &[(&str, &str)],
-    credentials: &AccountCredentials,
-) -> anyhow::Result<Value> {
-    let base_url = base_url.trim_end_matches('/');
-    let host = base_url.split("://").nth(1).unwrap_or(base_url);
-    let timestamp = Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
-
-    let mut all: Vec<(&str, &str)> = vec![
-        ("AccessKeyId", credentials.api_key.as_str()),
-        ("SignatureMethod", "HmacSHA256"),
-        ("SignatureVersion", "2"),
-        ("Timestamp", timestamp.as_str()),
-    ];
-    all.extend_from_slice(params);
-    all.sort_by(|left, right| left.0.cmp(right.0));
-
-    let query = all
-        .iter()
-        .map(|(name, value)| format!("{}={}", htx_encode(name), htx_encode(value)))
-        .collect::<Vec<_>>()
-        .join("&");
-    let signature = hmac_sha256_base64(
-        &credentials.api_secret,
-        &format!("GET\n{host}\n{path}\n{query}"),
-    )?;
-    let url = format!(
-        "{base_url}{path}?{query}&Signature={}",
-        htx_encode(&signature)
-    );
-    http.get_json(&url)
-}
-
-fn htx_error(value: &Value) -> String {
-    value["err-msg"]
-        .as_str()
-        .or_else(|| value["err_msg"].as_str())
-        .unwrap_or("未知错误")
-        .to_string()
-}
-
-/// MEXC 合约私有接口：签名 = HMAC-SHA256(secret, apiKey + 毫秒时间戳 + 参数串)。
-fn mexc_get(
-    http: &HttpClient,
-    base_url: &str,
-    path: &str,
-    query: &str,
-    credentials: &AccountCredentials,
-) -> anyhow::Result<Value> {
-    let timestamp = Utc::now().timestamp_millis().to_string();
-    let signature = hmac_sha256_hex(
-        &credentials.api_secret,
-        &format!("{}{}{}", credentials.api_key, timestamp, query),
-    )?;
-    let headers = [
-        ("ApiKey", credentials.api_key.as_str()),
-        ("Request-Time", timestamp.as_str()),
-        ("Signature", signature.as_str()),
-        ("Recv-Window", "10"),
-    ];
-    let url = if query.is_empty() {
-        format!("{base_url}{path}")
-    } else {
-        format!("{base_url}{path}?{query}")
-    };
-    http.get_json_with_headers(&url, &headers)
-}
-
-/// RFC3986 编码，交易所签名对空格、斜杠等字符的编码方式要求一致。
-fn htx_encode(value: &str) -> String {
-    let mut encoded = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                encoded.push(byte as char)
-            }
-            _ => encoded.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    encoded
 }
 
 fn binance_error(value: &Value) -> anyhow::Error {

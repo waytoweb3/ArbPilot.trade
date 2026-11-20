@@ -1,15 +1,12 @@
 pub mod aster;
 pub mod binance;
-pub mod bingx;
 pub mod bitget;
 pub mod bybit;
 pub mod dex;
 pub mod gate;
-pub mod htx;
 pub mod hyperliquid;
 pub mod lighter;
 pub mod live;
-pub mod mexc;
 pub mod okx;
 
 use anyhow::{anyhow, bail};
@@ -20,15 +17,12 @@ use serde_json::Value;
 use std::str::FromStr;
 
 pub use binance::{BinanceFundingClient, BinanceMarketClient, VENUE};
-pub use bingx::{BingxFundingClient, VENUE as BINGX_VENUE};
 pub use bitget::{BitgetFundingClient, VENUE as BITGET_VENUE};
 pub use bybit::{BybitFundingClient, VENUE as BYBIT_VENUE};
 pub use gate::{GateFundingClient, VENUE as GATE_VENUE};
-pub use htx::{HtxFundingClient, VENUE as HTX_VENUE};
 pub use hyperliquid::{HyperliquidFundingClient, VENUE as HYPERLIQUID_VENUE};
 pub use lighter::{LighterFundingClient, VENUE as LIGHTER_VENUE};
 pub use live::{LiveEndpoints, LiveExchange};
-pub use mexc::{MexcFundingClient, VENUE as MEXC_VENUE};
 pub use okx::{ContractSpec, OkxFundingClient, OkxMarketClient, VENUE as OKX_VENUE};
 
 /// Aster 的合约接口与 Binance 完全兼容，只换域名与交易所标识。

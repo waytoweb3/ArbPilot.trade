@@ -14,11 +14,10 @@ use serde::Serialize;
 use crate::{
     config::Config,
     exchange::{
-        BinanceFundingClient, BingxFundingClient, BitgetFundingClient, BybitFundingClient,
-        FundingRate, FundingSnapshot, FundingVenueClient, GateFundingClient, HtxFundingClient,
-        HyperliquidFundingClient, LighterFundingClient, MexcFundingClient, OkxFundingClient,
-        ASTER_VENUE, BINGX_VENUE, BITGET_VENUE, BYBIT_VENUE, GATE_VENUE, HTX_VENUE,
-        HYPERLIQUID_VENUE, LIGHTER_VENUE, MEXC_VENUE, OKX_VENUE, VENUE,
+        BinanceFundingClient, BitgetFundingClient, BybitFundingClient, FundingRate,
+        FundingSnapshot, FundingVenueClient, GateFundingClient, HyperliquidFundingClient,
+        LighterFundingClient, OkxFundingClient, ASTER_VENUE, BITGET_VENUE, BYBIT_VENUE, GATE_VENUE,
+        HYPERLIQUID_VENUE, LIGHTER_VENUE, OKX_VENUE, VENUE,
     },
     http_client::HttpClient,
     realtime::RealtimeFeed,
@@ -256,36 +255,6 @@ impl FundingFeed {
                         ))),
                     );
                 }
-                if config.htx_enabled {
-                    push_venue(
-                        HTX_VENUE,
-                        &config.htx_base_url,
-                        Some(Arc::new(HtxFundingClient::new(
-                            &config.htx_base_url,
-                            http.clone(),
-                        ))),
-                    );
-                }
-                if config.mexc_enabled {
-                    push_venue(
-                        MEXC_VENUE,
-                        &config.mexc_base_url,
-                        Some(Arc::new(MexcFundingClient::new(
-                            &config.mexc_base_url,
-                            http.clone(),
-                        ))),
-                    );
-                }
-                if config.bingx_enabled {
-                    push_venue(
-                        BINGX_VENUE,
-                        &config.bingx_base_url,
-                        Some(Arc::new(BingxFundingClient::new(
-                            &config.bingx_base_url,
-                            http.clone(),
-                        ))),
-                    );
-                }
             }
             None => {
                 tracing::error!("HTTP 客户端不可用，资金费率采集不会启动");
@@ -310,15 +279,6 @@ impl FundingFeed {
                 }
                 if config.lighter_enabled {
                     push_venue(LIGHTER_VENUE, &config.lighter_base_url, None);
-                }
-                if config.htx_enabled {
-                    push_venue(HTX_VENUE, &config.htx_base_url, None);
-                }
-                if config.mexc_enabled {
-                    push_venue(MEXC_VENUE, &config.mexc_base_url, None);
-                }
-                if config.bingx_enabled {
-                    push_venue(BINGX_VENUE, &config.bingx_base_url, None);
                 }
             }
         }
@@ -463,6 +423,46 @@ impl FundingFeed {
             }
         }
         intervals
+    }
+
+    /// 全部启用交易所已发现的合约并集，行情侧据此把盘口与机会扩到全市场。
+    pub fn traded_symbols(&self) -> Vec<String> {
+        let mut seen = HashSet::new();
+        let mut symbols = Vec::new();
+        for venue in &self.venues {
+            if venue.client.is_none() {
+                continue;
+            }
+            for symbol in venue
+                .symbols
+                .read()
+                .expect("资金费率交易对锁不可用")
+                .iter()
+            {
+                if seen.insert(symbol.clone()) {
+                    symbols.push(symbol.clone());
+                }
+            }
+        }
+        symbols.sort();
+        symbols
+    }
+
+    /// 每个启用交易所自己的合约清单，供行情侧按交易所增量订阅 WebSocket。
+    pub fn venue_symbols(&self) -> Vec<(String, Vec<String>)> {
+        self.venues
+            .iter()
+            .filter(|venue| venue.client.is_some())
+            .map(|venue| {
+                let mut symbols = venue
+                    .symbols
+                    .read()
+                    .expect("资金费率交易对锁不可用")
+                    .clone();
+                symbols.sort();
+                (venue.venue.to_string(), symbols)
+            })
+            .collect()
     }
 
     async fn sync_once(self: &Arc<Self>) {
