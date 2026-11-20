@@ -22,6 +22,7 @@ use crate::{
     listing::{
         self, CloseReason, ListingAnnouncement, ListingRule, ListingTrade, OpenListingRequest,
     },
+    routes::control,
     state::AppState,
 };
 
@@ -293,6 +294,11 @@ enum Callback {
         token: String,
         confirm: bool,
     },
+    /// 一键脱困：撤全部挂单并平全部仓位，同样需要二次点击确认。
+    Panic {
+        token: String,
+        confirm: bool,
+    },
 }
 
 /// Telegram 机器人：配对绑定、查询、暂停/恢复与经确认的开仓。
@@ -314,6 +320,8 @@ pub struct TelegramBot {
     listing_drafts: Mutex<HashMap<i64, ListingDraft>>,
     /// 待确认的一键平仓请求：编号 → (发起用户, 过期时间)。
     close_all: Mutex<HashMap<String, (i64, DateTime<Utc>)>>,
+    /// 待确认的一键脱困请求：编号 → (发起用户, 过期时间)。
+    panic: Mutex<HashMap<String, (i64, DateTime<Utc>)>>,
     offset: Mutex<i64>,
     bot_username: RwLock<Option<String>>,
     last_error: RwLock<Option<String>>,
@@ -340,6 +348,7 @@ impl TelegramBot {
             listing_wizards: Mutex::new(HashMap::new()),
             listing_drafts: Mutex::new(HashMap::new()),
             close_all: Mutex::new(HashMap::new()),
+            panic: Mutex::new(HashMap::new()),
             offset: Mutex::new(0),
             bot_username: RwLock::new(None),
             last_error: RwLock::new(None),
@@ -594,6 +603,12 @@ impl TelegramBot {
                             prepared.text
                         }
                         "/close" => self.close_one(state, user_id, lang, &args).await,
+                        "/cancel" => self.cancel_order(state, user_id, lang, &args).await,
+                        "/panic" => {
+                            let prepared = self.prepare_panic(state, user_id, lang);
+                            markup = prepared.markup;
+                            prepared.text
+                        }
                         "/lang" | "/language" => self.set_lang(user_id, lang, &args),
                         "/unbind" => self.unbind(user_id, lang),
                         other => format!(
@@ -720,6 +735,19 @@ impl TelegramBot {
                         BotReply::text(self.cancel_close_all(user_id, lang, &token))
                     } else if self.can_trade(user_id) {
                         BotReply::text(self.confirm_close_all(state, user_id, lang, &token).await)
+                    } else {
+                        BotReply::text(pick(
+                            lang,
+                            "该账号没有交易权限。",
+                            "This account has no trading permission.",
+                        ))
+                    }
+                }
+                Some(Callback::Panic { token, confirm }) => {
+                    if !confirm {
+                        BotReply::text(self.cancel_panic(user_id, lang, &token))
+                    } else if self.can_trade(user_id) {
+                        BotReply::text(self.confirm_panic(state, user_id, lang, &token).await)
                     } else {
                         BotReply::text(pick(
                             lang,
@@ -1811,6 +1839,197 @@ impl TelegramBot {
         }
     }
 
+    /// `/cancel <订单号前缀>`：撤销仍在执行中的订单；编号来自 `/orders`。
+    async fn cancel_order(
+        &self,
+        state: &AppState,
+        user_id: i64,
+        lang: Lang,
+        args: &[&str],
+    ) -> String {
+        if !self.can_trade(user_id) {
+            return pick(
+                lang,
+                "该账号没有交易权限。",
+                "This account has no trading permission.",
+            )
+            .to_string();
+        }
+        let Some(prefix) = args
+            .first()
+            .map(|value| value.trim_start_matches('#').trim())
+            .filter(|value| !value.is_empty())
+        else {
+            return pick(
+                lang,
+                "用法：/cancel <订单号前缀>，编号见 /orders。",
+                "Usage: /cancel <order id prefix>; ids are listed by /orders.",
+            )
+            .to_string();
+        };
+        let prefix = prefix.to_ascii_lowercase();
+
+        let matches: Vec<Uuid> = state
+            .orders
+            .read()
+            .expect("订单锁不可用")
+            .iter()
+            .filter(|order| !order.status.is_terminal())
+            .filter(|order| order.id.to_string().starts_with(&prefix))
+            .map(|order| order.id)
+            .collect();
+        if matches.len() > 1 {
+            return pick(
+                lang,
+                "匹配到多个未完成订单，请输入更长的编号前缀。",
+                "Multiple open orders match; send a longer id prefix.",
+            )
+            .to_string();
+        }
+        let Some(order_id) = matches.first().copied() else {
+            return pick(
+                lang,
+                "没有找到未完成订单，先用 /orders 查看编号。",
+                "No open order matched; check ids with /orders.",
+            )
+            .to_string();
+        };
+
+        match gateway::cancel_order_by_id(state, order_id).await {
+            Ok(order) => match order.note.as_deref() {
+                Some(note) if note.starts_with("部分") || note.starts_with("Partly") => {
+                    match lang {
+                        Lang::Zh => format!("撤单完成：{note}"),
+                        Lang::En => format!("Cancel finished: {note}"),
+                    }
+                }
+                _ => {
+                    let short = order.id.to_string();
+                    let short = &short[..8];
+                    match lang {
+                        Lang::Zh => format!("已撤单 {short}"),
+                        Lang::En => format!("Cancelled {short}"),
+                    }
+                }
+            },
+            Err(error) => match lang {
+                Lang::Zh => format!("撤单失败：{}", describe_error(lang, &error)),
+                Lang::En => format!("Cancel failed: {}", describe_error(lang, &error)),
+            },
+        }
+    }
+
+    /// `/panic`：先展示影响范围，用户点确认后才撤单并清仓。
+    fn prepare_panic(&self, state: &AppState, user_id: i64, lang: Lang) -> BotReply {
+        let order_count = state
+            .orders
+            .read()
+            .expect("订单锁不可用")
+            .iter()
+            .filter(|order| !order.status.is_terminal())
+            .count();
+        let position_count = state.positions.read().expect("仓位锁不可用").len();
+        if order_count == 0 && position_count == 0 {
+            return BotReply::text(pick(
+                lang,
+                "当前没有挂单与仓位，无需脱困。",
+                "No open orders or positions; nothing to do.",
+            ));
+        }
+
+        let token = Uuid::new_v4().simple().to_string()[..6].to_ascii_uppercase();
+        let expires_at = Utc::now() + chrono::Duration::seconds(CLOSE_ALL_TTL_SECS);
+        {
+            let mut pending = self.panic.lock().expect("一键脱困锁不可用");
+            pending.retain(|_, (_, expiry)| *expiry > Utc::now());
+            pending.insert(token.clone(), (user_id, expires_at));
+        }
+
+        let text = match lang {
+            Lang::Zh => format!(
+                "一键脱困确认 {token}\n将撤销未完成订单 {order_count} 笔，并以市价平掉全部仓位 {position_count} 个，执行后保持暂停。\n{CLOSE_ALL_TTL_SECS} 秒内点击下方按钮确认。"
+            ),
+            Lang::En => format!(
+                "Panic exit {token}\nThis cancels {order_count} open orders and market-closes {position_count} positions, then keeps trading paused.\nTap a button within {CLOSE_ALL_TTL_SECS}s."
+            ),
+        };
+        let markup = serde_json::json!({
+            "inline_keyboard": [[
+                {
+                    "text": pick(lang, "确认脱困", "Confirm panic exit"),
+                    "callback_data": format!("panic:confirm:{token}"),
+                },
+                {
+                    "text": pick(lang, "取消", "Cancel"),
+                    "callback_data": format!("panic:cancel:{token}"),
+                },
+            ]],
+        });
+        BotReply::with_markup(text, markup)
+    }
+
+    /// 用户点了「确认脱困」：与桌面端一键脱困共用同一套动作。
+    async fn confirm_panic(
+        &self,
+        state: &AppState,
+        user_id: i64,
+        lang: Lang,
+        token: &str,
+    ) -> String {
+        {
+            let mut pending = self.panic.lock().expect("一键脱困锁不可用");
+            let valid = pending
+                .get(token)
+                .map(|(owner, expiry)| *owner == user_id && *expiry > Utc::now())
+                .unwrap_or(false);
+            if !valid {
+                return pick(
+                    lang,
+                    "确认已过期，请重新发送 /panic。",
+                    "This confirmation expired; send /panic again.",
+                )
+                .to_string();
+            }
+            pending.remove(token);
+        }
+
+        let outcome = control::panic_actions(state, "telegram").await;
+        let mut lines = vec![match lang {
+            Lang::Zh => format!(
+                "已脱困：撤销 {} 笔订单，平掉 {} 个仓位，执行器保持暂停。",
+                outcome.cancelled_orders, outcome.closed_positions
+            ),
+            Lang::En => format!(
+                "Panic exit done: {} orders cancelled, {} positions closed; trading stays paused.",
+                outcome.cancelled_orders, outcome.closed_positions
+            ),
+        }];
+        if !outcome.errors.is_empty() {
+            lines.push(match lang {
+                Lang::Zh => "未完成：".to_string(),
+                Lang::En => "Not completed:".to_string(),
+            });
+            lines.extend(outcome.errors.iter().take(8).map(|error| format!("- {error}")));
+        }
+        lines.join("\n")
+    }
+
+    fn cancel_panic(&self, user_id: i64, lang: Lang, token: &str) -> String {
+        let mut pending = self.panic.lock().expect("一键脱困锁不可用");
+        match pending.get(token) {
+            Some((owner, _)) if *owner == user_id => {
+                pending.remove(token);
+                pick(lang, "已取消一键脱困。", "Panic exit cancelled.").to_string()
+            }
+            _ => pick(
+                lang,
+                "确认已过期，请重新发送 /panic。",
+                "This confirmation expired; send /panic again.",
+            )
+            .to_string(),
+        }
+    }
+
     /// 用户点了交易所按钮：给出带金额与止盈止损的确认卡片。
     async fn listing_preview(
         &self,
@@ -2442,6 +2661,8 @@ fn help_text(lang: Lang, enabled: bool) -> String {
             "/listing open 进入引导：代币 → 方向 → 交易所 → 参数",
             "/closeall 一键平仓：确认后平掉全部交易所仓位与上币/技能持仓",
             "/close <编号前缀> 平掉单个仓位（编号见 /positions）",
+            "/cancel <订单号前缀> 撤销未完成订单（编号见 /orders）",
+            "/panic 一键脱困：撤销全部挂单并平掉全部仓位，执行后保持暂停",
             "/lang zh|en 切换机器人语言",
             "/unbind 解除绑定",
             "",
@@ -2459,6 +2680,8 @@ fn help_text(lang: Lang, enabled: bool) -> String {
             "/listing open starts the guide: token → direction → venue → params",
             "/closeall Close everything: all exchange positions and listing/skill trades, after confirmation",
             "/close <id prefix> closes one position (ids are listed by /positions)",
+            "/cancel <order id prefix> cancels an open order (ids are listed by /orders)",
+            "/panic Panic exit: cancel all orders and close all positions, then stay paused",
             "/lang zh|en Switch the bot language",
             "/unbind Unlink this account",
             "",
@@ -3089,6 +3312,8 @@ fn command_menu(lang: Lang) -> Value {
             ("listing", "上币单腿交易：持仓与引导下单"),
             ("closeall", "一键平仓（需二次确认）"),
             ("close", "平掉单个仓位"),
+            ("cancel", "撤销未完成订单"),
+            ("panic", "一键脱困（需二次确认）"),
             ("lang", "切换机器人语言"),
             ("unbind", "解除绑定"),
         ],
@@ -3107,6 +3332,8 @@ fn command_menu(lang: Lang) -> Value {
             ),
             ("closeall", "Close everything (needs confirmation)"),
             ("close", "Close one position"),
+            ("cancel", "Cancel an open order"),
+            ("panic", "Panic exit (needs confirmation)"),
             ("lang", "Switch the bot language"),
             ("unbind", "Unlink this account"),
         ],
@@ -3319,6 +3546,21 @@ fn parse_callback(data: &str) -> Option<Callback> {
                 confirm,
             })
         }
+        "panic" => {
+            let (step, token) = value.split_once(':')?;
+            if token.is_empty() {
+                return None;
+            }
+            let confirm = match step {
+                "confirm" => true,
+                "cancel" => false,
+                _ => return None,
+            };
+            Some(Callback::Panic {
+                token: token.to_string(),
+                confirm,
+            })
+        }
         _ => None,
     }
 }
@@ -3403,7 +3645,8 @@ mod tests {
         assert!(text.contains("/open"));
         assert!(text.contains("确认按钮"));
         assert!(!text.contains("/confirm"));
-        assert!(!text.contains("/cancel"));
+        assert!(text.contains("/cancel"));
+        assert!(text.contains("/panic"));
         assert!(text.contains("/lang"));
         assert!(!text.contains("尚未配置"));
     }
@@ -3636,6 +3879,21 @@ mod tests {
         );
         assert_eq!(parse_callback("closeall:confirm:"), None);
         assert_eq!(parse_callback("closeall:other:ABC123"), None);
+        assert_eq!(
+            parse_callback("panic:confirm:XYZ789"),
+            Some(Callback::Panic {
+                token: "XYZ789".to_string(),
+                confirm: true,
+            })
+        );
+        assert_eq!(
+            parse_callback("panic:cancel:XYZ789"),
+            Some(Callback::Panic {
+                token: "XYZ789".to_string(),
+                confirm: false,
+            })
+        );
+        assert_eq!(parse_callback("panic:confirm:"), None);
     }
 
     #[test]
