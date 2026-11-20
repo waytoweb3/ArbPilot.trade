@@ -349,10 +349,13 @@ impl StrategyProgram {
                 "entry_long",
                 "方向为做多时必须提供做多入场表达式",
             )),
-            ProgramDirection::Short if self.entry_short.is_none() => issues.push(
-                ProgramIssue::new("entry_short", "方向为做空时必须提供做空入场表达式"),
-            ),
-            ProgramDirection::Both if self.entry_long.is_none() && self.entry_short.is_none() => {
+            ProgramDirection::Short if self.entry_short.is_none() => issues.push(ProgramIssue::new(
+                "entry_short",
+                "方向为做空时必须提供做空入场表达式",
+            )),
+            ProgramDirection::Both
+                if self.entry_long.is_none() && self.entry_short.is_none() =>
+            {
                 issues.push(ProgramIssue::new("entry", "至少提供一条入场表达式"))
             }
             _ => {}
@@ -783,7 +786,8 @@ fn risk_exit(
     if program.risk.trailing_stop_pct > Decimal::ZERO {
         match position.side {
             Side::Buy if position.highest_since_entry > Decimal::ZERO => {
-                let drawdown = (position.highest_since_entry - last) / position.highest_since_entry
+                let drawdown = (position.highest_since_entry - last)
+                    / position.highest_since_entry
                     * Decimal::from(100u32);
                 if drawdown >= program.risk.trailing_stop_pct {
                     return Some(format!("触发移动止损（回撤 {drawdown:.2}%）"));
@@ -920,15 +924,11 @@ fn eval_call(primitive: Primitive, args: &[Expr], ctx: &EvalCtx) -> Option<Decim
         }
         Primitive::Highest => {
             let period = period_arg(args.get(1), ctx)?;
-            rolling_values(args.first()?, ctx, period)?
-                .into_iter()
-                .max()
+            rolling_values(args.first()?, ctx, period)?.into_iter().max()
         }
         Primitive::Lowest => {
             let period = period_arg(args.get(1), ctx)?;
-            rolling_values(args.first()?, ctx, period)?
-                .into_iter()
-                .min()
+            rolling_values(args.first()?, ctx, period)?.into_iter().min()
         }
         Primitive::StdDev => {
             let period = period_arg(args.get(1), ctx)?;
@@ -950,9 +950,7 @@ fn eval_call(primitive: Primitive, args: &[Expr], ctx: &EvalCtx) -> Option<Decim
 
 fn period_arg(expr: Option<&Expr>, ctx: &EvalCtx) -> Option<u32> {
     let period = eval(expr?, ctx)?.to_u32()?;
-    (MIN_PERIOD..=MAX_PERIOD)
-        .contains(&period)
-        .then_some(period)
+    (MIN_PERIOD..=MAX_PERIOD).contains(&period).then_some(period)
 }
 
 fn bars_arg(expr: Option<&Expr>, ctx: &EvalCtx) -> Option<u32> {
@@ -1136,9 +1134,7 @@ mod tests {
         program.params.get_mut("fast").expect("参数存在").value = Decimal::ONE;
         let issues = program.validate();
         assert!(
-            issues
-                .iter()
-                .any(|issue| issue.message.contains("周期必须在")),
+            issues.iter().any(|issue| issue.message.contains("周期必须在")),
             "{issues:?}"
         );
     }

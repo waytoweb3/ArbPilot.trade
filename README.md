@@ -2,7 +2,7 @@
 
 自托管量化交易终端：桌面端（Tauri 2 + React）负责配置与监控，Rust 执行器负责行情、风控与订单执行。用户资金留在交易所/钱包，密钥只保存在执行器所在设备。
 
-> 产品方向、定价假设与待验证事项见 [ArbPilot-项目说明.md](./ArbPilot-项目说明.md)。
+> 产品方向、定价假设与待验证事项见 [ArbPilot-项目说明.md](./docs/ArbPilot-项目说明.md)。
 
 ## 目录结构
 
@@ -89,7 +89,7 @@ cargo run -p arbpilot-executor
 | `DATABASE_URL` | 空 | PostgreSQL 连接串，或 `sqlite:///path/to.db`；与 `ARBPILOT_LOCAL_DB` 都未配置时以内存模式运行 |
 | `ARBPILOT_LOCAL_DB` | 空 | 本地 SQLite 文件路径；桌面端随包启动时自动注入，用户无需配置 |
 | `ARBPILOT_FUNDING_ENABLED` | `true` | 资金费率采集开关，设为 `false` 关闭 |
-| `ARBPILOT_FUNDING_SYMBOLS` | `BTCUSDT,ETHUSDT` | 采集的 USDT 本位永续合约，逗号分隔 |
+| `ARBPILOT_FUNDING_SYMBOLS` | 空 | 采集的 USDT 本位永续合约，逗号分隔；留空自动发现交易所全部合约 |
 | `ARBPILOT_FUNDING_POLL_SECS` | `60` | 增量采集间隔（秒），最小 15 |
 | `ARBPILOT_BINANCE_FAPI_URL` | `https://fapi.binance.com` | Binance 合约公开行情地址，可指向镜像或本地桩 |
 | `VITE_EXECUTOR_TOKEN` | `dev-local-token` | 访问官方只读数据接口的令牌，官方发行版构建时注入 |
