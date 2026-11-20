@@ -49,12 +49,8 @@ if (!platforms || typeof platforms !== "object" || Array.isArray(platforms)) {
     ) {
       errors.push(`${name}: 下载地址与版本号 ${manifest.version} 不一致：${entry.url}`);
     }
-    // Tauri 的更新签名是 minisign 文本，第一行固定为 untrusted comment。
-    if (
-      typeof entry.signature !== "string" ||
-      !entry.signature.includes("untrusted comment:") ||
-      entry.signature.length < 100
-    ) {
+    // Tauri v2 的签名文件是 base64 文本（minisign 新格式不再带 untrusted comment 行）。
+    if (typeof entry.signature !== "string" || entry.signature.trim().length < 100) {
       errors.push(`${name}: 缺少有效的更新签名`);
     }
   }

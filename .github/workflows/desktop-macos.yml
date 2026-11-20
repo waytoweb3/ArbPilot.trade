@@ -108,12 +108,14 @@ jobs:
               .readFileSync(path.join(macosDir, `${updater}.sig`), "utf8")
               .trim();
 
+            // 更新包文件名带上版本号：校验脚本据此确认地址与版本一致，也便于归档。
+            const updaterName = `ArbPilot_${version}_${arch}.app.tar.gz`;
             fs.mkdirSync(outDir, { recursive: true });
             fs.copyFileSync(path.join(dmgDir, dmg), path.join(outDir, dmg));
-            fs.copyFileSync(path.join(macosDir, updater), path.join(outDir, updater));
+            fs.copyFileSync(path.join(macosDir, updater), path.join(outDir, updaterName));
             fs.copyFileSync(
               path.join(macosDir, `${updater}.sig`),
-              path.join(outDir, `${updater}.sig`),
+              path.join(outDir, `${updaterName}.sig`),
             );
 
             // macOS 未配置 Developer ID，官网靠 SHA-256 + 签名信息让用户自行核对安装包。
@@ -123,7 +125,7 @@ jobs:
               path.join(outDir, "SHA256SUMS-macos.txt"),
               [
                 `${sha256(path.join(dmgDir, dmg))}  ${dmg}`,
-                `${sha256(path.join(macosDir, updater))}  ${updater}`,
+                `${sha256(path.join(macosDir, updater))}  ${updaterName}`,
               ].join("\n") + "\n",
             );
 
@@ -148,7 +150,7 @@ jobs:
             }
             platforms[platform] = {
               signature,
-              url: `${baseUrl}/${updater}`,
+              url: `${baseUrl}/${updaterName}`,
             };
 
             const manifest = {

@@ -90,12 +90,20 @@ jobs:
             if (!installer) {
               throw new Error(`未找到 NSIS 安装包：${bundleDir}`);
             }
-            const sigPath = path.join(bundleDir, `${installer}.sig`);
+            // 官网下载用 setup.exe；自动更新必须用 Tauri 生成的 .nsis.zip 更新包。
+            const updater = fs
+              .readdirSync(bundleDir)
+              .find((name) => name.endsWith(".nsis.zip"));
+            if (!updater) {
+              throw new Error(`未找到 NSIS 更新包：${bundleDir}`);
+            }
+            const sigPath = path.join(bundleDir, `${updater}.sig`);
             const signature = fs.readFileSync(sigPath, "utf8").trim();
 
             fs.mkdirSync(outDir, { recursive: true });
             fs.copyFileSync(path.join(bundleDir, installer), path.join(outDir, installer));
-            fs.copyFileSync(sigPath, path.join(outDir, `${installer}.sig`));
+            fs.copyFileSync(path.join(bundleDir, updater), path.join(outDir, updater));
+            fs.copyFileSync(sigPath, path.join(outDir, `${updater}.sig`));
 
             // 未购买 Windows 代码签名证书，官网靠 SHA-256 让用户自行核对安装包。
             const sha256 = crypto
@@ -129,7 +137,7 @@ jobs:
             }
             platforms["windows-x86_64"] = {
               signature,
-              url: `${baseUrl}/${installer}`,
+              url: `${baseUrl}/${updater}`,
             };
 
             const manifest = {
