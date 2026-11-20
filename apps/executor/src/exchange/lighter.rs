@@ -19,6 +19,22 @@ use crate::http_client::HttpClient;
 /// Lighter 的交易所标识。
 pub const VENUE: &str = "lighter";
 
+/// Lighter 现货的交易所标识。
+pub const SPOT_VENUE: &str = "lighter-spot";
+
+/// Lighter 现货只有 USDC 计价市场，内部 symbol 需要剥掉 `USDT` / `USDC` 再匹配。
+fn spot_base(symbol: &str) -> anyhow::Result<String> {
+    let upper = symbol.trim().to_ascii_uppercase();
+    for suffix in ["USDT", "USDC"] {
+        if let Some(base) = upper.strip_suffix(suffix) {
+            if !base.is_empty() {
+                return Ok(base.to_string());
+            }
+        }
+    }
+    Err(anyhow!("Lighter 现货无法映射交易对: {symbol}"))
+}
+
 /// 交易对与 `market_id` 映射的缓存时长，避免每个交易对都重复拉一次全量清单。
 const MARKET_TTL: Duration = Duration::from_secs(10 * 60);
 /// 历史费率一次最多回补多少条（Lighter 按小时结算）。
@@ -276,6 +292,42 @@ impl LighterFundingClient {
         Ok(envelope.order_book_details)
     }
 
+    /// Lighter 现货市场清单（`filter=spot`）；现货只有 USDC 计价市场。
+    fn spot_books(&self) -> anyhow::Result<Vec<MarketRow>> {
+        let url = format!("{}/api/v1/orderBookDetails?filter=spot", self.base_url);
+        let envelope: BooksEnvelope = serde_json::from_value(self.fetch(&url)?)
+            .context("解析 Lighter 现货 orderBookDetails 失败")?;
+        if envelope.code != 200 {
+            bail!(
+                "Lighter 现货 orderBookDetails 返回错误 {}: {}",
+                envelope.code,
+                envelope.message.unwrap_or_default()
+            );
+        }
+        Ok(envelope.order_book_details)
+    }
+
+    /// 内部 `BTCUSDT` / `ETHUSDT` 对应的现货市场行（`BASE/USDC`）。
+    fn spot_market_row(&self, symbol: &str) -> anyhow::Result<MarketRow> {
+        let base = spot_base(symbol)?;
+        self.spot_books()?
+            .into_iter()
+            .find(|row| {
+                let mut parts = row.symbol.split('/');
+                let row_base = parts.next().unwrap_or_default();
+                let quote = parts.next().unwrap_or_default();
+                row_base.eq_ignore_ascii_case(&base) && quote.eq_ignore_ascii_case("USDC")
+            })
+            .ok_or_else(|| anyhow!("Lighter 现货没有 {base}/USDC 市场: {symbol}"))
+    }
+
+    /// 内部 `ETHUSDT` → 现货 `market_id`（USDC 计价，`market_id ≥ 2048`）。
+    pub fn spot_market(&self, symbol: &str) -> anyhow::Result<u64> {
+        let row = self.spot_market_row(symbol)?;
+        u64::try_from(row.market_id)
+            .map_err(|_| anyhow!("Lighter 现货 market_id 不合法: {}", row.market_id))
+    }
+
     fn remember(&self, books: &[MarketRow]) -> Arc<HashMap<String, i64>> {
         let mut mapping = HashMap::new();
         for row in books {
@@ -331,7 +383,17 @@ impl LighterFundingClient {
             market_id = self.market_ids(true)?.get(symbol).copied();
         }
         let market_id = market_id.ok_or_else(|| anyhow!("Lighter 未找到交易对: {symbol}"))?;
-        let cap = limit.clamp(1, 100);
+        self.depth_for_market(VENUE, symbol, market_id, limit.clamp(1, 100))
+    }
+
+    /// 按 `market_id` 拉取多档盘口；永续与现货共用同一套聚合逻辑。
+    fn depth_for_market(
+        &self,
+        venue: &str,
+        symbol: &str,
+        market_id: i64,
+        cap: u32,
+    ) -> anyhow::Result<DepthSnapshot> {
         let url = format!(
             "{}/api/v1/orderBookOrders?market_id={market_id}&limit={cap}",
             self.base_url
@@ -373,7 +435,28 @@ impl LighterFundingClient {
         asks.sort_by(|a, b| a.0.cmp(&b.0));
         bids.truncate(cap as usize);
         asks.truncate(cap as usize);
-        make_depth(VENUE, symbol, bids, asks, Decimal::ONE)
+        make_depth(venue, symbol, bids, asks, Decimal::ONE)
+    }
+
+    /// 现货的买一/卖一档；`market_id` 通过 `filter=spot` 的清单解析。
+    pub fn spot_book(&self, symbol: &str) -> anyhow::Result<BookSnapshot> {
+        let market_id = self.spot_market(symbol)?;
+        let url = format!(
+            "{}/api/v1/orderBookOrders?market_id={market_id}&limit=1",
+            self.base_url
+        );
+        book_from_orders(&self.fetch(&url)?, market_id as i64)
+    }
+
+    /// 现货多档盘口；单次最多 250 条订单，聚合后「能拿多少拿多少」。
+    pub fn spot_depth(&self, symbol: &str, limit: u32) -> anyhow::Result<DepthSnapshot> {
+        let market_id = self.spot_market(symbol)?;
+        self.depth_for_market(
+            SPOT_VENUE,
+            symbol,
+            market_id as i64,
+            limit.clamp(50, 250),
+        )
     }
 
     /// 单个永续的最小下单数量与最小名义额。
@@ -409,14 +492,60 @@ impl LighterFundingClient {
         Ok(Some(spec))
     }
 
+    /// 单个现货市场的最小下单数量、最小名义额与数量/价格步长（USDC 计价）。
+    pub fn spot_min_order(&self, symbol: &str) -> anyhow::Result<MinOrderSpec> {
+        let row = self.spot_market_row(symbol)?;
+        let mut spec = MinOrderSpec::new(SPOT_VENUE, symbol);
+        spec.min_quantity = row
+            .min_base_amount
+            .as_deref()
+            .and_then(|value| parse_decimal(value).ok())
+            .filter(|value| *value > Decimal::ZERO);
+        spec.min_notional_usd = row
+            .min_quote_amount
+            .as_deref()
+            .and_then(|value| parse_decimal(value).ok())
+            .filter(|value| *value > Decimal::ZERO);
+        spec.step_size = row
+            .size_decimals
+            .filter(|decimals| *decimals < 28)
+            .map(|decimals| Decimal::new(1, decimals));
+        spec.tick_size = row
+            .price_decimals
+            .filter(|decimals| *decimals < 28)
+            .map(|decimals| Decimal::new(1, decimals));
+        Ok(spec)
+    }
+
     /// 永续 K 线；`/api/v1/candles` 单次最多返回 500 根。
     pub fn candles(&self, symbol: &str, interval: &str, limit: u32) -> anyhow::Result<Vec<Candle>> {
-        let (resolution, step) = lighter_resolution(interval)?;
         let mut market_id = self.market_ids(false)?.get(symbol).copied();
         if market_id.is_none() {
             market_id = self.market_ids(true)?.get(symbol).copied();
         }
         let market_id = market_id.ok_or_else(|| anyhow!("Lighter 未找到交易对: {symbol}"))?;
+        self.candles_for_market(market_id, interval, limit)
+    }
+
+    /// 现货 K 线；直接使用现货 `market_id`，与永续共用同一端点。
+    pub fn spot_candles(
+        &self,
+        symbol: &str,
+        interval: &str,
+        limit: u32,
+    ) -> anyhow::Result<Vec<Candle>> {
+        let market_id = self.spot_market(symbol)?;
+        self.candles_for_market(market_id as i64, interval, limit)
+    }
+
+    /// 按 `market_id` 拉取 K 线；永续与现货共用同一套解析逻辑。
+    fn candles_for_market(
+        &self,
+        market_id: i64,
+        interval: &str,
+        limit: u32,
+    ) -> anyhow::Result<Vec<Candle>> {
+        let (resolution, step) = lighter_resolution(interval)?;
 
         let limit = limit.clamp(1, 500);
         let end = Utc::now();

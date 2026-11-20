@@ -18,7 +18,8 @@ pub mod strategy;
 pub mod types;
 
 pub use exchange::{
-    AccountSnapshot, ExchangeAdapter, ExchangeError, PlaceOrderRequest, VenueOrder, VenueOrderAck,
+    AccountSnapshot, ExchangeAdapter, ExchangeError, PlaceOrderRequest, VenueOrder,
+    VenueOrderAck, VenueOrderState, VenueOrderStatus,
 };
 pub use market::{
     compute_settlement, compute_settlement_from_gross, period_bounds, publish_readiness,

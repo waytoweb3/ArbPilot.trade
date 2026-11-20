@@ -16,8 +16,16 @@ use crate::http_client::HttpClient;
 /// Bitget 的交易所标识。
 pub const VENUE: &str = "bitget";
 
+/// Bitget 现货的交易所标识。
+pub const SPOT_VENUE: &str = "bitget-spot";
+
 /// Bitget 历史费率单页最多 100 条。
 const HISTORY_LIMIT: u32 = 100;
+
+/// Bitget 现货与永续共用 `BTCUSDT` 形式的 symbol，这里只做去空格与大写。
+pub fn spot_symbol(symbol: &str) -> String {
+    symbol.trim().to_ascii_uppercase()
+}
 
 /// Bitget v2 统一的响应信封：`code` 为 "00000" 才表示成功。
 #[derive(Debug, Deserialize)]
@@ -85,6 +93,28 @@ struct ContractRow {
 struct HistoryRow {
     funding_rate: String,
     funding_time: String,
+}
+
+/// `/api/v2/spot/public/symbols` 的下单限制字段。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SpotSymbolRow {
+    symbol: String,
+    /// 最小下单数量（基础币）。
+    #[serde(default)]
+    min_trade_num: Option<String>,
+    /// 最小下单名义额（USDT）。
+    #[serde(rename = "minTradeUSDT", default)]
+    min_trade_usdt: Option<String>,
+    /// 数量步长。
+    #[serde(default)]
+    size_multiplier: Option<String>,
+    /// 价格精度（小数位数，字符串）。
+    #[serde(default)]
+    price_precision: Option<String>,
+    /// 数量精度（小数位数，字符串）。
+    #[serde(default)]
+    quantity_precision: Option<String>,
 }
 
 /// `market/current-fund-rate` 的一行：tickers 里没有结算间隔与下次结算时间。
@@ -257,6 +287,32 @@ impl BitgetFundingClient {
         )
     }
 
+    /// Bitget 现货的买一/卖一档；现货 tickers 与永续字段一致，数量单位是币。
+    pub fn spot_book(&self, symbol: &str) -> anyhow::Result<BookSnapshot> {
+        let wanted = spot_symbol(symbol);
+        let url = format!(
+            "{}/api/v2/spot/market/tickers?symbol={wanted}",
+            self.base_url
+        );
+        let envelope: Envelope<TickerRow> = serde_json::from_value(self.http.get_json(&url)?)
+            .context("解析 Bitget 现货 tickers 失败")?;
+        let row = into_data(envelope, "spot/market/tickers")?
+            .into_iter()
+            .find(|row| row.symbol.eq_ignore_ascii_case(&wanted))
+            .ok_or_else(|| anyhow!("Bitget 现货 tickers 未返回 {wanted}"))?;
+        let field = |value: Option<&str>, name: &str| -> anyhow::Result<Decimal> {
+            value
+                .ok_or_else(|| anyhow!("Bitget 现货 ticker 缺少 {name}: {wanted}"))
+                .and_then(parse_decimal)
+        };
+        make_book(
+            field(row.bid_pr.as_deref(), "bidPr")?,
+            field(row.bid_sz.as_deref(), "bidSz")?,
+            field(row.ask_pr.as_deref(), "askPr")?,
+            field(row.ask_sz.as_deref(), "askSz")?,
+        )
+    }
+
     /// USDT 本位永续的多档盘口；数量单位是币。
     pub fn depth(&self, symbol: &str, limit: u32) -> anyhow::Result<DepthSnapshot> {
         let wanted = symbol.trim().to_ascii_uppercase();
@@ -279,6 +335,35 @@ impl BitgetFundingClient {
             .ok_or_else(|| anyhow!("Bitget merge-depth 响应缺少 data"))?;
         make_depth(
             VENUE,
+            symbol,
+            depth_rows(data, "bids")?,
+            depth_rows(data, "asks")?,
+            Decimal::ONE,
+        )
+    }
+
+    /// Bitget 现货多档盘口；`type=step0` 返回原始档位，单次最多 150 档。
+    pub fn spot_depth(&self, symbol: &str, limit: u32) -> anyhow::Result<DepthSnapshot> {
+        let wanted = spot_symbol(symbol);
+        let limit = limit.clamp(50, 150);
+        let url = format!(
+            "{}/api/v2/spot/market/orderbook?symbol={wanted}&type=step0&limit={limit}",
+            self.base_url
+        );
+        let value = self.http.get_json(&url)?;
+        let code = value.get("code").and_then(Value::as_str).unwrap_or("00000");
+        if code != "00000" {
+            let message = value
+                .get("msg")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            bail!("Bitget 现货 orderbook 返回错误 {code}: {message}");
+        }
+        let data = value
+            .get("data")
+            .ok_or_else(|| anyhow!("Bitget 现货 orderbook 响应缺少 data"))?;
+        make_depth(
+            SPOT_VENUE,
             symbol,
             depth_rows(data, "bids")?,
             depth_rows(data, "asks")?,
@@ -345,6 +430,50 @@ impl BitgetFundingClient {
         Ok(Some(spec))
     }
 
+    /// 单个 Bitget 现货交易对的最小下单数量、最小名义额与数量/价格步长。
+    pub fn spot_min_order(&self, symbol: &str) -> anyhow::Result<MinOrderSpec> {
+        let wanted = spot_symbol(symbol);
+        let url = format!("{}/api/v2/spot/public/symbols", self.base_url);
+        let envelope: Envelope<SpotSymbolRow> = serde_json::from_value(self.http.get_json(&url)?)
+            .context("解析 Bitget 现货 symbols 失败")?;
+        let row = into_data(envelope, "spot/public/symbols")?
+            .into_iter()
+            .find(|row| row.symbol.eq_ignore_ascii_case(&wanted))
+            .ok_or_else(|| anyhow!("Bitget 现货未找到交易对: {wanted}"))?;
+
+        let mut spec = MinOrderSpec::new(SPOT_VENUE, symbol);
+        spec.min_quantity = row
+            .min_trade_num
+            .as_deref()
+            .and_then(|value| parse_decimal(value).ok())
+            .filter(|value| *value > Decimal::ZERO);
+        spec.min_notional_usd = row
+            .min_trade_usdt
+            .as_deref()
+            .and_then(|value| parse_decimal(value).ok())
+            .filter(|value| *value > Decimal::ZERO);
+        // `sizeMultiplier` 就是数量步长；缺失时回退到 `quantityPrecision` 的小数位。
+        spec.step_size = row
+            .size_multiplier
+            .as_deref()
+            .and_then(|value| parse_decimal(value).ok())
+            .filter(|value| *value > Decimal::ZERO)
+            .or_else(|| {
+                row.quantity_precision
+                    .as_deref()
+                    .and_then(|value| value.trim().parse::<u32>().ok())
+                    .filter(|decimals| *decimals < 28)
+                    .map(|decimals| Decimal::new(1, decimals))
+            });
+        spec.tick_size = row
+            .price_precision
+            .as_deref()
+            .and_then(|value| value.trim().parse::<u32>().ok())
+            .filter(|decimals| *decimals < 28)
+            .map(|decimals| Decimal::new(1, decimals));
+        Ok(spec)
+    }
+
     /// 历史已结算费率，按结算时间升序返回。
     ///
     /// Bitget 不支持按时间过滤，取最新一页后只保留 `start` 之后的记录。
@@ -398,6 +527,26 @@ impl BitgetFundingClient {
         let rows = into_data(envelope, "market/candles")?;
         candles_from_rows(rows, true)
     }
+
+    /// Bitget 现货 K 线；现货的 `granularity` 用 `1min` / `1day` 这类写法。
+    pub fn spot_candles(
+        &self,
+        symbol: &str,
+        interval: &str,
+        limit: u32,
+    ) -> anyhow::Result<Vec<Candle>> {
+        let wanted = spot_symbol(symbol);
+        let granularity = bitget_spot_interval(interval)?;
+        let url = format!(
+            "{}/api/v2/spot/market/candles?symbol={wanted}&granularity={granularity}&limit={}",
+            self.base_url,
+            limit.clamp(1, 200)
+        );
+        let envelope: Envelope<Vec<Value>> = serde_json::from_value(self.http.get_json(&url)?)
+            .context("解析 Bitget 现货 K 线失败")?;
+        let rows = into_data(envelope, "spot/market/candles")?;
+        candles_from_rows(rows, true)
+    }
 }
 
 /// Bitget 的 K 线周期格式：分钟用小写 m，小时/天/周用大写。
@@ -412,6 +561,21 @@ fn bitget_interval(interval: &str) -> anyhow::Result<&'static str> {
         "1d" => "1D",
         "1w" => "1W",
         other => bail!("Bitget 不支持的 K 线周期: {other}"),
+    })
+}
+
+/// Bitget 现货的 K 线周期格式：分钟用 `min`，其余用 `1h` / `1day` / `1week`。
+fn bitget_spot_interval(interval: &str) -> anyhow::Result<&'static str> {
+    Ok(match interval {
+        "1m" => "1min",
+        "5m" => "5min",
+        "15m" => "15min",
+        "30m" => "30min",
+        "1h" => "1h",
+        "4h" => "4h",
+        "1d" => "1day",
+        "1w" => "1week",
+        other => bail!("Bitget 现货不支持的 K 线周期: {other}"),
     })
 }
 

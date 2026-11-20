@@ -197,6 +197,11 @@ pub struct OrderLeg {
     pub venue_order_id: Option<String>,
     pub filled_quantity: Decimal,
     pub average_price: Option<Decimal>,
+    /// 交易所实际收取的手续费；下单回执不返回时为 `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fee: Option<Decimal>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fee_currency: Option<String>,
 }
 
 impl OrderLeg {
@@ -207,6 +212,8 @@ impl OrderLeg {
             venue_order_id: None,
             filled_quantity: Decimal::ZERO,
             average_price: None,
+            fee: None,
+            fee_currency: None,
         }
     }
 

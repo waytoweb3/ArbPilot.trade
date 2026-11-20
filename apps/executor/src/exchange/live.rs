@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use arb_core::{ExchangeError, PlaceOrderRequest, Side, VenueOrderAck};
+use arb_core::{ExchangeError, PlaceOrderRequest, Side, VenueOrderAck, VenueOrderState, VenueOrderStatus};
 use base64::Engine as _;
 use chrono::{SecondsFormat, Utc};
 use hmac::{Hmac, Mac};
@@ -13,9 +13,9 @@ use crate::{
     exchange::{
         aster,
         dex::{
-            hyperliquid_cloid, hyperliquid_update_leverage_action, sign_hyperliquid_action,
-            sign_lighter_leverage, sign_lighter_order, HyperliquidOrder, LighterLeverage,
-            LighterOrder, LIGHTER_MAINNET_CHAIN_ID,
+            hyperliquid_cancel_action, hyperliquid_cloid, hyperliquid_update_leverage_action,
+            sign_hyperliquid_action, sign_lighter_leverage, sign_lighter_order, HyperliquidOrder,
+            LighterLeverage, LighterOrder, LIGHTER_MAINNET_CHAIN_ID,
         },
     },
     http_client::{HttpClient, HttpStatusError},
@@ -30,13 +30,16 @@ pub struct LiveEndpoints {
     pub okx: String,
     pub bybit: String,
     pub bitget: String,
+    /// Bitget 现货与永续共用同一域名，仅接口路径不同。
+    pub bitget_spot: String,
     pub gate: String,
+    /// Gate 现货接口根地址。
+    pub gate_spot: String,
     pub aster: String,
-    pub htx: String,
-    pub mexc: String,
-    pub bingx: String,
     /// Hyperliquid 与 Lighter 的接口根地址，签名在本机完成后提交。
     pub hyperliquid: String,
+    /// Hyperliquid 现货与永续共用同一个 `/exchange` 端点。
+    pub hyperliquid_spot: String,
     pub lighter: String,
 }
 
@@ -82,10 +85,79 @@ impl LiveExchange {
         .map_err(|error| ExchangeError::Transport(format!("下单任务失败: {error}")))?
     }
 
+    /// 查询订单真实状态：下单回执只代表「已受理」，成交数量、均价与手续费以这里为准。
+    pub async fn order_status(
+        &self,
+        venue: &str,
+        symbol: &str,
+        venue_order_id: &str,
+        client_order_id: &str,
+    ) -> Result<VenueOrderStatus, ExchangeError> {
+        let http = self.http.clone().ok_or_else(|| {
+            ExchangeError::Transport("HTTP 客户端不可用，无法查询订单状态".to_string())
+        })?;
+        let venue = venue.trim().to_ascii_lowercase();
+        let credentials = self.accounts.credentials_for(&venue).ok_or_else(|| {
+            ExchangeError::Credentials(format!("{venue} 尚未导入账户，无法查询订单状态"))
+        })?;
+        let endpoints = self.endpoints.clone();
+        let symbol = symbol.to_string();
+        let venue_order_id = venue_order_id.to_string();
+        let client_order_id = client_order_id.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            order_status_blocking(
+                &http,
+                &endpoints,
+                &venue,
+                &credentials,
+                &symbol,
+                &venue_order_id,
+                &client_order_id,
+            )
+        })
+        .await
+        .map_err(|error| ExchangeError::Transport(format!("查询订单状态任务失败: {error}")))?
+    }
+
+    /// 撤掉一笔尚未完全成交的订单；已成交或已撤销时返回成功，便于补偿流程幂等。
+    pub async fn cancel_order(
+        &self,
+        venue: &str,
+        symbol: &str,
+        venue_order_id: &str,
+        client_order_id: &str,
+    ) -> Result<(), ExchangeError> {
+        let http = self.http.clone().ok_or_else(|| {
+            ExchangeError::Transport("HTTP 客户端不可用，无法撤单".to_string())
+        })?;
+        let venue = venue.trim().to_ascii_lowercase();
+        let credentials = self.accounts.credentials_for(&venue).ok_or_else(|| {
+            ExchangeError::Credentials(format!("{venue} 尚未导入账户，无法撤单"))
+        })?;
+        let endpoints = self.endpoints.clone();
+        let symbol = symbol.to_string();
+        let venue_order_id = venue_order_id.to_string();
+        let client_order_id = client_order_id.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            cancel_blocking(
+                &http,
+                &endpoints,
+                &venue,
+                &credentials,
+                &symbol,
+                &venue_order_id,
+                &client_order_id,
+            )
+        })
+        .await
+        .map_err(|error| ExchangeError::Transport(format!("撤单任务失败: {error}")))?
+    }
+
     /// 在下单前把杠杆设置到交易所。
     ///
-    /// 只有调用方显式给出杠杆时才需要调用；MEXC / HTX 的杠杆随下单请求提交，
-    /// 这里直接返回成功。
+    /// 只有调用方显式给出杠杆时才需要调用；现货腿没有杠杆概念，直接返回成功。
     pub async fn set_leverage(
         &self,
         venue: &str,
@@ -213,21 +285,6 @@ fn place(
             request,
             &client_order_id,
         ),
-        "htx" => htx_place(http, &endpoints.htx, credentials, request, &client_order_id),
-        "mexc" => mexc_place(
-            http,
-            &endpoints.mexc,
-            credentials,
-            request,
-            &client_order_id,
-        ),
-        "bingx" => bingx_place(
-            http,
-            &endpoints.bingx,
-            credentials,
-            request,
-            &client_order_id,
-        ),
         "hyperliquid" => hyperliquid_place(
             http,
             &endpoints.hyperliquid,
@@ -253,9 +310,823 @@ fn is_spot(venue: &str) -> bool {
     venue.trim().to_ascii_lowercase().ends_with("-spot")
 }
 
+/// 订单状态查询入口：按交易所分派到各自的私有查单接口。
+fn order_status_blocking(
+    http: &HttpClient,
+    endpoints: &LiveEndpoints,
+    venue: &str,
+    credentials: &AccountCredentials,
+    symbol: &str,
+    venue_order_id: &str,
+    client_order_id: &str,
+) -> Result<VenueOrderStatus, ExchangeError> {
+    match venue {
+        "binance" => binance_status(http, &endpoints.binance, credentials, symbol, venue_order_id),
+        "aster" => aster_status(http, &endpoints.aster, credentials, symbol, venue_order_id),
+        "binance-spot" => {
+            binance_spot_status(http, &endpoints.binance_spot, credentials, symbol, venue_order_id)
+        }
+        "okx" => okx_status(http, &endpoints.okx, credentials, symbol, venue_order_id, false),
+        "okx-spot" => okx_status(http, &endpoints.okx, credentials, symbol, venue_order_id, true),
+        "bybit" => bybit_status(http, &endpoints.bybit, credentials, symbol, venue_order_id, false),
+        "bybit-spot" => {
+            bybit_status(http, &endpoints.bybit, credentials, symbol, venue_order_id, true)
+        }
+        "bitget" => bitget_status(http, &endpoints.bitget, credentials, symbol, venue_order_id),
+        "gate" => gate_status(http, &endpoints.gate, credentials, venue_order_id),
+        "hyperliquid" => {
+            hyperliquid_status(http, &endpoints.hyperliquid, venue_order_id, client_order_id)
+        }
+        "lighter" => Err(ExchangeError::Unsupported(
+            "Lighter 暂不支持查询订单状态，请在 Lighter 界面确认成交".to_string(),
+        )),
+        other => Err(ExchangeError::Unsupported(format!(
+            "{other} 暂未接入订单状态查询"
+        ))),
+    }
+}
+
+/// 撤单入口：已终态或交易所查不到该单时视为成功，保证补偿流程可重试。
+fn cancel_blocking(
+    http: &HttpClient,
+    endpoints: &LiveEndpoints,
+    venue: &str,
+    credentials: &AccountCredentials,
+    symbol: &str,
+    venue_order_id: &str,
+    client_order_id: &str,
+) -> Result<(), ExchangeError> {
+    match venue {
+        "binance" => binance_cancel(http, &endpoints.binance, credentials, symbol, venue_order_id),
+        "aster" => aster_cancel(http, &endpoints.aster, credentials, symbol, venue_order_id),
+        "binance-spot" => {
+            binance_spot_cancel(http, &endpoints.binance_spot, credentials, symbol, venue_order_id)
+        }
+        "okx" => okx_cancel(http, &endpoints.okx, credentials, symbol, venue_order_id, false),
+        "okx-spot" => okx_cancel(http, &endpoints.okx, credentials, symbol, venue_order_id, true),
+        "bybit" => bybit_cancel(http, &endpoints.bybit, credentials, symbol, venue_order_id, false),
+        "bybit-spot" => {
+            bybit_cancel(http, &endpoints.bybit, credentials, symbol, venue_order_id, true)
+        }
+        "bitget" => bitget_cancel(http, &endpoints.bitget, credentials, symbol, venue_order_id),
+        "gate" => gate_cancel(http, &endpoints.gate, credentials, venue_order_id),
+        "hyperliquid" => hyperliquid_cancel(
+            http,
+            &endpoints.hyperliquid,
+            credentials,
+            symbol,
+            venue_order_id,
+            client_order_id,
+        ),
+        "lighter" => Err(ExchangeError::Unsupported(
+            "Lighter 暂不支持撤单，请在 Lighter 界面手动撤销".to_string(),
+        )),
+        other => Err(ExchangeError::Unsupported(format!("{other} 暂未接入撤单"))),
+    }
+}
+
+fn status(
+    state: VenueOrderState,
+    filled: Option<Decimal>,
+    average_price: Option<Decimal>,
+    fee: Option<Decimal>,
+) -> VenueOrderStatus {
+    VenueOrderStatus {
+        state,
+        filled_quantity: filled.unwrap_or_default().max(Decimal::ZERO),
+        average_price: average_price.filter(|value| *value > Decimal::ZERO),
+        fee,
+        fee_currency: None,
+    }
+}
+
+fn binance_state(raw: Option<&str>) -> VenueOrderState {
+    match raw.unwrap_or_default() {
+        "NEW" | "PENDING_NEW" => VenueOrderState::Open,
+        "PARTIALLY_FILLED" => VenueOrderState::PartiallyFilled,
+        "FILLED" => VenueOrderState::Filled,
+        "CANCELED" | "EXPIRED" | "EXPIRED_IN_MATCH" => VenueOrderState::Canceled,
+        "REJECTED" => VenueOrderState::Rejected,
+        _ => VenueOrderState::Unknown,
+    }
+}
+
+fn base_from_symbol(symbol: &str) -> Result<String, ExchangeError> {
+    symbol
+        .trim()
+        .to_ascii_uppercase()
+        .strip_suffix("USDT")
+        .filter(|base| !base.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| ExchangeError::Unsupported(format!("仅支持 USDT 本位合约: {symbol}")))
+}
+
+fn binance_status(
+    http: &HttpClient,
+    base_url: &str,
+    credentials: &AccountCredentials,
+    symbol: &str,
+    venue_order_id: &str,
+) -> Result<VenueOrderStatus, ExchangeError> {
+    let (key, secret) = key_pair(credentials)?;
+    let base_url = base_url.trim_end_matches('/');
+    let params = format!(
+        "symbol={}&orderId={venue_order_id}&recvWindow=5000&timestamp={}",
+        symbol.trim().to_ascii_uppercase(),
+        now_millis()
+    );
+    let signature = hmac_hex(secret, &params)?;
+    let value = http
+        .get_json_with_headers(
+            &format!("{base_url}/fapi/v1/order?{params}&signature={signature}"),
+            &[("X-MBX-APIKEY", key)],
+        )
+        .map_err(transport)?;
+    Ok(status(
+        binance_state(value["status"].as_str()),
+        decimal(&value["executedQty"]),
+        decimal(&value["avgPrice"]),
+        None,
+    ))
+}
+
+fn binance_cancel(
+    http: &HttpClient,
+    base_url: &str,
+    credentials: &AccountCredentials,
+    symbol: &str,
+    venue_order_id: &str,
+) -> Result<(), ExchangeError> {
+    let (key, secret) = key_pair(credentials)?;
+    let base_url = base_url.trim_end_matches('/');
+    let params = format!(
+        "symbol={}&orderId={venue_order_id}&recvWindow=5000&timestamp={}",
+        symbol.trim().to_ascii_uppercase(),
+        now_millis()
+    );
+    let signature = hmac_hex(secret, &params)?;
+    let value = http
+        .request(
+            "DELETE",
+            &format!("{base_url}/fapi/v1/order?{params}&signature={signature}"),
+            &[("X-MBX-APIKEY", key)],
+            None,
+        )
+        .map_err(transport)?;
+    let value: Value = serde_json::from_slice(&value).unwrap_or(Value::Null);
+    // -2011：该订单已不存在（已成交或已撤销），按成功处理。
+    if value["code"].as_i64() == Some(-2011) {
+        return Ok(());
+    }
+    if let Some(code) = value["code"].as_i64() {
+        if code != 200 {
+            return Err(ExchangeError::Rejected(format!(
+                "Binance 撤单失败: {}",
+                value["msg"].as_str().unwrap_or("未知错误")
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn binance_spot_status(
+    http: &HttpClient,
+    base_url: &str,
+    credentials: &AccountCredentials,
+    symbol: &str,
+    venue_order_id: &str,
+) -> Result<VenueOrderStatus, ExchangeError> {
+    let (key, secret) = key_pair(credentials)?;
+    let base_url = base_url.trim_end_matches('/');
+    let params = format!(
+        "symbol={}&orderId={venue_order_id}&recvWindow=5000&timestamp={}",
+        symbol.trim().to_ascii_uppercase(),
+        now_millis()
+    );
+    let signature = hmac_hex(secret, &params)?;
+    let value = http
+        .get_json_with_headers(
+            &format!("{base_url}/api/v3/order?{params}&signature={signature}"),
+            &[("X-MBX-APIKEY", key)],
+        )
+        .map_err(transport)?;
+    Ok(status(
+        binance_state(value["status"].as_str()),
+        decimal(&value["executedQty"]),
+        decimal(&value["cummulativeQuoteQty"])
+            .zip(decimal(&value["executedQty"]))
+            .filter(|(_, executed)| *executed > Decimal::ZERO)
+            .map(|(quote, executed)| quote / executed),
+        None,
+    ))
+}
+
+fn binance_spot_cancel(
+    http: &HttpClient,
+    base_url: &str,
+    credentials: &AccountCredentials,
+    symbol: &str,
+    venue_order_id: &str,
+) -> Result<(), ExchangeError> {
+    let (key, secret) = key_pair(credentials)?;
+    let base_url = base_url.trim_end_matches('/');
+    let params = format!(
+        "symbol={}&orderId={venue_order_id}&recvWindow=5000&timestamp={}",
+        symbol.trim().to_ascii_uppercase(),
+        now_millis()
+    );
+    let signature = hmac_hex(secret, &params)?;
+    let value = http
+        .request(
+            "DELETE",
+            &format!("{base_url}/api/v3/order?{params}&signature={signature}"),
+            &[("X-MBX-APIKEY", key)],
+            None,
+        )
+        .map_err(transport)?;
+    let value: Value = serde_json::from_slice(&value).unwrap_or(Value::Null);
+    if value["code"].as_i64() == Some(-2011) {
+        return Ok(());
+    }
+    if let Some(code) = value["code"].as_i64() {
+        if code != 0 {
+            return Err(ExchangeError::Rejected(format!(
+                "Binance 现货撤单失败: {}",
+                value["msg"].as_str().unwrap_or("未知错误")
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn aster_status(
+    http: &HttpClient,
+    base_url: &str,
+    credentials: &AccountCredentials,
+    symbol: &str,
+    venue_order_id: &str,
+) -> Result<VenueOrderStatus, ExchangeError> {
+    let user = credentials
+        .wallet_address
+        .as_deref()
+        .ok_or_else(|| ExchangeError::Credentials("Aster 需要主账户钱包地址".to_string()))?;
+    let signer_key = credentials
+        .signer_key
+        .as_deref()
+        .ok_or_else(|| ExchangeError::Credentials("Aster 需要 API 钱包私钥".to_string()))?;
+    let signer = aster::AsterSigner::new(user, signer_key)
+        .map_err(|error| ExchangeError::Credentials(error.to_string()))?;
+    let value = aster::request(
+        http,
+        "GET",
+        base_url,
+        "/fapi/v1/order",
+        &signer,
+        &[
+            ("symbol", symbol.trim().to_ascii_uppercase()),
+            ("orderId", venue_order_id.to_string()),
+        ],
+    )
+    .map_err(transport)?;
+    Ok(status(
+        binance_state(value["status"].as_str()),
+        decimal(&value["executedQty"]),
+        decimal(&value["avgPrice"]),
+        None,
+    ))
+}
+
+fn aster_cancel(
+    http: &HttpClient,
+    base_url: &str,
+    credentials: &AccountCredentials,
+    symbol: &str,
+    venue_order_id: &str,
+) -> Result<(), ExchangeError> {
+    let user = credentials
+        .wallet_address
+        .as_deref()
+        .ok_or_else(|| ExchangeError::Credentials("Aster 需要主账户钱包地址".to_string()))?;
+    let signer_key = credentials
+        .signer_key
+        .as_deref()
+        .ok_or_else(|| ExchangeError::Credentials("Aster 需要 API 钱包私钥".to_string()))?;
+    let signer = aster::AsterSigner::new(user, signer_key)
+        .map_err(|error| ExchangeError::Credentials(error.to_string()))?;
+    let value = aster::request(
+        http,
+        "DELETE",
+        base_url,
+        "/fapi/v1/order",
+        &signer,
+        &[
+            ("symbol", symbol.trim().to_ascii_uppercase()),
+            ("orderId", venue_order_id.to_string()),
+        ],
+    )
+    .map_err(transport)?;
+    if value["code"].as_i64() == Some(-2011) {
+        return Ok(());
+    }
+    if let Some(code) = value["code"].as_i64() {
+        if code != 200 {
+            return Err(ExchangeError::Rejected(format!(
+                "Aster 撤单失败: {}",
+                value["msg"].as_str().unwrap_or("未知错误")
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn okx_status(
+    http: &HttpClient,
+    base_url: &str,
+    credentials: &AccountCredentials,
+    symbol: &str,
+    venue_order_id: &str,
+    spot: bool,
+) -> Result<VenueOrderStatus, ExchangeError> {
+    let (key, secret) = key_pair(credentials)?;
+    let passphrase = credentials
+        .passphrase
+        .as_deref()
+        .ok_or_else(|| ExchangeError::Credentials("OKX 需要 Passphrase".to_string()))?;
+    let base_url = base_url.trim_end_matches('/');
+    let base = base_from_symbol(symbol)?;
+    let inst_id = if spot {
+        format!("{base}-USDT")
+    } else {
+        format!("{base}-USDT-SWAP")
+    };
+    let path = format!("/api/v5/trade/order?instId={inst_id}&ordId={venue_order_id}");
+    let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+    let signature = hmac_base64(secret, &format!("{timestamp}GET{path}"))?;
+    let headers = [
+        ("OK-ACCESS-KEY", key),
+        ("OK-ACCESS-SIGN", signature.as_str()),
+        ("OK-ACCESS-TIMESTAMP", timestamp.as_str()),
+        ("OK-ACCESS-PASSPHRASE", passphrase),
+    ];
+    let value = http
+        .get_json_with_headers(&format!("{base_url}{path}"), &headers)
+        .map_err(transport)?;
+    let data = &value["data"][0];
+    let state = match data["state"].as_str().unwrap_or_default() {
+        "live" => VenueOrderState::Open,
+        "partially_filled" => VenueOrderState::PartiallyFilled,
+        "filled" => VenueOrderState::Filled,
+        "canceled" | "mmp_canceled" => VenueOrderState::Canceled,
+        _ => VenueOrderState::Unknown,
+    };
+    let mut filled = decimal(&data["accFillSz"]);
+    // 永续的成交数量以张计，换算成币数量才能与订单数量对齐。
+    if !spot {
+        if let Some(contract_value) = okx_contract_value(http, base_url, &inst_id) {
+            filled = filled.map(|value| value * contract_value);
+        }
+    }
+    let mut result = status(
+        state,
+        filled,
+        decimal(&data["avgPx"]),
+        decimal(&data["fee"]).map(|value| value.abs()),
+    );
+    result.fee_currency = data["feeCcy"].as_str().map(str::to_string);
+    Ok(result)
+}
+
+fn okx_contract_value(http: &HttpClient, base_url: &str, inst_id: &str) -> Option<Decimal> {
+    let value = http
+        .get_json(&format!(
+            "{base_url}/api/v5/public/instruments?instType=SWAP&instId={inst_id}"
+        ))
+        .ok()?;
+    decimal(&value["data"][0]["ctVal"]).filter(|value| *value > Decimal::ZERO)
+}
+
+fn okx_cancel(
+    http: &HttpClient,
+    base_url: &str,
+    credentials: &AccountCredentials,
+    symbol: &str,
+    venue_order_id: &str,
+    spot: bool,
+) -> Result<(), ExchangeError> {
+    let (key, secret) = key_pair(credentials)?;
+    let passphrase = credentials
+        .passphrase
+        .as_deref()
+        .ok_or_else(|| ExchangeError::Credentials("OKX 需要 Passphrase".to_string()))?;
+    let base_url = base_url.trim_end_matches('/');
+    let base = base_from_symbol(symbol)?;
+    let inst_id = if spot {
+        format!("{base}-USDT")
+    } else {
+        format!("{base}-USDT-SWAP")
+    };
+    let body = json!({ "instId": inst_id, "ordId": venue_order_id }).to_string();
+    let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+    let signature =
+        hmac_base64(secret, &format!("{timestamp}POST/api/v5/trade/cancel-order{body}"))?;
+    let headers = [
+        ("OK-ACCESS-KEY", key),
+        ("OK-ACCESS-SIGN", signature.as_str()),
+        ("OK-ACCESS-TIMESTAMP", timestamp.as_str()),
+        ("OK-ACCESS-PASSPHRASE", passphrase),
+    ];
+    let value = http
+        .post_body_with_headers(
+            &format!("{base_url}/api/v5/trade/cancel-order"),
+            &headers,
+            &body,
+        )
+        .map_err(transport)?;
+    let code = value["data"][0]["sCode"].as_str().unwrap_or("0");
+    // 51400：订单已不存在（已成交/已撤销），按成功处理。
+    if code == "0" || code == "51400" {
+        return Ok(());
+    }
+    Err(ExchangeError::Rejected(format!(
+        "OKX 撤单失败: {}",
+        value["data"][0]["sMsg"].as_str().unwrap_or("未知错误")
+    )))
+}
+
+fn bybit_status(
+    http: &HttpClient,
+    base_url: &str,
+    credentials: &AccountCredentials,
+    symbol: &str,
+    venue_order_id: &str,
+    spot: bool,
+) -> Result<VenueOrderStatus, ExchangeError> {
+    let (key, secret) = key_pair(credentials)?;
+    let base_url = base_url.trim_end_matches('/');
+    let category = if spot { "spot" } else { "linear" };
+    let query = format!(
+        "category={category}&symbol={}&orderId={venue_order_id}",
+        symbol.trim().to_ascii_uppercase()
+    );
+    let timestamp = now_millis().to_string();
+    let recv_window = "5000";
+    let signature = hmac_hex(secret, &format!("{timestamp}{key}{recv_window}{query}"))?;
+    let headers = [
+        ("X-BAPI-API-KEY", key),
+        ("X-BAPI-TIMESTAMP", timestamp.as_str()),
+        ("X-BAPI-SIGN", signature.as_str()),
+        ("X-BAPI-RECV-WINDOW", recv_window),
+    ];
+    let mut value = http
+        .get_json_with_headers(&format!("{base_url}/v5/order/realtime?{query}"), &headers)
+        .map_err(transport)?;
+    // 终态订单会从 realtime 移入 history，空结果时再查一次历史。
+    let empty = value["result"]["list"]
+        .as_array()
+        .map(|rows| rows.is_empty())
+        .unwrap_or(true);
+    if empty {
+        value = http
+            .get_json_with_headers(&format!("{base_url}/v5/order/history?{query}"), &headers)
+            .map_err(transport)?;
+    }
+    let Some(order) = value["result"]["list"].as_array().and_then(|rows| rows.first()) else {
+        return Err(ExchangeError::Rejected(format!(
+            "Bybit 未找到订单 {venue_order_id}: {}",
+            value["retMsg"].as_str().unwrap_or("未知错误")
+        )));
+    };
+    let state = match order["orderStatus"].as_str().unwrap_or_default() {
+        "New" | "Untriggered" => VenueOrderState::Open,
+        "PartiallyFilled" => VenueOrderState::PartiallyFilled,
+        "Filled" => VenueOrderState::Filled,
+        "Cancelled" | "PartiallyFilledCanceled" | "Deactivated" => VenueOrderState::Canceled,
+        "Rejected" => VenueOrderState::Rejected,
+        _ => VenueOrderState::Unknown,
+    };
+    let mut result = status(
+        state,
+        decimal(&order["cumExecQty"]),
+        decimal(&order["avgPrice"]),
+        decimal(&order["cumExecFee"]).map(|value| value.abs()),
+    );
+    result.fee_currency = Some("USDT".to_string());
+    Ok(result)
+}
+
+fn bybit_cancel(
+    http: &HttpClient,
+    base_url: &str,
+    credentials: &AccountCredentials,
+    symbol: &str,
+    venue_order_id: &str,
+    spot: bool,
+) -> Result<(), ExchangeError> {
+    let (key, secret) = key_pair(credentials)?;
+    let base_url = base_url.trim_end_matches('/');
+    let body = json!({
+        "category": if spot { "spot" } else { "linear" },
+        "symbol": symbol.trim().to_ascii_uppercase(),
+        "orderId": venue_order_id,
+    })
+    .to_string();
+    let timestamp = now_millis().to_string();
+    let recv_window = "5000";
+    let signature = hmac_hex(secret, &format!("{timestamp}{key}{recv_window}{body}"))?;
+    let headers = [
+        ("X-BAPI-API-KEY", key),
+        ("X-BAPI-TIMESTAMP", timestamp.as_str()),
+        ("X-BAPI-SIGN", signature.as_str()),
+        ("X-BAPI-RECV-WINDOW", recv_window),
+    ];
+    let value = http
+        .post_body_with_headers(&format!("{base_url}/v5/order/cancel"), &headers, &body)
+        .map_err(transport)?;
+    // 110001：订单不存在或已终态，按成功处理。
+    let code = value["retCode"].as_i64().unwrap_or(0);
+    if code == 0 || code == 110001 {
+        return Ok(());
+    }
+    Err(ExchangeError::Rejected(format!(
+        "Bybit 撤单失败: {}",
+        value["retMsg"].as_str().unwrap_or("未知错误")
+    )))
+}
+
+fn bitget_status(
+    http: &HttpClient,
+    base_url: &str,
+    credentials: &AccountCredentials,
+    symbol: &str,
+    venue_order_id: &str,
+) -> Result<VenueOrderStatus, ExchangeError> {
+    let (key, secret) = key_pair(credentials)?;
+    let passphrase = credentials
+        .passphrase
+        .as_deref()
+        .ok_or_else(|| ExchangeError::Credentials("Bitget 需要 Passphrase".to_string()))?;
+    let base_url = base_url.trim_end_matches('/');
+    let path = format!(
+        "/api/v2/mix/order/detail?symbol={}&productType=USDT-FUTURES&orderId={venue_order_id}",
+        symbol.trim().to_ascii_uppercase()
+    );
+    let timestamp = now_millis().to_string();
+    let signature = hmac_base64(secret, &format!("{timestamp}GET{path}"))?;
+    let headers = [
+        ("ACCESS-KEY", key),
+        ("ACCESS-SIGN", signature.as_str()),
+        ("ACCESS-TIMESTAMP", timestamp.as_str()),
+        ("ACCESS-PASSPHRASE", passphrase),
+        ("locale", "zh-CN"),
+    ];
+    let value = http
+        .get_json_with_headers(&format!("{base_url}{path}"), &headers)
+        .map_err(transport)?;
+    let data = &value["data"];
+    let state = match data["state"].as_str().unwrap_or_default() {
+        "live" | "new" => VenueOrderState::Open,
+        "partially_filled" => VenueOrderState::PartiallyFilled,
+        "filled" => VenueOrderState::Filled,
+        "canceled" | "cancelled" => VenueOrderState::Canceled,
+        "rejected" => VenueOrderState::Rejected,
+        _ => VenueOrderState::Unknown,
+    };
+    let mut result = status(
+        state,
+        decimal(&data["baseVolume"]),
+        decimal(&data["priceAvg"]),
+        decimal(&data["fee"]).map(|value| value.abs()),
+    );
+    result.fee_currency = data["feeCoin"].as_str().map(str::to_string);
+    Ok(result)
+}
+
+fn bitget_cancel(
+    http: &HttpClient,
+    base_url: &str,
+    credentials: &AccountCredentials,
+    symbol: &str,
+    venue_order_id: &str,
+) -> Result<(), ExchangeError> {
+    let (key, secret) = key_pair(credentials)?;
+    let passphrase = credentials
+        .passphrase
+        .as_deref()
+        .ok_or_else(|| ExchangeError::Credentials("Bitget 需要 Passphrase".to_string()))?;
+    let base_url = base_url.trim_end_matches('/');
+    let body = json!({
+        "symbol": symbol.trim().to_ascii_uppercase(),
+        "productType": "USDT-FUTURES",
+        "marginCoin": "USDT",
+        "orderId": venue_order_id,
+    })
+    .to_string();
+    let timestamp = now_millis().to_string();
+    let signature = hmac_base64(
+        secret,
+        &format!("{timestamp}POST/api/v2/mix/order/cancel-order{body}"),
+    )?;
+    let headers = [
+        ("ACCESS-KEY", key),
+        ("ACCESS-SIGN", signature.as_str()),
+        ("ACCESS-TIMESTAMP", timestamp.as_str()),
+        ("ACCESS-PASSPHRASE", passphrase),
+        ("locale", "zh-CN"),
+    ];
+    let value = http
+        .post_body_with_headers(
+            &format!("{base_url}/api/v2/mix/order/cancel-order"),
+            &headers,
+            &body,
+        )
+        .map_err(transport)?;
+    if value["code"].as_str().unwrap_or("00000") == "00000" {
+        return Ok(());
+    }
+    Err(ExchangeError::Rejected(format!(
+        "Bitget 撤单失败: {}",
+        value["msg"].as_str().unwrap_or("未知错误")
+    )))
+}
+
+fn gate_status(
+    http: &HttpClient,
+    base_url: &str,
+    credentials: &AccountCredentials,
+    venue_order_id: &str,
+) -> Result<VenueOrderStatus, ExchangeError> {
+    let base_url = base_url.trim_end_matches('/');
+    let path = format!("/api/v4/futures/usdt/orders/{venue_order_id}");
+    let timestamp = Utc::now().timestamp().to_string();
+    let signature = gate_sign(&credentials.api_secret, "GET", &path, "", "", &timestamp)?;
+    let headers = [
+        ("KEY", credentials.api_key.as_str()),
+        ("SIGN", signature.as_str()),
+        ("TIMESTAMP", timestamp.as_str()),
+    ];
+    let value = http
+        .get_json_with_headers(&format!("{base_url}{path}"), &headers)
+        .map_err(transport)?;
+    let state = match value["status"].as_str().unwrap_or_default() {
+        "open" => {
+            let size = decimal(&value["size"]).map(|value| value.abs()).unwrap_or_default();
+            let left = decimal(&value["left"]).map(|value| value.abs()).unwrap_or_default();
+            if left > Decimal::ZERO && left < size {
+                VenueOrderState::PartiallyFilled
+            } else {
+                VenueOrderState::Open
+            }
+        }
+        "finished" => match value["finish_as"].as_str().unwrap_or("filled") {
+            "filled" => VenueOrderState::Filled,
+            "cancelled" => VenueOrderState::Canceled,
+            _ => VenueOrderState::Unknown,
+        },
+        _ => VenueOrderState::Unknown,
+    };
+    let size = decimal(&value["size"]).map(|value| value.abs()).unwrap_or_default();
+    let left = decimal(&value["left"]).map(|value| value.abs()).unwrap_or_default();
+    let mut result = status(
+        state,
+        Some((size - left).max(Decimal::ZERO)),
+        decimal(&value["fill_price"]),
+        decimal(&value["fee"]).map(|value| value.abs()),
+    );
+    result.fee_currency = Some("USDT".to_string());
+    Ok(result)
+}
+
+fn gate_cancel(
+    http: &HttpClient,
+    base_url: &str,
+    credentials: &AccountCredentials,
+    venue_order_id: &str,
+) -> Result<(), ExchangeError> {
+    let base_url = base_url.trim_end_matches('/');
+    let path = format!("/api/v4/futures/usdt/orders/{venue_order_id}");
+    let timestamp = Utc::now().timestamp().to_string();
+    let signature = gate_sign(&credentials.api_secret, "DELETE", &path, "", "", &timestamp)?;
+    let headers = [
+        ("KEY", credentials.api_key.as_str()),
+        ("SIGN", signature.as_str()),
+        ("TIMESTAMP", timestamp.as_str()),
+    ];
+    let value = http
+        .request(
+            "DELETE",
+            &format!("{base_url}{path}"),
+            &headers,
+            None,
+        )
+        .map_err(transport)?;
+    let value: Value = serde_json::from_slice(&value).unwrap_or(Value::Null);
+    // 订单不存在/已终态时 Gate 返回空对象或错误码，按成功处理。
+    if value.is_null() || value.as_object().map(|object| object.is_empty()).unwrap_or(false) {
+        return Ok(());
+    }
+    if let Some(label) = value["label"].as_str() {
+        if label != "ORDER_NOT_FOUND" {
+            return Err(ExchangeError::Rejected(format!(
+                "Gate 撤单失败: {}",
+                value["message"].as_str().unwrap_or(label)
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn hyperliquid_status(
+    http: &HttpClient,
+    base_url: &str,
+    venue_order_id: &str,
+    client_order_id: &str,
+) -> Result<VenueOrderStatus, ExchangeError> {
+    let base_url = base_url.trim_end_matches('/');
+    let oid = venue_order_id.parse::<i64>().ok();
+    // 有数字 oid 时按 oid 查；否则回退到 cloid（本执行器下单时用的就是它）。
+    let payload = match oid {
+        Some(oid) => json!({ "type": "orderStatus", "oid": oid }),
+        None => json!({ "type": "orderStatus", "oid": hyperliquid_cloid(client_order_id) }),
+    };
+    let value = http
+        .post_json(&format!("{base_url}/info"), &payload)
+        .map_err(transport)?;
+    let order = &value["order"]["order"];
+    let state = match order["status"].as_str().unwrap_or_default() {
+        "open" | "triggered" => VenueOrderState::Open,
+        "filled" => VenueOrderState::Filled,
+        "canceled" => VenueOrderState::Canceled,
+        "rejected" => VenueOrderState::Rejected,
+        _ => VenueOrderState::Unknown,
+    };
+    let original = decimal(&order["origSz"]).unwrap_or_default();
+    let remaining = decimal(&order["sz"]).unwrap_or_default();
+    let filled = if state == VenueOrderState::Filled {
+        original.max(remaining)
+    } else {
+        (original - remaining).max(Decimal::ZERO)
+    };
+    let average_price = decimal(&value["order"]["orderStatus"]["avgPx"])
+        .or_else(|| decimal(&value["order"]["status"]["avgPx"]));
+    Ok(status(state, Some(filled), average_price, None))
+}
+
+fn hyperliquid_cancel(
+    http: &HttpClient,
+    base_url: &str,
+    credentials: &AccountCredentials,
+    symbol: &str,
+    venue_order_id: &str,
+    client_order_id: &str,
+) -> Result<(), ExchangeError> {
+    let private_key = credentials
+        .signer_key
+        .as_deref()
+        .ok_or_else(|| ExchangeError::Credentials("Hyperliquid 撤单需要 API Wallet 私钥".to_string()))?;
+    let base_url = base_url.trim_end_matches('/');
+    let coin = base_from_symbol(symbol)?;
+    let oid = venue_order_id.parse::<i64>().ok();
+    let meta = http
+        .post_json(&format!("{base_url}/info"), &json!({ "type": "meta" }))
+        .map_err(transport)?;
+    let asset = meta["universe"]
+        .as_array()
+        .and_then(|universe| {
+            universe
+                .iter()
+                .position(|entry| entry["name"].as_str() == Some(coin.as_str()))
+        })
+        .ok_or_else(|| ExchangeError::Rejected(format!("Hyperliquid 未上架该合约: {coin}")))?
+        as u32;
+    let (action_bytes, action_value) = hyperliquid_cancel_action(
+        asset,
+        oid.map(|value| value as u64),
+        Some(&hyperliquid_cloid(client_order_id)),
+    );
+    let nonce = now_millis() as u64;
+    let mainnet = !base_url.contains("testnet");
+    let signature = sign_hyperliquid_action(&action_bytes, nonce, private_key, mainnet)
+        .map_err(|error| ExchangeError::Credentials(error.to_string()))?;
+    let body = json!({
+        "action": action_value,
+        "nonce": nonce,
+        "signature": { "r": signature.r, "s": signature.s, "v": signature.v },
+        "vaultAddress": Value::Null,
+    })
+    .to_string();
+    let value = http
+        .post_body_with_headers(&format!("{base_url}/exchange"), &[], &body)
+        .map_err(transport)?;
+    if value["status"].as_str() == Some("ok") {
+        return Ok(());
+    }
+    Err(ExchangeError::Rejected(format!(
+        "Hyperliquid 撤单失败: {}",
+        value.to_string()
+    )))
+}
+
 /// 各交易所的杠杆设置入口。`symbol` 为内部交易对（如 `BTCUSDT`）。
-///
-/// MEXC / HTX 把杠杆放在下单请求里，这里无需额外请求。
 fn set_leverage_blocking(
     http: &HttpClient,
     endpoints: &LiveEndpoints,
@@ -276,13 +1147,10 @@ fn set_leverage_blocking(
         "bybit" => bybit_leverage(http, &endpoints.bybit, credentials, &symbol, leverage),
         "bitget" => bitget_leverage(http, &endpoints.bitget, credentials, &symbol, leverage),
         "gate" => gate_leverage(http, &endpoints.gate, credentials, base, leverage),
-        "bingx" => bingx_leverage(http, &endpoints.bingx, credentials, base, leverage),
         "hyperliquid" => {
             hyperliquid_leverage(http, &endpoints.hyperliquid, credentials, base, leverage)
         }
         "lighter" => lighter_leverage(http, &endpoints.lighter, credentials, base, leverage),
-        // 杠杆随下单请求提交（见 `mexc_place` / `htx_place`）。
-        "mexc" | "htx" => Ok(()),
         other => Err(ExchangeError::Unsupported(format!(
             "{other} 暂未接入杠杆设置"
         ))),
@@ -290,8 +1158,6 @@ fn set_leverage_blocking(
 }
 
 /// 各交易所当前杠杆的查询入口。`symbol` 为内部交易对（如 `BTCUSDT`）。
-///
-/// MEXC / HTX 的杠杆随下单请求提交，无法单独查询，返回 `None` 由调用方回退。
 fn current_leverage_blocking(
     http: &HttpClient,
     endpoints: &LiveEndpoints,
@@ -311,12 +1177,10 @@ fn current_leverage_blocking(
         "bybit" => bybit_current_leverage(http, &endpoints.bybit, credentials, &symbol),
         "bitget" => bitget_current_leverage(http, &endpoints.bitget, credentials, &symbol),
         "gate" => gate_current_leverage(http, &endpoints.gate, credentials, base),
-        "bingx" => bingx_current_leverage(http, &endpoints.bingx, credentials, base),
         "hyperliquid" => {
             hyperliquid_current_leverage(http, &endpoints.hyperliquid, credentials, base)
         }
         "lighter" => lighter_current_leverage(http, &endpoints.lighter, credentials, base),
-        "mexc" | "htx" => Ok(None),
         other => Err(ExchangeError::Unsupported(format!(
             "{other} 暂未接入杠杆查询"
         ))),
@@ -537,44 +1401,6 @@ fn gate_current_leverage(
         .or_else(|| {
             decimal(&value["cross_leverage_limit"]).filter(|leverage| *leverage > Decimal::ZERO)
         }))
-}
-
-/// BingX 的杠杆查询按多空两侧返回，设置杠杆时两侧一致，取先取到的一侧。
-fn bingx_current_leverage(
-    http: &HttpClient,
-    base_url: &str,
-    credentials: &AccountCredentials,
-    base: &str,
-) -> Result<Option<Decimal>, ExchangeError> {
-    let (key, secret) = key_pair(credentials)?;
-    let base_url = base_url.trim_end_matches('/');
-    let symbol = format!("{base}-USDT");
-    let timestamp = now_millis().to_string();
-    let mut params = [
-        ("symbol", symbol.as_str()),
-        ("recvWindow", "5000"),
-        ("timestamp", timestamp.as_str()),
-    ];
-    params.sort_by(|left, right| left.0.cmp(right.0));
-    let query = params
-        .iter()
-        .map(|(name, value)| format!("{name}={value}"))
-        .collect::<Vec<_>>()
-        .join("&");
-    let signature = hmac_hex(secret, &query)?;
-    let value = http
-        .get_json_with_headers(
-            &format!("{base_url}/openApi/swap/v2/trade/leverage?{query}&signature={signature}"),
-            &[("X-BX-APIKEY", key)],
-        )
-        .map_err(transport)?;
-    if value["code"].as_i64().unwrap_or(-1) != 0 {
-        return Ok(None);
-    }
-    let data = &value["data"];
-    Ok(decimal(&data["longLeverage"])
-        .filter(|leverage| *leverage > Decimal::ZERO)
-        .or_else(|| decimal(&data["shortLeverage"]).filter(|leverage| *leverage > Decimal::ZERO)))
 }
 
 /// Hyperliquid 只在有持仓时返回该合约的杠杆。
@@ -972,62 +1798,6 @@ fn gate_leverage_request(
         return Err(ExchangeError::Rejected(format!(
             "Gate 设置杠杆失败: {}",
             value["message"].as_str().unwrap_or("未知错误")
-        )));
-    }
-    Ok(())
-}
-
-/// BingX 双向持仓需要分别设置多空两侧的杠杆。
-fn bingx_leverage(
-    http: &HttpClient,
-    base_url: &str,
-    credentials: &AccountCredentials,
-    base: &str,
-    leverage: Decimal,
-) -> Result<(), ExchangeError> {
-    for side in ["LONG", "SHORT"] {
-        bingx_leverage_once(http, base_url, credentials, base, side, leverage)?;
-    }
-    Ok(())
-}
-
-fn bingx_leverage_once(
-    http: &HttpClient,
-    base_url: &str,
-    credentials: &AccountCredentials,
-    base: &str,
-    side: &str,
-    leverage: Decimal,
-) -> Result<(), ExchangeError> {
-    let (key, secret) = key_pair(credentials)?;
-    let base_url = base_url.trim_end_matches('/');
-    let symbol = format!("{base}-USDT");
-    let leverage = num(leverage);
-    let timestamp = now_millis().to_string();
-    let mut params = [
-        ("leverage", leverage.as_str()),
-        ("recvWindow", "5000"),
-        ("side", side),
-        ("symbol", symbol.as_str()),
-        ("timestamp", timestamp.as_str()),
-    ];
-    params.sort_by(|left, right| left.0.cmp(right.0));
-    let query = params
-        .iter()
-        .map(|(name, value)| format!("{name}={value}"))
-        .collect::<Vec<_>>()
-        .join("&");
-    let signature = hmac_hex(secret, &query)?;
-    let value = http
-        .post_with_headers(
-            &format!("{base_url}/openApi/swap/v2/trade/leverage?{query}&signature={signature}"),
-            &[("X-BX-APIKEY", key)],
-        )
-        .map_err(transport)?;
-    if value["code"].as_i64().unwrap_or(-1) != 0 {
-        return Err(ExchangeError::Rejected(format!(
-            "BingX 设置杠杆失败: {}",
-            value["msg"].as_str().unwrap_or("未知错误")
         )));
     }
     Ok(())
@@ -1838,293 +2608,6 @@ fn gate_multiplier(
         .ok_or_else(|| ExchangeError::Rejected(format!("Gate 未返回 {contract} 的合约面值")))
 }
 
-/// HTX U 本位永续下单，数量单位是合约张数。
-fn htx_place(
-    http: &HttpClient,
-    base_url: &str,
-    credentials: &AccountCredentials,
-    request: &PlaceOrderRequest,
-    client_order_id: &str,
-) -> Result<VenueOrderAck, ExchangeError> {
-    let contract = format!("{}-USDT", base_asset(request)?);
-    let info = htx_request(
-        http,
-        base_url,
-        "GET",
-        "/linear-swap-api/v1/swap_contract_info",
-        &[("contract_code", contract.as_str())],
-        credentials,
-    )?;
-    let contract_size = decimal(&info["data"][0]["contract_size"])
-        .filter(|value| *value > Decimal::ZERO)
-        .ok_or_else(|| ExchangeError::Rejected(format!("HTX 未返回 {contract} 的合约面值")))?;
-    let volume = (request.quantity / contract_size)
-        .floor()
-        .to_i64()
-        .filter(|value| *value > 0)
-        .ok_or_else(|| {
-            ExchangeError::Rejected(format!(
-                "HTX {contract} 数量不足 1 张（每张 {contract_size}）"
-            ))
-        })?;
-
-    let volume = volume.to_string();
-    let price = num(request.limit_price);
-    let reduce_only = if request.reduce_only { "1" } else { "0" };
-    // HTX 的杠杆随下单请求提交；未指定时沿用原有的 20 倍默认值。
-    let lever_rate = match request.leverage {
-        Some(value) => value
-            .round_dp(0)
-            .to_u64()
-            .filter(|value| *value > 0)
-            .ok_or_else(|| ExchangeError::Rejected(format!("HTX {contract} 杠杆不合法")))?
-            .to_string(),
-        None => "20".to_string(),
-    };
-    let value = htx_request(
-        http,
-        base_url,
-        "POST",
-        "/linear-swap-api/v1/swap_cross_order",
-        &[
-            ("contract_code", contract.as_str()),
-            ("volume", volume.as_str()),
-            ("price", price.as_str()),
-            (
-                "direction",
-                if request.side == Side::Buy {
-                    "buy"
-                } else {
-                    "sell"
-                },
-            ),
-            ("offset", if request.reduce_only { "close" } else { "open" }),
-            ("order_price_type", "limit"),
-            ("lever_rate", lever_rate.as_str()),
-            ("reduce_only", reduce_only),
-            ("client_order_id", client_order_id),
-        ],
-        credentials,
-    )?;
-
-    if value["status"].as_str() != Some("ok") {
-        return Err(ExchangeError::Rejected(format!(
-            "HTX 拒单: {}",
-            value["err-msg"].as_str().unwrap_or("未知错误")
-        )));
-    }
-    let order_id = value["data"]["order_id_str"]
-        .as_str()
-        .map(str::to_string)
-        .or_else(|| value["data"]["order_id"].as_i64().map(|id| id.to_string()))
-        .ok_or_else(|| ExchangeError::Rejected(format!("HTX 响应缺少订单号: {value}")))?;
-    Ok(ack(order_id, client_order_id))
-}
-
-/// HTX 私有接口：参数排序后参与签名，POST 时同时放进 JSON 请求体。
-fn htx_request(
-    http: &HttpClient,
-    base_url: &str,
-    method: &str,
-    path: &str,
-    params: &[(&str, &str)],
-    credentials: &AccountCredentials,
-) -> Result<Value, ExchangeError> {
-    let (key, secret) = key_pair(credentials)?;
-    let base_url = base_url.trim_end_matches('/');
-    let host = base_url.split("://").nth(1).unwrap_or(base_url);
-    let timestamp = Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
-
-    let mut all: Vec<(&str, &str)> = vec![
-        ("AccessKeyId", key),
-        ("SignatureMethod", "HmacSHA256"),
-        ("SignatureVersion", "2"),
-        ("Timestamp", timestamp.as_str()),
-    ];
-    all.extend_from_slice(params);
-    all.sort_by(|left, right| left.0.cmp(right.0));
-
-    let query = all
-        .iter()
-        .map(|(name, value)| format!("{}={}", pct(name), pct(value)))
-        .collect::<Vec<_>>()
-        .join("&");
-    let signature = hmac_base64(secret, &format!("{method}\n{host}\n{path}\n{query}"))?;
-    let url = format!("{base_url}{path}?{query}&Signature={}", pct(&signature));
-
-    let value = if method == "POST" {
-        let mut payload = serde_json::Map::new();
-        for (name, value) in &all {
-            payload.insert((*name).to_string(), json!(value));
-        }
-        http.post_body_with_headers(&url, &[], &Value::Object(payload).to_string())
-            .map_err(transport)?
-    } else {
-        http.get_json(&url).map_err(transport)?
-    };
-    Ok(value)
-}
-
-/// MEXC 合约下单，`vol` 为合约张数，方向用 1/2/3/4 表示开平仓。
-fn mexc_place(
-    http: &HttpClient,
-    base_url: &str,
-    credentials: &AccountCredentials,
-    request: &PlaceOrderRequest,
-    client_order_id: &str,
-) -> Result<VenueOrderAck, ExchangeError> {
-    let base_url = base_url.trim_end_matches('/');
-    let symbol = format!("{}_USDT", base_asset(request)?);
-    let detail = http
-        .get_json(&format!(
-            "{base_url}/api/v1/contract/detail?symbol={symbol}"
-        ))
-        .map_err(transport)?;
-    let contract_size = decimal(&detail["data"]["contractSize"])
-        .filter(|value| *value > Decimal::ZERO)
-        .ok_or_else(|| ExchangeError::Rejected(format!("MEXC 未返回 {symbol} 的合约面值")))?;
-    let volume = (request.quantity / contract_size)
-        .floor()
-        .to_i64()
-        .filter(|value| *value > 0)
-        .ok_or_else(|| {
-            ExchangeError::Rejected(format!(
-                "MEXC {symbol} 数量不足 1 张（每张 {contract_size}）"
-            ))
-        })?;
-
-    // 1 开多、2 平空、3 开空、4 平多。
-    let side = match (request.side, request.reduce_only) {
-        (Side::Buy, false) => 1,
-        (Side::Sell, true) => 2,
-        (Side::Sell, false) => 3,
-        (Side::Buy, true) => 4,
-    };
-    // MEXC 的杠杆随下单请求提交；未指定时沿用原有的 20 倍默认值。
-    let leverage = match request.leverage {
-        Some(value) => value
-            .round_dp(0)
-            .to_u64()
-            .filter(|value| *value > 0)
-            .ok_or_else(|| ExchangeError::Rejected(format!("MEXC {symbol} 杠杆不合法")))?,
-        None => 20,
-    };
-    let body = json!({
-        "symbol": symbol,
-        "price": num(request.limit_price),
-        "vol": volume,
-        "leverage": leverage,
-        "side": side,
-        "type": 1,
-        "openType": 2,
-        "externalOid": client_order_id,
-    })
-    .to_string();
-    let timestamp = now_millis().to_string();
-    let signature = hmac_hex(
-        credentials.api_secret.as_str(),
-        &format!("{}{}{}", credentials.api_key, timestamp, body),
-    )?;
-    let headers = [
-        ("ApiKey", credentials.api_key.as_str()),
-        ("Request-Time", timestamp.as_str()),
-        ("Signature", signature.as_str()),
-        ("Recv-Window", "10"),
-    ];
-    let value = http
-        .post_body_with_headers(
-            &format!("{base_url}/api/v1/private/order/submit"),
-            &headers,
-            &body,
-        )
-        .map_err(transport)?;
-
-    if value["success"].as_bool() != Some(true) {
-        return Err(ExchangeError::Rejected(format!(
-            "MEXC 拒单: {}",
-            value["message"].as_str().unwrap_or("未知错误")
-        )));
-    }
-    let order_id = value["data"]
-        .as_str()
-        .map(str::to_string)
-        .or_else(|| value["data"].as_i64().map(|id| id.to_string()))
-        .ok_or_else(|| ExchangeError::Rejected(format!("MEXC 响应缺少订单号: {value}")))?;
-    Ok(ack(order_id, client_order_id))
-}
-
-/// BingX 永续下单：签名串是按键排序后的 query，订单参数全部放在 URL 上。
-fn bingx_place(
-    http: &HttpClient,
-    base_url: &str,
-    credentials: &AccountCredentials,
-    request: &PlaceOrderRequest,
-    client_order_id: &str,
-) -> Result<VenueOrderAck, ExchangeError> {
-    let (key, secret) = key_pair(credentials)?;
-    let base_url = base_url.trim_end_matches('/');
-    let symbol = format!("{}-USDT", base_asset(request)?);
-    let quantity = num(request.quantity);
-    let price = num(request.limit_price);
-    let timestamp = now_millis().to_string();
-    // 平仓时 positionSide 指向被平掉的那一腿。
-    let position_side = match (request.side, request.reduce_only) {
-        (Side::Buy, false) | (Side::Sell, true) => "LONG",
-        _ => "SHORT",
-    };
-    let reduce_only = if request.reduce_only { "true" } else { "false" };
-
-    let mut params = [
-        ("positionSide", position_side),
-        ("price", price.as_str()),
-        ("quantity", quantity.as_str()),
-        ("recvWindow", "5000"),
-        ("reduceOnly", reduce_only),
-        (
-            "side",
-            if request.side == Side::Buy {
-                "BUY"
-            } else {
-                "SELL"
-            },
-        ),
-        ("symbol", symbol.as_str()),
-        ("timeInForce", "GTC"),
-        ("timestamp", timestamp.as_str()),
-        ("type", "LIMIT"),
-    ];
-    params.sort_by(|left, right| left.0.cmp(right.0));
-    let query = params
-        .iter()
-        .map(|(name, value)| format!("{name}={value}"))
-        .collect::<Vec<_>>()
-        .join("&");
-    let signature = hmac_hex(secret, &query)?;
-    let value = http
-        .post_with_headers(
-            &format!("{base_url}/openApi/swap/v2/trade/order?{query}&signature={signature}"),
-            &[("X-BX-APIKEY", key)],
-        )
-        .map_err(transport)?;
-
-    if value["code"].as_i64().unwrap_or(-1) != 0 {
-        return Err(ExchangeError::Rejected(format!(
-            "BingX 拒单: {}",
-            value["msg"].as_str().unwrap_or("未知错误")
-        )));
-    }
-    let order_id = value["data"]["order"]["orderId"]
-        .as_i64()
-        .map(|id| id.to_string())
-        .or_else(|| {
-            value["data"]["order"]["orderId"]
-                .as_str()
-                .map(str::to_string)
-        })
-        .ok_or_else(|| ExchangeError::Rejected(format!("BingX 响应缺少订单号: {value}")))?;
-    Ok(ack(order_id, client_order_id))
-}
-
 /// Hyperliquid 永续限价单：签名完全在本地完成，提交的只有已签名 action。
 fn hyperliquid_place(
     http: &HttpClient,
@@ -2504,7 +2987,7 @@ fn now_millis() -> i64 {
     Utc::now().timestamp_millis()
 }
 
-/// RFC3986 百分号编码，HTX 签名要求空格、冒号、斜杠等字符统一编码。
+/// RFC3986 百分号编码，签名对空格、冒号、斜杠等字符统一编码。
 fn pct(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len());
     for byte in value.bytes() {

@@ -187,6 +187,43 @@ pub fn hyperliquid_update_leverage_action(asset: u32, is_cross: bool, leverage: 
     out
 }
 
+/// Hyperliquid `cancel` action 的 msgpack 与 JSON 序列化。
+///
+/// 撤单必须带上合约的 asset index；有数字 oid 时按 oid 撤，否则按 cloid 撤。
+pub fn hyperliquid_cancel_action(
+    asset: u32,
+    oid: Option<u64>,
+    cloid: Option<&str>,
+) -> (Vec<u8>, Value) {
+    let mut out = Vec::new();
+    msgpack_map(&mut out, 2);
+    msgpack_str(&mut out, "type");
+    msgpack_str(&mut out, "cancel");
+    msgpack_str(&mut out, "cancels");
+    msgpack_array(&mut out, 1);
+    msgpack_map(&mut out, 2);
+    msgpack_str(&mut out, "a");
+    msgpack_uint(&mut out, u64::from(asset));
+    let cancel = match (oid, cloid) {
+        (Some(oid), _) => {
+            msgpack_str(&mut out, "o");
+            msgpack_uint(&mut out, oid);
+            json!({ "a": asset, "o": oid })
+        }
+        (None, Some(cloid)) => {
+            msgpack_str(&mut out, "c");
+            msgpack_str(&mut out, cloid);
+            json!({ "a": asset, "c": cloid })
+        }
+        (None, None) => {
+            msgpack_str(&mut out, "o");
+            msgpack_uint(&mut out, 0);
+            json!({ "a": asset, "o": 0 })
+        }
+    };
+    (out, json!({ "type": "cancel", "cancels": [cancel] }))
+}
+
 /// Hyperliquid 的签名结果，`v` 为 27/28。
 pub struct HyperliquidSignature {
     pub r: String,

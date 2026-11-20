@@ -7,13 +7,17 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::{
-    make_book, make_depth, parse_decimal, parse_json_decimal, BookSnapshot, Candle, DepthSnapshot,
-    FundingRate, FundingSnapshot, FundingVenueClient, MinOrderSpec,
+    depth_rows, make_book, make_depth, parse_decimal, parse_json_decimal, value_to_millis,
+    BookSnapshot, Candle, DepthSnapshot, FundingRate, FundingSnapshot, FundingVenueClient,
+    MinOrderSpec,
 };
 use crate::http_client::HttpClient;
 
 /// Gate.io 的交易所标识。
 pub const VENUE: &str = "gate";
+
+/// Gate 现货的交易所标识。
+pub const SPOT_VENUE: &str = "gate-spot";
 
 /// Gate 单次最多返回 1000 条历史费率。
 const HISTORY_LIMIT: u32 = 1_000;
@@ -40,6 +44,11 @@ fn gate_contract(symbol: &str) -> anyhow::Result<String> {
         bail!("交易对名称不合法: {symbol}");
     }
     Ok(format!("{base}_USDT"))
+}
+
+/// 内部 `BTCUSDT` → Gate 现货的 `BTC_USDT`。
+pub fn spot_pair(symbol: &str) -> anyhow::Result<String> {
+    gate_contract(symbol).map_err(|_| anyhow!("Gate 现货只支持 USDT 交易对: {symbol}"))
 }
 
 #[derive(Debug, Deserialize)]
@@ -105,6 +114,21 @@ struct HistoryRow {
     t: i64,
     /// 该期费率。
     r: String,
+}
+
+/// `/spot/currency_pairs/{pair}` 的下单限制字段。
+#[derive(Debug, Deserialize)]
+struct SpotPairRow {
+    #[serde(default)]
+    min_base_amount: Option<String>,
+    #[serde(default)]
+    min_quote_amount: Option<String>,
+    /// 数量精度（小数位数）。
+    #[serde(default)]
+    amount_precision: Option<u32>,
+    /// 价格精度（小数位数）。
+    #[serde(default)]
+    precision: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -235,6 +259,53 @@ impl GateFundingClient {
         )
     }
 
+    /// Gate 现货的买一/卖一档；现货盘口数量单位是币，无需合约乘数。
+    ///
+    /// 现货 `tickers` 只有价格没有挂单量，这里改用 `order_book` 一次取回价格与数量。
+    pub fn spot_book(&self, symbol: &str) -> anyhow::Result<BookSnapshot> {
+        let pair = spot_pair(symbol)?;
+        let url = format!(
+            "{}/spot/order_book?currency_pair={pair}&limit=1&with_id=true",
+            self.base_url
+        );
+        let value = self.http.get_json(&url)?;
+        let level = |key: &str, label: &str| -> anyhow::Result<(Decimal, Decimal)> {
+            let row = value
+                .get(key)
+                .and_then(Value::as_array)
+                .and_then(|rows| rows.first())
+                .ok_or_else(|| anyhow!("Gate 现货盘口缺少{label}: {pair}"))?;
+            let row = row
+                .as_array()
+                .ok_or_else(|| anyhow!("Gate 现货盘口{label}格式不合法: {pair}"))?;
+            if row.len() < 2 {
+                bail!("Gate 现货盘口{label}字段不足: {pair}");
+            }
+            Ok((parse_json_decimal(&row[0])?, parse_json_decimal(&row[1])?))
+        };
+        let (bid, bid_size) = level("bids", "买一")?;
+        let (ask, ask_size) = level("asks", "卖一")?;
+        make_book(bid, bid_size, ask, ask_size)
+    }
+
+    /// Gate 现货多档盘口；单次最多 500 档，数量单位是币。
+    pub fn spot_depth(&self, symbol: &str, limit: u32) -> anyhow::Result<DepthSnapshot> {
+        let pair = spot_pair(symbol)?;
+        let limit = limit.clamp(50, 500);
+        let url = format!(
+            "{}/spot/order_book?currency_pair={pair}&limit={limit}&with_id=true",
+            self.base_url
+        );
+        let value = self.http.get_json(&url)?;
+        make_depth(
+            SPOT_VENUE,
+            symbol,
+            depth_rows(&value, "bids")?,
+            depth_rows(&value, "asks")?,
+            Decimal::ONE,
+        )
+    }
+
     /// USDT 本位永续 K 线。
     ///
     /// Gate v4 的 K 线行是 `{t, o, h, l, c, v}` 对象（`t` 为 Unix 秒），
@@ -249,6 +320,24 @@ impl GateFundingClient {
         );
         let value = self.http.get_json(&url)?;
         gate_candles(&value)
+    }
+
+    /// Gate 现货 K 线；现货与合约的周期写法不同，行格式是数组而非对象。
+    pub fn spot_candles(
+        &self,
+        symbol: &str,
+        interval: &str,
+        limit: u32,
+    ) -> anyhow::Result<Vec<Candle>> {
+        let pair = spot_pair(symbol)?;
+        let interval = gate_spot_interval(interval)?;
+        let url = format!(
+            "{}/spot/candlesticks?currency_pair={pair}&interval={interval}&limit={}",
+            self.base_url,
+            limit.clamp(1, 1_000)
+        );
+        let value = self.http.get_json(&url)?;
+        gate_spot_candles(&value)
     }
 
     /// 一张合约对应的标的数量，供 WebSocket 盘口把张数折算成币。
@@ -287,6 +376,36 @@ impl GateFundingClient {
             spec.min_quantity = Some(multiplier * Decimal::from(min_contracts));
         }
         Ok(Some(spec))
+    }
+
+    /// 单个 Gate 现货交易对的最小下单数量、最小名义额与数量/价格步长。
+    ///
+    /// `amount_precision` / `precision` 是小数位数，步长即 `10^-n`。
+    pub fn spot_min_order(&self, symbol: &str) -> anyhow::Result<MinOrderSpec> {
+        let pair = spot_pair(symbol)?;
+        let url = format!("{}/spot/currency_pairs/{pair}", self.base_url);
+        let row: SpotPairRow = serde_json::from_value(self.http.get_json(&url)?)
+            .with_context(|| format!("解析 Gate 现货交易对失败: {pair}"))?;
+        let mut spec = MinOrderSpec::new(SPOT_VENUE, symbol);
+        spec.min_quantity = row
+            .min_base_amount
+            .as_deref()
+            .and_then(|value| parse_decimal(value).ok())
+            .filter(|value| *value > Decimal::ZERO);
+        spec.min_notional_usd = row
+            .min_quote_amount
+            .as_deref()
+            .and_then(|value| parse_decimal(value).ok())
+            .filter(|value| *value > Decimal::ZERO);
+        spec.step_size = row
+            .amount_precision
+            .filter(|decimals| *decimals < 28)
+            .map(|decimals| Decimal::new(1, decimals));
+        spec.tick_size = row
+            .precision
+            .filter(|decimals| *decimals < 28)
+            .map(|decimals| Decimal::new(1, decimals));
+        Ok(spec)
     }
 
     /// 当前正在交易的 USDT 本位永续合约清单。
@@ -354,6 +473,21 @@ fn gate_interval(interval: &str) -> anyhow::Result<&'static str> {
     })
 }
 
+/// Gate 现货 K 线周期；现货没有 `1w`，用 `7d` 表示。
+fn gate_spot_interval(interval: &str) -> anyhow::Result<&'static str> {
+    Ok(match interval {
+        "1m" => "1m",
+        "5m" => "5m",
+        "15m" => "15m",
+        "30m" => "30m",
+        "1h" => "1h",
+        "4h" => "4h",
+        "1d" => "1d",
+        "1w" => "7d",
+        other => bail!("Gate 现货不支持的 K 线周期: {other}"),
+    })
+}
+
 #[derive(Debug, Deserialize)]
 struct CandleRow {
     /// 开盘时间（Unix 秒）。
@@ -386,6 +520,43 @@ fn gate_candles(value: &Value) -> anyhow::Result<Vec<Candle>> {
                 .map(parse_json_decimal)
                 .transpose()?
                 .unwrap_or_default(),
+        });
+    }
+    candles.sort_by_key(|candle| candle.open_time);
+    Ok(candles)
+}
+
+/// Gate 现货 K 线行是数组 `[时间(秒), 计价量, 收, 高, 低, 开, 基础量, ...]`，
+/// 与合约的 `{t,o,h,l,c,v}` 对象不同，需要单独解析。
+fn gate_spot_candles(value: &Value) -> anyhow::Result<Vec<Candle>> {
+    let rows = value
+        .as_array()
+        .ok_or_else(|| anyhow!("Gate 现货 K 线响应不是数组"))?;
+    let mut candles = Vec::with_capacity(rows.len());
+    for row in rows {
+        let row = row
+            .as_array()
+            .ok_or_else(|| anyhow!("Gate 现货 K 线行格式不合法: {row:?}"))?;
+        if row.len() < 6 {
+            bail!("Gate 现货 K 线字段不足: {row:?}");
+        }
+        let seconds = value_to_millis(&row[0])
+            .ok_or_else(|| anyhow!("Gate 现货 K 线时间不合法: {}", row[0]))?;
+        let Some(open_time) = Utc.timestamp_opt(seconds, 0).single() else {
+            continue;
+        };
+        let volume = row
+            .get(6)
+            .map(parse_json_decimal)
+            .transpose()?
+            .unwrap_or_default();
+        candles.push(Candle {
+            open_time,
+            open: parse_json_decimal(&row[5])?,
+            high: parse_json_decimal(&row[3])?,
+            low: parse_json_decimal(&row[4])?,
+            close: parse_json_decimal(&row[2])?,
+            volume,
         });
     }
     candles.sort_by_key(|candle| candle.open_time);

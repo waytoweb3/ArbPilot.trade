@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use anyhow::{anyhow, bail, Context};
 use chrono::{DateTime, TimeZone, Utc};
@@ -14,6 +17,9 @@ use crate::http_client::HttpClient;
 
 /// Hyperliquid 的交易所标识。
 pub const VENUE: &str = "hyperliquid";
+
+/// Hyperliquid 现货的交易所标识。
+pub const SPOT_VENUE: &str = "hyperliquid-spot";
 
 /// Hyperliquid 对所有交易对统一要求的最小下单名义额（美元）。
 const MIN_ORDER_NOTIONAL_USD: i64 = 10;
@@ -87,6 +93,35 @@ struct Meta {
 }
 
 #[derive(Debug, Deserialize)]
+struct SpotToken {
+    name: String,
+    #[serde(default)]
+    index: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct SpotUniverseEntry {
+    /// canonical 交易对名（如 `PURR/USDC`）；非 canonical 由 `@{index}` 表示。
+    #[serde(default)]
+    name: String,
+    /// `[base token index, quote token index]`。
+    #[serde(default)]
+    tokens: Vec<u32>,
+    #[serde(default)]
+    index: u32,
+    #[serde(rename = "isCanonical", default)]
+    is_canonical: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct SpotMeta {
+    #[serde(default)]
+    universe: Vec<SpotUniverseEntry>,
+    #[serde(default)]
+    tokens: Vec<SpotToken>,
+}
+
+#[derive(Debug, Deserialize)]
 struct AssetCtx {
     #[serde(default)]
     funding: Option<String>,
@@ -135,6 +170,8 @@ fn hyperliquid_interval(interval: &str) -> anyhow::Result<(&'static str, i64)> {
 pub struct HyperliquidFundingClient {
     base_url: String,
     http: Arc<HttpClient>,
+    /// 现货 `base token → (coin, asset_id)` 缓存，`spotMeta` 变更很少。
+    spot_markets: Mutex<Option<Arc<HashMap<String, (String, u32)>>>>,
 }
 
 impl HyperliquidFundingClient {
@@ -142,6 +179,7 @@ impl HyperliquidFundingClient {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             http,
+            spot_markets: Mutex::new(None),
         }
     }
 
@@ -185,12 +223,22 @@ impl HyperliquidFundingClient {
     /// 永续的多档盘口；`l2Book` 一次返回全部档位，数量单位是币。
     pub fn depth(&self, symbol: &str, limit: u32) -> anyhow::Result<DepthSnapshot> {
         let coin = venue_coin(symbol)?;
+        self.depth_for_coin(coin, VENUE, symbol, limit.clamp(1, 100) as usize)
+    }
+
+    /// 任意 coin（永续或现货）的多档盘口；`l2Book` 每侧最多 20 档。
+    fn depth_for_coin(
+        &self,
+        coin: &str,
+        venue: &str,
+        symbol: &str,
+        cap: usize,
+    ) -> anyhow::Result<DepthSnapshot> {
         let value = self.info(json!({ "type": "l2Book", "coin": coin }))?;
         let levels = value
             .get("levels")
             .and_then(Value::as_array)
             .ok_or_else(|| anyhow!("Hyperliquid l2Book 响应缺少 levels"))?;
-        let cap = limit.clamp(1, 100) as usize;
         let side = |index: usize| -> anyhow::Result<Vec<(Decimal, Decimal)>> {
             let rows = levels
                 .get(index)
@@ -209,12 +257,133 @@ impl HyperliquidFundingClient {
                 })
                 .collect()
         };
-        make_depth(VENUE, symbol, side(0)?, side(1)?, Decimal::ONE)
+        make_depth(venue, symbol, side(0)?, side(1)?, Decimal::ONE)
+    }
+
+    /// 现货的买一/卖一档；币名由 `spotMeta` 解析，数量单位是币。
+    pub fn spot_book(&self, symbol: &str) -> anyhow::Result<BookSnapshot> {
+        let (coin, _) = self.spot_coin(symbol)?;
+        let value = self.info(json!({ "type": "l2Book", "coin": coin }))?;
+        book_from_l2(&value)
+    }
+
+    /// 现货多档盘口；`l2Book` 每侧最多 20 档，`limit` 超过 20 也只能拿到 20 档。
+    pub fn spot_depth(&self, symbol: &str, limit: u32) -> anyhow::Result<DepthSnapshot> {
+        let (coin, _) = self.spot_coin(symbol)?;
+        self.depth_for_coin(&coin, SPOT_VENUE, symbol, limit.clamp(1, 20) as usize)
+    }
+
+    /// Hyperliquid 现货没有逐市场的最小下单字段，只有统一的 10 USDC 名义额下限。
+    pub fn spot_min_order(&self, symbol: &str) -> anyhow::Result<MinOrderSpec> {
+        let mut spec = MinOrderSpec::new(SPOT_VENUE, symbol);
+        spec.min_notional_usd = Some(Decimal::from(MIN_ORDER_NOTIONAL_USD));
+        Ok(spec)
+    }
+
+    /// 现货 K 线；与永续同一 `candleSnapshot` 端点，只是 coin 换成现货名。
+    pub fn spot_candles(
+        &self,
+        symbol: &str,
+        interval: &str,
+        limit: u32,
+    ) -> anyhow::Result<Vec<Candle>> {
+        let (coin, _) = self.spot_coin(symbol)?;
+        self.candles_for_coin(&coin, interval, limit)
+    }
+
+    /// `spotMeta` 解析出的 `base token → (coin, asset_id)` 映射。
+    ///
+    /// 现货全部以 USDC 计价；canonical 交易对用 `PURR/USDC` 作为 coin，
+    /// 非 canonical 用 `@{universeIndex}`，资产 id 为 `10000 + universe index`。
+    fn spot_markets(&self) -> anyhow::Result<Arc<HashMap<String, (String, u32)>>> {
+        if let Some(cached) = self
+            .spot_markets
+            .lock()
+            .expect("Hyperliquid 现货缓存锁不可用")
+            .as_ref()
+            .cloned()
+        {
+            return Ok(cached);
+        }
+
+        let value = self.info(json!({ "type": "spotMeta" }))?;
+        let meta: SpotMeta =
+            serde_json::from_value(value).context("解析 Hyperliquid spotMeta 失败")?;
+        let names: HashMap<u32, &str> = meta
+            .tokens
+            .iter()
+            .map(|token| (token.index, token.name.as_str()))
+            .collect();
+
+        let mut markets = HashMap::new();
+        for entry in &meta.universe {
+            let Some(&base_index) = entry.tokens.first() else {
+                continue;
+            };
+            let Some(&quote_index) = entry.tokens.get(1) else {
+                continue;
+            };
+            let Some(base) = names.get(&base_index) else {
+                continue;
+            };
+            if !names
+                .get(&quote_index)
+                .map(|quote| quote.eq_ignore_ascii_case("USDC"))
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let coin = if entry.is_canonical || entry.name.contains('/') {
+                entry.name.clone()
+            } else {
+                format!("@{}", entry.index)
+            };
+            let asset_id = 10_000u32 + entry.index;
+            markets.insert(base.to_ascii_uppercase(), (coin.clone(), asset_id));
+            // `UBTC` 这类 token 名对应的是内部 `BTC`，两种写法都能命中。
+            if let Some(stripped) = base.strip_prefix('U') {
+                if !stripped.is_empty() {
+                    markets
+                        .entry(stripped.to_ascii_uppercase())
+                        .or_insert((coin, asset_id));
+                }
+            }
+        }
+
+        let markets = Arc::new(markets);
+        *self
+            .spot_markets
+            .lock()
+            .expect("Hyperliquid 现货缓存锁不可用") = Some(markets.clone());
+        Ok(markets)
+    }
+
+    /// 内部 `BTCUSDT` → 现货 coin 名与 asset id（`10000 + universe index`）。
+    pub fn spot_coin(&self, symbol: &str) -> anyhow::Result<(String, u32)> {
+        let base = venue_coin(symbol)?.to_ascii_uppercase();
+        let markets = self.spot_markets()?;
+        if let Some(found) = markets.get(&base) {
+            return Ok(found.clone());
+        }
+        if let Some(found) = markets.get(&format!("U{base}")) {
+            return Ok(found.clone());
+        }
+        bail!("Hyperliquid 现货未找到交易对: {symbol}")
     }
 
     /// 永续 K 线；`candleSnapshot` 按毫秒时间窗返回 `{t, o, h, l, c, v}` 对象数组。
     pub fn candles(&self, symbol: &str, interval: &str, limit: u32) -> anyhow::Result<Vec<Candle>> {
         let coin = venue_coin(symbol)?;
+        self.candles_for_coin(coin, interval, limit)
+    }
+
+    /// 按 coin 拉取 K 线；永续与现货共用同一端点。
+    fn candles_for_coin(
+        &self,
+        coin: &str,
+        interval: &str,
+        limit: u32,
+    ) -> anyhow::Result<Vec<Candle>> {
         let (interval, step) = hyperliquid_interval(interval)?;
         let limit = limit.clamp(1, 5_000);
         let end = Utc::now();

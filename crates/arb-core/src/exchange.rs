@@ -31,7 +31,7 @@ pub struct PlaceOrderRequest {
     /// 幂等标识，交易所不支持时由执行器本地去重。
     pub client_order_id: String,
     /// 该腿应使用的杠杆；`None` 表示沿用交易所当前设置。
-    /// 部分交易所（如 MEXC / HTX）直接把杠杆放在下单请求里。
+    /// 部分交易所直接把杠杆放在下单请求里。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub leverage: Option<Decimal>,
 }
@@ -49,6 +49,33 @@ pub struct VenueOrder {
     pub status: LegStatus,
     pub filled_quantity: Decimal,
     pub average_price: Option<Decimal>,
+    /// 交易所实际收取的手续费；部分交易所异步返回，未返回时为 `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fee: Option<Decimal>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fee_currency: Option<String>,
+}
+
+/// 交易所订单的最终/中间状态：下单回执只代表「已受理」，必须再查一次状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VenueOrderState {
+    Open,
+    PartiallyFilled,
+    Filled,
+    Canceled,
+    Rejected,
+    /// 交易所未返回可识别状态（接口不支持或字段缺失）。
+    Unknown,
+}
+
+/// 订单状态查询结果：成交均价与手续费以交易所回报为准。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VenueOrderStatus {
+    pub state: VenueOrderState,
+    pub filled_quantity: Decimal,
+    pub average_price: Option<Decimal>,
+    pub fee: Option<Decimal>,
+    pub fee_currency: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
