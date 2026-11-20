@@ -90,26 +90,34 @@ jobs:
             const outDir = "dist/desktop";
             const bundleDir = "target/release/bundle/nsis";
 
-            const installer = fs
-              .readdirSync(bundleDir)
-              .find((name) => name.endsWith("-setup.exe"));
+            // 先打印实际产物，命名与 Tauri 版本有关，出问题时日志里能直接看到。
+            const files = fs.readdirSync(bundleDir);
+            console.log(`NSIS 产物：${files.join(", ")}`);
+
+            const installer = files.find((name) => /-setup\.exe$/i.test(name));
             if (!installer) {
               throw new Error(`未找到 NSIS 安装包：${bundleDir}`);
             }
-            // 官网下载用 setup.exe；自动更新用 Tauri 生成的更新包（.nsis.zip / .exe.zip）。
-            const updater = fs
-              .readdirSync(bundleDir)
-              .find((name) => /\.(nsis\.zip|exe\.zip)$/.test(name));
+            // 官网下载用 setup.exe；自动更新优先用带签名的 .nsis.zip 更新包，
+            // 个别版本只产出 setup.exe 时退化为安装包本身。
+            const hasSig = (name) => files.includes(`${name}.sig`);
+            const zip = files.find((name) => /-setup\.(nsis|exe)\.zip$/i.test(name) && hasSig(name));
+            const updater = zip || (hasSig(installer) ? installer : null);
             if (!updater) {
-              throw new Error(`未找到更新包：${bundleDir}`);
+              throw new Error(`未找到带签名的更新包：${bundleDir}`);
             }
             const sigPath = path.join(bundleDir, `${updater}.sig`);
             const signature = fs.readFileSync(sigPath, "utf8").trim();
 
             fs.mkdirSync(outDir, { recursive: true });
             fs.copyFileSync(path.join(bundleDir, installer), path.join(outDir, installer));
-            fs.copyFileSync(path.join(bundleDir, updater), path.join(outDir, updater));
-            fs.copyFileSync(sigPath, path.join(outDir, `${updater}.sig`));
+            // 退化为安装包本身时，源和目标相同，不能再复制一次。
+            if (updater !== installer) {
+              fs.copyFileSync(path.join(bundleDir, updater), path.join(outDir, updater));
+              fs.copyFileSync(sigPath, path.join(outDir, `${updater}.sig`));
+            } else {
+              fs.copyFileSync(sigPath, path.join(outDir, `${installer}.sig`));
+            }
 
             // 未购买 Windows 代码签名证书，官网靠 SHA-256 让用户自行核对安装包。
             const sha256 = crypto
@@ -123,23 +131,24 @@ jobs:
 
             const baseUrl = "https://download.arbpilot.trade/desktop";
             let platforms = {};
-            let response;
+            // 读不到线上清单时不让打包失败：其它平台的条目由发布流程在服务器上合并。
             try {
-              response = await fetch(`${baseUrl}/latest.json`, { cache: "no-store" });
-            } catch (error) {
-              // 读不到线上清单就无法合并其它平台，直接失败，避免用不完整的清单覆盖线上。
-              throw new Error(`读取线上 latest.json 失败：${error.message}`);
-            }
-            if (response.ok) {
-              const published = await response.json();
-              // 只有同一个版本才合并，避免把旧包地址带到新版本里。
-              if (published.version === version && published.platforms) {
-                platforms = published.platforms;
+              const response = await fetch(`${baseUrl}/latest.json`, { cache: "no-store" });
+              if (response.ok) {
+                const published = await response.json();
+                // 只有同一个版本才合并，避免把旧包地址带到新版本里。
+                if (published.version === version && published.platforms) {
+                  platforms = published.platforms;
+                } else {
+                  console.log(
+                    `线上清单版本 ${published.version} 与当前 ${version} 不一致，只发布本平台条目`,
+                  );
+                }
+              } else {
+                console.log(`线上清单返回 HTTP ${response.status}，跳过合并`);
               }
-            } else if (![403, 404].includes(response.status)) {
-              // 403 多为 Cloudflare 拦截 runner 出口 IP：无法合并其它平台时
-              // 由发布流程在服务器上合并，不让整个打包失败。
-              throw new Error(`读取线上 latest.json 失败：HTTP ${response.status}`);
+            } catch (error) {
+              console.log(`读取线上清单失败：${error.message}，跳过合并`);
             }
             platforms["windows-x86_64"] = {
               signature,

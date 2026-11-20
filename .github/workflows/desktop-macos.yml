@@ -131,22 +131,23 @@ jobs:
 
             const baseUrl = "https://download.arbpilot.trade/desktop";
             let platforms = {};
-            let response;
+            // 读不到线上清单时不让打包失败：其它平台的条目由发布流程在服务器上合并。
             try {
-              response = await fetch(`${baseUrl}/latest.json`, { cache: "no-store" });
-            } catch (error) {
-              // 读不到线上清单就无法合并其它平台，直接失败，避免覆盖成不完整的清单。
-              throw new Error(`读取线上 latest.json 失败：${error.message}`);
-            }
-            if (response.ok) {
-              const published = await response.json();
-              if (published.version === version && published.platforms) {
-                platforms = published.platforms;
+              const response = await fetch(`${baseUrl}/latest.json`, { cache: "no-store" });
+              if (response.ok) {
+                const published = await response.json();
+                if (published.version === version && published.platforms) {
+                  platforms = published.platforms;
+                } else {
+                  console.log(
+                    `线上清单版本 ${published.version} 与当前 ${version} 不一致，只发布本平台条目`,
+                  );
+                }
+              } else {
+                console.log(`线上清单返回 HTTP ${response.status}，跳过合并`);
               }
-            } else if (![403, 404].includes(response.status)) {
-              // 403 多为 Cloudflare 拦截 runner 出口 IP：此时无法合并其它平台，
-              // 由发布流程在服务器上合并，不应让整个打包失败。
-              throw new Error(`读取线上 latest.json 失败：HTTP ${response.status}`);
+            } catch (error) {
+              console.log(`读取线上清单失败：${error.message}，跳过合并`);
             }
             platforms[platform] = {
               signature,
