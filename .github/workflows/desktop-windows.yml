@@ -67,6 +67,9 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: pnpm tauri build --bundles nsis
 
+      - name: 列出打包产物
+        run: find target/release/bundle -maxdepth 2 -type f | sort
+
       - name: 生成 latest.json
         shell: bash
         env:
@@ -90,12 +93,12 @@ jobs:
             if (!installer) {
               throw new Error(`未找到 NSIS 安装包：${bundleDir}`);
             }
-            // 官网下载用 setup.exe；自动更新必须用 Tauri 生成的 .nsis.zip 更新包。
+            // 官网下载用 setup.exe；自动更新用 Tauri 生成的更新包（.nsis.zip / .exe.zip）。
             const updater = fs
               .readdirSync(bundleDir)
-              .find((name) => name.endsWith(".nsis.zip"));
+              .find((name) => /\.(nsis\.zip|exe\.zip)$/.test(name));
             if (!updater) {
-              throw new Error(`未找到 NSIS 更新包：${bundleDir}`);
+              throw new Error(`未找到更新包：${bundleDir}`);
             }
             const sigPath = path.join(bundleDir, `${updater}.sig`);
             const signature = fs.readFileSync(sigPath, "utf8").trim();
