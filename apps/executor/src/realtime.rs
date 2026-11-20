@@ -2,7 +2,7 @@
 //!
 //! - Binance / Aster：`<symbol>@bookTicker` 逐笔最优买卖价；
 //! - OKX 现货 / 永续：`tickers` 频道提供最优买卖价，`funding-rate` 频道推送当期费率；
-//! - Bybit / Bitget / Gate / HTX / MEXC / BingX / Hyperliquid / Lighter：
+//! - Bybit / Bitget / Gate / Hyperliquid / Lighter：
 //!   各自的公共最优档频道，统一折算成名义金额后写入共享表。
 //!
 //! 每个交易所一条独立线程，断线后自动重连；行情写入共享表，`MarketFeed` /
@@ -29,12 +29,14 @@ use crate::{
     config::Config,
     exchange::{
         make_book, millis_to_time, parse_decimal, BookSnapshot, FundingSnapshot, GateFundingClient,
-        HtxFundingClient, LighterFundingClient, MexcFundingClient, OkxMarketClient, ASTER_VENUE,
-        BINGX_VENUE, BITGET_VENUE, BYBIT_VENUE, GATE_VENUE, HTX_VENUE, HYPERLIQUID_VENUE,
-        LIGHTER_VENUE, MEXC_VENUE, OKX_VENUE, VENUE,
+        LighterFundingClient, OkxMarketClient, ASTER_VENUE, BITGET_VENUE, BYBIT_VENUE, GATE_VENUE,
+        HYPERLIQUID_VENUE, LIGHTER_VENUE, OKX_VENUE, VENUE,
     },
     http_client::HttpClient,
     market::{OKX_SPOT_VENUE, SPOT_VENUE},
+    orderbook::{
+        check_next, check_range, LevelBook, SequenceCheck, Side, TradeBuffer, TradeTick, L2Book,
+    },
     ws::{WebSocket, WsEvent},
 };
 
@@ -50,14 +52,10 @@ const BYBIT_PING_INTERVAL: Duration = Duration::from_secs(20);
 const BITGET_PING_INTERVAL: Duration = Duration::from_secs(25);
 /// Gate 服务端也会主动 ping，这里再做一层客户端心跳。
 const GATE_PING_INTERVAL: Duration = Duration::from_secs(20);
-/// HTX 要求 5 秒内至少发送一次心跳。
-const HTX_PING_INTERVAL: Duration = Duration::from_secs(5);
-/// MEXC 心跳间隔。
-const MEXC_PING_INTERVAL: Duration = Duration::from_secs(15);
-/// BingX 心跳间隔。
-const BINGX_PING_INTERVAL: Duration = Duration::from_secs(15);
 /// Hyperliquid 心跳间隔。
 const HYPERLIQUID_PING_INTERVAL: Duration = Duration::from_secs(30);
+/// Lighter 要求 2 分钟内至少发送一次心跳。
+const LIGHTER_PING_INTERVAL: Duration = Duration::from_secs(60);
 /// 断线重连间隔。
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 /// OKX 单次 subscribe 请求的 args 上限，超过需分批发送。
@@ -166,6 +164,10 @@ impl SymbolRegistry {
 pub struct RealtimeFeed {
     books: RwLock<HashMap<(String, String), BookUpdate>>,
     funding: RwLock<HashMap<(String, String), FundingUpdate>>,
+    /// 增量维护的 L2 盘口，供滑点 / 冲击成本估算使用。
+    l2: RwLock<HashMap<(String, String), L2Book>>,
+    /// 逐笔成交环形缓冲。
+    trades: RwLock<HashMap<(String, String), TradeBuffer>>,
     funding_symbols: Arc<SymbolRegistry>,
     /// 盘口订阅清单：watchlist + 各交易所的持仓交易对。
     book_symbols: Arc<SymbolRegistry>,
@@ -185,6 +187,8 @@ impl RealtimeFeed {
         let feed = Arc::new(Self {
             books: RwLock::new(HashMap::new()),
             funding: RwLock::new(HashMap::new()),
+            l2: RwLock::new(HashMap::new()),
+            trades: RwLock::new(HashMap::new()),
             funding_symbols: Arc::new(SymbolRegistry::new()),
             book_symbols: book_symbols.clone(),
         });
@@ -192,20 +196,32 @@ impl RealtimeFeed {
         let binance_spot = feed.clone();
         let spot_http = http.clone();
         let spot_url = config.binance_spot_ws_url.clone();
+        let spot_rest = config.binance_spot_url.clone();
         let spot_symbols = book_symbols.clone();
         spawn("binance-spot-ws", move || {
-            run_binance_books(binance_spot, spot_http, spot_url, SPOT_VENUE, spot_symbols)
+            run_binance_books(
+                binance_spot,
+                spot_http,
+                spot_url,
+                spot_rest,
+                true,
+                SPOT_VENUE,
+                spot_symbols,
+            )
         });
 
         let binance_futures = feed.clone();
         let futures_http = http.clone();
         let futures_url = config.binance_futures_ws_url.clone();
+        let futures_rest = config.binance_fapi_url.clone();
         let futures_symbols = book_symbols.clone();
         spawn("binance-futures-ws", move || {
             run_binance_books(
                 binance_futures,
                 futures_http,
                 futures_url,
+                futures_rest,
+                false,
                 VENUE,
                 futures_symbols,
             )
@@ -233,12 +249,15 @@ impl RealtimeFeed {
             let aster_feed = feed.clone();
             let aster_http = http.clone();
             let aster_url = config.aster_ws_url.clone();
+            let aster_rest = config.aster_base_url.clone();
             let aster_symbols = book_symbols.clone();
             spawn("aster-ws", move || {
                 run_binance_books(
                     aster_feed,
                     aster_http,
                     aster_url,
+                    aster_rest,
+                    false,
                     ASTER_VENUE,
                     aster_symbols,
                 )
@@ -281,7 +300,29 @@ impl RealtimeFeed {
             let bitget_url = config.bitget_ws_url.clone();
             let bitget_symbols = book_symbols.clone();
             spawn_loop("bitget-ws", move || {
-                stream_bitget(&bitget_feed, &bitget_http, &bitget_url, &bitget_symbols)
+                stream_bitget(
+                    &bitget_feed,
+                    &bitget_http,
+                    &bitget_url,
+                    &bitget_symbols,
+                    BITGET_VENUE,
+                    "USDT-FUTURES",
+                )
+            });
+
+            let spot_feed = feed.clone();
+            let spot_http = http.clone();
+            let spot_url = config.bitget_spot_ws_url.clone();
+            let spot_symbols = book_symbols.clone();
+            spawn_loop("bitget-spot-ws", move || {
+                stream_bitget(
+                    &spot_feed,
+                    &spot_http,
+                    &spot_url,
+                    &spot_symbols,
+                    crate::market::BITGET_SPOT_VENUE,
+                    "SPOT",
+                )
             });
         }
 
@@ -291,40 +332,33 @@ impl RealtimeFeed {
             let gate_http = http.clone();
             let gate_url = config.gate_ws_url.clone();
             let gate_symbols = book_symbols.clone();
+            let gate_client = client.clone();
             spawn_loop("gate-ws", move || {
-                stream_gate(&gate_feed, &gate_http, &gate_url, &gate_symbols, &client)
+                stream_gate(
+                    &gate_feed,
+                    &gate_http,
+                    &gate_url,
+                    &gate_symbols,
+                    &gate_client,
+                    GATE_VENUE,
+                    true,
+                )
             });
-        }
 
-        if config.htx_enabled {
-            let client = Arc::new(HtxFundingClient::new(&config.htx_base_url, http.clone()));
-            let htx_feed = feed.clone();
-            let htx_http = http.clone();
-            let htx_url = config.htx_ws_url.clone();
-            let htx_symbols = book_symbols.clone();
-            spawn_loop("htx-ws", move || {
-                stream_htx(&htx_feed, &htx_http, &htx_url, &htx_symbols, &client)
-            });
-        }
-
-        if config.mexc_enabled {
-            let client = Arc::new(MexcFundingClient::new(&config.mexc_base_url, http.clone()));
-            let mexc_feed = feed.clone();
-            let mexc_http = http.clone();
-            let mexc_url = config.mexc_ws_url.clone();
-            let mexc_symbols = book_symbols.clone();
-            spawn_loop("mexc-ws", move || {
-                stream_mexc(&mexc_feed, &mexc_http, &mexc_url, &mexc_symbols, &client)
-            });
-        }
-
-        if config.bingx_enabled {
-            let bingx_feed = feed.clone();
-            let bingx_http = http.clone();
-            let bingx_url = config.bingx_ws_url.clone();
-            let bingx_symbols = book_symbols.clone();
-            spawn_loop("bingx-ws", move || {
-                stream_bingx(&bingx_feed, &bingx_http, &bingx_url, &bingx_symbols)
+            let spot_feed = feed.clone();
+            let spot_http = http.clone();
+            let spot_url = config.gate_spot_ws_url.clone();
+            let spot_symbols = book_symbols.clone();
+            spawn_loop("gate-spot-ws", move || {
+                stream_gate(
+                    &spot_feed,
+                    &spot_http,
+                    &spot_url,
+                    &spot_symbols,
+                    &client,
+                    crate::market::GATE_SPOT_VENUE,
+                    false,
+                )
             });
         }
 
@@ -422,6 +456,47 @@ impl RealtimeFeed {
             },
         );
     }
+
+    /// 读取最近一次 L2 盘口（不判断新鲜度）。
+    pub fn l2(&self, venue: &str, symbol: &str) -> Option<L2Book> {
+        self.l2
+            .read()
+            .expect("L2 盘口锁不可用")
+            .get(&(venue.to_string(), symbol.to_string()))
+            .cloned()
+    }
+
+    /// 写入一次 L2 盘口快照。
+    pub fn store_l2(&self, book: L2Book) {
+        let key = (book.venue.clone(), book.symbol.clone());
+        let first = {
+            let l2 = self.l2.read().expect("L2 盘口锁不可用");
+            !l2.contains_key(&key)
+        };
+        if first {
+            tracing::info!(venue = %book.venue, symbol = %book.symbol, "已收到 WebSocket L2 盘口推送");
+        }
+        self.l2.write().expect("L2 盘口锁不可用").insert(key, book);
+    }
+
+    /// 最近 `limit` 笔逐笔成交，按时间由旧到新。
+    pub fn trades(&self, venue: &str, symbol: &str, limit: usize) -> Vec<TradeTick> {
+        self.trades
+            .read()
+            .expect("逐笔成交锁不可用")
+            .get(&(venue.to_string(), symbol.to_string()))
+            .map(|buffer| buffer.latest(limit))
+            .unwrap_or_default()
+    }
+
+    pub fn store_trade(&self, venue: &str, symbol: &str, trade: TradeTick) {
+        self.trades
+            .write()
+            .expect("逐笔成交锁不可用")
+            .entry((venue.to_string(), symbol.to_string()))
+            .or_default()
+            .push(trade);
+    }
 }
 
 fn spawn(name: &str, task: impl FnOnce() + Send + 'static) {
@@ -509,36 +584,6 @@ fn fetch_multipliers(client: &GateFundingClient, symbols: &[String]) -> HashMap<
     multipliers
 }
 
-fn fetch_contract_sizes(client: &HtxFundingClient, symbols: &[String]) -> HashMap<String, Decimal> {
-    let mut sizes = HashMap::new();
-    for symbol in symbols {
-        match client.symbol_contract_size(symbol) {
-            Ok(value) => {
-                sizes.insert(symbol.clone(), value);
-            }
-            Err(error) => {
-                tracing::warn!(venue = "htx", symbol, %error, "获取合约面值失败，该合约暂用 REST 盘口")
-            }
-        }
-    }
-    sizes
-}
-
-fn fetch_mexc_sizes(client: &MexcFundingClient, symbols: &[String]) -> HashMap<String, Decimal> {
-    let mut sizes = HashMap::new();
-    for symbol in symbols {
-        match client.symbol_contract_size(symbol) {
-            Ok(value) => {
-                sizes.insert(symbol.clone(), value);
-            }
-            Err(error) => {
-                tracing::warn!(venue = "mexc", symbol, %error, "获取合约面值失败，该合约暂用 REST 盘口")
-            }
-        }
-    }
-    sizes
-}
-
 /// `BTCUSDT` → `BTC`（Hyperliquid 的币种名）。
 fn hyperliquid_coin(symbol: &str) -> Option<String> {
     let base = symbol.trim().trim_end_matches("USDT");
@@ -551,15 +596,20 @@ fn gate_contract(symbol: &str) -> Option<String> {
     (!base.is_empty()).then(|| format!("{base}_USDT"))
 }
 
-/// `BTCUSDT` → `BTC-USDT`（HTX / BingX）。
-fn dash_contract(symbol: &str) -> Option<String> {
-    let base = symbol.trim().trim_end_matches("USDT");
-    (!base.is_empty()).then(|| format!("{base}-USDT"))
-}
-
-/// `BTCUSDT` → `BTC_USDT`（MEXC）。
-fn mexc_contract(symbol: &str) -> Option<String> {
-    gate_contract(symbol)
+/// 解析 `[["price", "quantity"], ...]` 形式的盘口数组。
+fn level_pairs(value: Option<&Value>) -> Vec<(Decimal, Decimal)> {
+    value
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| {
+                    let price = parse_decimal(row.get(0)?.as_str()?).ok()?;
+                    let quantity = parse_decimal(row.get(1)?.as_str()?).ok()?;
+                    Some((price, quantity))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Bybit 公共盘口：`orderbook.1.<symbol>`。
@@ -577,13 +627,26 @@ fn stream_bybit(
     let mut ws = WebSocket::connect(http, url, HANDSHAKE_TIMEOUT, POLL_TIMEOUT)?;
     let args = symbols
         .iter()
-        .map(|symbol| format!("\"orderbook.1.{}\"", symbol.to_ascii_uppercase()))
-        .collect::<Vec<_>>()
-        .join(",");
-    ws.send_text(&format!(r#"{{"op":"subscribe","args":[{args}]}}"#))?;
+        .flat_map(|symbol| {
+            let symbol = symbol.to_ascii_uppercase();
+            [
+                format!("\"orderbook.1.{symbol}\""),
+                format!("\"orderbook.50.{symbol}\""),
+                format!("\"publicTrade.{symbol}\""),
+            ]
+        })
+        .collect::<Vec<_>>();
+    // Bybit 单次订阅有参数上限，按 10 条分批发送。
+    for chunk in args.chunks(10) {
+        ws.send_text(&format!(
+            r#"{{"op":"subscribe","args":[{}]}}"#,
+            chunk.join(",")
+        ))?;
+    }
 
     let mut version = registry.version();
     let mut last_ping = Instant::now();
+    let mut l2: HashMap<String, LevelBook> = HashMap::new();
     loop {
         // 本交易所持仓变化时断开重连，用新的交易对清单重新订阅。
         if needs_reconnect(registry, venue, &symbols, &mut version) {
@@ -613,24 +676,85 @@ fn stream_bybit(
         let Some(topic) = value.get("topic").and_then(Value::as_str) else {
             continue;
         };
-        let Some(symbol) = topic.strip_prefix("orderbook.1.") else {
-            continue;
-        };
         let Some(data) = value.get("data") else {
             continue;
         };
-        let level = |side: &str| -> Option<(Decimal, Decimal)> {
-            let row = data.pointer(&format!("/{side}/0"))?;
-            Some((
-                parse_decimal(row.get(0)?.as_str()?).ok()?,
-                parse_decimal(row.get(1)?.as_str()?).ok()?,
-            ))
-        };
-        let (Some((bid, bid_qty)), Some((ask, ask_qty))) = (level("b"), level("a")) else {
+
+        if let Some(symbol) = topic.strip_prefix("orderbook.1.") {
+            let level = |side: &str| -> Option<(Decimal, Decimal)> {
+                let row = data.pointer(&format!("/{side}/0"))?;
+                Some((
+                    parse_decimal(row.get(0)?.as_str()?).ok()?,
+                    parse_decimal(row.get(1)?.as_str()?).ok()?,
+                ))
+            };
+            let (Some((bid, bid_qty)), Some((ask, ask_qty))) = (level("b"), level("a")) else {
+                continue;
+            };
+            if let Ok(snapshot) = make_book(bid, bid_qty, ask, ask_qty) {
+                feed.store_book(venue, &symbol.to_ascii_uppercase(), snapshot, Utc::now());
+            }
             continue;
-        };
-        if let Ok(snapshot) = make_book(bid, bid_qty, ask, ask_qty) {
-            feed.store_book(venue, &symbol.to_ascii_uppercase(), snapshot, Utc::now());
+        }
+
+        if let Some(symbol) = topic.strip_prefix("orderbook.50.") {
+            let symbol = symbol.to_ascii_uppercase();
+            let bids = level_pairs(data.get("b"));
+            let asks = level_pairs(data.get("a"));
+            let u = data.get("u").and_then(Value::as_u64);
+            let snapshot = value
+                .get("type")
+                .and_then(Value::as_str)
+                .map(|kind| kind == "snapshot")
+                .unwrap_or(false);
+            let book = l2.entry(symbol.clone()).or_default();
+            if snapshot {
+                book.replace(bids, asks);
+            } else {
+                if matches!(check_next(book.last_update_id, u.unwrap_or(0)), SequenceCheck::Gap)
+                    && book.last_update_id.is_some()
+                {
+                    tracing::debug!(venue, symbol = %symbol, "Bybit L2 序列不连续，按增量继续合并");
+                }
+                book.apply(bids, asks);
+            }
+            book.last_update_id = u.or(book.last_update_id);
+            let (bids, asks) = book.top(200);
+            feed.store_l2(L2Book {
+                venue: venue.to_string(),
+                symbol,
+                bids,
+                asks,
+                last_update_id: book.last_update_id,
+                observed_at: Utc::now(),
+            });
+            continue;
+        }
+
+        if let Some(symbol) = topic.strip_prefix("publicTrade.") {
+            let symbol = symbol.to_ascii_uppercase();
+            let Some(rows) = value.get("data").and_then(Value::as_array) else {
+                continue;
+            };
+            for row in rows {
+                let (Some(price), Some(quantity)) = (
+                    row.get("p").and_then(Value::as_str).and_then(|v| parse_decimal(v).ok()),
+                    row.get("v").and_then(Value::as_str).and_then(|v| parse_decimal(v).ok()),
+                ) else {
+                    continue;
+                };
+                let side = match row.get("S").and_then(Value::as_str) {
+                    Some("Buy") => Side::Buy,
+                    Some("Sell") => Side::Sell,
+                    _ => Side::Buy,
+                };
+                let at = row
+                    .get("T")
+                    .and_then(Value::as_i64)
+                    .and_then(millis_to_time)
+                    .unwrap_or_else(Utc::now);
+                feed.store_trade(venue, &symbol, TradeTick { price, quantity, side, at });
+            }
         }
     }
 }
@@ -641,28 +765,37 @@ fn stream_bitget(
     http: &HttpClient,
     url: &str,
     registry: &SymbolRegistry,
+    venue: &str,
+    inst_type: &str,
 ) -> anyhow::Result<()> {
-    let symbols = registry.symbols_for(BITGET_VENUE);
+    let symbols = registry.symbols_for(venue);
     if symbols.is_empty() {
         bail!("没有可订阅的交易对");
     }
     let mut ws = WebSocket::connect(http, url, HANDSHAKE_TIMEOUT, POLL_TIMEOUT)?;
     let args = symbols
         .iter()
-        .map(|symbol| {
-            format!(
-                r#"{{"instType":"USDT-FUTURES","channel":"books1","instId":"{}"}}"#,
-                symbol.to_ascii_uppercase()
-            )
+        .flat_map(|symbol| {
+            let symbol = symbol.to_ascii_uppercase();
+            ["books1", "books15", "trade"].map(|channel| {
+                format!(
+                    r#"{{"instType":"{inst_type}","channel":"{channel}","instId":"{symbol}"}}"#
+                )
+            })
         })
-        .collect::<Vec<_>>()
-        .join(",");
-    ws.send_text(&format!(r#"{{"op":"subscribe","args":[{args}]}}"#))?;
+        .collect::<Vec<_>>();
+    for chunk in args.chunks(20) {
+        ws.send_text(&format!(
+            r#"{{"op":"subscribe","args":[{}]}}"#,
+            chunk.join(",")
+        ))?;
+    }
 
     let mut version = registry.version();
     let mut last_ping = Instant::now();
+    let mut l2: HashMap<String, LevelBook> = HashMap::new();
     loop {
-        if needs_reconnect(registry, BITGET_VENUE, &symbols, &mut version) {
+        if needs_reconnect(registry, venue, &symbols, &mut version) {
             return Ok(());
         }
         if last_ping.elapsed() >= BITGET_PING_INTERVAL {
@@ -688,6 +821,11 @@ fn stream_bitget(
         let Some(symbol) = value.pointer("/arg/instId").and_then(Value::as_str) else {
             continue;
         };
+        let symbol = symbol.to_ascii_uppercase();
+        let channel = value
+            .pointer("/arg/channel")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         let Some(item) = value
             .get("data")
             .and_then(Value::as_array)
@@ -695,23 +833,72 @@ fn stream_bitget(
         else {
             continue;
         };
-        let level = |side: &str| -> Option<(Decimal, Decimal)> {
-            let row = item.get(side)?.as_array()?.first()?;
-            Some((
-                parse_decimal(row.get(0)?.as_str()?).ok()?,
-                parse_decimal(row.get(1)?.as_str()?).ok()?,
-            ))
-        };
-        let (Some((bid, bid_qty)), Some((ask, ask_qty))) = (level("bids"), level("asks")) else {
-            continue;
-        };
-        if let Ok(snapshot) = make_book(bid, bid_qty, ask, ask_qty) {
-            feed.store_book(
-                BITGET_VENUE,
-                &symbol.to_ascii_uppercase(),
-                snapshot,
-                Utc::now(),
-            );
+
+        match channel {
+            "books1" => {
+                let level = |side: &str| -> Option<(Decimal, Decimal)> {
+                    let row = item.get(side)?.as_array()?.first()?;
+                    Some((
+                        parse_decimal(row.get(0)?.as_str()?).ok()?,
+                        parse_decimal(row.get(1)?.as_str()?).ok()?,
+                    ))
+                };
+                let (Some((bid, bid_qty)), Some((ask, ask_qty))) =
+                    (level("bids"), level("asks"))
+                else {
+                    continue;
+                };
+                if let Ok(snapshot) = make_book(bid, bid_qty, ask, ask_qty) {
+                    feed.store_book(venue, &symbol, snapshot, Utc::now());
+                }
+            }
+            "books15" => {
+                let bids = level_pairs(item.get("bids"));
+                let asks = level_pairs(item.get("asks"));
+                let seq = item.get("seq").and_then(Value::as_u64);
+                let snapshot = value.get("action").and_then(Value::as_str) == Some("snapshot");
+                let book = l2.entry(symbol.clone()).or_default();
+                if snapshot {
+                    book.replace(bids, asks);
+                } else {
+                    book.apply(bids, asks);
+                }
+                book.last_update_id = seq.or(book.last_update_id);
+                let (bids, asks) = book.top(200);
+                feed.store_l2(L2Book {
+                    venue: venue.to_string(),
+                    symbol,
+                    bids,
+                    asks,
+                    last_update_id: book.last_update_id,
+                    observed_at: Utc::now(),
+                });
+            }
+            "trade" => {
+                let Some(rows) = value.get("data").and_then(Value::as_array) else {
+                    continue;
+                };
+                for row in rows {
+                    let (Some(price), Some(quantity)) = (
+                        row.get("price").and_then(Value::as_str).and_then(|v| parse_decimal(v).ok()),
+                        row.get("size").and_then(Value::as_str).and_then(|v| parse_decimal(v).ok()),
+                    ) else {
+                        continue;
+                    };
+                    let side = match row.get("side").and_then(Value::as_str) {
+                        Some("sell") | Some("Sell") => Side::Sell,
+                        _ => Side::Buy,
+                    };
+                    let at = row
+                        .get("ts")
+                        .and_then(Value::as_str)
+                        .and_then(|v| v.parse::<i64>().ok())
+                        .and_then(millis_to_time)
+                        .unwrap_or_else(Utc::now);
+                    feed.store_trade(venue, &symbol, TradeTick { price, quantity, side, at });
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -723,37 +910,67 @@ fn stream_gate(
     url: &str,
     registry: &SymbolRegistry,
     client: &GateFundingClient,
+    venue: &str,
+    futures: bool,
 ) -> anyhow::Result<()> {
-    let symbols = registry.symbols_for(GATE_VENUE);
+    let symbols = registry.symbols_for(venue);
     if symbols.is_empty() {
         bail!("没有可订阅的交易对");
     }
-    // 连接建立时预取合约乘数，失败只影响名义金额，不影响价格。
-    let multipliers = fetch_multipliers(client, &symbols);
-    let mut ws = WebSocket::connect(http, url, HANDSHAKE_TIMEOUT, POLL_TIMEOUT)?;
-    let payload = symbols
+    // 永续的数量单位是张，需要合约乘数；现货直接是基础币。
+    let multipliers = if futures {
+        fetch_multipliers(client, &symbols)
+    } else {
+        HashMap::new()
+    };
+    let contracts = symbols
         .iter()
         .filter_map(|symbol| gate_contract(symbol))
         .collect::<Vec<_>>();
+    let market = if futures { "futures" } else { "spot" };
+    let mut ws = WebSocket::connect(http, url, HANDSHAKE_TIMEOUT, POLL_TIMEOUT)?;
     ws.send_text(
         &json!({
             "time": Utc::now().timestamp(),
-            "channel": "futures.book_ticker",
+            "channel": format!("{market}.book_ticker"),
             "event": "subscribe",
-            "payload": payload,
+            "payload": contracts,
+        })
+        .to_string(),
+    )?;
+    // 增量盘口一次只能订阅一个合约/交易对，逐个发送。
+    for contract in &contracts {
+        ws.send_text(
+            &json!({
+                "time": Utc::now().timestamp(),
+                "channel": format!("{market}.order_book_update"),
+                "event": "subscribe",
+                "payload": [contract, "100ms"],
+            })
+            .to_string(),
+        )?;
+    }
+    ws.send_text(
+        &json!({
+            "time": Utc::now().timestamp(),
+            "channel": format!("{market}.trades"),
+            "event": "subscribe",
+            "payload": contracts,
         })
         .to_string(),
     )?;
 
     let mut version = registry.version();
     let mut last_ping = Instant::now();
+    let mut l2: HashMap<String, LevelBook> = HashMap::new();
     loop {
-        if needs_reconnect(registry, GATE_VENUE, &symbols, &mut version) {
+        if needs_reconnect(registry, venue, &symbols, &mut version) {
             return Ok(());
         }
         if last_ping.elapsed() >= GATE_PING_INTERVAL {
             ws.send_text(
-                &json!({ "time": Utc::now().timestamp(), "channel": "futures.ping" }).to_string(),
+                &json!({ "time": Utc::now().timestamp(), "channel": format!("{market}.ping") })
+                    .to_string(),
             )?;
             last_ping = Instant::now();
         }
@@ -792,13 +1009,95 @@ fn stream_gate(
         let Some(result) = value.get("result") else {
             continue;
         };
+
+        if channel.ends_with(".trades") {
+            let Some(rows) = result.as_array() else {
+                continue;
+            };
+            for row in rows {
+                let (Some(contract), Some(price)) = (
+                    row.get("contract")
+                        .or_else(|| row.get("currency_pair"))
+                        .and_then(Value::as_str),
+                    row.get("price").and_then(Value::as_str).and_then(|v| parse_decimal(v).ok()),
+                ) else {
+                    continue;
+                };
+                let symbol = contract.replace('_', "").to_ascii_uppercase();
+                let size = row
+                    .get("size")
+                    .or_else(|| row.get("amount"))
+                    .and_then(Value::as_str)
+                    .and_then(|v| parse_decimal(v).ok())
+                    .unwrap_or(Decimal::ZERO);
+                let multiplier = multipliers.get(&symbol).copied().unwrap_or(Decimal::ONE);
+                let side = match row.get("side").and_then(Value::as_str) {
+                    Some("sell") => Side::Sell,
+                    _ => Side::Buy,
+                };
+                let at = row
+                    .get("create_time_ms")
+                    .and_then(Value::as_i64)
+                    .and_then(millis_to_time)
+                    .unwrap_or_else(Utc::now);
+                feed.store_trade(
+                    venue,
+                    &symbol,
+                    TradeTick {
+                        price,
+                        quantity: size * multiplier,
+                        side,
+                        at,
+                    },
+                );
+            }
+            continue;
+        }
+
+        if channel.ends_with(".order_book_update") {
+            let Some(contract) = result.get("s").and_then(Value::as_str) else {
+                continue;
+            };
+            let symbol = contract.replace('_', "").to_ascii_uppercase();
+            let multiplier = multipliers.get(&symbol).copied().unwrap_or(Decimal::ONE);
+            let scale = |levels: Vec<(Decimal, Decimal)>| {
+                levels
+                    .into_iter()
+                    .map(|(price, quantity)| (price, quantity * multiplier))
+                    .collect::<Vec<_>>()
+            };
+            let bids = scale(level_pairs(result.get("b")));
+            let asks = scale(level_pairs(result.get("a")));
+            let last = result.get("u").and_then(Value::as_u64);
+            let book = l2.entry(symbol.clone()).or_default();
+            // 增量流的第一条没有历史档位，先用 REST 快照补齐。
+            if book.last_update_id.is_none() && futures {
+                if let Ok(snapshot) = client.depth(&symbol, 100) {
+                    book.replace(
+                        snapshot.bids.iter().map(|level| (level.price, level.quantity)),
+                        snapshot.asks.iter().map(|level| (level.price, level.quantity)),
+                    );
+                }
+            }
+            book.apply(bids, asks);
+            book.last_update_id = last.or(book.last_update_id);
+            let (bids, asks) = book.top(200);
+            feed.store_l2(L2Book {
+                venue: venue.to_string(),
+                symbol,
+                bids,
+                asks,
+                last_update_id: book.last_update_id,
+                observed_at: Utc::now(),
+            });
+            continue;
+        }
+
         let Some(contract) = result.get("s").and_then(Value::as_str) else {
             continue;
         };
         let symbol = contract.replace('_', "").to_ascii_uppercase();
-        let Some(multiplier) = multipliers.get(&symbol).copied() else {
-            continue;
-        };
+        let multiplier = multipliers.get(&symbol).copied().unwrap_or(Decimal::ONE);
         let text_field =
             |name: &str| -> Option<Decimal> { parse_decimal(result.get(name)?.as_str()?).ok() };
         // Gate 的数量字段 `B` / `A` 是数字而不是字符串。
@@ -813,245 +1112,7 @@ fn stream_gate(
             continue;
         };
         if let Ok(snapshot) = make_book(bid, bid_size * multiplier, ask, ask_size * multiplier) {
-            feed.store_book(GATE_VENUE, &symbol, snapshot, Utc::now());
-        }
-    }
-}
-
-/// HTX USDT 本位永续盘口：`market.<contract>.bbo`，数量单位是张，消息为 gzip 压缩。
-fn stream_htx(
-    feed: &RealtimeFeed,
-    http: &HttpClient,
-    url: &str,
-    registry: &SymbolRegistry,
-    client: &HtxFundingClient,
-) -> anyhow::Result<()> {
-    let symbols = registry.symbols_for(HTX_VENUE);
-    if symbols.is_empty() {
-        bail!("没有可订阅的交易对");
-    }
-    // 连接建立时预取合约面值，失败只影响名义金额，不影响价格。
-    let sizes = fetch_contract_sizes(client, &symbols);
-    let mut ws = WebSocket::connect(http, url, HANDSHAKE_TIMEOUT, POLL_TIMEOUT)?;
-    for symbol in &symbols {
-        if let Some(contract) = dash_contract(symbol) {
-            ws.send_text(
-                &json!({ "sub": format!("market.{contract}.bbo"), "id": "arbpilot" }).to_string(),
-            )?;
-        }
-    }
-
-    let mut version = registry.version();
-    let mut last_ping = Instant::now();
-    loop {
-        if needs_reconnect(registry, HTX_VENUE, &symbols, &mut version) {
-            return Ok(());
-        }
-        if last_ping.elapsed() >= HTX_PING_INTERVAL {
-            ws.send_text(&json!({ "ping": Utc::now().timestamp_millis() }).to_string())?;
-            last_ping = Instant::now();
-        }
-        let Some(event) = ws.poll()? else {
-            continue;
-        };
-        let Some(text) = message_text(event, true)? else {
-            continue;
-        };
-        if text == "pong" {
-            continue;
-        }
-        let value: Value = match serde_json::from_str(&text) {
-            Ok(value) => value,
-            Err(error) => {
-                tracing::debug!(target: "htx", %error, "忽略无法解析的 HTX 消息");
-                continue;
-            }
-        };
-        let Some(channel) = value.get("ch").and_then(Value::as_str) else {
-            continue;
-        };
-        let Some(contract) = channel
-            .strip_prefix("market.")
-            .and_then(|rest| rest.strip_suffix(".bbo"))
-        else {
-            continue;
-        };
-        let symbol = contract.replace('-', "").to_ascii_uppercase();
-        let Some(size) = sizes.get(&symbol).copied() else {
-            continue;
-        };
-        let level = |side: &str| -> Option<(Decimal, Decimal)> {
-            let row = value.pointer(&format!("/tick/{side}"))?;
-            Some((
-                parse_decimal(&row.get(0)?.to_string()).ok()?,
-                parse_decimal(&row.get(1)?.to_string()).ok()?,
-            ))
-        };
-        let (Some((bid, bid_qty)), Some((ask, ask_qty))) = (level("bid"), level("ask")) else {
-            continue;
-        };
-        if let Ok(snapshot) = make_book(bid, bid_qty * size, ask, ask_qty * size) {
-            feed.store_book(HTX_VENUE, &symbol, snapshot, Utc::now());
-        }
-    }
-}
-
-/// MEXC 合约盘口：`sub.depth.full`，数量单位是张。
-fn stream_mexc(
-    feed: &RealtimeFeed,
-    http: &HttpClient,
-    url: &str,
-    registry: &SymbolRegistry,
-    client: &MexcFundingClient,
-) -> anyhow::Result<()> {
-    let symbols = registry.symbols_for(MEXC_VENUE);
-    if symbols.is_empty() {
-        bail!("没有可订阅的交易对");
-    }
-    // 连接建立时预取合约面值，失败只影响名义金额，不影响价格。
-    let sizes = fetch_mexc_sizes(client, &symbols);
-    let mut ws = WebSocket::connect(http, url, HANDSHAKE_TIMEOUT, POLL_TIMEOUT)?;
-    for symbol in &symbols {
-        if let Some(contract) = mexc_contract(symbol) {
-            ws.send_text(
-                &json!({
-                    "method": "sub.depth.full",
-                    "param": { "symbol": contract, "limit": 5 },
-                })
-                .to_string(),
-            )?;
-        }
-    }
-
-    let mut version = registry.version();
-    let mut last_ping = Instant::now();
-    loop {
-        if needs_reconnect(registry, MEXC_VENUE, &symbols, &mut version) {
-            return Ok(());
-        }
-        if last_ping.elapsed() >= MEXC_PING_INTERVAL {
-            ws.send_text(&json!({ "method": "ping" }).to_string())?;
-            last_ping = Instant::now();
-        }
-        let Some(event) = ws.poll()? else {
-            continue;
-        };
-        let Some(text) = message_text(event, false)? else {
-            continue;
-        };
-        let value: Value = match serde_json::from_str(&text) {
-            Ok(value) => value,
-            Err(error) => {
-                tracing::debug!(target: "mexc", %error, "忽略无法解析的 MEXC 消息");
-                continue;
-            }
-        };
-        if value.get("channel").and_then(Value::as_str) != Some("push.depth.full") {
-            continue;
-        }
-        let Some(data) = value.get("data") else {
-            continue;
-        };
-        // MEXC 把 `symbol` 放在消息顶层，部分老版本才放在 data 里。
-        let Some(contract) = value
-            .get("symbol")
-            .and_then(Value::as_str)
-            .or_else(|| data.get("symbol").and_then(Value::as_str))
-        else {
-            continue;
-        };
-        let symbol = contract.replace('_', "").to_ascii_uppercase();
-        let Some(size) = sizes.get(&symbol).copied() else {
-            continue;
-        };
-        let level = |side: &str| -> Option<(Decimal, Decimal)> {
-            let row = data.get(side)?.as_array()?.first()?;
-            Some((
-                parse_decimal(&row.get(0)?.to_string()).ok()?,
-                parse_decimal(&row.get(1)?.to_string()).ok()?,
-            ))
-        };
-        let (Some((bid, bid_qty)), Some((ask, ask_qty))) = (level("bids"), level("asks")) else {
-            continue;
-        };
-        if let Ok(snapshot) = make_book(bid, bid_qty * size, ask, ask_qty * size) {
-            feed.store_book(MEXC_VENUE, &symbol, snapshot, Utc::now());
-        }
-    }
-}
-
-/// BingX 合约盘口：`<contract>@bookTicker`，消息为 gzip 压缩。
-fn stream_bingx(
-    feed: &RealtimeFeed,
-    http: &HttpClient,
-    url: &str,
-    registry: &SymbolRegistry,
-) -> anyhow::Result<()> {
-    let symbols = registry.symbols_for(BINGX_VENUE);
-    if symbols.is_empty() {
-        bail!("没有可订阅的交易对");
-    }
-    let mut ws = WebSocket::connect(http, url, HANDSHAKE_TIMEOUT, POLL_TIMEOUT)?;
-    for symbol in &symbols {
-        if let Some(contract) = dash_contract(symbol) {
-            ws.send_text(
-                &json!({
-                    "id": "arbpilot",
-                    "reqType": "sub",
-                    "dataType": format!("{contract}@bookTicker"),
-                })
-                .to_string(),
-            )?;
-        }
-    }
-
-    let mut version = registry.version();
-    let mut last_ping = Instant::now();
-    loop {
-        if needs_reconnect(registry, BINGX_VENUE, &symbols, &mut version) {
-            return Ok(());
-        }
-        if last_ping.elapsed() >= BINGX_PING_INTERVAL {
-            ws.send_text(
-                &json!({ "ping": Utc::now().timestamp_millis().to_string() }).to_string(),
-            )?;
-            last_ping = Instant::now();
-        }
-        let Some(event) = ws.poll()? else {
-            continue;
-        };
-        let Some(text) = message_text(event, true)? else {
-            continue;
-        };
-        let value: Value = match serde_json::from_str(&text) {
-            Ok(value) => value,
-            Err(error) => {
-                tracing::debug!(target: "bingx", %error, "忽略无法解析的 BingX 消息");
-                continue;
-            }
-        };
-        let Some(data_type) = value.get("dataType").and_then(Value::as_str) else {
-            continue;
-        };
-        if !data_type.ends_with("@bookTicker") {
-            continue;
-        }
-        let Some(data) = value.get("data") else {
-            continue;
-        };
-        let Some(contract) = data.get("s").and_then(Value::as_str) else {
-            continue;
-        };
-        let symbol = contract.replace('-', "").to_ascii_uppercase();
-        let field =
-            |name: &str| -> Option<Decimal> { parse_decimal(data.get(name)?.as_str()?).ok() };
-        let (Some(bid), Some(bid_qty), Some(ask), Some(ask_qty)) =
-            (field("b"), field("B"), field("a"), field("A"))
-        else {
-            continue;
-        };
-        if let Ok(snapshot) = make_book(bid, bid_qty, ask, ask_qty) {
-            feed.store_book(BINGX_VENUE, &symbol, snapshot, Utc::now());
+            feed.store_book(venue, &symbol, snapshot, Utc::now());
         }
     }
 }
@@ -1070,10 +1131,12 @@ fn stream_hyperliquid(
     let mut ws = WebSocket::connect(http, url, HANDSHAKE_TIMEOUT, POLL_TIMEOUT)?;
     for symbol in &symbols {
         if let Some(coin) = hyperliquid_coin(symbol) {
-            ws.send_text(
-                &json!({ "method": "subscribe", "subscription": { "type": "bbo", "coin": coin } })
-                    .to_string(),
-            )?;
+            for kind in ["bbo", "l2Book", "trades"] {
+                ws.send_text(
+                    &json!({ "method": "subscribe", "subscription": { "type": kind, "coin": coin } })
+                        .to_string(),
+                )?;
+            }
         }
     }
 
@@ -1100,12 +1163,78 @@ fn stream_hyperliquid(
                 continue;
             }
         };
-        if value.get("channel").and_then(Value::as_str) != Some("bbo") {
-            continue;
-        }
+        let channel = value
+            .get("channel")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         let Some(data) = value.get("data") else {
             continue;
         };
+
+        // 逐笔成交：`side` 为 `B` / `A`，表示主动买 / 主动卖。
+        if channel == "trades" {
+            let Some(rows) = data.as_array() else {
+                continue;
+            };
+            for row in rows {
+                let (Some(coin), Some(price), Some(quantity)) = (
+                    row.get("coin").and_then(Value::as_str),
+                    row.get("px").and_then(Value::as_str).and_then(|v| parse_decimal(v).ok()),
+                    row.get("sz").and_then(Value::as_str).and_then(|v| parse_decimal(v).ok()),
+                ) else {
+                    continue;
+                };
+                let symbol = format!("{}USDT", coin.to_ascii_uppercase());
+                let side = match row.get("side").and_then(Value::as_str) {
+                    Some("A") => Side::Sell,
+                    _ => Side::Buy,
+                };
+                let at = row
+                    .get("time")
+                    .and_then(Value::as_i64)
+                    .and_then(millis_to_time)
+                    .unwrap_or_else(Utc::now);
+                feed.store_trade(HYPERLIQUID_VENUE, &symbol, TradeTick { price, quantity, side, at });
+            }
+            continue;
+        }
+
+        // L2 每次推送都是全量快照（最多 20 档/侧），直接整体替换。
+        if channel == "l2Book" {
+            let Some(coin) = data.get("coin").and_then(Value::as_str) else {
+                continue;
+            };
+            let side_levels = |index: usize| -> Vec<(Decimal, Decimal)> {
+                data.pointer(&format!("/levels/{index}"))
+                    .and_then(Value::as_array)
+                    .map(|rows| {
+                        rows.iter()
+                            .filter_map(|row| {
+                                Some((
+                                    parse_decimal(row.get("px")?.as_str()?).ok()?,
+                                    parse_decimal(row.get("sz")?.as_str()?).ok()?,
+                                ))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            let book = LevelBook::from_snapshot(side_levels(0), side_levels(1));
+            let (bids, asks) = book.top(200);
+            feed.store_l2(L2Book {
+                venue: HYPERLIQUID_VENUE.to_string(),
+                symbol: format!("{}USDT", coin.to_ascii_uppercase()),
+                bids,
+                asks,
+                last_update_id: None,
+                observed_at: Utc::now(),
+            });
+            continue;
+        }
+
+        if channel != "bbo" {
+            continue;
+        }
         let Some(coin) = data.get("coin").and_then(Value::as_str) else {
             continue;
         };
@@ -1158,6 +1287,9 @@ fn stream_lighter(
             &json!({ "type": "subscribe", "channel": format!("order_book/{market_id}") })
                 .to_string(),
         )?;
+        ws.send_text(
+            &json!({ "type": "subscribe", "channel": format!("trade/{market_id}") }).to_string(),
+        )?;
     }
     let mut by_id: HashMap<i64, &str> = HashMap::new();
     for (symbol, market_id) in &markets {
@@ -1165,9 +1297,15 @@ fn stream_lighter(
     }
 
     let mut version = registry.version();
+    let mut last_ping = Instant::now();
+    let mut last_price: HashMap<i64, Decimal> = HashMap::new();
     loop {
         if needs_reconnect(registry, LIGHTER_VENUE, &symbols, &mut version) {
             return Ok(());
+        }
+        if last_ping.elapsed() >= LIGHTER_PING_INTERVAL {
+            ws.send_text(r#"{"type":"ping"}"#)?;
+            last_ping = Instant::now();
         }
         let Some(event) = ws.poll()? else {
             continue;
@@ -1185,6 +1323,35 @@ fn stream_lighter(
         let Some(channel) = value.get("channel").and_then(Value::as_str) else {
             continue;
         };
+
+        if let Some(id) = channel
+            .strip_prefix("trade:")
+            .and_then(|value| value.parse::<i64>().ok())
+        {
+            let Some(symbol) = by_id.get(&id).copied() else {
+                continue;
+            };
+            let Some(rows) = value.get("trades").and_then(Value::as_array) else {
+                continue;
+            };
+            for row in rows {
+                let (Some(price), Some(quantity)) = (
+                    row.get("price").and_then(Value::as_str).and_then(|v| parse_decimal(v).ok()),
+                    row.get("size").and_then(Value::as_str).and_then(|v| parse_decimal(v).ok()),
+                ) else {
+                    continue;
+                };
+                // Lighter 不直接给出主动方向，用价格跳动推断（uptick 视为主动买）。
+                let side = match last_price.get(&id) {
+                    Some(previous) if price < *previous => Side::Sell,
+                    _ => Side::Buy,
+                };
+                last_price.insert(id, price);
+                feed.store_trade(LIGHTER_VENUE, symbol, TradeTick { price, quantity, side, at: Utc::now() });
+            }
+            continue;
+        }
+
         let Some(id) = channel
             .strip_prefix("order_book:")
             .and_then(|value| value.parse::<i64>().ok())
@@ -1197,31 +1364,63 @@ fn stream_lighter(
         let Some(book) = value.get("order_book") else {
             continue;
         };
-        let level = |side: &str| -> Option<(Decimal, Decimal)> {
-            let row = book.get(side)?.as_array()?.first()?;
-            Some((
-                parse_decimal(row.get("price")?.as_str()?).ok()?,
-                parse_decimal(row.get("size")?.as_str()?).ok()?,
-            ))
+        let rows = |side: &str| -> Vec<(Decimal, Decimal)> {
+            book.get(side)
+                .and_then(Value::as_array)
+                .map(|rows| {
+                    rows.iter()
+                        .filter_map(|row| {
+                            Some((
+                                parse_decimal(row.get("price")?.as_str()?).ok()?,
+                                parse_decimal(row.get("size")?.as_str()?).ok()?,
+                            ))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
         };
-        let (Some((bid, bid_qty)), Some((ask, ask_qty))) = (level("bids"), level("asks")) else {
-            continue;
-        };
-        if let Ok(snapshot) = make_book(bid, bid_qty, ask, ask_qty) {
-            feed.store_book(LIGHTER_VENUE, symbol, snapshot, Utc::now());
+        let bids = rows("bids");
+        let asks = rows("asks");
+        // 首次推送给的是全量盘口，直接采用。
+        let level_book = LevelBook::from_snapshot(bids.clone(), asks.clone());
+        let (bids, asks) = level_book.top(200);
+        feed.store_l2(L2Book {
+            venue: LIGHTER_VENUE.to_string(),
+            symbol: symbol.to_string(),
+            bids,
+            asks,
+            last_update_id: None,
+            observed_at: Utc::now(),
+        });
+        if let (Some(bid), Some(ask)) = (
+            book.pointer("/bids/0"),
+            book.pointer("/asks/0"),
+        ) {
+            if let (Some(price), Some(qty), Some(ask_price), Some(ask_qty)) = (
+                bid.get("price").and_then(Value::as_str).and_then(|v| parse_decimal(v).ok()),
+                bid.get("size").and_then(Value::as_str).and_then(|v| parse_decimal(v).ok()),
+                ask.get("price").and_then(Value::as_str).and_then(|v| parse_decimal(v).ok()),
+                ask.get("size").and_then(Value::as_str).and_then(|v| parse_decimal(v).ok()),
+            ) {
+                if let Ok(snapshot) = make_book(price, qty, ask_price, ask_qty) {
+                    feed.store_book(LIGHTER_VENUE, symbol, snapshot, Utc::now());
+                }
+            }
         }
     }
 }
 
-/// Binance 盘口线程：`/stream?streams=` 组合多条 `<symbol>@bookTicker`。
+/// Binance 行情线程：组合流同时订阅最优档、增量盘口与逐笔成交。
 fn run_binance_books(
     feed: Arc<RealtimeFeed>,
     http: Arc<HttpClient>,
     base_url: String,
+    rest_base: String,
+    spot: bool,
     venue: &'static str,
     registry: Arc<SymbolRegistry>,
 ) {
-    tracing::info!(venue, "Binance WebSocket 盘口线程已启动");
+    tracing::info!(venue, "Binance WebSocket 行情线程已启动");
     let mut last_error: Option<Instant> = None;
     loop {
         // 每次重连都按当前订阅清单重建 URL，新开仓的交易对随之生效。
@@ -1232,7 +1431,14 @@ fn run_binance_books(
         }
         let streams = symbols
             .iter()
-            .map(|symbol| format!("{}@bookTicker", symbol.to_ascii_lowercase()))
+            .flat_map(|symbol| {
+                let symbol = symbol.to_ascii_lowercase();
+                [
+                    format!("{symbol}@bookTicker"),
+                    format!("{symbol}@depth@100ms"),
+                    format!("{symbol}@aggTrade"),
+                ]
+            })
             .collect::<Vec<_>>()
             .join("/");
         let url = format!(
@@ -1240,7 +1446,7 @@ fn run_binance_books(
             base_url.trim_end_matches('/')
         );
 
-        match stream_binance(&feed, &http, &url, venue, &registry) {
+        match stream_binance(&feed, &http, &url, &rest_base, spot, venue, &registry) {
             Ok(()) => tracing::warn!(venue, "Binance WebSocket 已结束，准备重连"),
             Err(error) => {
                 let now = Instant::now();
@@ -1257,16 +1463,42 @@ fn run_binance_books(
     }
 }
 
+/// 拉取一次 Binance 全量盘口作为增量流的起点。
+fn fetch_binance_depth(
+    http: &HttpClient,
+    rest_base: &str,
+    spot: bool,
+    symbol: &str,
+) -> anyhow::Result<LevelBook> {
+    let (path, limit) = if spot {
+        ("/api/v3/depth", 1000)
+    } else {
+        ("/fapi/v1/depth", 1000)
+    };
+    let url = format!(
+        "{}{path}?symbol={}&limit={limit}",
+        rest_base.trim_end_matches('/'),
+        symbol.to_ascii_uppercase()
+    );
+    let value = http.get_json(&url)?;
+    let mut book = LevelBook::from_snapshot(level_pairs(value.get("bids")), level_pairs(value.get("asks")));
+    book.last_update_id = value.get("lastUpdateId").and_then(Value::as_u64);
+    Ok(book)
+}
+
 fn stream_binance(
     feed: &RealtimeFeed,
     http: &HttpClient,
     url: &str,
+    rest_base: &str,
+    spot: bool,
     venue: &str,
     registry: &SymbolRegistry,
 ) -> anyhow::Result<()> {
     let symbols = registry.symbols_for(venue);
     let mut ws = WebSocket::connect(http, url, HANDSHAKE_TIMEOUT, POLL_TIMEOUT)?;
     let mut version = registry.version();
+    let mut l2: HashMap<String, LevelBook> = HashMap::new();
     loop {
         if needs_reconnect(registry, venue, &symbols, &mut version) {
             return Ok(());
@@ -1284,7 +1516,97 @@ fn stream_binance(
                 continue;
             }
         };
-        if let Some((symbol, snapshot)) = parse_binance_book(&value) {
+        let data = value.get("data").unwrap_or(&value);
+        let symbol = data
+            .get("s")
+            .and_then(Value::as_str)
+            .map(str::to_ascii_uppercase)
+            .or_else(|| {
+                value
+                    .get("stream")
+                    .and_then(Value::as_str)
+                    .and_then(|stream| stream.split('@').next())
+                    .map(str::to_ascii_uppercase)
+            });
+        let Some(symbol) = symbol else {
+            continue;
+        };
+
+        // 逐笔成交：`m` 表示买方是否为 maker，是则主动方为卖方。
+        if data.get("e").and_then(Value::as_str) == Some("aggTrade") {
+            let (Some(price), Some(quantity)) = (
+                data.get("p").and_then(Value::as_str).and_then(|v| parse_decimal(v).ok()),
+                data.get("q").and_then(Value::as_str).and_then(|v| parse_decimal(v).ok()),
+            ) else {
+                continue;
+            };
+            let buyer_maker = data.get("m").and_then(Value::as_bool).unwrap_or(false);
+            let at = data
+                .get("T")
+                .and_then(Value::as_i64)
+                .and_then(millis_to_time)
+                .unwrap_or_else(Utc::now);
+            feed.store_trade(
+                venue,
+                &symbol,
+                TradeTick {
+                    price,
+                    quantity,
+                    side: if buyer_maker { Side::Sell } else { Side::Buy },
+                    at,
+                },
+            );
+            continue;
+        }
+
+        // 增量盘口：`U` 为首条更新号、`u` 为末条更新号。
+        if data.get("U").is_some() {
+            let last = data.get("u").and_then(Value::as_u64);
+            let first = data.get("U").and_then(Value::as_u64).unwrap_or(0);
+            let Some(last) = last else {
+                continue;
+            };
+            let need_resync = match l2.get(&symbol).and_then(|book| book.last_update_id) {
+                None => true,
+                Some(prev) => matches!(check_range(Some(prev), first, last), SequenceCheck::Gap),
+            };
+            if need_resync {
+                match fetch_binance_depth(http, rest_base, spot, &symbol) {
+                    Ok(book) => {
+                        let (bids, asks) = book.top(200);
+                        feed.store_l2(L2Book {
+                            venue: venue.to_string(),
+                            symbol: symbol.clone(),
+                            bids,
+                            asks,
+                            last_update_id: book.last_update_id,
+                            observed_at: Utc::now(),
+                        });
+                        l2.insert(symbol.clone(), book);
+                    }
+                    Err(error) => tracing::debug!(%error, symbol, "Binance 盘口快照拉取失败"),
+                }
+                // 快照已比当前事件新，丢弃这条旧增量。
+                continue;
+            }
+            let Some(book) = l2.get_mut(&symbol) else {
+                continue;
+            };
+            book.apply(level_pairs(data.get("b")), level_pairs(data.get("a")));
+            book.last_update_id = Some(last);
+            let (bids, asks) = book.top(200);
+            feed.store_l2(L2Book {
+                venue: venue.to_string(),
+                symbol,
+                bids,
+                asks,
+                last_update_id: Some(last),
+                observed_at: Utc::now(),
+            });
+            continue;
+        }
+
+        if let Some((symbol, snapshot)) = parse_binance_book(data) {
             feed.store_book(venue, &symbol, snapshot, Utc::now());
         }
     }
@@ -1353,16 +1675,20 @@ fn stream_okx(
     let watchlist = books.snapshot();
     let mut book_args = Vec::new();
     for symbol in symbols {
+        let inst_id = okx_inst_id(symbol, true);
         book_args.push(format!(
-            r#"{{"channel":"tickers","instId":"{}"}}"#,
-            okx_inst_id(symbol, true)
+            r#"{{"channel":"tickers","instId":"{inst_id}"}}"#
         ));
+        book_args.push(format!(r#"{{"channel":"books","instId":"{inst_id}"}}"#));
+        book_args.push(format!(r#"{{"channel":"trades","instId":"{inst_id}"}}"#));
     }
     for symbol in &watchlist {
+        let inst_id = okx_inst_id(symbol, false);
         book_args.push(format!(
-            r#"{{"channel":"tickers","instId":"{}"}}"#,
-            okx_inst_id(symbol, false)
+            r#"{{"channel":"tickers","instId":"{inst_id}"}}"#
         ));
+        book_args.push(format!(r#"{{"channel":"books","instId":"{inst_id}"}}"#));
+        book_args.push(format!(r#"{{"channel":"trades","instId":"{inst_id}"}}"#));
     }
     for chunk in book_args.chunks(OKX_SUBSCRIBE_CHUNK) {
         ws.send_text(&format!(
@@ -1378,6 +1704,7 @@ fn stream_okx(
     let mut book_version = books.version();
     let mut version = u64::MAX;
     let mut last_ping = Instant::now();
+    let mut l2: HashMap<(String, String), LevelBook> = HashMap::new();
     loop {
         // 持仓交易对变化时断开重连，用新的清单重新订阅盘口。
         if needs_reconnect(books, OKX_VENUE, symbols, &mut book_version) {
@@ -1438,11 +1765,16 @@ fn stream_okx(
                 continue;
             }
         };
-        dispatch_okx(feed, &value, ct_values);
+        dispatch_okx(feed, &value, ct_values, &mut l2);
     }
 }
 
-fn dispatch_okx(feed: &RealtimeFeed, value: &Value, ct_values: &HashMap<String, Decimal>) {
+fn dispatch_okx(
+    feed: &RealtimeFeed,
+    value: &Value,
+    ct_values: &HashMap<String, Decimal>,
+    l2: &mut HashMap<(String, String), LevelBook>,
+) {
     if let Some(event) = value.get("event").and_then(Value::as_str) {
         match event {
             "error" => {
@@ -1491,6 +1823,81 @@ fn dispatch_okx(feed: &RealtimeFeed, value: &Value, ct_values: &HashMap<String, 
             if let Ok(snapshot) = parse_okx_book(item, ct_val) {
                 feed.store_book(venue, &symbol, snapshot, Utc::now());
             }
+        }
+        "books" => {
+            let swap = inst_id.ends_with("-SWAP");
+            let venue = if swap { OKX_VENUE } else { OKX_SPOT_VENUE };
+            let Some(symbol) = okx_symbol(inst_id) else {
+                return;
+            };
+            let ct_val = if swap {
+                ct_values.get(&symbol).copied().unwrap_or(Decimal::ONE)
+            } else {
+                Decimal::ONE
+            };
+            let scale = |levels: Vec<(Decimal, Decimal)>| {
+                levels
+                    .into_iter()
+                    .map(|(price, quantity)| (price, quantity * ct_val))
+                    .collect::<Vec<_>>()
+            };
+            let bids = scale(level_pairs(item.get("bids")));
+            let asks = scale(level_pairs(item.get("asks")));
+            let seq = item.get("seqId").and_then(Value::as_u64);
+            let snapshot = value.get("action").and_then(Value::as_str) == Some("snapshot");
+            let book = l2.entry((venue.to_string(), symbol.clone())).or_default();
+            if snapshot {
+                book.replace(bids, asks);
+            } else {
+                book.apply(bids, asks);
+            }
+            book.last_update_id = seq.or(book.last_update_id);
+            let (bids, asks) = book.top(200);
+            feed.store_l2(L2Book {
+                venue: venue.to_string(),
+                symbol,
+                bids,
+                asks,
+                last_update_id: book.last_update_id,
+                observed_at: Utc::now(),
+            });
+        }
+        "trades" => {
+            let swap = inst_id.ends_with("-SWAP");
+            let venue = if swap { OKX_VENUE } else { OKX_SPOT_VENUE };
+            let Some(symbol) = okx_symbol(inst_id) else {
+                return;
+            };
+            let ct_val = if swap {
+                ct_values.get(&symbol).copied().unwrap_or(Decimal::ONE)
+            } else {
+                Decimal::ONE
+            };
+            let (Some(price), Some(size)) = (
+                item.get("px").and_then(Value::as_str).and_then(|v| parse_decimal(v).ok()),
+                item.get("sz").and_then(Value::as_str).and_then(|v| parse_decimal(v).ok()),
+            ) else {
+                return;
+            };
+            let side = match item.get("side").and_then(Value::as_str) {
+                Some("sell") => Side::Sell,
+                _ => Side::Buy,
+            };
+            let at = item
+                .get("ts")
+                .and_then(Value::as_i64)
+                .and_then(millis_to_time)
+                .unwrap_or_else(Utc::now);
+            feed.store_trade(
+                venue,
+                &symbol,
+                TradeTick {
+                    price,
+                    quantity: size * ct_val,
+                    side,
+                    at,
+                },
+            );
         }
         "funding-rate" => {
             let Some(symbol) = okx_symbol(inst_id) else {

@@ -1,6 +1,9 @@
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, RwLock},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, RwLock,
+    },
     time::Duration,
 };
 
@@ -12,19 +15,22 @@ use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use crate::{
-    config::Config,
+    config::{Config, FeeConfig},
     events::ExecutorEvent,
     exchange::{
-        BinanceMarketClient, BingxFundingClient, BitgetFundingClient, BookSnapshot,
-        BybitFundingClient, Candle, ContractSpec, DeliveryContract, DepthSnapshot, FundingRate,
-        GateFundingClient, HtxFundingClient, HyperliquidFundingClient, LighterFundingClient,
-        MexcFundingClient, MinOrderSpec, OkxMarketClient, Segment, ASTER_VENUE, BINGX_VENUE,
-        BITGET_VENUE, BYBIT_VENUE, GATE_VENUE, HTX_VENUE, HYPERLIQUID_VENUE, LIGHTER_VENUE,
-        MEXC_VENUE, OKX_VENUE, VENUE,
+        BinanceMarketClient, BitgetFundingClient, BookSnapshot, BybitFundingClient, Candle,
+        ContractSpec, DeliveryContract, DepthSnapshot, FundingRate, GateFundingClient,
+        HyperliquidFundingClient, LighterFundingClient, MinOrderSpec, OkxMarketClient, Segment,
+        ASTER_VENUE, BITGET_VENUE, BYBIT_VENUE, GATE_VENUE, HYPERLIQUID_VENUE, LIGHTER_VENUE,
+        OKX_VENUE, VENUE,
     },
     funding::{annualize, FundingFeed},
     http_client::HttpClient,
     notifier::Notifier,
+    orderbook::{
+        assess_maker_first, estimate_slippage, MakerFirstAssessment, Side as OrderSide,
+        SlippageEstimate, TradeTick, L2Book,
+    },
     realtime::RealtimeFeed,
     store::Store,
 };
@@ -35,6 +41,14 @@ pub const SPOT_VENUE: &str = "binance-spot";
 pub const OKX_SPOT_VENUE: &str = "okx-spot";
 /// Bybit 现货腿标识；Bybit 永续沿用 `bybit`。
 pub const BYBIT_SPOT_VENUE: &str = "bybit-spot";
+/// Gate 现货腿标识；Gate 永续沿用 `gate`。
+pub const GATE_SPOT_VENUE: &str = "gate-spot";
+/// Bitget 现货腿标识；Bitget 永续沿用 `bitget`。
+pub const BITGET_SPOT_VENUE: &str = "bitget-spot";
+/// Hyperliquid 现货腿标识；Hyperliquid 永续沿用 `hyperliquid`。
+pub const HYPERLIQUID_SPOT_VENUE: &str = "hyperliquid-spot";
+/// Lighter 现货腿标识；Lighter 永续沿用 `lighter`。
+pub const LIGHTER_SPOT_VENUE: &str = "lighter-spot";
 
 /// 是否现货腿：沿用「以 `-spot` 结尾」的交易所标识约定。
 pub fn is_spot_venue(venue: &str) -> bool {
@@ -42,12 +56,21 @@ pub fn is_spot_venue(venue: &str) -> bool {
 }
 
 /// 已接入现货下单的交易所；与永续腿共用同一个交易所账户。
-pub const SPOT_VENUES: [&str; 3] = [SPOT_VENUE, OKX_SPOT_VENUE, BYBIT_SPOT_VENUE];
+pub const SPOT_VENUES: [&str; 7] = [
+    SPOT_VENUE,
+    OKX_SPOT_VENUE,
+    BYBIT_SPOT_VENUE,
+    GATE_SPOT_VENUE,
+    BITGET_SPOT_VENUE,
+    HYPERLIQUID_SPOT_VENUE,
+    LIGHTER_SPOT_VENUE,
+];
 
-/// 单腿手续费估算（bps）：现货与永续各 4 bps。
-const LEG_FEE_BPS: i64 = 4;
-/// 双腿滑点估算（bps）。
-const SLIPPAGE_BPS: i64 = 1;
+/// 兜底交割合约与现货腿使用的交易对：未显式配置 `ARBPILOT_MARKET_SYMBOLS` 时，
+/// 永续机会覆盖全部已发现合约，但交割基差仍只跟踪这两个流动性最好的币种。
+const DEFAULT_DELIVERY_SYMBOLS: [&str; 2] = ["BTCUSDT", "ETHUSDT"];
+/// 每轮 REST 兜底的最大请求数：全市场合约交给 WebSocket，REST 只补齐缺失的腿并轮转。
+const REST_FALLBACK_BUDGET: usize = 240;
 /// 仓位实时定价允许的 WebSocket 快照最大年龄；超过视为断线，回退交易所标记价。
 const REALTIME_PRICE_MAX_AGE_SECS: i64 = 30;
 /// 交割合约清单的刷新间隔：合约按季度挂牌，无需每轮行情都重新拉取。
@@ -178,9 +201,6 @@ struct BookClients {
     aster: Option<Arc<BinanceMarketClient>>,
     hyperliquid: Option<Arc<HyperliquidFundingClient>>,
     lighter: Option<Arc<LighterFundingClient>>,
-    htx: Option<Arc<HtxFundingClient>>,
-    mexc: Option<Arc<MexcFundingClient>>,
-    bingx: Option<Arc<BingxFundingClient>>,
 }
 
 impl BookClients {
@@ -206,11 +226,21 @@ impl BookClients {
                 .as_ref()
                 .ok_or_else(|| anyhow!("Bybit 行情客户端未启用"))?
                 .book(symbol),
+            BITGET_SPOT_VENUE => self
+                .bitget
+                .as_ref()
+                .ok_or_else(|| anyhow!("Bitget 行情客户端未启用"))?
+                .spot_book(symbol),
             BITGET_VENUE => self
                 .bitget
                 .as_ref()
                 .ok_or_else(|| anyhow!("Bitget 行情客户端未启用"))?
                 .book(symbol),
+            GATE_SPOT_VENUE => self
+                .gate
+                .as_ref()
+                .ok_or_else(|| anyhow!("Gate 行情客户端未启用"))?
+                .spot_book(symbol),
             GATE_VENUE => self
                 .gate
                 .as_ref()
@@ -221,30 +251,25 @@ impl BookClients {
                 .as_ref()
                 .ok_or_else(|| anyhow!("Aster 行情客户端未启用"))?
                 .book(symbol, Segment::Swap),
+            HYPERLIQUID_SPOT_VENUE => self
+                .hyperliquid
+                .as_ref()
+                .ok_or_else(|| anyhow!("Hyperliquid 行情客户端未启用"))?
+                .spot_book(symbol),
             HYPERLIQUID_VENUE => self
                 .hyperliquid
                 .as_ref()
                 .ok_or_else(|| anyhow!("Hyperliquid 行情客户端未启用"))?
                 .book(symbol),
+            LIGHTER_SPOT_VENUE => self
+                .lighter
+                .as_ref()
+                .ok_or_else(|| anyhow!("Lighter 行情客户端未启用"))?
+                .spot_book(symbol),
             LIGHTER_VENUE => self
                 .lighter
                 .as_ref()
                 .ok_or_else(|| anyhow!("Lighter 行情客户端未启用"))?
-                .book(symbol),
-            HTX_VENUE => self
-                .htx
-                .as_ref()
-                .ok_or_else(|| anyhow!("HTX 行情客户端未启用"))?
-                .book(symbol),
-            MEXC_VENUE => self
-                .mexc
-                .as_ref()
-                .ok_or_else(|| anyhow!("MEXC 行情客户端未启用"))?
-                .book(symbol),
-            BINGX_VENUE => self
-                .bingx
-                .as_ref()
-                .ok_or_else(|| anyhow!("BingX 行情客户端未启用"))?
                 .book(symbol),
             other => bail!("不支持的行情来源: {other}"),
         }
@@ -279,11 +304,21 @@ impl BookClients {
                 .as_ref()
                 .ok_or_else(|| anyhow!("Bybit 行情客户端未启用"))?
                 .depth(symbol, false, limit),
+            BITGET_SPOT_VENUE => self
+                .bitget
+                .as_ref()
+                .ok_or_else(|| anyhow!("Bitget 行情客户端未启用"))?
+                .spot_depth(symbol, limit),
             BITGET_VENUE => self
                 .bitget
                 .as_ref()
                 .ok_or_else(|| anyhow!("Bitget 行情客户端未启用"))?
                 .depth(symbol, limit),
+            GATE_SPOT_VENUE => self
+                .gate
+                .as_ref()
+                .ok_or_else(|| anyhow!("Gate 行情客户端未启用"))?
+                .spot_depth(symbol, limit),
             GATE_VENUE => self
                 .gate
                 .as_ref()
@@ -294,30 +329,25 @@ impl BookClients {
                 .as_ref()
                 .ok_or_else(|| anyhow!("Aster 行情客户端未启用"))?
                 .depth(symbol, Segment::Swap, limit),
+            HYPERLIQUID_SPOT_VENUE => self
+                .hyperliquid
+                .as_ref()
+                .ok_or_else(|| anyhow!("Hyperliquid 行情客户端未启用"))?
+                .spot_depth(symbol, limit),
             HYPERLIQUID_VENUE => self
                 .hyperliquid
                 .as_ref()
                 .ok_or_else(|| anyhow!("Hyperliquid 行情客户端未启用"))?
                 .depth(symbol, limit),
+            LIGHTER_SPOT_VENUE => self
+                .lighter
+                .as_ref()
+                .ok_or_else(|| anyhow!("Lighter 行情客户端未启用"))?
+                .spot_depth(symbol, limit),
             LIGHTER_VENUE => self
                 .lighter
                 .as_ref()
                 .ok_or_else(|| anyhow!("Lighter 行情客户端未启用"))?
-                .depth(symbol, limit),
-            HTX_VENUE => self
-                .htx
-                .as_ref()
-                .ok_or_else(|| anyhow!("HTX 行情客户端未启用"))?
-                .depth(symbol),
-            MEXC_VENUE => self
-                .mexc
-                .as_ref()
-                .ok_or_else(|| anyhow!("MEXC 行情客户端未启用"))?
-                .depth(symbol, limit),
-            BINGX_VENUE => self
-                .bingx
-                .as_ref()
-                .ok_or_else(|| anyhow!("BingX 行情客户端未启用"))?
                 .depth(symbol, limit),
             other => bail!("不支持的行情来源: {other}"),
         }
@@ -356,11 +386,23 @@ impl BookClients {
                 .as_ref()
                 .ok_or_else(|| anyhow!("Bybit 行情客户端未启用"))?
                 .min_order(symbol),
+            BITGET_SPOT_VENUE => self
+                .bitget
+                .as_ref()
+                .ok_or_else(|| anyhow!("Bitget 行情客户端未启用"))?
+                .spot_min_order(symbol)
+                .map(Some),
             BITGET_VENUE => self
                 .bitget
                 .as_ref()
                 .ok_or_else(|| anyhow!("Bitget 行情客户端未启用"))?
                 .min_order(symbol),
+            GATE_SPOT_VENUE => self
+                .gate
+                .as_ref()
+                .ok_or_else(|| anyhow!("Gate 行情客户端未启用"))?
+                .spot_min_order(symbol)
+                .map(Some),
             GATE_VENUE => self
                 .gate
                 .as_ref()
@@ -371,30 +413,27 @@ impl BookClients {
                 .as_ref()
                 .ok_or_else(|| anyhow!("Aster 行情客户端未启用"))?
                 .min_order(venue, symbol, Segment::Swap),
+            HYPERLIQUID_SPOT_VENUE => self
+                .hyperliquid
+                .as_ref()
+                .ok_or_else(|| anyhow!("Hyperliquid 行情客户端未启用"))?
+                .spot_min_order(symbol)
+                .map(Some),
             HYPERLIQUID_VENUE => self
                 .hyperliquid
                 .as_ref()
                 .ok_or_else(|| anyhow!("Hyperliquid 行情客户端未启用"))?
                 .min_order(symbol),
+            LIGHTER_SPOT_VENUE => self
+                .lighter
+                .as_ref()
+                .ok_or_else(|| anyhow!("Lighter 行情客户端未启用"))?
+                .spot_min_order(symbol)
+                .map(Some),
             LIGHTER_VENUE => self
                 .lighter
                 .as_ref()
                 .ok_or_else(|| anyhow!("Lighter 行情客户端未启用"))?
-                .min_order(symbol),
-            HTX_VENUE => self
-                .htx
-                .as_ref()
-                .ok_or_else(|| anyhow!("HTX 行情客户端未启用"))?
-                .min_order(symbol),
-            MEXC_VENUE => self
-                .mexc
-                .as_ref()
-                .ok_or_else(|| anyhow!("MEXC 行情客户端未启用"))?
-                .min_order(symbol),
-            BINGX_VENUE => self
-                .bingx
-                .as_ref()
-                .ok_or_else(|| anyhow!("BingX 行情客户端未启用"))?
                 .min_order(symbol),
             other => bail!("不支持的行情来源: {other}"),
         }
@@ -436,7 +475,20 @@ pub fn fetch_book_quote(
 /// 永续盘口来自各交易所，并结合已入库的资金费率生成「永续-永续」资金费率差机会；
 /// 现货盘口只用于交割基差与 K 线。
 pub struct MarketFeed {
+    /// 显式扫描清单（手动模式）或交割/现货腿清单（自动模式下为 BTC/ETH）。
     symbols: Vec<String>,
+    /// 是否由用户显式限制了扫描清单；false 时永续腿跟随资金费率发现结果。
+    manual_symbols: bool,
+    /// 最近一次订阅的永续合约清单，变化时增量订阅 WebSocket。
+    watched: RwLock<Vec<String>>,
+    /// REST 兜底轮转游标，避免全市场合约每轮都打满交易所接口。
+    rest_cursor: AtomicUsize,
+    /// 机会成本估算使用的费率档位，设置页修改后立即生效。
+    fees: RwLock<FeeConfig>,
+    /// 上一轮各交易所合约的年化费率，用于识别突变。
+    last_funding: RwLock<HashMap<(String, String), Decimal>>,
+    /// 资金费率年化跳变阈值（百分点）。
+    funding_jump_pct: Decimal,
     poll: Duration,
     /// WebSocket 快照的最长可用时长，超过即回退到 REST。
     ws_max_age: Duration,
@@ -449,9 +501,6 @@ pub struct MarketFeed {
     aster: Option<Arc<BinanceMarketClient>>,
     hyperliquid: Option<Arc<HyperliquidFundingClient>>,
     lighter: Option<Arc<LighterFundingClient>>,
-    htx: Option<Arc<HtxFundingClient>>,
-    mexc: Option<Arc<MexcFundingClient>>,
-    bingx: Option<Arc<BingxFundingClient>>,
     /// 参与永续-永续资金费率差的交易所（只含已启用且已建客户端的）。
     perp_venues: Vec<&'static str>,
     realtime: Option<Arc<RealtimeFeed>>,
@@ -476,8 +525,7 @@ impl MarketFeed {
         store: Arc<Store>,
         events: broadcast::Sender<ExecutorEvent>,
     ) -> Arc<Self> {
-        let (binance, okx, bybit, bitget, gate, aster, hyperliquid, lighter, htx, mexc, bingx) =
-            match http {
+        let (binance, okx, bybit, bitget, gate, aster, hyperliquid, lighter) = match http {
                 Some(http) => {
                     let binance = Some(Arc::new(BinanceMarketClient::new(
                         &config.binance_spot_url,
@@ -522,37 +570,11 @@ impl MarketFeed {
                             http.clone(),
                         ))
                     });
-                    let htx = config.htx_enabled.then(|| {
-                        Arc::new(HtxFundingClient::new(&config.htx_base_url, http.clone()))
-                    });
-                    let mexc = config.mexc_enabled.then(|| {
-                        Arc::new(MexcFundingClient::new(&config.mexc_base_url, http.clone()))
-                    });
-                    let bingx = config.bingx_enabled.then(|| {
-                        Arc::new(BingxFundingClient::new(
-                            &config.bingx_base_url,
-                            http.clone(),
-                        ))
-                    });
-                    (
-                        binance,
-                        okx,
-                        bybit,
-                        bitget,
-                        gate,
-                        aster,
-                        hyperliquid,
-                        lighter,
-                        htx,
-                        mexc,
-                        bingx,
-                    )
+                    (binance, okx, bybit, bitget, gate, aster, hyperliquid, lighter)
                 }
                 None => {
                     tracing::error!("行情 HTTP 客户端不可用，盘口只能依赖 WebSocket 推送");
-                    (
-                        None, None, None, None, None, None, None, None, None, None, None,
-                    )
+                    (None, None, None, None, None, None, None, None)
                 }
             };
 
@@ -566,9 +588,6 @@ impl MarketFeed {
             (aster.is_some(), ASTER_VENUE),
             (hyperliquid.is_some(), HYPERLIQUID_VENUE),
             (lighter.is_some(), LIGHTER_VENUE),
-            (htx.is_some(), HTX_VENUE),
-            (mexc.is_some(), MEXC_VENUE),
-            (bingx.is_some(), BINGX_VENUE),
         ] {
             if enabled {
                 perp_venues.push(venue);
@@ -576,8 +595,22 @@ impl MarketFeed {
         }
 
         let poll = Duration::from_secs(config.quote_poll_secs.max(1));
+        let symbols = if config.market_symbols_manual {
+            config.market_symbols.clone()
+        } else {
+            DEFAULT_DELIVERY_SYMBOLS
+                .iter()
+                .map(|symbol| symbol.to_string())
+                .collect()
+        };
         let feed = Arc::new(Self {
-            symbols: config.market_symbols.clone(),
+            symbols,
+            manual_symbols: config.market_symbols_manual,
+            watched: RwLock::new(Vec::new()),
+            rest_cursor: AtomicUsize::new(0),
+            fees: RwLock::new(config.fees),
+            last_funding: RwLock::new(HashMap::new()),
+            funding_jump_pct: config.risk_guard.funding_jump_pct,
             poll,
             ws_max_age: poll * 2,
             binance,
@@ -588,9 +621,6 @@ impl MarketFeed {
             aster,
             hyperliquid,
             lighter,
-            htx,
-            mexc,
-            bingx,
             perp_venues,
             realtime,
             store,
@@ -602,9 +632,15 @@ impl MarketFeed {
             funding: RwLock::new(None),
         });
 
-        if feed.symbols.is_empty() || (feed.perp_venues.is_empty() && feed.realtime.is_none()) {
-            tracing::info!("盘口采集已停用（检查 ARBPILOT_BINANCE_* / ARBPILOT_OKX_* 与 ARBPILOT_MARKET_SYMBOLS）");
+        if feed.perp_venues.is_empty() && feed.realtime.is_none() {
+            tracing::info!("盘口采集已停用（检查 ARBPILOT_BINANCE_* / ARBPILOT_OKX_* 等交易所开关）");
             return feed;
+        }
+
+        if feed.manual_symbols {
+            tracing::info!(symbols = ?feed.symbols, "盘口采集按显式清单启动（ARBPILOT_MARKET_SYMBOLS）");
+        } else {
+            tracing::info!("盘口采集将跟随资金费率发现结果，覆盖全部已接入的 USDT 永续");
         }
 
         tracing::info!(
@@ -618,9 +654,6 @@ impl MarketFeed {
             aster_enabled = feed.aster.is_some(),
             hyperliquid_enabled = feed.hyperliquid.is_some(),
             lighter_enabled = feed.lighter.is_some(),
-            htx_enabled = feed.htx.is_some(),
-            mexc_enabled = feed.mexc.is_some(),
-            bingx_enabled = feed.bingx.is_some(),
             perp_venues = ?feed.perp_venues,
             websocket = feed.realtime.is_some(),
             symbols = ?feed.symbols,
@@ -680,6 +713,101 @@ impl MarketFeed {
     /// 绑定资金费率采集器，用于读取各合约的结算间隔并归一费率。
     pub fn attach_funding(&self, funding: Arc<FundingFeed>) {
         *self.funding.write().expect("行情资金费率锁不可用") = Some(funding);
+    }
+
+    /// 当前机会成本使用的费率档位。
+    pub fn fees(&self) -> FeeConfig {
+        *self.fees.read().expect("费率锁不可用")
+    }
+
+    /// 设置页修改费率后立即重算机会，无需重启。
+    pub fn set_fees(&self, fees: FeeConfig) {
+        *self.fees.write().expect("费率锁不可用") = fees;
+    }
+
+    /// 资金费率突变检测：年化跳变超过阈值时请求停摆（带上一轮值便于人工判断）。
+    fn check_funding_jumps(
+        &self,
+        funding: &[FundingRate],
+        intervals: &HashMap<(String, String), i64>,
+    ) {
+        let threshold = self.funding_jump_pct;
+        if threshold <= Decimal::ZERO {
+            return;
+        }
+        let mut current = HashMap::with_capacity(funding.len());
+        let mut halt: Option<(String, Decimal, Decimal)> = None;
+        {
+            let previous = self
+                .last_funding
+                .read()
+                .expect("资金费率突变锁不可用");
+            for row in funding {
+                let key = (row.venue.clone(), row.symbol.clone());
+                let interval = intervals
+                    .get(&key)
+                    .copied()
+                    .unwrap_or(FUNDING_TARGET_INTERVAL_SECS);
+                let annualized = annualize(row.funding_rate, interval);
+                if let Some(before) = previous.get(&key) {
+                    let jump = (annualized - *before).abs();
+                    if jump >= threshold && halt.is_none() {
+                        halt = Some((format!("{}/{}", row.venue, row.symbol), *before, annualized));
+                    }
+                }
+                current.insert(key, annualized);
+            }
+        }
+        *self.last_funding.write().expect("资金费率突变锁不可用") = current;
+        if let Some((symbol, before, after)) = halt {
+            tracing::warn!(%symbol, %before, %after, "资金费率年化突变，暂停开仓");
+            let _ = self.events.send(ExecutorEvent::RiskHalt {
+                reason: format!(
+                    "资金费率年化突变：{symbol} 从 {before}% 变为 {after}%"
+                ),
+                reason_en: format!(
+                    "Funding rate jump: {symbol} moved from {before}% to {after}%"
+                ),
+                at: Utc::now(),
+            });
+        }
+    }
+
+    /// 本轮要扫描的合约：手动模式用显式清单，自动模式跟随资金费率发现结果。
+    fn watchlist(&self) -> Vec<String> {
+        if self.manual_symbols {
+            return self.symbols.clone();
+        }
+        let discovered = self
+            .funding
+            .read()
+            .expect("行情资金费率锁不可用")
+            .as_ref()
+            .map(|feed| feed.traded_symbols())
+            .unwrap_or_default();
+        if discovered.is_empty() {
+            return self.symbols.clone();
+        }
+        discovered
+    }
+
+    /// 订阅清单变化时增量扩展 WebSocket；同一批交易对重复订阅由实时层去重。
+    fn sync_watchlist(&self, symbols: &[String]) {
+        let changed = {
+            let watched = self.watched.read().expect("行情订阅锁不可用");
+            *watched != symbols
+        };
+        if !changed {
+            return;
+        }
+        for &venue in &self.perp_venues {
+            self.watch_symbols(venue, symbols);
+        }
+        // 现货腿只为交割基差服务，仍按显式清单订阅。
+        for venue in SPOT_VENUES {
+            self.watch_symbols(venue, &self.symbols);
+        }
+        *self.watched.write().expect("行情订阅锁不可用") = symbols.to_vec();
     }
 
     pub fn quote(&self, venue: &str, symbol: &str) -> Option<Quote> {
@@ -878,6 +1006,50 @@ impl MarketFeed {
                     .await
                     .map_err(|error| anyhow!("K 线任务异常退出: {error}"))?
             }
+            GATE_SPOT_VENUE => {
+                let client = self
+                    .gate
+                    .clone()
+                    .ok_or_else(|| anyhow!("Gate 行情客户端未启用"))?;
+                tokio::task::spawn_blocking(move || {
+                    client.spot_candles(&symbol, &native, fetch_limit)
+                })
+                .await
+                .map_err(|error| anyhow!("K 线任务异常退出: {error}"))?
+            }
+            BITGET_SPOT_VENUE => {
+                let client = self
+                    .bitget
+                    .clone()
+                    .ok_or_else(|| anyhow!("Bitget 行情客户端未启用"))?;
+                tokio::task::spawn_blocking(move || {
+                    client.spot_candles(&symbol, &native, fetch_limit)
+                })
+                .await
+                .map_err(|error| anyhow!("K 线任务异常退出: {error}"))?
+            }
+            HYPERLIQUID_SPOT_VENUE => {
+                let client = self
+                    .hyperliquid
+                    .clone()
+                    .ok_or_else(|| anyhow!("Hyperliquid 行情客户端未启用"))?;
+                tokio::task::spawn_blocking(move || {
+                    client.spot_candles(&symbol, &native, fetch_limit)
+                })
+                .await
+                .map_err(|error| anyhow!("K 线任务异常退出: {error}"))?
+            }
+            LIGHTER_SPOT_VENUE => {
+                let client = self
+                    .lighter
+                    .clone()
+                    .ok_or_else(|| anyhow!("Lighter 行情客户端未启用"))?;
+                tokio::task::spawn_blocking(move || {
+                    client.spot_candles(&symbol, &native, fetch_limit)
+                })
+                .await
+                .map_err(|error| anyhow!("K 线任务异常退出: {error}"))?
+            }
             other => bail!("{other} 暂不支持 K 线"),
         }?;
 
@@ -900,6 +1072,16 @@ impl MarketFeed {
         let symbol = normalize_symbol(symbol)?;
         let limit = limit.clamp(1, 200);
         let requested = venue.trim().to_ascii_lowercase();
+        // WebSocket 增量盘口优先：延迟低于 REST，且能提供上百档。
+        if let Some(book) = self.fresh_l2(&requested, &symbol) {
+            return Ok(DepthSnapshot {
+                venue: requested,
+                symbol,
+                bids: book.bids.into_iter().take(limit as usize).collect(),
+                asks: book.asks.into_iter().take(limit as usize).collect(),
+                observed_at: book.observed_at,
+            });
+        }
         let segment = if requested.ends_with("-spot") {
             Segment::Spot
         } else {
@@ -914,9 +1096,6 @@ impl MarketFeed {
             aster: self.aster.clone(),
             hyperliquid: self.hyperliquid.clone(),
             lighter: self.lighter.clone(),
-            htx: self.htx.clone(),
-            mexc: self.mexc.clone(),
-            bingx: self.bingx.clone(),
         };
         let target = requested.clone();
         let mut snapshot =
@@ -928,6 +1107,76 @@ impl MarketFeed {
         snapshot.bids.truncate(limit as usize);
         snapshot.asks.truncate(limit as usize);
         Ok(snapshot)
+    }
+
+    /// 读取新鲜的 L2 盘口：10 秒内更新过且买卖两侧都有挂单。
+    fn fresh_l2(&self, venue: &str, symbol: &str) -> Option<L2Book> {
+        let book = self.realtime.as_ref()?.l2(venue, symbol)?;
+        let age = (Utc::now() - book.observed_at).num_seconds();
+        (age >= 0 && age <= 10 && !book.bids.is_empty() && !book.asks.is_empty())
+            .then_some(book)
+    }
+
+    /// L2 盘口优先，缺失时回退到 REST 多档盘口。
+    async fn l2_or_depth(&self, venue: &str, symbol: &str) -> anyhow::Result<L2Book> {
+        if let Some(book) = self.fresh_l2(venue, symbol) {
+            return Ok(book);
+        }
+        let snapshot = self.depth(venue, symbol, 200).await?;
+        Ok(L2Book {
+            venue: venue.to_string(),
+            symbol: symbol.to_string(),
+            bids: snapshot.bids,
+            asks: snapshot.asks,
+            last_update_id: None,
+            observed_at: snapshot.observed_at,
+        })
+    }
+
+    /// 最近 `limit` 笔逐笔成交，用于观察主动买卖流。
+    pub async fn trades(
+        &self,
+        venue: &str,
+        symbol: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<TradeTick>> {
+        let symbol = normalize_symbol(symbol)?;
+        let requested = venue.trim().to_ascii_lowercase();
+        let Some(realtime) = self.realtime.as_ref() else {
+            return Ok(Vec::new());
+        };
+        Ok(realtime.trades(&requested, &symbol, limit))
+    }
+
+    /// 按目标名义额估算吃单滑点与冲击成本。
+    pub async fn slippage(
+        &self,
+        venue: &str,
+        symbol: &str,
+        side: OrderSide,
+        notional_usd: Decimal,
+    ) -> anyhow::Result<SlippageEstimate> {
+        let symbol = normalize_symbol(symbol)?;
+        let requested = venue.trim().to_ascii_lowercase();
+        let book = self.l2_or_depth(&requested, &symbol).await?;
+        estimate_slippage(&book, side, notional_usd)
+            .ok_or_else(|| anyhow!("{requested} {symbol} 盘口没有可成交深度"))
+    }
+
+    /// 判断 maker-first（挂单等待）相对吃单是否有正收益。
+    pub async fn maker_first(
+        &self,
+        venue: &str,
+        symbol: &str,
+        taker_fee_bps: Decimal,
+        maker_fee_bps: Decimal,
+        adverse_buffer_bps: Decimal,
+    ) -> anyhow::Result<MakerFirstAssessment> {
+        let symbol = normalize_symbol(symbol)?;
+        let requested = venue.trim().to_ascii_lowercase();
+        let book = self.l2_or_depth(&requested, &symbol).await?;
+        assess_maker_first(&book, taker_fee_bps, maker_fee_bps, adverse_buffer_bps)
+            .ok_or_else(|| anyhow!("{requested} {symbol} 盘口数据不足，无法判断 maker-first"))
     }
 
     /// 某交易所某交易对的最小下单限制，供桌面端展示与校验。
@@ -954,9 +1203,6 @@ impl MarketFeed {
             aster: self.aster.clone(),
             hyperliquid: self.hyperliquid.clone(),
             lighter: self.lighter.clone(),
-            htx: self.htx.clone(),
-            mexc: self.mexc.clone(),
-            bingx: self.bingx.clone(),
         };
         let target = requested.clone();
         tokio::task::spawn_blocking(move || clients.min_order(&target, &symbol, segment))
@@ -986,9 +1232,6 @@ impl MarketFeed {
             aster: self.aster.clone(),
             hyperliquid: self.hyperliquid.clone(),
             lighter: self.lighter.clone(),
-            htx: self.htx.clone(),
-            mexc: self.mexc.clone(),
-            bingx: self.bingx.clone(),
         };
         let target = requested.clone();
         let symbol_for_client = symbol.clone();
@@ -1129,6 +1372,9 @@ impl MarketFeed {
         }
 
         let now = Utc::now();
+        // 自动模式下清单来自资金费率发现结果；变化时先扩展 WebSocket 订阅。
+        let symbols = self.watchlist();
+        self.sync_watchlist(&symbols);
         let pushed = self
             .realtime
             .as_ref()
@@ -1138,16 +1384,19 @@ impl MarketFeed {
         // 先取 WebSocket 快照，缺失或过期（例如刚启动、断线）的腿才走 REST。
         let mut latest: HashMap<(String, String), Book> = HashMap::new();
         let mut stale: Vec<(String, String, Segment)> = Vec::new();
-        for symbol in &self.symbols {
+        for symbol in &symbols {
             let mut legs: Vec<(&str, Segment)> = Vec::new();
-            if self.binance.is_some() {
-                legs.push((SPOT_VENUE, Segment::Spot));
-            }
-            if self.okx.is_some() {
-                legs.push((OKX_SPOT_VENUE, Segment::Spot));
-            }
-            if self.bybit.is_some() {
-                legs.push((BYBIT_SPOT_VENUE, Segment::Spot));
+            // 现货腿只为交割基差服务，只订阅显式清单中的币种，避免全市场请求。
+            if self.symbols.contains(symbol) {
+                if self.binance.is_some() {
+                    legs.push((SPOT_VENUE, Segment::Spot));
+                }
+                if self.okx.is_some() {
+                    legs.push((OKX_SPOT_VENUE, Segment::Spot));
+                }
+                if self.bybit.is_some() {
+                    legs.push((BYBIT_SPOT_VENUE, Segment::Spot));
+                }
             }
             for &venue in &self.perp_venues {
                 legs.push((venue, Segment::Swap));
@@ -1187,6 +1436,17 @@ impl MarketFeed {
             ));
         }
 
+        // 全市场合约靠 WebSocket 覆盖，REST 只补缺失的腿；按游标轮转，避免饿死后面的合约。
+        if stale.len() > REST_FALLBACK_BUDGET {
+            stale.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+            stale.dedup();
+            let len = stale.len();
+            let start = self.rest_cursor.fetch_add(REST_FALLBACK_BUDGET, Ordering::Relaxed);
+            stale = (0..REST_FALLBACK_BUDGET)
+                .map(|offset| stale[(start + offset) % len].clone())
+                .collect();
+        }
+
         if !stale.is_empty() {
             let clients = BookClients {
                 binance: self.binance.clone(),
@@ -1197,9 +1457,6 @@ impl MarketFeed {
                 aster: self.aster.clone(),
                 hyperliquid: self.hyperliquid.clone(),
                 lighter: self.lighter.clone(),
-                htx: self.htx.clone(),
-                mexc: self.mexc.clone(),
-                bingx: self.bingx.clone(),
             };
             let fetched = tokio::task::spawn_blocking(move || {
                 let mut books = Vec::new();
@@ -1240,7 +1497,7 @@ impl MarketFeed {
 
         let mut funding = Vec::new();
         for &venue in &self.perp_venues {
-            match self.store.funding_latest(venue, &self.symbols).await {
+            match self.store.funding_latest(venue, &symbols).await {
                 Ok(rows) => funding.extend(rows),
                 Err(error) => tracing::warn!(%error, venue, "读取最新资金费率失败"),
             }
@@ -1252,17 +1509,31 @@ impl MarketFeed {
             .as_ref()
             .map(|feed| feed.intervals())
             .unwrap_or_default();
+        // 资金费率突变检测：极端跳变往往意味着行情或数据源异常，先停摆再排查。
+        self.check_funding_jumps(&funding, &intervals);
 
-        let mut opportunities =
-            perp_perp_opportunities(&latest, &funding, &intervals, now, self.poll.as_secs());
-        // 各所结算间隔不同（Hyperliquid 1h、多数 CEX 8h），只按年化收益排序。
+        let fees = self.fees();
+        let mut opportunities = perp_perp_opportunities(
+            &latest,
+            &funding,
+            &intervals,
+            now,
+            self.poll.as_secs(),
+            &fees,
+        );
+        // 按「扣费后每期净收益 × 可执行金额」排序：先看真实可赚的钱，再看年化。
         opportunities.sort_by(|a, b| {
-            b.funding_annualized_pct
-                .unwrap_or_default()
-                .cmp(&a.funding_annualized_pct.unwrap_or_default())
+            let score = |item: &Opportunity| item.net_edge_bps * item.max_notional_usd;
+            score(b)
+                .cmp(&score(a))
+                .then_with(|| {
+                    b.funding_annualized_pct
+                        .unwrap_or_default()
+                        .cmp(&a.funding_annualized_pct.unwrap_or_default())
+                })
         });
         // 交割基差单独成表，按年化基差从高到低排序。
-        let basis = basis_opportunities(&latest, &delivery, now, self.poll.as_secs());
+        let basis = basis_opportunities(&latest, &delivery, now, self.poll.as_secs(), &fees);
 
         // 先按通知设置推送资金费率机会，再把本轮结果写入行情快照。
         let notifier = self.notifier.read().expect("行情通知锁不可用").clone();
@@ -1310,10 +1581,11 @@ fn basis_opportunities(
     contracts: &[DeliveryContract],
     now: DateTime<Utc>,
     poll_secs: u64,
+    fees: &FeeConfig,
 ) -> Vec<Opportunity> {
     let expires_at = now + ChronoDuration::seconds((poll_secs as i64 * 2).max(10));
-    let fee_bps = Decimal::from(LEG_FEE_BPS * 2);
-    let slippage_bps = Decimal::from(SLIPPAGE_BPS);
+    let fee_bps = fees.taker_bps * Decimal::from(2);
+    let slippage_bps = fees.slippage_bps;
     let seconds_per_day = 86_400;
     let year_days = Decimal::from(365);
 
@@ -1389,10 +1661,11 @@ fn perp_perp_opportunities(
     intervals: &HashMap<(String, String), i64>,
     now: DateTime<Utc>,
     poll_secs: u64,
+    fees: &FeeConfig,
 ) -> Vec<Opportunity> {
     let expires_at = now + ChronoDuration::seconds((poll_secs as i64 * 2).max(10));
-    let fee_bps = Decimal::from(LEG_FEE_BPS * 2);
-    let slippage_bps = Decimal::from(SLIPPAGE_BPS);
+    let fee_bps = fees.taker_bps * Decimal::from(2);
+    let slippage_bps = fees.slippage_bps;
 
     // 同一交易对在各交易所的当期费率与结算间隔。
     let mut by_symbol: HashMap<&str, Vec<(&str, Decimal, i64)>> = HashMap::new();
@@ -1582,7 +1855,7 @@ mod tests {
             funding("bybit", dec!(0.0003)),
         ];
         let opportunities =
-            perp_perp_opportunities(&books, &funding, &HashMap::new(), Utc::now(), 60);
+            perp_perp_opportunities(&books, &funding, &HashMap::new(), Utc::now(), 60, &FeeConfig::default());
 
         assert_eq!(opportunities.len(), 1);
         let opportunity = &opportunities[0];
@@ -1614,7 +1887,7 @@ mod tests {
         ];
         let intervals = HashMap::from([(("bybit".to_string(), "BTCUSDT".to_string()), 4 * 3600)]);
 
-        let opportunities = perp_perp_opportunities(&books, &funding, &intervals, Utc::now(), 60);
+        let opportunities = perp_perp_opportunities(&books, &funding, &intervals, Utc::now(), 60, &FeeConfig::default());
 
         assert_eq!(opportunities.len(), 1);
         assert_eq!(opportunities[0].gross_spread_bps, dec!(2));
@@ -1641,7 +1914,7 @@ mod tests {
             (("hyperliquid".to_string(), "BTCUSDT".to_string()), 3600),
         ]);
 
-        let opportunities = perp_perp_opportunities(&books, &funding, &intervals, Utc::now(), 60);
+        let opportunities = perp_perp_opportunities(&books, &funding, &intervals, Utc::now(), 60, &FeeConfig::default());
 
         assert_eq!(opportunities.len(), 1);
         let opportunity = &opportunities[0];
@@ -1661,7 +1934,7 @@ mod tests {
         ];
 
         assert!(
-            perp_perp_opportunities(&books, &funding, &HashMap::new(), Utc::now(), 60).is_empty()
+            perp_perp_opportunities(&books, &funding, &HashMap::new(), Utc::now(), 60, &FeeConfig::default()).is_empty()
         );
     }
 
@@ -1679,7 +1952,7 @@ mod tests {
         ];
 
         assert!(
-            perp_perp_opportunities(&books, &funding, &HashMap::new(), Utc::now(), 60).is_empty()
+            perp_perp_opportunities(&books, &funding, &HashMap::new(), Utc::now(), 60, &FeeConfig::default()).is_empty()
         );
     }
 
@@ -1711,7 +1984,7 @@ mod tests {
     fn builds_delivery_basis_opportunity() {
         // 现货卖一 101，交割买一 103：基差 2/101 ≈ 198.02 bps，剩余 365 天 → 年化 1.98%。
         let books = basis_books(dec!(101), dec!(103));
-        let opportunities = basis_opportunities(&books, &[delivery_contract(365)], Utc::now(), 60);
+        let opportunities = basis_opportunities(&books, &[delivery_contract(365)], Utc::now(), 60, &FeeConfig::default());
 
         assert_eq!(opportunities.len(), 1);
         let opportunity = &opportunities[0];
@@ -1734,12 +2007,12 @@ mod tests {
     fn skips_backwardated_delivery() {
         // 交割买一低于现货卖一，现货腿无法做空，不构成基差机会。
         let books = basis_books(dec!(101), dec!(100));
-        assert!(basis_opportunities(&books, &[delivery_contract(365)], Utc::now(), 60).is_empty());
+        assert!(basis_opportunities(&books, &[delivery_contract(365)], Utc::now(), 60, &FeeConfig::default()).is_empty());
     }
 
     #[test]
     fn skips_delivery_near_expiry() {
         let books = basis_books(dec!(101), dec!(103));
-        assert!(basis_opportunities(&books, &[delivery_contract(0)], Utc::now(), 60).is_empty());
+        assert!(basis_opportunities(&books, &[delivery_contract(0)], Utc::now(), 60, &FeeConfig::default()).is_empty());
     }
 }

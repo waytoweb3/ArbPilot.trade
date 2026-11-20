@@ -172,7 +172,7 @@ impl WebSocket {
 #[derive(Debug, PartialEq, Eq)]
 pub enum WsEvent {
     Text(String),
-    /// 二进制消息（部分交易所如 HTX / BingX 用 gzip 压缩后再以二进制帧下发）。
+    /// 二进制消息（部分交易所用 gzip 压缩后再以二进制帧下发）。
     Binary(Vec<u8>),
     Ping(Vec<u8>),
     Close,
