@@ -2,7 +2,11 @@ import { useEffect, useState, type ReactNode } from "react";
 import { Link } from "react-router-dom";
 
 import { useI18n } from "../lib/i18n";
-import { APP_VERSION, DISCORD_URL, DOWNLOAD_BASE } from "../lib/links";
+import {
+  APP_VERSION,
+  DISCORD_URL,
+  DOWNLOAD_VERSION_PATH,
+} from "../lib/links";
 
 function SectionHeading({
   eyebrow,
@@ -344,7 +348,7 @@ function ChecksumRow({
   const { t } = useI18n();
   const [copied, setCopied] = useState(false);
   const sumsName = `SHA256SUMS-${platform}.txt`;
-  const sumsUrl = `${DOWNLOAD_BASE}/desktop/${sumsName}`;
+  const sumsUrl = `${DOWNLOAD_VERSION_PATH}/${sumsName}`;
 
   const copy = async () => {
     if (!hash) return;
@@ -397,14 +401,14 @@ export function DownloadSection() {
       platform: "macos" as const,
       name: t.download.macos,
       detail: t.download.macosArm,
-      file: `${DOWNLOAD_BASE}/desktop/${macosFile}`,
+      file: `${DOWNLOAD_VERSION_PATH}/${macosFile}`,
       fileName: macosFile,
     },
     {
       platform: "windows" as const,
       name: t.download.windows,
       detail: t.download.windowsDesc,
-      file: `${DOWNLOAD_BASE}/desktop/${windowsFile}`,
+      file: `${DOWNLOAD_VERSION_PATH}/${windowsFile}`,
       fileName: windowsFile,
     },
   ];
@@ -413,7 +417,7 @@ export function DownloadSection() {
     let alive = true;
     const sums = ["macos", "windows"].map(async (platform) => {
       try {
-        const res = await fetch(`${DOWNLOAD_BASE}/desktop/SHA256SUMS-${platform}.txt`, {
+        const res = await fetch(`${DOWNLOAD_VERSION_PATH}/SHA256SUMS-${platform}.txt`, {
           cache: "no-store",
         });
         return res.ok ? await res.text() : "";
