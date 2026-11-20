@@ -18,7 +18,7 @@ jobs:
   build:
     runs-on: windows-latest
     permissions:
-      contents: read
+      contents: write
     steps:
       # 仓库里的 .sh 都是 LF，Windows runner 默认的换行转换会让 bash 执行失败。
       - run: git config --global core.autocrlf false
@@ -67,7 +67,10 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: pnpm tauri build --bundles nsis
 
+      # Windows 默认 shell 是 pwsh，find 会解析到 Windows 自带的 find.exe；
+      # 这里显式用 bash，才能拿到真实产物清单。
       - name: 列出打包产物
+        shell: bash
         run: find target/release/bundle -maxdepth 2 -type f | sort
 
       - name: 生成 latest.json
@@ -164,3 +167,17 @@ jobs:
           name: arbpilot-desktop-windows
           path: dist/desktop/
           if-no-files-found: error
+
+      # 打标签时同步发布到 GitHub Release，作为下载站不可达时的备用渠道。
+      - name: 发布 GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="$GITHUB_REF_NAME"
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" --title "ArbPilot $tag" \
+              --notes "安装包见下方 Assets；自动更新清单：https://download.arbpilot.trade/desktop/latest.json"
+          fi
+          gh release upload "$tag" dist/desktop/* --clobber

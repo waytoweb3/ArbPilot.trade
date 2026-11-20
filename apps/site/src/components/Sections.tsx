@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { Link } from "react-router-dom";
 
 import { useI18n } from "../lib/i18n";
@@ -326,21 +326,114 @@ export function StrategySection() {
   );
 }
 
+/** 从 `sha256  filename` 行里收集安装包哈希，供下载卡片展示。 */
+function collectSums(text: string, into: Record<string, string>) {
+  for (const line of text.split(/\r?\n/)) {
+    const match = line.trim().match(/^([0-9a-f]{64})\s+\*?(.+)$/i);
+    if (match) into[match[2]] = match[1].toLowerCase();
+  }
+}
+
+function ChecksumRow({
+  platform,
+  hash,
+}: {
+  platform: "macos" | "windows";
+  hash?: string;
+}) {
+  const { t } = useI18n();
+  const [copied, setCopied] = useState(false);
+  const sumsName = `SHA256SUMS-${platform}.txt`;
+  const sumsUrl = `${DOWNLOAD_BASE}/desktop/${sumsName}`;
+
+  const copy = async () => {
+    if (!hash) return;
+    try {
+      await navigator.clipboard.writeText(hash);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1500);
+    } catch {
+      // 剪贴板不可用（非 https 或未授权）时保留明文，用户可手动选择。
+    }
+  };
+
+  return (
+    <div className="mt-2.5 flex items-start gap-2 border-t border-line/70 pt-2.5">
+      <span className="shrink-0 pt-0.5 font-mono text-[9px] uppercase tracking-[0.1em] text-subtle">
+        SHA-256
+      </span>
+      {hash ? (
+        <>
+          <code className="break-all font-mono text-[10px] leading-[1.6] text-muted">{hash}</code>
+          <button
+            type="button"
+            onClick={copy}
+            className="ml-auto shrink-0 rounded border border-line px-1.5 py-0.5 text-[9.5px] text-subtle transition-colors hover:border-accent/40 hover:text-accent"
+          >
+            {copied ? t.download.copied : t.download.copy}
+          </button>
+        </>
+      ) : (
+        <a
+          href={sumsUrl}
+          className="font-mono text-[10px] text-subtle underline decoration-line underline-offset-2 transition-colors hover:text-accent"
+        >
+          {sumsName}
+        </a>
+      )}
+    </div>
+  );
+}
+
 export function DownloadSection() {
   const { t } = useI18n();
+  const [hashes, setHashes] = useState<Record<string, string>>({});
+
+  const macosFile = `ArbPilot_${APP_VERSION}_aarch64.dmg`;
+  const windowsFile = `ArbPilot_${APP_VERSION}_x64-setup.exe`;
 
   const builds = [
     {
-      platform: t.download.macos,
+      platform: "macos" as const,
+      name: t.download.macos,
       detail: t.download.macosArm,
-      file: `${DOWNLOAD_BASE}/desktop/ArbPilot_${APP_VERSION}_aarch64.dmg`,
+      file: `${DOWNLOAD_BASE}/desktop/${macosFile}`,
+      fileName: macosFile,
     },
     {
-      platform: t.download.windows,
+      platform: "windows" as const,
+      name: t.download.windows,
       detail: t.download.windowsDesc,
-      file: `${DOWNLOAD_BASE}/desktop/ArbPilot_${APP_VERSION}_x64-setup.exe`,
+      file: `${DOWNLOAD_BASE}/desktop/${windowsFile}`,
+      fileName: windowsFile,
     },
   ];
+
+  useEffect(() => {
+    let alive = true;
+    const sums = ["macos", "windows"].map(async (platform) => {
+      try {
+        const res = await fetch(`${DOWNLOAD_BASE}/desktop/SHA256SUMS-${platform}.txt`, {
+          cache: "no-store",
+        });
+        return res.ok ? await res.text() : "";
+      } catch {
+        // 下载域名未开放跨域时读不到校验文件，卡片会退化为直链。
+        return "";
+      }
+    });
+
+    Promise.all(sums).then((texts) => {
+      if (!alive) return;
+      const next: Record<string, string> = {};
+      for (const text of texts) collectSums(text, next);
+      setHashes(next);
+    });
+
+    return () => {
+      alive = false;
+    };
+  }, []);
 
   return (
     <section id="download" className="scroll-mt-24 border-t border-line py-24">
@@ -370,22 +463,45 @@ export function DownloadSection() {
 
             <div className="mt-5 grid gap-2 sm:grid-cols-2">
               {builds.map((build) => (
-                <a
-                  key={build.file}
-                  href={build.file}
-                  className="group flex items-center justify-between gap-3 rounded-xl border border-line bg-panel-soft px-4 py-3 transition-colors hover:border-accent/40"
+                <div
+                  key={build.fileName}
+                  className="rounded-xl border border-line bg-panel-soft px-4 py-3"
                 >
-                  <span>
-                    <span className="block text-[13px] font-medium text-fg">{build.platform}</span>
-                    <span className="mt-0.5 block text-[11px] text-subtle">{build.detail}</span>
-                  </span>
-                  <span className="flex items-center gap-2 text-[11px] text-muted transition-colors group-hover:text-accent">
-                    {t.download.download}
-                    <span aria-hidden>↓</span>
-                  </span>
-                </a>
+                  <a
+                    href={build.file}
+                    className="group flex items-center justify-between gap-3"
+                  >
+                    <span>
+                      <span className="block text-[13px] font-medium text-fg">{build.name}</span>
+                      <span className="mt-0.5 block text-[11px] text-subtle">{build.detail}</span>
+                    </span>
+                    <span className="flex items-center gap-2 text-[11px] text-muted transition-colors group-hover:text-accent">
+                      {t.download.download}
+                      <span aria-hidden>↓</span>
+                    </span>
+                  </a>
+                  <ChecksumRow platform={build.platform} hash={hashes[build.fileName]} />
+                </div>
               ))}
             </div>
+
+            <details open className="mt-4 rounded-xl border border-line bg-panel-soft px-4 py-3">
+              <summary className="cursor-pointer text-[12px] font-medium text-fg">
+                {t.download.winTitle}
+              </summary>
+              <p className="mt-2 text-[10.5px] leading-relaxed text-subtle">{t.download.winDesc}</p>
+              <ol className="mt-2 space-y-1 text-[10.5px] leading-relaxed text-muted">
+                {t.download.winSteps.map((step, index) => (
+                  <li key={step} className="flex gap-2">
+                    <span className="font-mono text-[10px] text-subtle">{index + 1}.</span>
+                    <span>{step}</span>
+                  </li>
+                ))}
+              </ol>
+              <p className="mt-2 break-all font-mono text-[10px] leading-relaxed text-subtle">
+                {t.download.winVerify.replace("{file}", windowsFile)}
+              </p>
+            </details>
 
             <p className="mt-5 text-[10.5px] leading-relaxed text-subtle">{t.download.note}</p>
           </div>
