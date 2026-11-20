@@ -800,8 +800,29 @@ impl MarketFeed {
         if !changed {
             return;
         }
+        // 全局清单是跨所并集，而单个交易所只上架其中一部分。按各所自己的合约
+        // 清单过滤，避免向未上架的交易所订阅，导致「合约不存在」告警与 REST 回退。
+        let venue_lists = self
+            .funding
+            .read()
+            .expect("行情资金费率锁不可用")
+            .as_ref()
+            .map(|feed| feed.venue_symbols())
+            .unwrap_or_default();
         for &venue in &self.perp_venues {
-            self.watch_symbols(venue, symbols);
+            let own = venue_lists
+                .iter()
+                .find(|(name, _)| name == venue)
+                .map(|(_, list)| list);
+            let subscribed = match own {
+                Some(list) => symbols
+                    .iter()
+                    .filter(|symbol| list.contains(symbol))
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                None => symbols.to_vec(),
+            };
+            self.watch_symbols(venue, &subscribed);
         }
         // 现货腿只为交割基差服务，仍按显式清单订阅。
         for venue in SPOT_VENUES {
