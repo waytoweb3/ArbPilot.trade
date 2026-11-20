@@ -141,7 +141,9 @@ jobs:
               if (published.version === version && published.platforms) {
                 platforms = published.platforms;
               }
-            } else if (response.status !== 404) {
+            } else if (![403, 404].includes(response.status)) {
+              // 403 多为 Cloudflare 拦截 runner 出口 IP：此时无法合并其它平台，
+              // 由发布流程在服务器上合并，不应让整个打包失败。
               throw new Error(`读取线上 latest.json 失败：HTTP ${response.status}`);
             }
             platforms[platform] = {
