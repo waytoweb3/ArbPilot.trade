@@ -1505,8 +1505,18 @@ impl MarketFeed {
             match fetched {
                 Ok((books, errors)) => {
                     if !errors.is_empty() {
-                        let message = errors.join("; ");
-                        tracing::warn!(%message, "盘口 REST 兜底部分失败");
+                        // 全市场扫描后失败项可能有上千条，整串写入会让日志迅速膨胀。
+                        let sample = errors
+                            .iter()
+                            .take(5)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join("; ");
+                        tracing::warn!(
+                            failed = errors.len(),
+                            sample = %sample,
+                            "盘口 REST 兜底部分失败（仅列前 5 条）"
+                        );
                     }
                     for book in books {
                         latest.insert((book.quote.venue.clone(), book.quote.symbol.clone()), book);
