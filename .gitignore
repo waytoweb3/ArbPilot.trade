@@ -18,6 +18,9 @@ apps/desktop/src-tauri/binaries/
 apps/payments/.data/
 # 执行器运行期数据（账户凭证、风控限额、Telegram 绑定）
 data/
+# 升级前的数据库备份与 TLS 证书
+deploy/backups/
+deploy/certs/
 
 # 日志与临时文件
 *.log

@@ -44,14 +44,31 @@ services:
       ARBPILOT_TELEGRAM_BOT_TOKEN: ${ARBPILOT_TELEGRAM_BOT_TOKEN:-}
       ARBPILOT_TELEGRAM_ENABLED: ${ARBPILOT_TELEGRAM_ENABLED:-true}
       ARBPILOT_TELEGRAM_API_BASE: ${ARBPILOT_TELEGRAM_API_BASE:-https://api.telegram.org}
+      # 允许访问执行器 API 的前端来源，逗号分隔；不再接受通配符。
+      ARBPILOT_CORS_ORIGINS: ${ARBPILOT_CORS_ORIGINS:-}
+      # 内置 TLS：证书与私钥必须同时配置，容器内路径固定挂载在 /certs。
+      ARBPILOT_TLS_CERT_FILE: ${ARBPILOT_TLS_CERT_FILE:-}
+      ARBPILOT_TLS_KEY_FILE: ${ARBPILOT_TLS_KEY_FILE:-}
+      # 健康检查地址由 install.sh 根据 TLS 开关写入。
+      ARBPILOT_HEALTHCHECK_URL: ${ARBPILOT_HEALTHCHECK_URL:-http://127.0.0.1:8787/api/v1/health}
       RUST_LOG: info,arbpilot_executor=debug
     # 账户凭证、风控限额与 Telegram 绑定都在 data/ 下，必须持久化。
     volumes:
       - arbpilot-data:/data
+      # TLS 证书目录只读挂载；未配置 TLS 时这里为空目录，不影响启动。
+      - ${ARBPILOT_CERT_DIR:-./certs}:/certs:ro
     # 默认只绑定回环地址，桌面端通过 SSH 隧道连接；
     # 需要让桌面端直接用服务器 IP 访问时，设置 ARBPILOT_EXECUTOR_HOST=0.0.0.0 并放行端口。
     ports:
       - "${ARBPILOT_EXECUTOR_HOST:-127.0.0.1}:${ARBPILOT_EXECUTOR_PORT:-8787}:8787"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsSk \"$${ARBPILOT_HEALTHCHECK_URL}\" >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    # 给撤单、平仓等收尾动作留出时间，避免升级时被立即 SIGKILL。
+    stop_grace_period: 30s
 
 volumes:
   arbpilot-pgdata:

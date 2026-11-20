@@ -1,0 +1,154 @@
+name: desktop-macos
+
+# macOS 安装包必须在 macOS runner 上构建：dmg 需要 hdiutil，通用二进制需要 Apple 工具链。
+# 产物：dmg 安装包、更新包、更新签名与 latest.json，上传到 download.arbpilot.trade/desktop/。
+on:
+  workflow_dispatch:
+    inputs:
+      notes:
+        description: 更新说明（写入 latest.json，客户端更新卡片会显示）
+        required: false
+        default: ""
+  push:
+    tags:
+      - "desktop-v*"
+
+jobs:
+  build:
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.16.1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+
+      - name: 安装依赖
+        run: pnpm install --frozen-lockfile
+
+      # 桌面端启动时拉起执行器 sidecar，安装包必须把它一起打进去。
+      - name: 构建执行器 sidecar
+        run: bash deploy/prepare-sidecar.sh release
+
+      - name: 检查更新签名密钥
+        env:
+          KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          [ -n "$KEY" ] || {
+            echo "缺少仓库 Secret：TAURI_SIGNING_PRIVATE_KEY" >&2
+            exit 1
+          }
+
+      - name: 打包 macOS 安装包
+        working-directory: apps/desktop
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # 未配置 Apple Developer 证书时退化为 ad-hoc 签名；配置后自动使用正式证书。
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: pnpm tauri build --bundles dmg
+
+      - name: 生成 latest.json
+        env:
+          ARBPILOT_DESKTOP_NOTES: ${{ inputs.notes }}
+        run: |
+          node - <<'NODE'
+          const fs = require("fs");
+          const path = require("path");
+
+          (async () => {
+            const version = JSON.parse(
+              fs.readFileSync("apps/desktop/src-tauri/tauri.conf.json", "utf8"),
+            ).version;
+            const outDir = "dist/desktop";
+            const bundleRoot = "target/release/bundle";
+            const arch = process.arch === "arm64" ? "aarch64" : "x64";
+            const platform = `darwin-${arch}`;
+
+            const dmgDir = path.join(bundleRoot, "dmg");
+            const dmg = fs.readdirSync(dmgDir).find((name) => name.endsWith(".dmg"));
+            if (!dmg) {
+              throw new Error(`未找到 dmg 安装包：${dmgDir}`);
+            }
+
+            // 更新包是 macos 目录下的 .app.tar.gz，签名与它同名加 .sig。
+            const macosDir = path.join(bundleRoot, "macos");
+            const updater = fs
+              .readdirSync(macosDir)
+              .find((name) => name.endsWith(".app.tar.gz"));
+            if (!updater) {
+              throw new Error(`未找到更新包：${macosDir}`);
+            }
+            const signature = fs
+              .readFileSync(path.join(macosDir, `${updater}.sig`), "utf8")
+              .trim();
+
+            fs.mkdirSync(outDir, { recursive: true });
+            fs.copyFileSync(path.join(dmgDir, dmg), path.join(outDir, dmg));
+            fs.copyFileSync(path.join(macosDir, updater), path.join(outDir, updater));
+            fs.copyFileSync(
+              path.join(macosDir, `${updater}.sig`),
+              path.join(outDir, `${updater}.sig`),
+            );
+
+            const baseUrl = "https://download.arbpilot.trade/desktop";
+            let platforms = {};
+            let response;
+            try {
+              response = await fetch(`${baseUrl}/latest.json`, { cache: "no-store" });
+            } catch (error) {
+              // 读不到线上清单就无法合并其它平台，直接失败，避免覆盖成不完整的清单。
+              throw new Error(`读取线上 latest.json 失败：${error.message}`);
+            }
+            if (response.ok) {
+              const published = await response.json();
+              if (published.version === version && published.platforms) {
+                platforms = published.platforms;
+              }
+            } else if (response.status !== 404) {
+              throw new Error(`读取线上 latest.json 失败：HTTP ${response.status}`);
+            }
+            platforms[platform] = {
+              signature,
+              url: `${baseUrl}/${updater}`,
+            };
+
+            const manifest = {
+              version,
+              notes: process.env.ARBPILOT_DESKTOP_NOTES || "",
+              pub_date: new Date().toISOString().replace(/\.\d+Z$/, "Z"),
+              platforms,
+            };
+            fs.writeFileSync(
+              path.join(outDir, "latest.json"),
+              `${JSON.stringify(manifest, null, 2)}\n`,
+            );
+          })();
+          NODE
+
+      - name: 校验 latest.json
+        run: node scripts/verify-update.js dist/desktop/latest.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arbpilot-desktop-macos
+          path: dist/desktop/
+          if-no-files-found: error

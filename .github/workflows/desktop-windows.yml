@@ -132,6 +132,9 @@ jobs:
           })();
           NODE
 
+      - name: 校验 latest.json
+        run: node scripts/verify-update.js dist/desktop/latest.json
+
       - uses: actions/upload-artifact@v4
         with:
           name: arbpilot-desktop-windows
