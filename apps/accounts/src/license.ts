@@ -5,6 +5,28 @@ import type { Entitlement } from "./store";
 
 export const LICENSE_TOKEN_PREFIX = "arb1";
 
+/** 已知付费套餐；未知套餐名不会写进令牌，避免脏数据放大权益。 */
+const KNOWN_PLANS = new Set(["arbitrage"]);
+
+/**
+ * 统一权益口径：
+ * - 只有 `active` / `canceling` 且未到期才有效；
+ * - `canceling` 表示已退订，但可用到当期结束（期末失效）；
+ * - `past_due` / `none` 一律不发放。
+ */
+export function effectivePlans(entitlement: Entitlement, now = Date.now()): string[] {
+  if (entitlement.status !== "active" && entitlement.status !== "canceling") {
+    return [];
+  }
+  if (entitlement.expiresAt) {
+    const expires = Date.parse(entitlement.expiresAt);
+    if (Number.isFinite(expires) && expires <= now) {
+      return [];
+    }
+  }
+  return entitlement.plans.filter((plan) => KNOWN_PLANS.has(plan));
+}
+
 export interface LicenseClaims {
   /** 用户 ID */
   sub: string;
@@ -37,7 +59,7 @@ export function issueLicenseToken(input: {
   const claims: LicenseClaims = {
     sub: input.userId,
     email: input.email,
-    plans: input.entitlement.plans,
+    plans: effectivePlans(input.entitlement),
     status: input.entitlement.status,
     iat: now,
     exp,

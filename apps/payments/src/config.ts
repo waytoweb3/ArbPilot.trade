@@ -69,6 +69,16 @@ export interface PlanDefinition {
   productId: string;
 }
 
+/** 套餐权益写死在代码里，避免上线后与文案、授权校验对不上。 */
+export interface PlanEntitlements {
+  /** null 表示不限设备：自托管用户可以在多台机器上连接同一个账号。 */
+  maxDevices: number | null;
+  /** 退订后可用到当期结束，不做按比例退款。 */
+  cancelPolicy: "period_end";
+  refundPolicy: "none";
+  features: string[];
+}
+
 export const config = {
   port,
   environment: process.env.WAFFO_ENVIRONMENT === "test" ? ("test" as const) : ("prod" as const),
@@ -124,4 +134,63 @@ export const plans: PlanDefinition[] = [
 
 export function findPlan(id: string): PlanDefinition | undefined {
   return plans.find((plan) => plan.id === id);
+}
+
+/** 已售套餐的权益：不限设备、期末失效、不退款。 */
+export const planEntitlements: Record<PlanId, PlanEntitlements> = {
+  arbitrage: {
+    maxDevices: null,
+    cancelPolicy: "period_end",
+    refundPolicy: "none",
+    features: [
+      "funding-scan",
+      "live-trading",
+      "remote-executor",
+      "telegram-alerts",
+      "listing-watch",
+      "strategy-market",
+    ],
+  },
+};
+
+export function findEntitlements(id: string): PlanEntitlements | undefined {
+  return plans.some((plan) => plan.id === id)
+    ? planEntitlements[id as PlanId]
+    : undefined;
+}
+
+/** 生产环境禁止沿用的开发默认值。 */
+const DEV_DEFAULTS = new Set(["dev-local-token", "dev-internal-token"]);
+
+/**
+ * 生产启动前自检：测试环境的密钥、开发令牌或本机地址一旦带进线上，
+ * 会出现「付了钱没开通」或把管理接口暴露给错误对象，这里直接拒绝启动。
+ */
+export function assertProductionConfig(): void {
+  if (config.environment !== "prod") {
+    console.warn(
+      "[payments] WAFFO_ENVIRONMENT=test：webhook 验签与收银台都指向测试环境，请勿用于正式收款",
+    );
+    return;
+  }
+
+  const errors: string[] = [];
+  if (!config.privateKey) {
+    errors.push("WAFFO_PRIVATE_KEY 未配置，无法创建收银台");
+  }
+  if (DEV_DEFAULTS.has(config.executorToken)) {
+    errors.push("EXECUTOR_TOKEN 仍是开发默认值");
+  }
+  if (DEV_DEFAULTS.has(config.accountsInternalToken)) {
+    errors.push("ACCOUNTS_INTERNAL_TOKEN 仍是开发默认值");
+  }
+  if (!config.siteUrl.startsWith("https://")) {
+    errors.push(`SITE_URL 必须是 https://（当前 ${config.siteUrl}）`);
+  }
+  if (!config.publicBaseUrl.startsWith("https://")) {
+    errors.push(`PUBLIC_BASE_URL 必须是 https://（当前 ${config.publicBaseUrl}）`);
+  }
+  if (errors.length > 0) {
+    throw new Error(`支付服务生产环境配置不完整：\n- ${errors.join("\n- ")}`);
+  }
 }

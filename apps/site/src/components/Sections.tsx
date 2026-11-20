@@ -333,12 +333,12 @@ export function DownloadSection() {
     {
       platform: t.download.macos,
       detail: t.download.macosArm,
-      file: `${DOWNLOAD_BASE}/ArbPilot_${APP_VERSION}_aarch64.dmg`,
+      file: `${DOWNLOAD_BASE}/desktop/ArbPilot_${APP_VERSION}_aarch64.dmg`,
     },
     {
       platform: t.download.windows,
       detail: t.download.windowsDesc,
-      file: `${DOWNLOAD_BASE}/ArbPilot_${APP_VERSION}_x64-setup.exe`,
+      file: `${DOWNLOAD_BASE}/desktop/ArbPilot_${APP_VERSION}_x64-setup.exe`,
     },
   ];
 

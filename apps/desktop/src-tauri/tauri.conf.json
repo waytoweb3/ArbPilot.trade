@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "ArbPilot",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "identifier": "trade.arbpilot.desktop",
   "build": {
     "beforeDevCommand": "pnpm dev",
@@ -33,9 +33,6 @@
     "createUpdaterArtifacts": true,
     "externalBin": ["binaries/arbpilot-executor"],
     "category": "Finance",
-    "macOS": {
-      "signingIdentity": "-"
-    },
     "shortDescription": "自托管套利与量化交易终端",
     "longDescription": "ArbPilot 是面向国际用户的自托管量化交易终端：资金与密钥留在用户自己的设备或服务器，桌面端负责配置与监控，所有订单统一经过执行器风控。",
     "icon": [

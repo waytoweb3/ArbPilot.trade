@@ -12,7 +12,7 @@ import {
   type CashierLanguage,
 } from "@waffo/pancake-ts";
 
-import { config, findPlan, plans } from "./config";
+import { assertProductionConfig, config, findEntitlements, findPlan, plans } from "./config";
 import { notifyCheckout, notifyLicense, resolveUser } from "./accounts";
 import {
   ExecutorError,
@@ -734,7 +734,13 @@ async function handleCancelSubscription(
   try {
     const result = await client.orders.cancelSubscription({ orderId });
     console.log(`[payments] 取消订阅 ${orderId} → ${result.status}`);
-    sendJson(res, 200, result);
+    // 退订策略写死为期末失效：不按比例退款，当期权益保留到 currentPeriodEnd。
+    sendJson(res, 200, {
+      status: result.status,
+      cancelPolicy: "period_end",
+      effective: "period_end",
+      message: "已提交退订，本期结束前仍可使用，到期不再续费。",
+    });
   } catch (error) {
     sendJson(res, 502, {
       error: "cancel_failed",
@@ -776,6 +782,7 @@ const server = createServer((req, res) => {
             amount: plan.amount,
             billingPeriod: plan.billingPeriod,
             name: plan.name,
+            entitlements: findEntitlements(plan.id),
           })),
         });
         return;
@@ -869,6 +876,9 @@ const server = createServer((req, res) => {
     }
   })();
 });
+
+// 生产环境配置自检放在监听之前：配置不完整时直接退出，而不是收钱后才发现开不了权益。
+assertProductionConfig();
 
 server.listen(config.port, () => {
   console.log(
