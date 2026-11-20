@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         Arc, RwLock,
     },
     time::{Duration, Instant},
@@ -10,13 +10,15 @@ use std::{
 use arb_core::{Order, OrderStatus, Position, RiskLimits, Side, StrategyRecord};
 use chrono::Utc;
 use rust_decimal::Decimal;
+use serde::Serialize;
+use serde_json::json;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use crate::{
     accounts::{AccountEndpoints, Accounts, VenuePositions},
     conditional::ConditionalOrders,
-    config::Config,
+    config::{Config, FeeConfig},
     events::{AlertLevel, ExecutorEvent},
     exchange::{LiveEndpoints, LiveExchange, OkxMarketClient},
     funding::FundingFeed,
@@ -73,6 +75,12 @@ pub struct AppState {
     pub paused: Arc<AtomicBool>,
     /// 可在运行期编辑的风控限额，写入后立即对后续订单生效。
     pub risk_limits: Arc<RwLock<RiskLimits>>,
+    /// 机会成本与收益估算使用的手续费档位。
+    pub fees: Arc<RwLock<FeeConfig>>,
+    /// 连续失败/被拒的次数；达到阈值自动停摆，成功一笔后清零。
+    pub consecutive_rejects: Arc<AtomicU32>,
+    /// 上一次账户权益快照，用于发现余额异常。
+    pub last_equity_usd: Arc<RwLock<Option<Decimal>>>,
     pub started_at: Instant,
 }
 
@@ -119,9 +127,6 @@ impl AppState {
             bitget: config.bitget_base_url.clone(),
             gate: config.gate_base_url.clone(),
             aster: config.aster_base_url.clone(),
-            htx: config.htx_base_url.clone(),
-            mexc: config.mexc_base_url.clone(),
-            bingx: config.bingx_base_url.clone(),
             hyperliquid: config.hyperliquid_base_url.clone(),
             lighter: config.lighter_base_url.clone(),
         };
@@ -132,12 +137,12 @@ impl AppState {
             okx: config.okx_base_url.clone(),
             bybit: config.bybit_base_url.clone(),
             bitget: config.bitget_base_url.clone(),
+            bitget_spot: config.bitget_spot_base_url.clone(),
             gate: config.gate_base_url.clone(),
+            gate_spot: config.gate_spot_base_url.clone(),
             aster: config.aster_base_url.clone(),
-            htx: config.htx_base_url.clone(),
-            mexc: config.mexc_base_url.clone(),
-            bingx: config.bingx_base_url.clone(),
             hyperliquid: config.hyperliquid_base_url.clone(),
+            hyperliquid_spot: config.hyperliquid_spot_base_url.clone(),
             lighter: config.lighter_base_url.clone(),
         };
         let accounts = Accounts::start(
@@ -196,6 +201,7 @@ impl AppState {
         ));
 
         let risk_limits = config.risk.clone();
+        let fees_config = config.fees;
         // 通知分发器复用同一份 Store / 事件总线 / 电报机器人，行情与新闻采集命中条件时调用。
         let notifier = Notifier::new(store.clone(), events.clone(), telegram.clone());
         let state = Self {
@@ -219,6 +225,9 @@ impl AppState {
             events,
             paused: Arc::new(AtomicBool::new(false)),
             risk_limits: Arc::new(RwLock::new(risk_limits)),
+            fees: Arc::new(RwLock::new(fees_config)),
+            consecutive_rejects: Arc::new(AtomicU32::new(0)),
+            last_equity_usd: Arc::new(RwLock::new(None)),
             started_at: Instant::now(),
         };
         // 机器人需要读取执行器状态，因此在 AppState 构造完成后再挂载轮询。
@@ -230,9 +239,88 @@ impl AppState {
         state.news.attach_notifier(notifier);
         // 交易所真实持仓同步：桌面端与 Telegram 展示的仓位以交易所为准。
         state.spawn_position_sync();
+        // 启动对账：有未完成订单时先暂停，等人工确认后再继续开仓。
+        state.spawn_startup_reconciliation();
+        // 行情侧通过事件总线请求停摆（如资金费率突变），由状态层统一执行。
+        state.spawn_risk_halt_listener();
         // 价格与浮盈由 WebSocket 推送驱动，与持仓同步周期解耦。
         state.spawn_position_pricing();
         state
+    }
+
+    /// 订阅行情侧的停摆请求；用事件总线避免行情模块直接依赖执行器状态。
+    fn spawn_risk_halt_listener(&self) {
+        let mut events = self.events.subscribe();
+        let state = self.clone();
+        tokio::spawn(async move {
+            while let Ok(event) = events.recv().await {
+                if let ExecutorEvent::RiskHalt {
+                    reason, reason_en, ..
+                } = event
+                {
+                    if !state.is_paused() {
+                        state.set_paused(true, Some((&reason, &reason_en)));
+                    }
+                }
+            }
+        });
+    }
+
+    /// 启动对账：库中仍有未完成订单（提交中/部分成交/在平仓）时暂停开仓。
+    ///
+    /// 交易所持仓与本地仓位的差异已由 `spawn_position_sync` 以交易所为准覆盖；
+    /// 这里负责把「本地以为还在进行中的订单」暴露出来，避免重启后继续叠加仓位。
+    fn spawn_startup_reconciliation(&self) {
+        let state = self.clone();
+        tokio::spawn(async move {
+            // 给首轮持仓同步留出时间，避免把「尚未同步」误判成「没有持仓」。
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let report = state.reconcile_orders().await;
+            if report.incomplete_orders.is_empty() {
+                tracing::info!("启动对账通过：没有未完成订单");
+            }
+        });
+    }
+
+    /// 检查库中未完成订单；发现不一致时暂停并写审计。可被桌面端手动触发。
+    pub async fn reconcile_orders(&self) -> ReconcileReport {
+        let incomplete: Vec<Uuid> = self
+            .store
+            .orders()
+            .await
+            .into_iter()
+            .filter(|order| !order.status.is_terminal())
+            .map(|order| order.id)
+            .collect();
+        if !incomplete.is_empty() {
+            let ids = incomplete
+                .iter()
+                .map(Uuid::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            self.store
+                .append_audit_log(
+                    "system",
+                    "reconcile.mismatch",
+                    None,
+                    json!({ "incomplete_orders": &ids }),
+                )
+                .await;
+            self.set_paused(
+                true,
+                Some((
+                    &format!("启动对账发现 {} 笔未完成订单: {ids}", incomplete.len()),
+                    &format!(
+                        "{} unfinished orders found during reconciliation: {ids}",
+                        incomplete.len()
+                    ),
+                )),
+            );
+        }
+        ReconcileReport {
+            incomplete_orders: incomplete,
+            paused: self.is_paused(),
+        }
     }
 
     /// 定期把交易所的真实持仓并入内存仓位，替换本机订单留下的过期记录。
@@ -246,6 +334,11 @@ impl AppState {
             loop {
                 ticker.tick().await;
                 let snapshots = state.accounts.sync_open_positions().await;
+                // 余额异常检测：权益骤降时暂停并告警，而不是继续开仓。
+                let equity = state.accounts.total_equity_usd();
+                if equity > Decimal::ZERO {
+                    state.observe_equity(equity);
+                }
                 if snapshots.is_empty() {
                     continue;
                 }
@@ -451,6 +544,62 @@ impl AppState {
         self.risk_limits.read().expect("风控限额锁不可用").clone()
     }
 
+    pub fn fees(&self) -> FeeConfig {
+        *self.fees.read().expect("费率锁不可用")
+    }
+
+    /// 设置页保存后立即生效：写文件、更新内存，并让行情侧下一轮重算机会。
+    pub fn set_fees(&self, fees: FeeConfig) -> anyhow::Result<FeeConfig> {
+        let fees = fees.validate()?;
+        fees.save(&self.config.fees_file)?;
+        *self.fees.write().expect("费率锁不可用") = fees;
+        self.market.set_fees(fees);
+        Ok(fees)
+    }
+
+    /// 记录一次失败/拒单；连续次数达到阈值即停摆，避免极端行情下继续开仓。
+    pub fn record_reject(&self, reason: &str) {
+        let count = self.consecutive_rejects.fetch_add(1, Ordering::Relaxed) + 1;
+        if count >= self.config.risk_guard.max_consecutive_rejects && !self.is_paused() {
+            self.set_paused(
+                true,
+                Some((
+                    &format!("连续 {count} 次下单失败或拒单（最近一次: {reason}）"),
+                    &format!("{count} consecutive order failures/rejections (last: {reason})"),
+                )),
+            );
+        }
+    }
+
+    /// 成功成交后清零连续失败计数，避免偶发失败把执行器困在暂停状态。
+    pub fn record_success(&self) {
+        self.consecutive_rejects.store(0, Ordering::Relaxed);
+    }
+
+    /// 记录账户权益；跌幅超过阈值时暂停并告警。
+    pub fn observe_equity(&self, equity_usd: Decimal) {
+        let mut last = self.last_equity_usd.write().expect("权益锁不可用");
+        if let Some(previous) = *last {
+            if previous > Decimal::ZERO {
+                let drop_pct = (previous - equity_usd) / previous * Decimal::from(100);
+                if drop_pct >= self.config.risk_guard.equity_drop_pct {
+                    self.set_paused(
+                        true,
+                        Some((
+                            &format!(
+                                "账户权益从 {previous} 跌至 {equity_usd}（-{drop_pct}%）"
+                            ),
+                            &format!(
+                                "Account equity dropped from {previous} to {equity_usd} (-{drop_pct}%)"
+                            ),
+                        )),
+                    );
+                }
+            }
+        }
+        *last = Some(equity_usd);
+    }
+
     /// 暂停只阻止新开仓，查看仓位、撤单与风险处置始终可用。
     /// `reason` 同时提供中英文版本，告警会按语言分别推送到桌面端与 Telegram。
     pub fn set_paused(&self, paused: bool, reason: Option<(&str, &str)>) {
@@ -504,6 +653,13 @@ impl AppState {
             server_time: Utc::now(),
         }
     }
+}
+
+/// 启动对账结果：返回未完成订单，供桌面端与 Telegram 展示。
+#[derive(Debug, Clone, Serialize)]
+pub struct ReconcileReport {
+    pub incomplete_orders: Vec<Uuid>,
+    pub paused: bool,
 }
 
 /// 用交易所真实持仓覆盖某交易所的内存仓位。

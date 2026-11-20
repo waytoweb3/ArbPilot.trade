@@ -3,7 +3,7 @@ mod candles;
 mod chain;
 mod conditional;
 mod config;
-mod control;
+pub(crate) mod control;
 mod depth;
 mod funding;
 mod health;
@@ -24,18 +24,44 @@ mod templates;
 mod ws;
 
 use axum::{
+    http::{header, HeaderName, HeaderValue, Method},
     middleware,
     routing::{delete, get, patch, post},
     Router,
 };
 use tower_http::{
-    cors::{Any, CorsLayer},
+    cors::{AllowOrigin, CorsLayer},
     trace::TraceLayer,
 };
 
 use crate::state::AppState;
 
 pub fn build(state: AppState) -> Router {
+    // CORS 只放行显式配置的前端来源（桌面端开发服务器与 Tauri WebView），
+    // 不再使用通配符，避免任意网页借浏览器发起带令牌的请求。
+    let cors_origins: Vec<HeaderValue> = state
+        .config
+        .cors_origins
+        .iter()
+        .filter_map(|origin| origin.parse::<HeaderValue>().ok())
+        .collect();
+    let cors = CorsLayer::new()
+        .allow_origin(AllowOrigin::list(cors_origins))
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .allow_headers([
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            header::ACCEPT,
+            HeaderName::from_static("idempotency-key"),
+        ]);
+
     let protected = Router::new()
         .route("/opportunities", get(opportunities::list))
         .route("/opportunities/basis", get(opportunities::basis))
@@ -43,6 +69,9 @@ pub fn build(state: AppState) -> Router {
         .route("/depth", get(depth::get))
         .route("/min-order", get(depth::min_order))
         .route("/orders", get(orders::list).post(orders::create))
+        .route("/orders/reconcile", post(orders::reconcile))
+        .route("/orders/{id}", patch(orders::replace))
+        .route("/orders/{id}/cancel", post(orders::cancel))
         .route(
             "/conditional-orders",
             get(conditional::list).post(conditional::create),
@@ -192,6 +221,14 @@ pub fn build(state: AppState) -> Router {
         .route("/funding/status", get(funding::status))
         .route("/config/market", get(config::market))
         .route(
+            "/config/fees",
+            get(config::fees).put(config::update_fees),
+        )
+        .route(
+            "/config/telegram",
+            get(config::telegram).put(config::update_telegram),
+        )
+        .route(
             "/config/notifications",
             get(config::notifications).put(config::update_notifications),
         )
@@ -221,6 +258,7 @@ pub fn build(state: AppState) -> Router {
         )
         .route("/control/pause", post(control::pause))
         .route("/control/resume", post(control::resume))
+        .route("/control/panic", post(control::panic))
         .route("/events", get(ws::handler))
         .route("/prices/stream", get(prices::stream))
         // 先鉴权再校验套餐：内层先执行，因此授权中间件放在鉴权层之前声明。
@@ -248,13 +286,7 @@ pub fn build(state: AppState) -> Router {
     Router::new()
         .route("/api/v1/health", get(health::health))
         .nest("/api/v1", protected)
-        // 仅用于本地开发（Vite dev server）。正式部署应收紧允许来源。
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any),
-        )
+        .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

@@ -38,38 +38,7 @@ pub async fn close(
         return Err(ApiError::NotFound("仓位不存在或已平仓".to_string()));
     };
 
-    let side = match position.side {
-        Side::Buy => Side::Sell,
-        Side::Sell => Side::Buy,
-    };
-    let notional_usd = position.quantity * position.mark_price;
-    if notional_usd <= Decimal::ZERO {
-        return Err(ApiError::BadRequest("仓位数量为 0，无法平仓".to_string()));
-    }
-
-    let outcome = gateway::submit_legs(
-        &state,
-        OrderBatchRequest {
-            legs: vec![LegOrderRequest {
-                venue: position.venue.clone(),
-                symbol: position.symbol.clone(),
-                side,
-                notional_usd,
-                limit_price: None,
-                // 用交易所同步回来的持仓数量，避免按名义价值换算后留下零头。
-                quantity: Some(position.quantity),
-            }],
-            leverage: Some(position.leverage),
-            max_slippage_bps: None,
-            strategy_id: position.strategy_id,
-            source: None,
-            origin: OrderOrigin::Desktop,
-            idempotency_key: format!("close-{}", Uuid::new_v4()),
-            closing: true,
-            max_unhedged_secs: None,
-        },
-    )
-    .await?;
+    let outcome = close_position(&state, position).await?;
 
     let status = match outcome.order.status {
         OrderStatus::Rejected => StatusCode::UNPROCESSABLE_ENTITY,
@@ -84,6 +53,45 @@ pub async fn close(
             replayed: outcome.replayed,
         }),
     ))
+}
+
+/// 平掉单个仓位：一键脱困与单仓位平仓共用同一条路径。
+pub async fn close_position(
+    state: &AppState,
+    position: Position,
+) -> Result<gateway::PairOrderOutcome, ApiError> {
+    let side = match position.side {
+        Side::Buy => Side::Sell,
+        Side::Sell => Side::Buy,
+    };
+    let notional_usd = position.quantity * position.mark_price;
+    if notional_usd <= Decimal::ZERO {
+        return Err(ApiError::BadRequest("仓位数量为 0，无法平仓".to_string()));
+    }
+
+    gateway::submit_legs(
+        state,
+        OrderBatchRequest {
+            legs: vec![LegOrderRequest {
+                venue: position.venue.clone(),
+                symbol: position.symbol.clone(),
+                side,
+                notional_usd,
+                limit_price: None,
+                // 用交易所同步回来的持仓数量，避免按名义价值换算后留下零头。
+                quantity: Some(position.quantity),
+            }],
+            leverage: Some(position.leverage),
+            max_slippage_bps: None,
+            strategy_id: position.strategy_id,
+            source: Some("平仓".to_string()),
+            origin: OrderOrigin::Desktop,
+            idempotency_key: format!("close-{}", Uuid::new_v4()),
+            closing: true,
+            max_unhedged_secs: None,
+        },
+    )
+    .await
 }
 
 /// 整组平仓：把同一 `group_id` 的双腿仓位一次性反向平掉。

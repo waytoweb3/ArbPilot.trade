@@ -4,9 +4,10 @@ use std::collections::BTreeMap;
 
 use axum::{extract::State, Json};
 use rust_decimal::Decimal;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
+    config::FeeConfig,
     error::ApiError,
     news,
     state::AppState,
@@ -27,6 +28,99 @@ pub async fn market(State(state): State<AppState>) -> Json<MarketConfigResponse>
         symbols.entry(row.venue).or_default().push(row.symbol);
     }
     Json(MarketConfigResponse { venues, symbols })
+}
+
+/// 当前生效的手续费档位：taker / maker / 滑点，单位 bps。
+pub async fn fees(State(state): State<AppState>) -> Json<FeeConfig> {
+    Json(state.fees())
+}
+
+/// 修改费率档位：保存到本地文件并立即重算机会，VIP 用户可换成自己的实际费率。
+pub async fn update_fees(
+    State(state): State<AppState>,
+    Json(body): Json<FeeConfig>,
+) -> Result<Json<FeeConfig>, ApiError> {
+    let fees = state
+        .set_fees(body)
+        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    tracing::info!(
+        taker_bps = %fees.taker_bps,
+        maker_bps = %fees.maker_bps,
+        slippage_bps = %fees.slippage_bps,
+        "费率档位已更新"
+    );
+    Ok(Json(fees))
+}
+
+#[derive(Debug, Serialize)]
+pub struct TelegramConfig {
+    /// 是否已经配置 Token（不会回传 Token 本身）。
+    pub configured: bool,
+    pub enabled: bool,
+    pub api_base: String,
+    /// 内置执行器下保存后需要重启 sidecar 才能生效。
+    pub restart_required: bool,
+}
+
+pub async fn telegram(State(state): State<AppState>) -> Json<TelegramConfig> {
+    Json(TelegramConfig {
+        configured: state.config.telegram_bot_token.is_some(),
+        enabled: state.config.telegram_enabled,
+        api_base: state.config.telegram_api_base.clone(),
+        restart_required: false,
+    })
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateTelegramRequest {
+    pub token: Option<String>,
+    #[serde(default)]
+    pub enabled: Option<bool>,
+}
+
+/// 保存 Telegram Bot Token：写入本地文件（权限 600），重启执行器后生效。
+///
+/// 内置执行器没有 .env，桌面端必须通过这个入口把 Token 交给 sidecar。
+pub async fn update_telegram(
+    State(state): State<AppState>,
+    Json(body): Json<UpdateTelegramRequest>,
+) -> Result<Json<TelegramConfig>, ApiError> {
+    let token = body
+        .token
+        .as_deref()
+        .map(str::trim)
+        .filter(|token| !token.is_empty());
+    let path = &state.config.telegram_file;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| ApiError::BadRequest(format!("创建配置目录失败: {error}")))?;
+    }
+    let mut content = serde_json::json!({
+        "token": token,
+        "enabled": body.enabled.unwrap_or(state.config.telegram_enabled),
+    });
+    if let Some(existing) = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+    {
+        if token.is_none() {
+            content["token"] = existing["token"].clone();
+        }
+    }
+    std::fs::write(path, content.to_string())
+        .map_err(|error| ApiError::BadRequest(format!("保存 Telegram 配置失败: {error}")))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    tracing::info!(path = %path.display(), "Telegram 配置已保存，重启执行器后生效");
+    Ok(Json(TelegramConfig {
+        configured: content["token"].as_str().is_some(),
+        enabled: content["enabled"].as_bool().unwrap_or(false),
+        api_base: state.config.telegram_api_base.clone(),
+        restart_required: true,
+    }))
 }
 
 /// 消息通知配置：新闻推送与资金费率套利提醒的开关、阈值与渠道。

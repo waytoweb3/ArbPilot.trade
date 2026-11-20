@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use arb_core::{Order, OrderOrigin, OrderStatus, RiskDecision};
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::{HeaderMap, StatusCode},
     Json,
 };
@@ -13,7 +13,7 @@ use uuid::Uuid;
 use crate::{
     error::ApiError,
     gateway::{self, PairOrderRequest},
-    state::AppState,
+    state::{AppState, ReconcileReport},
 };
 
 #[derive(Debug, Deserialize)]
@@ -106,4 +106,34 @@ pub async fn create(
             replayed: outcome.replayed,
         }),
     ))
+}
+
+/// 撤单：桌面端与 Telegram 共用，撤单失败会返回具体交易所错误。
+pub async fn cancel(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Order>, ApiError> {
+    Ok(Json(gateway::cancel_order_by_id(&state, id).await?))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReplaceOrderRequest {
+    pub limit_price: Decimal,
+    pub quantity: Option<Decimal>,
+}
+
+/// 改单：撤掉原单后按新价格/数量重新走风控与成交确认。
+pub async fn replace(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<ReplaceOrderRequest>,
+) -> Result<Json<Order>, ApiError> {
+    Ok(Json(
+        gateway::replace_order(&state, id, body.limit_price, body.quantity).await?,
+    ))
+}
+
+/// 手动触发启动对账：返回仍未完成的订单，并同步暂停状态。
+pub async fn reconcile(State(state): State<AppState>) -> Json<ReconcileReport> {
+    Json(state.reconcile_orders().await)
 }

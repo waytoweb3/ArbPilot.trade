@@ -15,6 +15,7 @@ mod market;
 mod news;
 mod notifier;
 mod onchain;
+mod orderbook;
 mod public_mode;
 mod realtime;
 mod routes;
@@ -55,6 +56,13 @@ async fn main() -> anyhow::Result<()> {
         return selftest::run(config).await;
     }
     if config.api_token == "dev-local-token" {
+        // 默认令牌只能在回环地址上使用；暴露到公网前必须换成随机令牌。
+        if !config.bind_addr.ip().is_loopback() && !config.allow_default_token {
+            anyhow::bail!(
+                "检测到默认开发令牌且监听 {}（非回环地址）。请设置 ARBPILOT_API_TOKEN=$(openssl rand -hex 32) 后重启；仅本机调试可设 ARBPILOT_ALLOW_DEFAULT_TOKEN=true",
+                config.bind_addr
+            );
+        }
         tracing::warn!("正在使用默认访问令牌，正式部署前请设置 ARBPILOT_API_TOKEN");
     }
 
@@ -78,18 +86,42 @@ async fn main() -> anyhow::Result<()> {
     skill::spawn(state.clone());
     let app = routes::build(state);
 
-    let listener = TcpListener::bind(config.bind_addr)
-        .await
-        .context("绑定执行器端口失败")?;
     tracing::info!(
         addr = %config.bind_addr,
         "ArbPilot 执行器已启动"
     );
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("执行器异常退出")?;
+    match (&config.tls_cert_file, &config.tls_key_file) {
+        (Some(cert), Some(key)) => {
+            // 自托管用户把管理端口暴露到公网时，至少要有 TLS，避免令牌明文传输。
+            let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key)
+                .await
+                .with_context(|| {
+                    format!("加载 TLS 证书失败: {} / {}", cert.display(), key.display())
+                })?;
+            tracing::info!("HTTPS 已启用（证书 {}）", cert.display());
+            let handle = axum_server::Handle::new();
+            let shutdown = handle.clone();
+            tokio::spawn(async move {
+                shutdown_signal().await;
+                shutdown.graceful_shutdown(Some(std::time::Duration::from_secs(10)));
+            });
+            axum_server::bind_rustls(config.bind_addr, tls)
+                .handle(handle)
+                .serve(app.into_make_service())
+                .await
+                .context("执行器异常退出")?;
+        }
+        _ => {
+            let listener = TcpListener::bind(config.bind_addr)
+                .await
+                .context("绑定执行器端口失败")?;
+            axum::serve(listener, app)
+                .with_graceful_shutdown(shutdown_signal())
+                .await
+                .context("执行器异常退出")?;
+        }
+    }
 
     Ok(())
 }

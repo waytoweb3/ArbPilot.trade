@@ -2,9 +2,101 @@ use std::{env, net::SocketAddr, path::PathBuf};
 
 use anyhow::Context;
 use arb_core::{RiskLimits, SandboxLimits};
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// 手续费档位：市价腿按 taker 计，挂单腿按 maker 计，滑点单独估算。
+///
+/// 往返成本 = 两腿各一次手续费 + 一次滑点，机会净收益按这里的实际档位重算，
+/// 不再写死 4 bps/腿，VIP 用户与自定义费率的自托管用户可以算对。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct FeeConfig {
+    pub taker_bps: Decimal,
+    pub maker_bps: Decimal,
+    pub slippage_bps: Decimal,
+}
+
+impl Default for FeeConfig {
+    fn default() -> Self {
+        Self {
+            taker_bps: Decimal::from(4),
+            maker_bps: Decimal::from(2),
+            slippage_bps: Decimal::from(1),
+        }
+    }
+}
+
+impl FeeConfig {
+    /// 市价双腿往返成本：两腿 taker + 一次滑点。
+    pub fn round_trip_bps(&self) -> Decimal {
+        self.taker_bps * Decimal::from(2) + self.slippage_bps
+    }
+
+    pub fn validate(self) -> anyhow::Result<Self> {
+        for (name, value) in [
+            ("taker_bps", self.taker_bps),
+            ("maker_bps", self.maker_bps),
+            ("slippage_bps", self.slippage_bps),
+        ] {
+            if value < Decimal::ZERO || value > Decimal::from(100) {
+                anyhow::bail!("{name} 必须在 0~100 bps 之间");
+            }
+        }
+        Ok(self)
+    }
+
+    /// 与风控限额一致：文件优先于环境变量，文件损坏时回退默认值。
+    pub fn load(path: &std::path::Path) -> Self {
+        match std::fs::read_to_string(path) {
+            Ok(text) => match serde_json::from_str::<FeeConfig>(&text) {
+                Ok(config) => config.validate().unwrap_or_else(|error| {
+                    tracing::warn!(%error, path = %path.display(), "费率文件超出允许范围，沿用默认值");
+                    FeeConfig::default()
+                }),
+                Err(error) => {
+                    tracing::warn!(%error, path = %path.display(), "费率文件解析失败，沿用默认值");
+                    FeeConfig::default()
+                }
+            },
+            Err(_) => FeeConfig::default(),
+        }
+    }
+
+    pub fn save(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        let text = serde_json::to_string_pretty(self)?;
+        std::fs::write(path, text)?;
+        Ok(())
+    }
+}
+
+/// 自动停摆阈值：任一异常触发即暂停开仓并通过桌面端/Telegram 告警。
+#[derive(Debug, Clone, Copy)]
+pub struct RiskGuardConfig {
+    /// 连续拒单次数上限，超过即暂停。
+    pub max_consecutive_rejects: u32,
+    /// 账户权益在两次采集之间跌幅超过该百分比即暂停。
+    pub equity_drop_pct: Decimal,
+    /// 单个合约资金费率年化在两次扫描之间跳变超过该百分点即暂停。
+    pub funding_jump_pct: Decimal,
+    /// 成交确认最长轮询时间（秒）。
+    pub fill_confirm_secs: u64,
+}
+
+impl Default for RiskGuardConfig {
+    fn default() -> Self {
+        Self {
+            max_consecutive_rejects: 3,
+            equity_drop_pct: Decimal::from(10),
+            funding_jump_pct: Decimal::from(300),
+            fill_confirm_secs: 8,
+        }
+    }
+}
 
 /// 单个链上价格源：一个 DEX 池子，可选配一个预言机做偏离比较。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -115,15 +207,12 @@ pub struct Config {
     /// 是否启用 Lighter 资金费率采集。
     pub lighter_enabled: bool,
     pub lighter_base_url: String,
-    /// 是否启用 HTX（火币）资金费率采集。
-    pub htx_enabled: bool,
-    pub htx_base_url: String,
-    /// 是否启用 MEXC 资金费率采集。
-    pub mexc_enabled: bool,
-    pub mexc_base_url: String,
-    /// 是否启用 BingX 资金费率采集。
-    pub bingx_enabled: bool,
-    pub bingx_base_url: String,
+    /// Gate.io 现货行情地址。
+    pub gate_spot_base_url: String,
+    /// Bitget 现货行情地址。
+    pub bitget_spot_base_url: String,
+    /// Hyperliquid 现货与永续共用同一个 API 域名，这里只保留语义化别名。
+    pub hyperliquid_spot_base_url: String,
     /// Binance 现货 WebSocket 地址，用于 `bookTicker` 推送。
     pub binance_spot_ws_url: String,
     /// Binance USDT 本位永续 WebSocket 地址。
@@ -139,12 +228,12 @@ pub struct Config {
     pub gate_ws_url: String,
     /// Aster 合约 WebSocket 地址（Binance 兼容组合流）。
     pub aster_ws_url: String,
-    /// HTX USDT 本位永续 WebSocket 地址。
-    pub htx_ws_url: String,
-    /// MEXC 合约 WebSocket 地址。
-    pub mexc_ws_url: String,
-    /// BingX 合约 WebSocket 地址。
-    pub bingx_ws_url: String,
+    /// Gate.io 现货 WebSocket 地址。
+    pub gate_spot_ws_url: String,
+    /// Bitget 现货 WebSocket 地址。
+    pub bitget_spot_ws_url: String,
+    /// Hyperliquid 现货 WebSocket 地址（与永续同一条连接）。
+    pub hyperliquid_spot_ws_url: String,
     /// Hyperliquid WebSocket 地址。
     pub hyperliquid_ws_url: String,
     /// Lighter WebSocket 地址。
@@ -153,8 +242,23 @@ pub struct Config {
     pub quote_poll_secs: u64,
     /// 手动指定的资金费率交易对；为空时自动发现交易所全部 USDT 本位永续。
     pub funding_symbols: Vec<String>,
-    /// 盘口与套利机会使用的交易对（数量不宜过多，REST 兜底需逐币请求）。
+    /// 盘口与套利机会使用的交易对；为空表示自动跟随资金费率发现结果。
     pub market_symbols: Vec<String>,
+    /// 是否显式限制了 `market_symbols`；为 false 时自动覆盖全部已发现合约。
+    pub market_symbols_manual: bool,
+    /// 机会成本估算使用的手续费档位。
+    pub fees: FeeConfig,
+    /// 桌面端设置页保存的费率档位文件。
+    pub fees_file: PathBuf,
+    /// 自动停摆阈值与成交确认时长。
+    pub risk_guard: RiskGuardConfig,
+    /// 允许访问执行器 API 的前端来源；不再使用通配符。
+    pub cors_origins: Vec<String>,
+    /// HTTPS 证书与私钥；两者都配置时执行器直接提供 TLS。
+    pub tls_cert_file: Option<PathBuf>,
+    pub tls_key_file: Option<PathBuf>,
+    /// 是否允许继续使用开发默认令牌；仅限本机调试。
+    pub allow_default_token: bool,
     /// 资金费率轮询间隔（秒）。
     pub funding_poll_secs: u64,
     /// 是否启用上币新闻采集（Binance / Upbit / OKX / Bybit / Bitget）。
@@ -193,6 +297,8 @@ pub struct Config {
     pub telegram_pairing_secs: u64,
     /// Telegram 绑定关系保存路径，文件权限固定为 600。
     pub telegram_bindings_file: PathBuf,
+    /// 桌面端保存的 Telegram Bot Token 路径（内置执行器从文件读取）。
+    pub telegram_file: PathBuf,
     /// 交易所 API Key 的本地保存路径，文件权限固定为 600。
     pub accounts_file: PathBuf,
     /// 桌面端编辑后的风控限额保存路径，重启后从这里恢复。
@@ -295,23 +401,12 @@ impl Config {
         let lighter_base_url = env::var("ARBPILOT_LIGHTER_BASE_URL")
             .unwrap_or_else(|_| "https://mainnet.zklighter.elliot.ai".to_string());
 
-        let htx_enabled = env::var("ARBPILOT_HTX_ENABLED")
-            .map(|value| !value.eq_ignore_ascii_case("false"))
-            .unwrap_or(false);
-        let htx_base_url = env::var("ARBPILOT_HTX_BASE_URL")
-            .unwrap_or_else(|_| "https://api.hbdm.com".to_string());
-
-        let mexc_enabled = env::var("ARBPILOT_MEXC_ENABLED")
-            .map(|value| !value.eq_ignore_ascii_case("false"))
-            .unwrap_or(false);
-        let mexc_base_url = env::var("ARBPILOT_MEXC_BASE_URL")
-            .unwrap_or_else(|_| "https://contract.mexc.com".to_string());
-
-        let bingx_enabled = env::var("ARBPILOT_BINGX_ENABLED")
-            .map(|value| !value.eq_ignore_ascii_case("false"))
-            .unwrap_or(false);
-        let bingx_base_url = env::var("ARBPILOT_BINGX_BASE_URL")
-            .unwrap_or_else(|_| "https://open-api.bingx.com".to_string());
+        let gate_spot_base_url = env::var("ARBPILOT_GATE_SPOT_BASE_URL")
+            .unwrap_or_else(|_| "https://api.gateio.ws/api/v4".to_string());
+        let bitget_spot_base_url = env::var("ARBPILOT_BITGET_SPOT_BASE_URL")
+            .unwrap_or_else(|_| "https://api.bitget.com".to_string());
+        let hyperliquid_spot_base_url = env::var("ARBPILOT_HYPERLIQUID_SPOT_BASE_URL")
+            .unwrap_or_else(|_| "https://api.hyperliquid.xyz".to_string());
 
         let binance_spot_ws_url = env::var("ARBPILOT_BINANCE_SPOT_WS_URL")
             .unwrap_or_else(|_| "wss://stream.binance.com:9443".to_string());
@@ -332,12 +427,12 @@ impl Config {
             .unwrap_or_else(|_| "wss://fx-ws.gateio.ws/v4/ws/usdt".to_string());
         let aster_ws_url = env::var("ARBPILOT_ASTER_WS_URL")
             .unwrap_or_else(|_| "wss://fstream.asterdex.com".to_string());
-        let htx_ws_url = env::var("ARBPILOT_HTX_WS_URL")
-            .unwrap_or_else(|_| "wss://api.hbdm.com/linear-swap-ws".to_string());
-        let mexc_ws_url = env::var("ARBPILOT_MEXC_WS_URL")
-            .unwrap_or_else(|_| "wss://contract.mexc.com/edge".to_string());
-        let bingx_ws_url = env::var("ARBPILOT_BINGX_WS_URL")
-            .unwrap_or_else(|_| "wss://open-api-swap.bingx.com/swap-market".to_string());
+        let gate_spot_ws_url = env::var("ARBPILOT_GATE_SPOT_WS_URL")
+            .unwrap_or_else(|_| "wss://api.gateio.ws/ws/v4/".to_string());
+        let bitget_spot_ws_url = env::var("ARBPILOT_BITGET_SPOT_WS_URL")
+            .unwrap_or_else(|_| "wss://ws.bitget.com/v2/ws/public".to_string());
+        let hyperliquid_spot_ws_url = env::var("ARBPILOT_HYPERLIQUID_SPOT_WS_URL")
+            .unwrap_or_else(|_| "wss://api.hyperliquid.xyz/ws".to_string());
         let hyperliquid_ws_url = env::var("ARBPILOT_HYPERLIQUID_WS_URL")
             .unwrap_or_else(|_| "wss://api.hyperliquid.xyz/ws".to_string());
         let lighter_ws_url = env::var("ARBPILOT_LIGHTER_WS_URL")
@@ -370,17 +465,72 @@ impl Config {
             .map(|value| parse_symbols(&value))
             .unwrap_or_default();
 
-        // 盘口与机会必须逐币兜底 REST，默认只保留流动性最好的两个币种；
-        // 未配置时回退到手动指定的资金费率列表。
+        // 机会扫描默认跟随全部已发现合约；只有显式配置时才收窄清单。
         let market_symbols = env::var("ARBPILOT_MARKET_SYMBOLS")
             .map(|value| parse_symbols(&value))
+            .unwrap_or_default();
+        let market_symbols_manual = !market_symbols.is_empty();
+
+        // 费率档位：文件优先（桌面端可改），其次环境变量，最后默认值。
+        let fees_file = env::var("ARBPILOT_FEES_FILE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("data/fees.json"));
+        let mut fees = FeeConfig {
+            taker_bps: env_decimal("ARBPILOT_TAKER_FEE_BPS", Decimal::from(4))?,
+            maker_bps: env_decimal("ARBPILOT_MAKER_FEE_BPS", Decimal::from(2))?,
+            slippage_bps: env_decimal("ARBPILOT_SLIPPAGE_BPS", Decimal::from(1))?,
+        };
+        if fees_file.exists() {
+            fees = FeeConfig::load(&fees_file);
+        }
+
+        let risk_guard = RiskGuardConfig {
+            max_consecutive_rejects: env::var("ARBPILOT_MAX_CONSECUTIVE_REJECTS")
+                .unwrap_or_else(|_| "3".to_string())
+                .parse()
+                .context("解析 ARBPILOT_MAX_CONSECUTIVE_REJECTS 失败")?,
+            equity_drop_pct: env_decimal("ARBPILOT_EQUITY_DROP_PCT", Decimal::from(10))?,
+            funding_jump_pct: env_decimal("ARBPILOT_FUNDING_JUMP_PCT", Decimal::from(300))?,
+            fill_confirm_secs: env::var("ARBPILOT_FILL_CONFIRM_SECS")
+                .unwrap_or_else(|_| "8".to_string())
+                .parse()
+                .context("解析 ARBPILOT_FILL_CONFIRM_SECS 失败")?,
+        };
+
+        // CORS 白名单：桌面端开发服务器与 Tauri WebView 默认放行，其他来源需显式配置。
+        let cors_origins = env::var("ARBPILOT_CORS_ORIGINS")
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(|item| item.trim().to_string())
+                    .filter(|item| !item.is_empty())
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_else(|_| {
-                if funding_symbols.is_empty() {
-                    parse_symbols("BTCUSDT,ETHUSDT")
-                } else {
-                    funding_symbols.clone()
-                }
+                vec![
+                    "http://localhost:1420".to_string(),
+                    "http://127.0.0.1:1420".to_string(),
+                    "tauri://localhost".to_string(),
+                    "http://tauri.localhost".to_string(),
+                ]
             });
+
+        let tls_cert_file = env::var("ARBPILOT_TLS_CERT_FILE")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from);
+        let tls_key_file = env::var("ARBPILOT_TLS_KEY_FILE")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from);
+        if tls_cert_file.is_some() != tls_key_file.is_some() {
+            anyhow::bail!("ARBPILOT_TLS_CERT_FILE 与 ARBPILOT_TLS_KEY_FILE 必须同时配置");
+        }
+        let allow_default_token = env::var("ARBPILOT_ALLOW_DEFAULT_TOKEN")
+            .map(|value| value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
 
         let funding_poll_secs = env::var("ARBPILOT_FUNDING_POLL_SECS")
             .unwrap_or_else(|_| "60".to_string())
@@ -466,10 +616,15 @@ impl Config {
         }
 
         // Telegram 只负责告警、查询与经确认的下单；API Key 始终留在执行器所在机器。
+        // Token 优先取环境变量，其次读桌面端写入的 telegram_bot.json（内置执行器没有 .env）。
+        let telegram_file = env::var("ARBPILOT_TELEGRAM_FILE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| accounts_file.with_file_name("telegram_bot.json"));
         let telegram_bot_token = env::var("ARBPILOT_TELEGRAM_BOT_TOKEN")
             .ok()
             .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
+            .filter(|value| !value.is_empty())
+            .or_else(|| read_telegram_token(&telegram_file));
         let telegram_enabled = env::var("ARBPILOT_TELEGRAM_ENABLED")
             .map(|value| !value.eq_ignore_ascii_case("false"))
             .unwrap_or(telegram_bot_token.is_some());
@@ -579,12 +734,9 @@ impl Config {
             hyperliquid_base_url,
             lighter_enabled,
             lighter_base_url,
-            htx_enabled,
-            htx_base_url,
-            mexc_enabled,
-            mexc_base_url,
-            bingx_enabled,
-            bingx_base_url,
+            gate_spot_base_url,
+            bitget_spot_base_url,
+            hyperliquid_spot_base_url,
             binance_spot_ws_url,
             binance_futures_ws_url,
             okx_ws_url,
@@ -593,14 +745,22 @@ impl Config {
             bitget_ws_url,
             gate_ws_url,
             aster_ws_url,
-            htx_ws_url,
-            mexc_ws_url,
-            bingx_ws_url,
+            gate_spot_ws_url,
+            bitget_spot_ws_url,
+            hyperliquid_spot_ws_url,
             hyperliquid_ws_url,
             lighter_ws_url,
             quote_poll_secs,
             funding_symbols,
             market_symbols,
+            market_symbols_manual,
+            fees,
+            fees_file,
+            risk_guard,
+            cors_origins,
+            tls_cert_file,
+            tls_key_file,
+            allow_default_token,
             funding_poll_secs,
             news_enabled,
             news_poll_secs,
@@ -620,6 +780,7 @@ impl Config {
             telegram_poll_secs,
             telegram_pairing_secs,
             telegram_bindings_file,
+            telegram_file,
             accounts_file,
             risk_file,
             accounts_poll_secs,
@@ -646,4 +807,28 @@ fn parse_symbols(value: &str) -> Vec<String> {
         .map(|symbol| symbol.trim().to_ascii_uppercase())
         .filter(|symbol| !symbol.is_empty())
         .collect()
+}
+
+/// 读取桌面端保存的 Telegram Token；文件缺失或格式错误时返回 `None`。
+fn read_telegram_token(path: &std::path::Path) -> Option<String> {
+    #[derive(Deserialize)]
+    struct TelegramFile {
+        token: String,
+    }
+    let text = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str::<TelegramFile>(&text)
+        .ok()
+        .map(|file| file.token.trim().to_string())
+        .filter(|token| !token.is_empty())
+}
+
+/// 读取 bps 类配置；非法值直接报错，避免悄悄用了错误的费率。
+fn env_decimal(key: &str, default: Decimal) -> anyhow::Result<Decimal> {
+    match env::var(key) {
+        Ok(value) => value
+            .trim()
+            .parse()
+            .with_context(|| format!("解析 {key} 失败")),
+        Err(_) => Ok(default),
+    }
 }

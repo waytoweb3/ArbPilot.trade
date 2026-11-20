@@ -54,6 +54,12 @@ pub enum ExecutorEvent {
         message_en: Option<String>,
         at: DateTime<Utc>,
     },
+    /// 行情侧发现极端异常（如资金费率瞬间跳变），请求执行器停摆开仓。
+    RiskHalt {
+        reason: String,
+        reason_en: String,
+        at: DateTime<Utc>,
+    },
 }
 
 impl ExecutorEvent {

@@ -5,7 +5,12 @@ use axum::{extract::State, Json};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-use crate::{error::ApiError, state::AppState};
+use crate::{
+    error::ApiError,
+    gateway,
+    routes::portfolio,
+    state::AppState,
+};
 
 #[derive(Debug, Deserialize)]
 pub struct PauseRequest {
@@ -36,6 +41,82 @@ pub async fn resume(State(state): State<AppState>) -> Json<ControlResponse> {
         paused: false,
         reason: None,
     })
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PanicRequest {
+    /// 必须显式置为 true，防止误触。
+    pub confirm: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PanicResponse {
+    pub cancelled_orders: usize,
+    pub closed_positions: usize,
+    pub errors: Vec<String>,
+}
+
+/// 一键脱困：撤全部未完成订单 + 平全部仓位，并保持暂停直到人工恢复。
+///
+/// 这是无人值守场景下的最后一道保险，每一步都会写审计日志。
+pub async fn panic(
+    State(state): State<AppState>,
+    Json(body): Json<PanicRequest>,
+) -> Result<Json<PanicResponse>, ApiError> {
+    if !body.confirm {
+        return Err(ApiError::BadRequest(
+            "一键脱困需要显式确认（confirm=true）".to_string(),
+        ));
+    }
+    Ok(Json(panic_actions(&state, "desktop").await))
+}
+
+/// 一键脱困的实际动作：暂停 → 撤全部挂单 → 平全部仓位 → 写审计。
+///
+/// HTTP 接口与 Telegram `/panic` 共用，避免两条入口的行为逐渐分叉。
+pub(crate) async fn panic_actions(state: &AppState, origin: &str) -> PanicResponse {
+    state.set_paused(
+        true,
+        Some((
+            "一键脱困：撤销全部挂单并平掉全部仓位",
+            "panic: cancel all open orders and close all positions",
+        )),
+    );
+
+    let (cancelled_orders, mut errors) = gateway::cancel_all_open_orders(state).await;
+
+    let positions = {
+        let mut positions = state.positions.write().expect("仓位锁不可用");
+        state.apply_realtime_prices(&mut positions);
+        positions.clone()
+    };
+    let mut closed_positions = 0;
+    for position in positions {
+        match portfolio::close_position(state, position).await {
+            Ok(_) => closed_positions += 1,
+            Err(error) => errors.push(error.to_string()),
+        }
+    }
+
+    state
+        .store
+        .append_audit_log(
+            origin,
+            "panic",
+            None,
+            serde_json::json!({
+                "cancelled_orders": cancelled_orders,
+                "closed_positions": closed_positions,
+                "errors": &errors,
+            }),
+        )
+        .await;
+
+    PanicResponse {
+        cancelled_orders,
+        closed_positions,
+        errors,
+    }
 }
 
 pub async fn limits(State(state): State<AppState>) -> Json<RiskLimits> {

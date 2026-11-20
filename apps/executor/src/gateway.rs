@@ -1,6 +1,7 @@
 use arb_core::{
     Compensation, LegStatus, Order, OrderIntent, OrderLegIntent, OrderOrigin, OrderStatus,
     PlaceOrderRequest, Position, Quote, RiskContext, RiskDecision, RiskEngine, Side,
+    VenueOrderState, VenueOrderStatus,
 };
 use std::time::Duration;
 
@@ -231,6 +232,239 @@ pub async fn submit_pair(
     .await
 }
 
+/// 取消一笔未完成订单；已终态时直接返回，保证桌面端与补偿流程可以重复点击。
+pub async fn cancel_order_by_id(state: &AppState, order_id: Uuid) -> Result<Order, ApiError> {
+    let mut order = find_order(state, order_id)
+        .await
+        .ok_or_else(|| ApiError::NotFound("订单不存在".to_string()))?;
+    if order.status.is_terminal() {
+        return Ok(order);
+    }
+
+    let mut errors = Vec::new();
+    for (index, leg) in order.legs.iter().enumerate() {
+        let Some(venue_order_id) = leg.venue_order_id.clone() else {
+            continue;
+        };
+        if matches!(
+            leg.status,
+            LegStatus::Filled | LegStatus::Cancelled | LegStatus::Rejected
+        ) {
+            continue;
+        }
+        let client_order_id = format!("{}-{index}", order.intent.idempotency_key);
+        if let Err(error) = state
+            .exchange
+            .cancel_order(&leg.intent.venue, &leg.intent.symbol, &venue_order_id, &client_order_id)
+            .await
+        {
+            errors.push(format!("{}: {error}", leg.intent.venue));
+        }
+    }
+
+    let now = Utc::now();
+    for leg in &mut order.legs {
+        if matches!(leg.status, LegStatus::Pending | LegStatus::Submitted) {
+            leg.status = LegStatus::Cancelled;
+        }
+    }
+    order.status = OrderStatus::Cancelled;
+    order.updated_at = now;
+    order.note = if errors.is_empty() {
+        Some("已撤单".to_string())
+    } else {
+        Some(format!("部分交易所撤单失败: {}", errors.join("; ")))
+    };
+    state.store.save_order(&order).await;
+    log_event(
+        state,
+        order.id,
+        "order_cancelled",
+        json!({ "errors": errors }),
+    )
+    .await;
+    if !errors.is_empty() {
+        return Err(ApiError::BadRequest(order.note.clone().unwrap_or_default()));
+    }
+    Ok(order)
+}
+
+/// 改单：先撤原单，再按新的价格/数量重新走完整风控与下单流程。
+///
+/// 只允许单腿订单改单；双腿订单改单会破坏对冲，必须先撤单再重新开仓。
+pub async fn replace_order(
+    state: &AppState,
+    order_id: Uuid,
+    limit_price: Decimal,
+    quantity: Option<Decimal>,
+) -> Result<Order, ApiError> {
+    let order = find_order(state, order_id)
+        .await
+        .ok_or_else(|| ApiError::NotFound("订单不存在".to_string()))?;
+    if order.intent.legs.len() != 1 {
+        return Err(ApiError::BadRequest(
+            "双腿订单不支持改单，请先撤单后重新下单".to_string(),
+        ));
+    }
+    if order.status.is_terminal() {
+        return Err(ApiError::BadRequest("订单已结束，无法改单".to_string()));
+    }
+    if limit_price <= Decimal::ZERO {
+        return Err(ApiError::BadRequest("改单价格必须大于 0".to_string()));
+    }
+    let intent = &order.intent.legs[0];
+    let quantity = quantity.unwrap_or(intent.quantity);
+    if quantity <= Decimal::ZERO {
+        return Err(ApiError::BadRequest("改单数量必须大于 0".to_string()));
+    }
+
+    cancel_order_by_id(state, order_id).await?;
+
+    let outcome = submit_legs(
+        state,
+        OrderBatchRequest {
+            legs: vec![LegOrderRequest {
+                venue: intent.venue.clone(),
+                symbol: intent.symbol.clone(),
+                side: intent.side,
+                notional_usd: quantity * limit_price,
+                limit_price: Some(limit_price),
+                quantity: Some(quantity),
+            }],
+            leverage: Some(order.intent.leverage),
+            max_slippage_bps: Some(order.intent.max_slippage_bps),
+            strategy_id: order.intent.strategy_id,
+            source: Some("改单".to_string()),
+            origin: order.intent.origin,
+            idempotency_key: format!(
+                "{}-r{}",
+                order.intent.idempotency_key,
+                Utc::now().timestamp_millis()
+            ),
+            closing: intent.reduce_only,
+            max_unhedged_secs: None,
+        },
+    )
+    .await?;
+    Ok(outcome.order)
+}
+
+/// 取消全部未完成订单，返回成功撤单数量与失败明细。
+pub async fn cancel_all_open_orders(state: &AppState) -> (usize, Vec<String>) {
+    let mut ids: Vec<Uuid> = state
+        .orders
+        .read()
+        .expect("订单锁不可用")
+        .iter()
+        .filter(|order| !order.status.is_terminal())
+        .map(|order| order.id)
+        .collect();
+    // 重启后内存快照可能为空，持久化记录里的未完成订单同样要撤。
+    for order in state.store.orders().await {
+        if !order.status.is_terminal() && !ids.contains(&order.id) {
+            ids.push(order.id);
+        }
+    }
+    let mut cancelled = 0;
+    let mut errors = Vec::new();
+    for id in ids {
+        match cancel_order_by_id(state, id).await {
+            Ok(_) => cancelled += 1,
+            Err(error) => errors.push(format!("{id}: {error}")),
+        }
+    }
+    (cancelled, errors)
+}
+
+/// 从内存快照与持久化记录中查找订单。
+pub(crate) async fn find_order(state: &AppState, order_id: Uuid) -> Option<Order> {
+    if let Some(order) = state
+        .orders
+        .read()
+        .expect("订单锁不可用")
+        .iter()
+        .find(|order| order.id == order_id)
+        .cloned()
+    {
+        return Some(order);
+    }
+    state
+        .store
+        .orders()
+        .await
+        .into_iter()
+        .find(|order| order.id == order_id)
+}
+
+/// 下单回执只代表「交易所已受理」，这里轮询真实状态直到成交/撤单/拒单。
+///
+/// - 超过 `ARBPILOT_FILL_CONFIRM_SECS` 仍未成交：撤掉挂单并返回 `Open`，让上层按
+///   失衡处理，避免「以为成交了、其实还挂着」。
+/// - 交易所不支持查单（Lighter 等）：沿用回执即成交，但会把 `leg_unconfirmed`
+///   写进事件流，桌面端可见。
+async fn confirm_fill(
+    state: &AppState,
+    venue: &str,
+    symbol: &str,
+    quantity: Decimal,
+    limit_price: Option<Decimal>,
+    ack: &arb_core::VenueOrderAck,
+    client_order_id: &str,
+) -> Result<VenueOrderStatus, String> {
+    let timeout = Duration::from_secs(state.config.risk_guard.fill_confirm_secs.max(1));
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut last: Option<VenueOrderStatus> = None;
+    loop {
+        match state
+            .exchange
+            .order_status(venue, symbol, &ack.venue_order_id, client_order_id)
+            .await
+        {
+            Ok(status) => {
+                let terminal = matches!(
+                    status.state,
+                    VenueOrderState::Filled | VenueOrderState::Canceled | VenueOrderState::Rejected
+                );
+                if terminal {
+                    return Ok(status);
+                }
+                last = Some(status);
+            }
+            Err(arb_core::ExchangeError::Unsupported(message)) => {
+                tracing::warn!(venue, %symbol, %message, "交易所不支持查单，按回执确认成交");
+                return Ok(VenueOrderStatus {
+                    state: VenueOrderState::Filled,
+                    filled_quantity: quantity,
+                    average_price: limit_price,
+                    fee: None,
+                    fee_currency: None,
+                });
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+
+    // 超时仍未终态：主动撤单，避免残留挂单在无人值守时成交。
+    if let Err(error) = state
+        .exchange
+        .cancel_order(venue, symbol, &ack.venue_order_id, client_order_id)
+        .await
+    {
+        tracing::warn!(venue, %symbol, %error, "超时撤单失败");
+    }
+    Ok(last.unwrap_or(VenueOrderStatus {
+        state: VenueOrderState::Unknown,
+        filled_quantity: Decimal::ZERO,
+        average_price: None,
+        fee: None,
+        fee_currency: None,
+    }))
+}
+
 /// 统一订单入口：幂等检查 → 行情校验 → 风控 → 实盘下单 → 仓位记账。
 ///
 /// 单腿与多腿共用同一条路径，全部经过统一风控后才能到达交易所。
@@ -305,6 +539,7 @@ pub async fn submit_legs(
                     None => {
                         let reason =
                             format!("{} 在 {} 没有可用行情: {error}", leg.symbol, leg.venue);
+                        state.record_reject(&reason);
                         return Err(reject_request(state, &request, reason).await);
                     }
                 },
@@ -555,6 +790,7 @@ pub async fn submit_legs(
                 )
                 .await;
                 failure = Some(format!("第 {} 个交易所设置杠杆失败: {error}", index + 1));
+                state.record_reject(&format!("设置杠杆失败: {error}"));
                 break;
             }
         }
@@ -585,6 +821,7 @@ pub async fn submit_legs(
             }),
         )
         .await;
+        let client_order_id = place.client_order_id.clone();
         let executed = state.exchange.place_order(&venue, place);
 
         let placed = match (first_fill_at, request.max_unhedged_secs) {
@@ -610,30 +847,88 @@ pub async fn submit_legs(
 
         match placed {
             Ok(ack) => {
-                let entry = &mut order.legs[index];
-                entry.status = LegStatus::Filled;
-                entry.venue_order_id = Some(ack.venue_order_id.clone());
-                entry.filled_quantity = leg.quantity;
-                entry.average_price = Some(leg.limit_price);
-                first_fill_at.get_or_insert_with(Utc::now);
-                log_event(
+                let confirmation = confirm_fill(
                     state,
-                    order.id,
-                    "leg_filled",
-                    json!({
-                        "index": index,
-                        "venue": &venue,
-                        "symbol": &leg.symbol,
-                        "side": leg.side,
-                        "venue_order_id": &ack.venue_order_id,
-                        "filled_quantity": leg.quantity,
-                        "average_price": leg.limit_price,
-                    }),
+                    &venue,
+                    &leg.symbol,
+                    leg.quantity,
+                    Some(leg.limit_price),
+                    &ack,
+                    &client_order_id,
                 )
                 .await;
+                match confirmation {
+                    Ok(status) => {
+                        let entry = &mut order.legs[index];
+                        entry.venue_order_id = Some(ack.venue_order_id.clone());
+                        entry.filled_quantity = status.filled_quantity;
+                        entry.average_price = status.average_price.or(Some(leg.limit_price));
+                        entry.fee = status.fee;
+                        entry.fee_currency = status.fee_currency.clone();
+                        entry.status = match status.state {
+                            VenueOrderState::Filled => LegStatus::Filled,
+                            VenueOrderState::PartiallyFilled => LegStatus::PartiallyFilled,
+                            VenueOrderState::Canceled => LegStatus::Cancelled,
+                            _ => LegStatus::Rejected,
+                        };
+                        first_fill_at.get_or_insert_with(Utc::now);
+                        log_event(
+                            state,
+                            order.id,
+                            "leg_confirmed",
+                            json!({
+                                "index": index,
+                                "venue": &venue,
+                                "symbol": &leg.symbol,
+                                "side": leg.side,
+                                "venue_order_id": &ack.venue_order_id,
+                                "state": status.state,
+                                "filled_quantity": status.filled_quantity,
+                                "average_price": status.average_price,
+                                "fee": status.fee,
+                                "fee_currency": status.fee_currency,
+                            }),
+                        )
+                        .await;
+                        if entry.status == LegStatus::Filled {
+                            state.record_success();
+                        } else {
+                            state.record_reject("订单未完全成交");
+                            failure = Some(format!(
+                                "第 {} 个交易所订单未完全成交: {:?}",
+                                index + 1,
+                                status.state
+                            ));
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        // 查单失败不等于没成交：保留交易所订单号，交给启动对账处理。
+                        order.legs[index].venue_order_id = Some(ack.venue_order_id.clone());
+                        order.legs[index].status = LegStatus::Submitted;
+                        order.legs[index].filled_quantity = leg.quantity;
+                        order.legs[index].average_price = Some(leg.limit_price);
+                        state.record_reject(&error);
+                        log_event(
+                            state,
+                            order.id,
+                            "leg_unconfirmed",
+                            json!({
+                                "index": index,
+                                "venue": &venue,
+                                "venue_order_id": &ack.venue_order_id,
+                                "error": &error,
+                            }),
+                        )
+                        .await;
+                        failure = Some(format!("第 {} 个交易所成交确认失败: {error}", index + 1));
+                        break;
+                    }
+                }
             }
             Err(error) => {
                 order.legs[index].status = LegStatus::Rejected;
+                state.record_reject(&error);
                 log_event(
                     state,
                     order.id,
